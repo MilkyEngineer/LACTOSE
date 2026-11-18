@@ -78,7 +78,7 @@ signature change to list.
 | `build_shown`, `Shown` (facade) | A shown world between runs: a `Server` built by `build_server`'s path with extract's outputs installed, and the render side driven beside it; `step` for one tick and its frame, joined; `frame` for one paced frame; `flush` to join the frame in flight; `stop` to end the render side and hand both back; `server` and `server_mut` for what a `Server` offers by reference; `stats` |
 | `RenderSide`, `PresentSide`, `PresentLane` (facade) | The two traits the assembly drives the render side through, which name no backend (decision 5.11): the object the binary builds over the device, the graph, the renderer and the presentation schedule; the state of the present thread, over the swapchain; and the lane to it |
 | `TARGETS`, `TargetIndex`, `Region`, `FrameTime`, `Draw`, `KindCounts`, `FrameCounts`, `Submitted`, `Finished`, `PresentReport` (facade) | What crosses those traits, all plain data: the two offscreen targets by index; whether a region is open, or the point that frees one; the frame's time and fraction; what a frame draws into; a drawn frame's counts by world kind; what a submit left; what one present call reads, and what it did |
-| `ShownStep`, `ShownFrame`, `ShownFlush`, `ShownStop`, `Rendered`, `ShownOutput`, `ShownStats`, `Stopped`, `ShownError`, `ShownKept` (facade) | The shown world's runs in flight; what a frame did on the render side (drew, hid, waited, was torn); what a paced frame produced; the counters since the build; what `stop` hands back; and how a run fails, with what survived it |
+| `ShownStep`, `ShownFrame`, `ShownFlush`, `ShownStop`, `Rendered`, `ShownOutput`, `ShownStats`, `Stopped`, `ShownError`, `ShownKept` (facade) | The shown world's runs in flight; what a frame did on the render side (drew, hid, waited for a region, was busy, was torn); what a paced frame produced; the counters since the build; what `stop` hands back; and how a run fails, with what survived it |
 | `Source::Render`, `ErrorPolicy::MILESTONE_2` (facade) | The render side as a source of errors, and the table a shown world is built with: a lost device stops the run, and any other error tears the frame or skips the present |
 
 Hidden plumbing, which the implementation may reshape: the solver pool's construction and
@@ -115,7 +115,7 @@ table it is.
 | `frame-impl`'s tests of criterion 3 | A render side with no device that logs and blocks where the test says; a shown world and the same world unshown, stepped alike; the hash after each tick | `RenderSide` and `PresentSide` implemented by a test; `Shown::step`, `Shown::server`, `Server::step`; "Determinism of a shown world"; `tests/shown.rs`, section 5 |
 | `lactose-renderer`, `lactose-render-graph` and `lactose-presentation`, behind the binary's object | A job's context for the record and for the presentation schedule's forks, with no lock and no `Sync` asked of the object; the sink installed and replaced at the right frames; one extent a frame; the target's last read as a point; no pass of extract between `prepare` and the next open region; no submit behind a present on a worker; the drop off the workers, the graph first | `RenderSide::{open, present, draw}` take `&mut JobContext`, lent by `Executor::run_job`; "The frame's three states", "Counts, torn frames and resets"; `Draw`; "The shown frame"; "The targets and the present thread"; `Stopped::render` |
 | `lactose-platform`'s present thread, and the `swapchain` lane | The state its thread owns, declared by the frame; one call in flight; a last call that drops the swapchain; no host signal owed | `PresentSide` as the `S` of `present_thread`, `PresentLane`; "The targets and the present thread"; `Shown::stop` |
-| `measure-m2` | What to time and count for `frame-pace` and `record-stall`, what to record beside the counts, and the reservation to vary | `ShownOutput`, `Rendered` with `queued` and `held`, `Shown::stats`; `WorldConfig::physics` beside `RECORD_RESERVATION`; "Pacing" |
+| `measure-m2` | What to time and count for `frame-pace` and `record-stall`, what to record beside the counts, and the reservation to vary | `ShownOutput`, `Rendered` with `queued`, `held` and `Busy`, `Shown::stats`; `WorldConfig::physics` beside `RECORD_RESERVATION`; "Pacing" |
 | `game-sim` (the mover; `frame-impl`) | What to write so that the local world moves, with the binary declaring nothing a world registers | "The mover of the local world" |
 | `app-server`, `net`, and `app-client`'s replicated world (milestone 4) | The places named now and the signatures that will change | `Client` gains the replicated world; `build_client` loses `entity`; `Workers::platform` already takes the platform crate's `ClientPlatform`, from milestone 2; `Server::relevance` already takes the executor; a shown client's two worlds; "Not in this crate yet" |
 | The error policy (architecture section 19) | One place that decides, as a value a test can read | `ErrorPolicy::MILESTONE_1`, `ErrorPolicy::MILESTONE_2`, `Source`, `Response`; "Errors" below |
@@ -506,19 +506,26 @@ theirs too. Each sentence is one a dependent crate may rely on.
   installs a sink or a writer itself breaks the frame's count of full passes.
 - `Shown::frame(executor, now, frames, window)` is one paced frame. It does the following,
   in this order, and nothing else:
-  1. **The ticks.** `Server::frame`'s first half, unchanged: the poll with its resync while
-     paused, the budget, and `frames(next)` and `Server::step` for each tick ("The timer
-     root" above). The render task of the frame before, if one is in flight, runs beside
-     these ticks. That is the overlap of architecture section 5.3, and the only one.
-     (`Server::frame` is this half and step 4's passes and gather, back to back.)
-  2. **The join.** It awaits the render task of the frame before and takes back what the
-     task owned. What that frame did is `ShownOutput::joined`. From here to step 5 no
-     tick's stage and no method of the render side is in flight but the ones the steps
-     name.
+  1. **The ticks.** `Server::frame`'s first half, unchanged: the poll with its resync
+     while paused, the budget, and `frames(next)` and `Server::step` for each tick ("The
+     timer root" above). The render task in flight, if any, runs beside these ticks: it is
+     that of the last frame that started one. That is the overlap of architecture section
+     5.3, and the only one. (`Server::frame` is this half and step 4's passes and gather,
+     back to back.)
+  2. **The look.** It looks once at the render task in flight and waits for nothing. If
+     the task has resolved, the frame takes back what the task owned, and what that task's
+     frame did is `ShownOutput::joined`. If it has not, this frame is *busy* ("The frame's
+     three states"): it runs nothing more and resolves with `deferred` as
+     `Some(Rendered::Busy)`. So no tick waits for the render side. Past the bound on
+     deferring, and only there, the frame awaits the task instead. Once the task is taken
+     back, and until step 5, no tick's stage and no method of the render side is in flight
+     but the ones the steps name.
   3. **The state.** The frame *draws*, *waits* or is *hidden* ("The frame's three
      states"). Deciding may take one job (`Executor::run_job`; "The render side"), which
      calls `RenderSide::open`, when no region is known to be open. Where the present role
-     shares the graphics queue the task first awaits the present call in flight, if any
+     shares the graphics queue that job is started only with no present call in flight.
+     The task looks at the call and takes its report if it has returned; if it has not,
+     the frame is busy as in step 2, and the call is awaited only past the same bound
      ("The targets and the present thread").
   4. **The passes**, unless the frame waits. The sink is changed where the state or the
      last frame's counts ask for it ("Counts, torn frames and resets"); then
@@ -533,43 +540,57 @@ theirs too. Each sentence is one a dependent crate may rely on.
         `SnapshotReader::acquire`, once; `RenderSide::present` with the acquired frame and
         the frame's time; and, where the frame draws, `RenderSide::draw` with the target,
         the extent and the target's last read;
-     2. where the frame drew and the present role shares the graphics queue, the await of
-        the present call in flight, if any;
-     3. where the frame drew, `RenderSide::submit`, from the task's own poll: the latch and
-        the submit, with nothing of this crate's between them;
+     2. where the frame drew and the present role shares the graphics queue, the hold: the
+        await of the present call in flight, if any;
+     3. where the frame drew, `RenderSide::submit`, from the task's own poll: the latch
+        and the submit, with nothing of this crate's between them;
      4. where it submitted, the present protocol's one decision ("The targets and the
         present thread"): at most one call queued on the lane, and none awaited after it.
+        A frame whose submit was held queues none.
   6. `frame` resolves with the world's half as `Server::frame` reports it, `joined`, and
      `deferred` where the frame waited. It does not wait for the render task it started.
-- So extract is exclusive (architecture section 5.3). The passes of frame N run after the
-  ticks of frame N have resolved and before a tick of frame N+1 starts, since one task
-  owns the `Simulation` and awaits each of its runs; and they run with no method of the
-  render side in flight, since the render task of frame N−1 was joined first. The frame's
-  job reads the snapshot and seals the region only after frame N's `publish`, and the next
-  pass begins only after the task that ran that job was joined. So no frame reads the
-  snapshot buffer or the ring region extract is writing (the milestone 2 plan, criterion
-  3(a)), by order, with no lock held across either.
+- So extract is exclusive (architecture section 5.3). The passes of a frame run after its
+  ticks have resolved and before a tick of the next frame starts, since one task owns the
+  `Simulation` and awaits each of its runs; and they run with no method of the render side
+  in flight, since the frame took the last render task back, resolved, before them. A
+  render task's job reads the snapshot and seals the region only after its own frame's
+  `publish`, and the next pass begins only after that task was taken back. So no frame
+  reads the snapshot buffer or the ring region extract is writing (the milestone 2 plan,
+  criterion 3(a)), by order, with no lock held across either.
 - So the next frame's extract begins only after this frame is submitted.
   `crates/renderer/README.md` allows it from `prepare` on ("What `frame-design` must still
   decide"); the frame does not take that, because the render side is one object with one
   owner at a time, and a pass that ran beside `record` would write through the sink while
-  the rest of the object is lent to recording jobs. What it costs: a record that outlasts
-  the tick period holds the next frame's passes until it is done, the frame after starts
-  late, and its pacer owes the ticks, which it runs at the cap as after any late frame. On
-  a shared queue a submit held for a present call costs the same ("Pacing").
-- `Shown::step(executor, frame, time, window)` is the step-driven form, for the fixed-frame
-  mode of decision 5.1, a recorded test and a replayed log: the join of a frame in flight,
-  if any; `Server::step` with `frame`; steps 3 to 5 at `time` and `window`; then the join
-  of the render task it started, before it resolves. Nothing of a step's frame overlaps
-  the next step. The gathered frame is taken and dropped, as the headless binary drops it.
-  The graph runs and the jobs a step starts are in a fixed order (the step's runs; the job
-  that asks `open`, where no region is known open; the passes' runs; the frame's job), so
-  a program that gets the same answers from its render side starts the same runs in the
-  same order, which is what a replayed log follows, `Executor::run_job` being recorded as
-  a run of one node (`crates/task/README.md`, "Chaos"; `Workers::replay`; "What D162 asks
-  of other crates"). An await of a present call starts no run and moves none. The paced
-  form interleaves a render task with the next ticks by wall time and is not replayable,
-  as `Headless::run` is not.
+  the rest of the object is lent to recording jobs. What the order costs is pictures, and
+  no tick. While a record outlasts the tick period, or on a shared queue a submit is held
+  for a present call, each frame that begins is busy: it runs its ticks at their deadlines
+  and draws nothing. The next picture is drawn by the first frame whose look finds the
+  task resolved, at a tick's deadline and no sooner. So on either queue layout a record
+  that runs a little over the period costs every second picture, where a join that waited
+  would have drawn each one and started the ticks late. The ticks are what a `Server`
+  world may not give up: beyond the cap on catch-up a server "climbs the overload ladder"
+  and does not slow time (architecture section 5.1), and "Server time is never slowed"
+  (section 9.7). A frame redrawn as soon as the task resolves needs a deadline between
+  ticks, which is not here ("Not in this crate yet").
+- `Shown::step(executor, frame, time, window)` is the step-driven form, for the
+  fixed-frame mode of decision 5.1, a recorded test and a replayed log: the join of a
+  frame in flight, if any; `Server::step` with `frame`; steps 3 to 5 at `time` and
+  `window`; then the join of the render task it started, before it resolves. Nothing of a
+  step's frame overlaps the next step. It awaits wherever the paced form looks: the task
+  in flight at its start, the present call before a job that asks `open` on a shared
+  queue, and the task it started. So a step is never busy, and `Rendered::Busy` is the
+  paced form's alone. On a shared queue a step's render task holds its submit as a paced
+  frame's does, and a held frame is dropped: where a present call outlasts a step, the
+  next step waits for the call and its frame is not shown, and the one after it is. The
+  gathered frame is taken and dropped, as the headless binary drops it. The graph runs and
+  the jobs a step starts are in a fixed order (the step's runs; the job that asks `open`,
+  where no region is known open; the passes' runs; the frame's job), so a program that
+  gets the same answers from its render side starts the same runs in the same order, which
+  is what a replayed log follows, `Executor::run_job` being recorded as a run of one node
+  (`crates/task/README.md`, "Chaos"; `Workers::replay`; "What D162 asks of other crates").
+  An await of a present call starts no run and moves none. The paced form interleaves a
+  render task with the next ticks by wall time and is not replayable, as `Headless::run`
+  is not.
 - The frame's time. Neither form reads a clock. `FrameTime::now` is `frame`'s `now`.
   `FrameTime::fraction` is `1 − (next_deadline − now) / period`, clamped to `[0, 1]`, with
   `next_deadline` the pacer's after the frame's poll and `period` the tick period at the
@@ -578,15 +599,18 @@ theirs too. Each sentence is one a dependent crate may rely on.
   form takes the caller's `FrameTime` as it is and reads no pacer. The fraction is of one
   tick period whatever the pair's two ticks are: after a frame that waited or caught up,
   the pair spans several ticks and the picture covers them in one period.
-- `Shown::flush` joins the frame in flight and resolves with what it did; a present call
-  that frame queued may still be in flight. `Shown::stats` is the counters since the build.
+- `Shown::flush` joins the frame in flight, awaiting its render task, and resolves with
+  what it did; a present call that frame queued may still be in flight. `Shown::stats` is
+  the counters since the build.
 
 **The frame's three states** (architecture section 5.3; `crates/renderer/README.md`,
 "Regions"; `docs/verification.md`, the row on a reader that stops acquiring)
 
 - A frame *draws* when the window has an area and a region is open to extract's writers.
   It is *hidden* when the window has none (`window` is `None` or has a zero dimension), or
-  when it is starved (below). Otherwise it *waits*.
+  when it is starved (below). Otherwise it *waits*, for a region. And a frame of any
+  window waits while the frame before it is still on the render side: it is *busy*
+  (below).
 - Whether a region is open is what the render side last said: `Submitted::region` of the
   last frame that drew, else the answer of `RenderSide::open`. A frame whose window has an
   area calls `open`, in a job of its own (`Executor::run_job`), when the last answer was
@@ -596,19 +620,42 @@ theirs too. Each sentence is one a dependent crate may rely on.
   workers, as the fixed-frame mode's driver thread does for each frame's own point.
 - A frame that draws runs steps 4 and 5 in full.
 - A frame that waits runs its ticks and nothing else: no pass, no gather, no publication,
-  no acquire, no render task. `ShownOutput::deferred` is `Some(Rendered::Waited(point))`
-  and `world.gathered` is empty. The world's presentation events stay in its queue, and the
-  structural log keeps what the passes have not read. Waiting, and not hiding, is the
-  answer to a device that is behind: a frame that hid would detach the sink, and the frame
-  that drew again would need a full pass, every instance written again and a `cut` in the
-  snapshot (`crates/present-api/README.md`, "The triple buffer").
-- A frame defers its passes only while the world has run at most
-  `WorldConfig::log_retention − CATCH_UP_CAP` ticks since its last passes. The frame after
-  such a one has then run at most `log_retention`, which is what a step keeps of the
-  structural log (`crates/sim/README.md`, "Runs", step 3), so no consumer that reads the
-  log once a pass finds its cursor stale because a frame waited. Past that the frame is
-  *starved*: it is hidden, and so is every frame after it until `open` answers `Ready`,
-  each of them asking first.
+  no acquire, no render task. `ShownOutput::deferred` is `Some(Rendered::Waited(point))`,
+  or `Some(Rendered::Busy)` for a busy frame, and `world.gathered` is empty. The world's
+  presentation events stay in its queue, and the structural log keeps what the passes have
+  not read. Waiting, and not hiding, is the answer to a device that is behind: a frame
+  that hid would detach the sink, and the frame that drew again would need a full pass,
+  every instance written again and a `cut` in the snapshot
+  (`crates/present-api/README.md`, "The triple buffer").
+- A frame is *busy* when step 2's look finds the render task unresolved, or when, on a
+  shared queue, step 3 must ask `open` and finds a present call in flight ("The targets
+  and the present thread"). It waits as a frame with no region does and reports
+  `Rendered::Busy`, and `ShownStats::busy` counts it; `joined` is `None` where the task
+  was unresolved, and a later frame reports that task's frame. This is what keeps the
+  render side from slowing a world's time: a record that outlasts the period, and a submit
+  held for a present call, cost the pictures of the frames that begin meanwhile and no
+  tick (architecture sections 5.1 and 9.7). No invariant of the frame moves, since a busy
+  frame does only what a waiting frame already did:
+  - No pass runs while a method of the render side is in flight. A busy frame runs none,
+    and the next pass follows a look that took the task back, resolved.
+  - Publications and acquires alternate. A busy frame publishes nothing and acquires
+    nothing, and the task in flight acquires once, for its own frame's publication.
+  - The structural log and the events are read within `log_retention` ticks. One count, of
+    the ticks since the last passes, bounds a wait for either reason (below).
+  - Nothing hashed depends on a deferral. A pass run some frames later moves no hash, and
+    the ticks a frame runs depend on `now` and the frame callback alone ("Determinism of a
+    shown world").
+- A frame defers its passes, for a region or for the frame before it, only while the world
+  has run at most `WorldConfig::log_retention − CATCH_UP_CAP` ticks since its last passes:
+  116 at the defaults, which is 1.9 s at real time. The frame after such a one has then
+  run at most `log_retention`, which is what a step keeps of the structural log
+  (`crates/sim/README.md`, "Runs", step 3), so no consumer that reads the log once a pass
+  finds its cursor stale because a frame waited. Past that the frame defers for nothing.
+  It awaits the render task in flight, as `Shown::step` does, and on a shared queue the
+  present call before it asks `open`: the one place where the render side delays a tick,
+  and the frame after it is late as after any overrun ("Pacing"). And where no region is
+  open it is *starved*: it is hidden, and so is every frame after it until `open` answers
+  `Ready`, each of them asking first.
 - A starved frame is hidden whatever `open` answers, an error the policy logs included: it
   runs its passes with the sink detached and its job with no `draw`, as a hidden frame
   does, and never defers. It reports `Rendered::Hidden`, with `ShownOutput::deferred`
@@ -765,21 +812,29 @@ theirs too. Each sentence is one a dependent crate may rely on.
   driver call holds the queue's lock (D158), and no frame-critical worker may wait behind
   one (architecture section 5.1; D153). So no method of the render side that reaches a
   queue is called while a present call is in flight. Before `RenderSide::submit` the
-  render task awaits the call in flight, if any, and takes its report; before a job that
-  asks `open`, which may make the empty submit, the task that drives the frame does the
-  same. The await is of the call's future: no worker waits and no run permit is held. The
-  present thread reaches the queue only inside a call, and a call is queued only after a
-  frame's submit, or by `stop`, so when the render side takes the queue's lock no present
-  holds it. After the submit one call is queued for the target just finished, in every
-  frame that drew: `queued` is `true`, no frame is dropped, and `Rendered::Drew::held`
-  says whether the call was still in flight when the frame's job returned. The hold is
-  for the whole of that call, its wait for a swapchain image included, and not for the
-  driver's present alone ("Pacing"). An error the awaited call reports is decided before
-  the submit, and the submit is made whatever the response: on a lost device `submit`
-  returns at once, and the frame's `Stop` reaches the caller at the join.
+  render task awaits the call in flight, if any, and takes its report: that is the *hold*.
+  The await is of the call's future: no worker waits and no run permit is held. Before a
+  job that asks `open`, which may make the empty submit, the task that drives the frame
+  looks at the call instead: it takes the report of a call that has returned, and while
+  one has not, the frame is busy and starts no job ("The frame's three states"); it awaits
+  the call only past the bound on deferring, and in `Shown::step`. The present thread
+  reaches the queue only inside a call, and a call is queued only after a frame's submit,
+  or by `stop`, so when the render side takes the queue's lock no present holds it. After
+  the submit comes the decision a queue of its own makes, made here after the hold. A
+  frame whose submit was not held queues one call for the target just finished, and
+  `Rendered::Drew::queued` is `true`. A frame whose submit was held
+  (`Rendered::Drew::held`: the call was still in flight when the frame's job returned)
+  queues nothing, whatever the awaited call reported: `queued` is `false`, the frame is
+  never shown, and the next frame draws into the same target ("Pacing" says why). The hold
+  is for the whole of that call, its wait for a swapchain image included, and not for the
+  driver's present alone. An error the awaited call reports is decided before the submit,
+  and the submit is made whatever the response: on a lost device `submit` returns at once,
+  and the frame's `Stop` reaches the caller when the frame is taken back.
 - So at most one present call is in flight and at most one is queued a frame (architecture
-  section 3; D159), and the lane never grows. On a queue of its own that is back-pressure
-  and not pacing; on a shared queue it is the display's pace reaching the frame.
+  section 3; D159), and the lane never grows. On either layout that is back-pressure and
+  not pacing: a present call that outlasts a frame costs pictures. On a shared queue it
+  also holds one render task, and with it the passes of the frames that begin meanwhile,
+  and no tick within the bound on deferring.
 - **The present thread never acquires a release it skipped.** A frame's submit releases
   its target toward the present role whether or not a call will be queued for it. The
   release is skipped when no call was queued, or when the call returned having made no
@@ -816,21 +871,22 @@ theirs too. Each sentence is one a dependent crate may rely on.
   this crate owes no host signal (`crates/platform/README.md`, "Shutdown", step 2). A torn
   frame's point is the graph's to signal, with its next submit or at its drop
   (`crates/render-graph/README.md`, "Errors and drops").
-- When the present thread is slower than the frame, what gives way depends on the queue.
-  On a queue of its own a finished target is dropped, not shown late: the decision is made
-  once, at the frame's submit. On a shared queue the frame's submit is held and every
-  finished target is shown. Where the display takes images at least as fast as frames
-  finish, a call has returned by the next submit, and every frame is queued with no hold.
-  Where it does not, frames are dropped on a queue of its own, every second one or more
-  where a call outlasts a frame, and held on a shared one. `ShownStats::drawn`, `queued`,
-  `held` and `shown` say what happened, and `frame-pace` records them ("Pacing").
+- When the present thread is slower than the frame, a finished target is dropped, not
+  shown late, on either layout. The decision is made once a frame: at the frame's submit
+  on a queue of its own, and after the hold on a shared one. Where the display takes
+  images at least as fast as frames finish, a call has returned by the next submit, and
+  every frame is queued with no hold. Where it does not, frames are dropped, every second
+  one or more where a call outlasts a frame; on a shared queue each dropped frame was held
+  first, and the frames that began during its hold were busy. `ShownStats::drawn`,
+  `queued`, `held`, `busy` and `shown` say what happened, and `frame-pace` records them
+  ("Pacing").
 
 **Threads, and what each owns** (architecture sections 3 and 5.1;
 `crates/platform/README.md`, "A client binary, by thread")
 
 | Thread | What it runs of the shown frame | What it owns |
 |---|---|---|
-| The task that drives the frame: the timer root, on whichever frame-critical worker polls it, or a step-driven run's driver thread through `Executor::block_on` | Steps 1 to 4 and 6: it awaits the world's runs, joins the render task, starts the job that asks `open` (behind an await of the present call in flight, where the roles share a queue), changes the sink, publishes and spawns | `Shown`: the `Server`, and between frames the render side and the protocol's state |
+| The task that drives the frame: the timer root, on whichever frame-critical worker polls it, or a step-driven run's driver thread through `Executor::block_on` | Steps 1 to 4 and 6: it awaits the world's runs, looks at the render task and takes it back once it has resolved, starts the job that asks `open` (only with no present call in flight, where the roles share a queue), changes the sink, publishes and spawns | `Shown`: the `Server`, and between frames the render side and the protocol's state |
 | Frame-critical workers | The jobs of the ticks and of the passes; the job that asks `open` and the frame's job, and what `open`, `present` and `draw` fork from their contexts, the graph's recording jobs among them; the render task's own polls, which call `submit` and touch the lane. No worker waits for a present: a poll that finds a call in flight on a shared queue returns `Pending` | Nothing between jobs. The render task owns the render side and the protocol's state from its spawn to its join, and a job owns what was moved into its closure until it returns |
 | The present thread | `PresentSide::present` and `close`, one call at a time, through the lane's pump | The `Box<dyn PresentSide>`: the swapchain, its encoder, its timeline, its heap slots |
 | The solver pool's threads | The physics step, while all but `RECORD_RESERVATION` of the other frame-critical workers are parked | The backend's own |
@@ -845,8 +901,8 @@ State that more than one of them touches, and the rule for each:
   `publish` and once by `acquire`, in that order in every frame, so here it is never
   contended.
 - The renderer's open region: written by the passes' jobs through the sink, sealed and
-  read by the render side's methods. Never at once: a pass runs only between a join and a
-  spawn.
+  read by the render side's methods. Never at once: a pass runs only after the last render
+  task was taken back and before the next is spawned.
 - The render side and the protocol's state: moved between the driving task, the render
   task and the one job either is running, never shared. No lock and no atomic of this
   crate's: a move rides the task's join slot or the job's completion slot, which are
@@ -875,11 +931,14 @@ The locks a frame takes are these, and none is this crate's own.
 - `lactose-task`'s own, which section 3 neither permits nor lists. The task registry, one
   map for the whole executor that every background spawn shares, is taken at the render
   task's spawn and at its finish. The task's join slot is taken when the task completes
-  and at each poll of the join. And for each job (`Executor::run_job`), as for each graph
-  run of the ticks and of the passes, the run registry is taken at its start and its end,
-  and the run's completion slot at its end and at each poll of its future. Every tick of
-  milestone 1 already takes the last two, and the timer's lock; a spawn and a join each
-  frame are new with this frame.
+  and at each poll of the join: once at each frame's look, and at each wake where a frame
+  awaits. A look may leave the driving task's waker in the slot, and that task is then
+  woken once when the render task resolves: a root asleep on its timer is polled, finds
+  its sleep pending and sleeps on. And for each job (`Executor::run_job`), as for each
+  graph run of the ticks and of the passes, the run registry is taken at its start and its
+  end, and the run's completion slot at its start, at its end and at each poll of its
+  future. Every tick of milestone 1 already takes the last two, and the timer's lock; a
+  spawn and a look each frame are new with this frame.
 
 Whether section 3 should name the executor's internal locks is a question for the
 planner, which D162's merge raises: today they are neither permitted nor listed. This
@@ -890,11 +949,14 @@ the row on the keeper's timed wait on Windows)
 
 - The timer root paces the frame and nothing else does. The binary's root sleeps until
   `ShownOutput::world.next_deadline` with `Executor::sleep_until` and calls `Shown::frame`
-  again, as a loop around `Server::frame` does. Where the present role has a queue of its
-  own the present thread paces nothing: a present that blocks holds no frame, since its
-  caller holds a future and queues nothing behind it, and no frame waits for a display.
-  Where it shares the graphics queue a present call still in flight holds the frame's
-  submit, and no worker (below).
+  again, as a loop around `Server::frame` does. Neither the render side nor the present
+  thread paces a tick. A frame looks at the render task in flight and waits for nothing
+  ("The shown frame", step 2), so a record that outlasts the period holds no tick. A
+  present that blocks holds none either, since its caller holds a future and queues
+  nothing behind it, and no frame waits for a display. Where the present role shares the
+  graphics queue a present call still in flight holds one frame's submit, and no worker
+  and no tick (below). The one exception is a frame past the bound on deferring ("The
+  frame's three states").
 - At milestone 2 a frame is therefore a tick's: one frame at each tick deadline, 60 a
   second at real time, drawn at a fraction near zero, which is the state of the tick before
   the newest. A display faster than that repeats frames.
@@ -905,73 +967,123 @@ the row on the keeper's timed wait on Windows)
   (`crates/platform/README.md`, "Not in this crate yet") and no milestone 2 row reads one.
   The 144 Hz of the plan's decision 5.3 is a cost test's timer and not the client's frame.
   "Not in this crate yet" names it.
-- A frame is late when the task that drives it is late: by the keeper's wake, by ticks
-  that overrun, by the join of a record that outlasts the period or, on a shared queue, by
-  the join of a submit held for a present call. The pacer counts what is then owed and the
-  frame runs it at the cap, as a server's does.
+- A frame is late when the task that drives it is late: by the keeper's wake, or by ticks,
+  passes or a job that asks `open` that overrun the period. The render task makes no frame
+  late while frames may defer: a record that outlasts the period, and a submit held for a
+  present call, cost pictures ("The shown frame"). Past the bound on deferring a frame
+  awaits the render side and is late by that wait. The pacer counts what is then owed and
+  the frame runs it at the cap, as a server's does.
 - **Where the present role shares the graphics queue** (`Capabilities::queues.present` is
   `QueuePath::Shared`; the row of `docs/verification.md` on which queue families present),
   a submit made while a present's driver call holds the queue's lock waits behind it
   (D158). No frame-critical worker does: the frame's submit, and `open`, are made only
-  with no present call in flight, and the task that would make one awaits the call, which
-  parks no worker and holds no run permit ("The targets and the present thread"). So the
-  physics step stays the one sanctioned blocking wait on a worker (architecture section
-  5.1), and no frame-critical worker waits behind a present on any layout. D153 rules out
-  "a frame submit waiting behind a present" and gives the present role a queue of its own
-  "where the device offers one". Where it offers none, something of the frame gives way to
-  a present that holds the queue, whichever thread submits, and what waits here is a task.
-  Neither sentence is amended. What the hold changes:
-  - *The latch.* `RenderSide::submit` is called after the hold, so the sample it latches is
-    the newest at the submit, as on a queue of its own. The world in the picture is the
-    frame's, older than its camera by the hold.
-  - *The pace.* Here, and nowhere else, the present thread holds a frame: for what is
-    left of one present call, which lasts as long as the present side's bounded waits,
-    `acquire`'s bound of about a second and the driver's present allow
-    (`crates/rhi-api/README.md`, "The swapchain"). Through the join the hold delays the
-    next frame's passes, and the frame after starts late: its ticks are owed and run at
-    the cap, and a call that outlasts `CATCH_UP_CAP` periods shows as `behind`. The held
-    frame's own ticks ran before its join. Every finished frame is shown, late where the
-    display is slow, and none is dropped: the display's pace reaches the frame, which is
-    "as fast as the display allows" (architecture section 5.3).
+  with no present call in flight. The render task awaits the call before its submit, which
+  parks no worker and holds no run permit, and the driving task starts no job that asks
+  `open` while one is in flight ("The targets and the present thread"). So the physics
+  step stays the one sanctioned blocking wait on a worker (architecture section 5.1), and
+  no frame-critical worker waits behind a present on any layout. D153 rules out "a frame
+  submit waiting behind a present", and that rule applies where the device offers the
+  present role a queue of its own, as D153's first sentence sets. Where the device offers
+  none, D153 has the roles share the graphics queue, "a present that blocks holds its
+  queue on any driver", and something of the frame gives way whichever thread submits.
+  D162 chooses what: the picture of the frame whose submit was held, and the passes of the
+  frames that begin meanwhile; never a frame-critical worker and, within the bound on
+  deferring, never a tick. What the hold changes:
+  - *The latch.* `RenderSide::submit` is called after the hold, so the sample it latches
+    is the newest at the submit, as on a queue of its own. No held frame is shown, so
+    every picture shown was submitted with no hold, and its world is older than its camera
+    by its record alone, as on a queue of its own.
+  - *The pace.* The hold delays one render task and, through the look, no tick: the frames
+    that begin while a submit is held are busy ("The frame's three states"). A hold lasts
+    for what is left of one present call, which lasts as long as the present side's
+    bounded waits, `acquire`'s bound of about a second and the driver's present allow
+    (`crates/rhi-api/README.md`, "The swapchain"). Only a call that outlasts the bound on
+    deferring, 1.9 s at the defaults and real time, reaches a tick.
+  - *The drop.* A held frame is submitted and never shown: the decision a queue of its own
+    makes at its submit, made here after the hold. Shown, it would be a picture as old as
+    its hold, queued behind the call that held it, and the swapchain would keep one image
+    more from then on, with every later present waiting a refresh for it. `reviewer-gpu`
+    ran the frame's order on MoltenVK with both roles on one queue, frames at the
+    display's 60 Hz (the review of D162's second draft). With held frames shown and the
+    look in place, one present call stalled for 40 ms left that backlog for the rest of
+    the run in 7 runs of 8: the latch was 11.7 to 16.6 ms old at the median when its
+    present call returned, against 0.13 to 1.67 ms on a queue of its own after the same
+    stall. With no stall at all, a frame period 0.1% and 0.4% shorter than the display's
+    ended with 45% to 55% of all frames held and the latch 15.7 to 16.4 ms old. With held
+    frames dropped, the same stall cost 1 or 2 frames in 5 runs of 6 and 20 in the sixth,
+    the latch 0.28 to 0.34 ms old in 4 of the 6 and 4.0 and 8.0 ms in the others; and the
+    drift cost 2 or 3 frames a run, the latch 3.7 to 5.8 ms old, where a queue of its own
+    dropped 3 at 5.5 ms. No tick started late in any of these runs. D162 records them.
   - *A present that stalls.* A window whose presents stall, as an occluded one's may,
-    holds every frame of a shared queue for a call's bound. The answer is a hidden frame
-    (`window: None`), which makes no submit and queues no call; `lactose-platform` reports
-    no occlusion for the binary to act on ("Not in this crate yet").
-  - *The counts.* `queued` equals `drawn`. `Rendered::Drew::held` and `ShownStats::held`
-    count the frames whose submit was held, which are the frames a queue of its own would
-    have dropped at that moment.
+    costs a shared queue its pictures: each call holds one frame for the call's bound, the
+    frames that begin meanwhile are busy, and the held frame is dropped. It costs no tick
+    while each call returns within the bound on deferring, as one bounded by `acquire`'s
+    second does. Under MoltenVK a present with no drawable may take about three seconds
+    for each image, or more (`crates/rhi-api/README.md`, "The swapchain"). That is past
+    the bound: the frame then awaits, and the world runs slow by the part of each call
+    past the bound. `reviewer`'s model of this order ran 60 ticks a second through calls
+    of one second and 41.8 through calls of three. The answer is a hidden frame (`window:
+    None`), which makes no submit and queues no call; `lactose-platform` reports no
+    occlusion for the binary to act on ("Not in this crate yet").
+  - *The counts.* `Rendered::Drew::held` and `ShownStats::held` count the frames whose
+    submit was held, each of them dropped: on a shared queue `queued` is `drawn` less
+    `held`, and on either layout `drawn` less `queued` is the frames finished and never
+    shown. `ShownStats::busy` counts the frames that deferred their passes behind a render
+    task or a present call. None of the three shows a picture that was shown late; the
+    latch's age does (`frame-pace`, below).
 - Two other places for a shared queue's submit were weighed. *Through the present lane*:
   the lane runs one call at a time, so the submit would wait for the same present call;
   and it would be a second call a frame where architecture section 3 permits one (D159),
   with the render side moved to the present thread for it, the latch made there, and a
   lane closed under it dropping the render side on the caller's worker. *On a thread of
-  its own*: the submit would wait for the present's driver call alone, and a late frame
-  would be dropped as on a queue of its own; but it asks for a thread architecture section
-  5.1 does not list, a lane's two locks a frame that section 3 does not permit, and the
-  render side moved across for every submit. Awaiting the call takes neither and adds
-  nothing to the surface but `present_queue` and `held`. The thread is the refinement a
-  shared-queue device with a display may ask for, with `frame-pace`'s figures ("Not in
-  this crate yet").
+  its own*: the submit would wait for the present's driver call alone; but it asks for a
+  thread architecture section 5.1 does not list, a lane's two locks a frame that section 3
+  does not permit, and the render side moved across for every submit. And it wins nothing
+  the hold lacks, once held frames are dropped and busy frames defer. In `reviewer-gpu`'s
+  runs on MoltenVK, whose present waits inside the queue's lock, with the GPU near
+  saturation, the thread showed 54.7 to 55.7 frames a second, the latch 30.6 ms old at the
+  median when its present call returned, and its first tick started 9.0 ms late at the
+  median; the hold showed 52.1 to 52.6, the latch 10.0 to 10.2 ms old, and no tick late.
+  On a stand-in for a driver whose present waits outside the lock, the hold showed 53.6 to
+  55.4 frames a second and the thread 55.2 to 55.7, the latch 8.9 to 10.1 ms and 9.9 to
+  10.2 ms old, with no tick late under either. Awaiting the call adds nothing to the
+  surface but `present_queue`, `held` and `Rendered::Busy`. What would reopen the thread
+  is `frame-pace` from a shared-queue device with a display ("Not in this crate yet").
 - `frame-pace` is the result file the frame asks of `measure-m2`, on the M1 and on
-  Windows, from a run of `lactose-app-client` of ten seconds or more, shown, and on Windows
-  also minimised (`MainThread::set_minimised`). It records, for each paced frame: the
-  lateness of its first tick's start against the deadline the root slept to, taken in the
-  frame callback; whether the frame drew, waited or hid; whether its present was queued
-  and whether its submit was held; the time `RenderSide::submit` took and, on a shared
-  queue, the time from `draw`'s return to `submit`'s entry, both taken by the binary's
-  render side; and the time each present call took, taken by its present side. It reports
-  the P50 and P99 of the lateness; the counters of `Shown::stats`; the frames that reported
-  `behind`; and the P50 and P99 of the submit's time, of the hold and of the present
-  call's, beside the device's `QueueLayout`. It records what moves those figures as well:
-  the load averages before and after the run, the swapchain's image count, whether a
-  validation layer was on, and the display's state (its refresh rate, whether the window
-  was occluded, whether another client was drawing). Each row is run once on a quiet
-  machine. The lateness is read against D144's 1 ms on Windows and D156's 50 µs on macOS.
-  Those are criteria of a tick's start with idle workers, so a figure over one in a shown
-  run is a finding for the planner and no failed criterion. On a shared queue the submit's
-  P99 is read beside the present call's: a submit that took as long as a present call
-  waited behind one on a worker, which the frame's order rules out, and is a defect to
-  report. Everything else is recorded with no threshold.
+  Windows, from a run of `lactose-app-client` of ten seconds or more, shown, and on
+  Windows also minimised (`MainThread::set_minimised`). It records, for each paced frame:
+  the lateness of its first tick's start against the deadline the root slept to, taken in
+  the frame callback; whether the frame drew, waited for a region, was busy or hid;
+  whether its present was queued and whether its submit was held; and the time
+  `RenderSide::submit` took and, on a shared queue, the hold, which is the time from
+  `draw`'s return to `submit`'s entry, both taken by the binary's render side. It records
+  each present call in three parts, taken by the binary's present side: its own waits (for
+  its last read, and the resize), the acquire, and the driver's submit and present, which
+  is the part under the queue's lock. And it records the latch's age at the return of the
+  present call that showed it: the render side stamps each latch, the present side each
+  return, and `Finished::point` joins the two. It reports the P50 and P99 of the lateness,
+  of the submit's time, of the hold, of each part of the present call and of the latch's
+  age; the counters of `Shown::stats`; and the frames that reported `behind`, beside the
+  device's `QueueLayout`. It records what moves those figures as well: the load averages
+  before and after the run, the swapchain's image count, whether a validation layer was
+  on, and the display's state (its refresh rate, whether the window was occluded, whether
+  another client was drawing). Each row is run once on a quiet machine. The lateness is
+  read against D144's 1 ms on Windows and D156's 50 µs on macOS. Those are criteria of a
+  tick's start with idle workers, so a figure over one in a shown run is a finding for the
+  planner and no failed criterion. Three readings are fixed, and everything else is
+  recorded with no threshold:
+  - On every layout, the submit's P99 is read beside the P99 of the present call's third
+    part. A submit that took as long as a present's driver call waited behind one on a
+    worker. Where the roles share a queue the frame's order rules that out; where they do
+    not, only a driver that serialises its queues inside itself can cause it, which no
+    capability reports. It is the same defect on either, and it is reported.
+  - On a shared queue, the hold is read against the present call's third part. A hold much
+    longer than the part under the queue's lock is what a thread for the submit would
+    remove, and is the figure that reopens that question.
+  - The latch's age is read against the display's refresh. An age near a whole refresh at
+    the median is a backlog in the swapchain, which no count shows, and is a finding. A
+    run of ten seconds that shows none does not rule one out under drift alone: at 0.1%
+    `reviewer-gpu`'s swapchain took half a minute to fill.
 - The frame names no use that needs a tick or a frame to start within 35 µs of its deadline
   on macOS, which is what `docs/proposals/tick-start-macos-27.md` asks a milestone 2 design
   to say if it has one. A frame that starts late takes its fraction from `now`, so the
@@ -1023,9 +1135,11 @@ still decide" and "Writers"; `crates/present-api/README.md`, "The triple buffer"
   its next call, a new sink is owed, no present is queued and `ShownStats::torn` counts
   it.
 - An error a present call returns is a present skipped: the target's `read` is unchanged
-  and the next submit queues again. A lane call that resolves `Cancelled`, because the
-  present thread is gone, is the same. On a shared queue the error is met at the await
-  before the next submit, and that submit is made.
+  and a later frame queues again. A lane call that resolves `Cancelled`, because the
+  present thread is gone, is the same. On a shared queue the error is met where the call's
+  report is taken: at the hold before a submit, or at a look before a job that asks
+  `open`. The submit is made, and its frame, having been held, is dropped as any held
+  frame is.
 
 **Determinism of a shown world** (architecture sections 8.1 and 8.3; the milestone 2 plan,
 criterion 3; D152)
@@ -1035,16 +1149,18 @@ criterion 3; D152)
   on any backend, in every SOUR mode. What keeps it so:
   - One assembly path. `build_shown` is `build_server` and three installs; no registration,
     setup, applier or hook differs.
-  - Nothing the render side says reaches a world. Its answers decide whether a pass runs
-    now or a frame later and whether a sink is installed, and nothing else: no value of
-    its is written to a column, a resource or a `TickInput`. The ticks a paced frame runs
-    depend on `now` and the frame callback alone; a step-driven run's, on its steps.
+  - Nothing the render side says reaches a world, and nor does how long it takes. Its
+    answers, and whether its task has resolved or a present call has returned when a frame
+    looks, decide whether a pass runs now or some frames later and whether a sink is
+    installed, and nothing else: no value of its is written to a column, a resource or a
+    `TickInput`. The ticks a paced frame runs depend on `now` and the frame callback
+    alone; a step-driven run's, on its steps.
   - A pass leaves the hash as it found it (D152; `lactose-present-api` shows it for
-    extract). So passes run a frame later, or with another sink, or with none, move no
+    extract). So passes run some frames later, or with another sink, or with none, move no
     hash. `ExtractState`, the snapshot's writer and the sink are a service's, in no column.
   - The presentation events' queue and the keys a world has delivered are outside every
     region (`crates/sim/README.md`, "The world hash"). So leaving them for the frame, and
-    taking them a frame later, moves no hash; the `lactose-sim` option must keep that.
+    taking them some frames later, moves no hash; the `lactose-sim` option must keep that.
   - The frame's jobs are no system and touch no world: what they are handed is the render
     side and the snapshot's reading half. `Executor::run_job` is in an execution log as a
     run of one node, which a replay follows as it follows a graph's, and in no hash, save
@@ -1055,16 +1171,18 @@ criterion 3; D152)
   - (a) and (b) are in this package's `integration` target, module `shown`, over a render
     side with no device (`tests/shown.rs`, section 5). (a): a sink and a render side that
     log their calls, a system of the tick that logs its start, and a frame callback; over
-    paced frames and stepped ones, through each of the three states, no tick's system
-    starts between a pass's `begin` and its `end`, and no `present` or `draw` is called
-    between a pass's `begin` and the `publish` after it. (b): frame N's `draw` waits at a
-    barrier until a system of tick N+1 has started, and that system waits until `draw` has
-    started, through `Shown::frame`, since `step` joins before it resolves. Each of the
-    two waits is bounded, at ten seconds, and past its bound fails the test with a message
-    that names the side that never arrived, so a regression fails and does not hang to
-    the runner's timeout. The test builds an executor of its own, of two frame workers or
-    more, since one worker cannot hold both, and records no hash. Each asserts on order
-    and never on time: the bound is a failure's and no assertion reads a duration.
+    paced frames and stepped ones, through each of the three states and through a busy
+    frame, no tick's system starts between a pass's `begin` and its `end`, and no
+    `present` or `draw` is called between a pass's `begin` and the `publish` after it.
+    (b): frame N's `draw` waits at a barrier until a system of tick N+1 has started, and
+    that system waits until `draw` has started, through `Shown::frame`, since `step` joins
+    before it resolves. The frame that begins while `draw` is at the barrier may be busy,
+    and the test asserts nothing of what it deferred. Each of the two waits is bounded, at
+    ten seconds, and past its bound fails the test with a message that names the side that
+    never arrived, so a regression fails and does not hang to the runner's timeout. The
+    test builds an executor of its own, of two frame workers or more, since one worker
+    cannot hold both, and records no hash. Each asserts on order and never on time: the
+    bound is a failure's and no assertion reads a duration.
   - (c) is in `lactose-app-client`'s `integration` target, module `recorded`. That package
     alone may name the real render side in normal code, so the test steps the wiring that
     ships, and the mover in `game-sim`, with no copy of either (D152). It steps one world
@@ -1196,7 +1314,7 @@ cited, which hold the evidence for each.
 | `RenderSide::draw`: `RenderGraph::compile`, `record` | As the graph's rows for `compile` and `record` | As those rows | As those rows | As those rows | graph, "How each call is honoured" |
 | `RenderSide::submit`: `Renderer::latch` | `write_buffer`, `flush_buffer` on the frame's camera buffer | Judged at the submit, after the write | A write into shared memory | A write into the mapping | renderer, "How each call is honoured" (`latch`); graph, "A frame, by step" |
 | `RenderSide::submit`: `RenderGraph::submit`, `Renderer::submitted`, `Renderer::open` | `Device::submit` for each of the frame's submits, with its waits, the import's `ready` among them, and its signals, the frame's point among them; `timeline_value`. Made with no present call in flight where the roles share a queue | Checks every command in order, applies the states, completes when its waits are reached; pending until the caller sees its point | Command buffers enqueued in slice order; `encodeWaitForEvent`, `encodeSignalEvent` | `vkQueueSubmit2` with timeline semaphores | graph, "How each call is honoured" (`submit`), "Submission"; rhi-api, "Timelines" |
-| The present call: `Lane::run`, and the task's look at its `LaneCall`, or its await of it where the roles share a queue | No device: the lane's queue and the call's reply slot; the call runs on `lactose-platform`'s present thread | The same on every backend | | | task, "Lanes"; platform, "The present thread and its pump" |
+| The present call: `Lane::run`, and a task's look at its `LaneCall`, or the render task's await of it before a submit where the roles share a queue | No device: the lane's queue and the call's reply slot; the call runs on `lactose-platform`'s present thread | The same on every backend | | | task, "Lanes"; platform, "The present thread and its pump" |
 | `PresentSide::present`: the resize | `wait_timeline` for its own points, within a bound; `Swapchain::resize` | Images with no window | A `CAMetalLayer`, its bounds and `contentsScale` the view's | A swapchain; the present fence of each present waited for by `resize` within `acquire`'s bound | rhi-api, "The swapchain", "How each call is honoured" (`create_swapchain`, `acquire`, `present`, `resize`) |
 | `PresentSide::present`: `Swapchain::acquire` | The acquire, bounded by the backend | An acquire that can be made to return `None` | `nextDrawable`, which has its own one-second limit | An acquire with a finite timeout | The same |
 | `PresentSide::present`: the encoder | `create_encoder` on the present role; `transition_images`, the acquire half of the hand-off; `write_heap_slot` for a target's image it has not seen, behind `wait_timeline` for its last `read`, within a bound; the pass that samples the target into the acquired image | A command list; the state and owner of each subresource, applied at the submit in order; an acquire with no equal release is refused (`no-qfot`); the image for each slot, and a write refused while a pending pass declares the slot (`uuwp-used`) | A command buffer made on first use; nothing for the transition; a render command encoder, `useResource` for the declared slot's texture; a write of the texture's resource id into the argument buffer | A command pool and one command buffer; the acquire across families; `vkCmdBeginRendering`; an update-after-bind descriptor write | rhi-api, "The present thread", "States", "The heap and the sampler table", "How each call is honoured" |
@@ -1208,28 +1326,38 @@ cited, which hold the evidence for each.
 
 Two rules of the layers below that the frame leans on:
 
-- **The re-take from `Undefined` ends a release no acquire met** (D160, item 7 (c)). Null
-  does it, as `crates/render-graph/README.md`, "What each consumer needs", states;
-  `crates/rhi-api/README.md`, "States", says so once item 7's sentence is in, and its
-  "Between the two the resource is used by nothing" reads against it until then. The frame
-  makes such a re-take whenever a finished target was not queued, or its call made no
-  submit. On native Metal there is no ownership and nothing to end; on Vulkan it is a
-  barrier from undefined on the releasing queue. The facade stands on null with
-  the sentence or without it.
+- **The re-take from `Undefined` ends a release no acquire met** (D160, item 7 (c)).
+  `crates/rhi-api/README.md`, "States", says so: a transition from `Undefined` "ends a
+  release no acquire met and takes the resource with no transfer, its contents undefined",
+  and "an acquire of that release is then refused". Null does it, as
+  `crates/render-graph/README.md`, "What each consumer needs", states. The frame makes
+  such a re-take whenever a finished target was not queued, or its call made no submit. On
+  native Metal there is no ownership and nothing to end; on Vulkan it is a barrier from
+  undefined on the releasing queue.
 - **Such a re-take follows a write on the frame's own queue.** Before D162 every re-take
-  followed a present's read. A re-take after a frame no present read (one dropped on a
-  queue of its own, one whose call made no submit, one whose present was skipped), or
-  after a torn frame whose submit wrote the target, follows that frame's own attachment
-  store: a write after a write. Where the roles have two queues a frame's release makes
-  its write available. On one queue nothing is recorded for the hand-off, and a torn frame
-  that wrote the target and released nothing leaves the write on either layout. So the
-  barrier from undefined carries the earlier write in its source scope on every layout:
-  every stage and every write access (`ALL_COMMANDS`, `MEMORY_WRITE`). That sentence of
-  `crates/rhi-api/README.md`, "States", is lane `rhi-null`'s to make, and `rhi-vulkan`
-  owes the barrier. Null tracks states and not availability, so it cannot show the
-  defect. The evidence is `frame-impl`'s: a run on one queue under the Khronos layer's
-  synchronisation validation, with a call that makes no submit and a torn frame in it,
-  since a shared queue drops no frame. The layer reports the write after a write. It does
+  followed a present's read. A re-take after a frame no present read (one dropped, at its
+  submit on a queue of its own or after its hold on a shared one; one whose call made no
+  submit; one whose present was skipped), or after a torn frame whose submit wrote the
+  target, follows that frame's own attachment store: a write after a write. Where the
+  roles have two queues a frame's release makes its write available. On one queue nothing
+  is recorded for the hand-off, and a torn frame that wrote the target and released
+  nothing leaves the write on either layout. So the barrier from undefined carries the
+  earlier write in its source scope on every layout, which "States" says as well: "Vulkan
+  gives such a transition a source scope of every stage and every write access
+  (`ALL_COMMANDS`, `MEMORY_WRITE`): the earlier use on its own queue may be a write, an
+  attachment a dropped or torn frame stored, and not only a read." `rhi-vulkan` owes the
+  barrier, and the suite's output case `retake_after_a_store_on_one_queue_is_clean` holds
+  it there under synchronisation validation (`crates/rhi-api/README.md`, "The conformance
+  suite"). Null tracks states and not availability, so it cannot show the defect. A shared
+  queue's drop makes the case an everyday one: every held frame is a store and then a
+  re-take on one queue. `reviewer-gpu` ran the frame's order with the drop on MoltenVK,
+  both roles on one queue, under the Khronos layer's synchronisation and thread-safety
+  validation (the review of D162's second draft). With a source scope of every stage and
+  no access, the layer reported the write after a write: 10 errors over 93 dropped frames
+  in one run and 1 after 1 in another. With `MEMORY_WRITE` in the scope it reported
+  nothing in three runs, and every readback was exact (540, 598 and 1201 frames).
+  `frame-impl` owes the same run through the shipped frame, once a Vulkan backend can run
+  it, with held frames, a call that makes no submit and a torn frame in it. The layer does
   not report a re-take after a present's read whose barrier names too narrow a source
   stage, which `reviewer-gpu`'s probe ran unreported: that order rests on Vulkan's rules
   for the barrier's every-stage source, and a clean one-queue run is no evidence of it.
@@ -1271,13 +1399,17 @@ stand without any of them, and `frame-impl` cannot write the bodies without the 
   ```
 
   What the frame relies on, as the sentences `crates/task/README.md` would carry:
-  - *A job like any other.* The closure is queued when `run_job` is called, as a graph
-    run starts at the call, and a frame-critical worker runs it once: never the calling
-    thread, never a background worker. It is one job as one call of `GraphNode::run` with
-    one unit is. It has that job's `JobContext`, whose `slot` is the worker's; the job
-    scratch is reset when it returns; one abort-on-unwind guard wraps it; it may open
-    scopes one after another, and their children are its own. It is one entry, never
-    split or put back, and it has no `finalize`.
+  - *A job like any other.* The closure is queued when `run_job` is called, as a graph run
+    starts at the call, and a frame-critical worker runs it once: never inside the call,
+    and never a background worker. Where a task on a frame-critical worker calls it, the
+    job may run on that worker, once the task's poll has returned, or on another that
+    takes it sooner. A caller that is no worker, as the thread that drives a stepped run
+    is, never runs it. It is one job as one call of `GraphNode::run` with one unit is. It
+    has that job's `JobContext`, whose `slot` is the worker's; the job scratch is reset
+    when it returns; one abort-on-unwind guard wraps it; it may open scopes one after
+    another, and their children are its own. It is one entry and never split. A worker
+    that takes it while the gate is closed puts it back unstarted, as the rest of a range
+    is put back. It has no `finalize`.
   - *The gate and the reservation.* A worker takes it only while it holds a run permit, as
     it takes a graph's job. So while `block_in_place` holds the gate it starts on a worker
     the reservation leaves awake, or waits for the gate; a job that is running when a
@@ -1289,15 +1421,29 @@ stand without any of them, and `frame-impl` cannot write the bodies without the 
     when shutdown began before the job started; the closure is then dropped unrun, under
     the abort guard, on the thread that discards the queued work. Dropping `JobRun` does
     not cancel the job, and its value is then dropped by the worker that ran it or by the
-    thread that dropped the future, whichever comes last.
-  - *What it costs.* One allocation a call, and the locks a graph run takes and no other:
-    the run registry at its start and its end, the completion slot at its end and at each
-    poll.
+    thread that dropped the future, whichever comes last. This is architecture section
+    5.1's "Resolution means quiescent" for a job, with a rule of its own for a job that
+    started, which a graph run of one node does not have. So the lane that makes `run_job`
+    adds `JobRun` to that sentence's futures, as an amendment of its own, and holds the
+    race the rule turns on in a loom model through the shipped functions: a worker taking
+    the job against shutdown beginning. The future resolves `Ok` or `Cancelled` and never
+    both, the closure is run or dropped exactly once, and `Ok` comes only after every
+    scope it opened has closed.
+  - *What it costs.* One allocation a call is the lane's target, which an entry of the
+    lane's own can meet and a graph run of one node does not. Its locks are at most the
+    ones a graph run takes: the run registry at its start and its end, and the completion
+    slot at its start, at its end and at each poll.
   - *Tags and spans.* It runs untagged unless the closure enters a tag, as a graph job
     does, and has one span, target `whisk`.
   - *Chaos.* In an execution log it is the one job of a run of one node: it takes a run
     ordinal as `run_graph` does, its scopes' children are recorded as that job's, and a
     replay needs a program that calls `run_graph` and `run_job` in the same order.
+  - *A lane call polled after it resolved.* Asked of the same lane, and not of `run_job`:
+    a `LaneCall` polled again after it returned `Ready` panics, as a `GraphRun` does,
+    where today it keeps the waker and stays `Pending` for ever. On a shared queue the
+    frame holds one call that three places may poll (step 3's look, the render task's hold
+    and `stop`), and a slip that polls one twice then fails with a message and does not
+    hang.
 
   What it may not be used for:
   - A wait in the closure for anything but its own scopes. A job that blocks keeps its
@@ -1305,7 +1451,10 @@ stand without any of them, and `frame-impl` cannot write the bodies without the 
     physics step's alone (architecture section 5.1).
   - A world's work outside its schedule. A system reaches a job through its schedule and
     its `Job` parameter; nothing inside the determinism boundary is a task, and nothing
-    there calls this.
+    there calls this. The boundary's lint file holds it: `lactose_task::Executor::run_job`
+    is disallowed in every boundary crate, beside `run_graph` and `spawn`
+    (`crates/core/clippy.toml`, with the list `cargo xtask boundary` pins). D162's own
+    change adds that entry, before the method exists.
   - What a graph is for: work with units, dependencies or a `finalize` is a `GraphNode`.
 
   Why this and nothing smaller. It is `run_graph` over one node of one unit, less
@@ -1366,14 +1515,15 @@ stand without any of them, and `frame-impl` cannot write the bodies without the 
 
   `Source::Render` is an error from a method of the `RenderSide`, or the result of a
   present call. `Log` tears the frame or skips the present ("Counts, torn frames and
-  resets") and the next frame runs. `Stop` on a lost device ends the run with `ShownError {
-  kept: ShownKept::Shown(..) }`: the world is whole, and the binary calls `Shown::stop`,
+  resets") and the next frame runs. `Stop` on a lost device ends the run with `ShownError
+  { kept: ShownKept::Shown(..) }`: the world is whole, and the binary calls `Shown::stop`,
   which ends in order on a lost device because every wait there returns at once and every
   drop succeeds (`crates/rhi-api/README.md`, "Device loss"). Recovery is not here ("Not in
   this crate yet"). Under `MILESTONE_1`, `Source::Render` is `Stop` whatever the kind. A
-  render task decides its own errors with a copy of the policy; a `Stop` it met reaches the
-  caller at the join, as the error of the `step` that started the task or of the next
-  `frame` or `flush`, and `stop` logs it and goes on.
+  render task decides its own errors with a copy of the policy. A `Stop` it met reaches
+  the caller where its frame is taken back: as the error of the `step` that started the
+  task, of the first `frame` whose look finds the task resolved, or of `flush`. `stop`
+  logs it and goes on.
 - Every response is logged at `LOG_TARGET` with the source and the error before it is
   acted on. The lifecycle's load, session and asset failures are not errors of a run. On a
   server they are returned in the `StepOutput` of the step that reported them and in the
@@ -1592,14 +1742,22 @@ stand without any of them, and `frame-impl` cannot write the bodies without the 
   The binary then awaits `PresentThread::stop`; waits within a bound for the last frame's
   point and drops `Stopped::render` on a thread of its own made through
   `Executor::platform`, the graph before the renderer, since those drops wait for the
-  device and no worker may; calls `Server::shutdown`; drops what else holds the device, the
-  last of it in a main-lane call; and shuts the executor down. `stop` is awaited by the
-  task that drives the frame, or through `Executor::block_on`. With a frame in flight, an
-  executor shut down first resolves it `Cancelled` with nothing handed back, since the
-  join of that frame's render task is what the executor cancels; the render side is then
-  dropped wherever its task or its job was dropped, which may be a worker. With no frame
-  in flight `stop` touches no executor: it awaits the present thread alone and hands both
-  back. The binary shuts the executor down last.
+  device and no worker may; calls `Server::shutdown`; drops what else holds the device,
+  the last of it in a main-lane call; and shuts the executor down. `stop` is awaited by
+  the task that drives the frame, or through `Executor::block_on`. With a frame in flight,
+  an executor shut down first resolves it `Cancelled` with nothing handed back, since the
+  join of that frame's render task is what the executor cancels. The render side is then
+  dropped wherever its task or its job was dropped: a worker, the thread that called the
+  shutdown or, where the roles share a queue, the present thread. That last is a render
+  task held at its await when the shutdown begins: the present call's reply wakes it from
+  the lane's drain, and a task woken after the shutdown began is cancelled, and its future
+  dropped, by the thread that woke it. A driving task that awaits a present call (in
+  `Shown::step`, past the bound on deferring, or in `stop`) is dropped there the same way,
+  and the `Server` with it. Such a drop waits for the device inside a present call, and
+  `PresentThread::stop` waits behind it. The order above never meets it, since
+  `Shown::stop` comes before the executor's shutdown. With no frame in flight `stop`
+  touches no executor: it awaits the present thread alone and hands both back. The binary
+  shuts the executor down last.
 - `Shown::stop` is the one end the facade gives a shown world, and the one path on which
   it says where the render side is dropped: nowhere, since `stop` hands it back. A `Shown`
   that is dropped, or a run future of one, drops the render side where the drop lands.
@@ -1729,9 +1887,12 @@ game's crates, so the first step an engine type needs adds that registration poi
 - The bodies of the shown frame, `lactose-app-client`, criterion 3's tests and the mover:
   lane `frame-impl` ("Proof for the shown frame").
 - A frame between ticks with a display's refresh as its deadline. `Shown::frame` carries
-  such a frame as it is ("Pacing"); the deadline is what is missing, and `lactose-platform`
-  reports no display's refresh. The keeper's wait asked once less a margin, and the spin's
-  power cost, are re-gated to the change that adds it (`docs/verification.md`).
+  such a frame as it is ("Pacing"); the deadline is what is missing, and
+  `lactose-platform` reports no display's refresh. The same deadline is what would draw
+  again as soon as a render task resolves, where today the picture after a busy frame
+  waits for the next tick's deadline ("The shown frame"). The keeper's wait asked once
+  less a margin, and the spin's power cost, are re-gated to the change that adds it
+  (`docs/verification.md`).
 - A pass run alone. A frame that waits defers every pass, the replication gather among
   them. A local world's gathered frame goes nowhere; a listen server that is shown needs
   its gather every frame whatever the device does, and `lactose-sim` runs the passes as one
@@ -1756,14 +1917,17 @@ game's crates, so the first step an engine type needs adds that registration poi
   needs a target's state shared between two tasks, which nothing here has.
 - A submit thread, where the present role shares the graphics queue: a thread outside the
   frame-critical workers that makes the frame's submit and waits for the queue's lock
-  itself, so that a frame is held for a present's driver call alone and a late frame is
-  dropped as on a queue of its own. It asks for a thread architecture section 5.1 does not
-  list and a lane's locks that section 3 does not permit a frame, so it is a plan change,
-  to be asked for with `frame-pace`'s figures from the first shared-queue device that has
-  a display ("Pacing").
+  itself, so that a frame is held for a present's driver call alone. It asks for a thread
+  architecture section 5.1 does not list and a lane's locks that section 3 does not permit
+  a frame, so it is a plan change. No measurement in reach asks for it: with held frames
+  dropped and busy frames deferred, the hold did as well as the thread or better in
+  `reviewer-gpu`'s runs ("Pacing"). What would reopen it is `frame-pace` from a
+  shared-queue device with a display: a hold much longer than the part of its present call
+  under the queue's lock.
 - An occluded window's frames hidden by the binary: `lactose-platform` reports no
-  occlusion. Until it does, a window whose presents stall holds a shared queue's frames
-  for a call's bound each ("Pacing").
+  occlusion. Until it does, a window whose presents stall costs a shared queue its
+  pictures, for a call's bound each, and its ticks only for the part of a call past the
+  bound on deferring ("Pacing").
 - The overload ladder's render half: `ShownStats` and `FrameOutput::behind` are its
   inputs, and nothing acts on either.
 - Everything else a client binary adds: milestone 4.
@@ -1784,25 +1948,35 @@ stand-in for `Executor::run_job`. What is held now, and by what:
 | `PresentSide` can be written over `lactose-rhi-api`'s swapchain | Section 2: the resize behind its wait, a slot written behind its wait whenever the image is not the one it holds, the acquire, an encoder that a call which submits nothing drops, the present with its wait and its signal, `Stale` as a submit that was taken, `close` behind its wait with a slot left where the clear is refused. Compile-only |
 | The binary's wiring and its shutdown type-check | Section 3: `build_shown`; the root's loop around `Shown::frame` with a window's extent; every arm of `ShownKept`, in one function that a failed frame and a failed step both end through, with no `?` on a `ShownError`; `Shown::stop` through to the render side's drop on a thread of the platform's. Section 4: the fixed-frame mode's driver around `Shown::step`, and the render side taken back as its own type. Compile-only |
 | `frame-impl`'s tests can be written | Section 5: a render side and a present side with no device, which count their calls, the render side answering either queue path; a shown world and the same world unshown, stepped alike with the hashes compared; the protocol's choice of target. Compile-only |
-| The frame's job needs no lock, no world and no `Sync` | Section 6, `the_frame_job_is_one_job_with_the_render_side_moved_in_and_out`, which runs on an executor of two frame workers under chaos, every range split, steals shuffled and yields injected. A render side that is `Send` and not `Sync` is moved into a closure; the closure runs as one job, through a stand-in of `Executor::run_job`'s signature; `RenderSide::open` is called with the job's context and forks through it, disjoint `&mut` chunks in one scope and a range in a second, each unit exactly once; the object and the answer come back in the closure's value. It does so from a task spawned on a frame-critical worker, which then calls `submit` from its own poll, and again through `block_on`; neither job runs on the calling thread; and the render side leaves by value, as its own type. The stand-in is a graph of one node whose closure sits in a mutex, which is the lock the primitive removes: `frame-impl` deletes it and calls `Executor::run_job` |
+| The frame's job needs no lock, no world and no `Sync` | Section 6, `the_frame_job_is_one_job_with_the_render_side_moved_in_and_out`, which runs on an executor of two frame workers under chaos, every range split, steals shuffled and yields injected. A render side that is `Send` and not `Sync` is moved into a closure; the closure runs as one job, through a stand-in of `Executor::run_job`'s signature; `RenderSide::open` is called with the job's context and forks through it, disjoint `&mut` chunks in one scope and a range in a second, each unit exactly once; the object and the answer come back in the closure's value. It does so from a task spawned on a frame-critical worker, which then calls `submit` from its own poll, and again through `block_on`; neither job runs on the thread that drives the test, which is all the test says of where a job runs, since a job a task starts may run on that task's worker once its poll has returned; each of the test's two waits is bounded, at ten seconds, with a message; and the render side leaves by value, as its own type. The stand-in is a graph of one node whose closure sits in a mutex, which is the lock the primitive removes: `frame-impl` deletes it and calls `Executor::run_job` |
 
 What `frame-impl` proves, beside criterion 3's three tests ("Determinism of a shown
-world"): each state's order of calls, with a render side that logs them; the bound on
-waiting, at `log_retention − CATCH_UP_CAP` ticks, and the starved frames after it; the
-four cases of a new sink, and no second reset after a full pass that left rows out; a
-starved frame whose `open` fails, hidden with its passes run and counted torn and hidden;
-the protocol on a queue of its own, with a present side that holds its call (no target
-drawn while a call names it, `ready` the last `read`, `queued: false` while a call is in
-flight, nothing kept of a call that reported no read); the protocol on a shared queue,
-with the same present side (no `open` and no `submit` while a call is in flight, `queued`
-in every frame that drew, `held` where the call had not returned, nothing dropped); the
+world"): each state's order of calls, with a render side that logs them; a busy frame,
+with a render side whose `draw` is held: its ticks run, no pass, no publication and no
+method of the render side is called, `deferred` is `Rendered::Busy`, and the first frame
+after the task resolves reports it in `joined` and runs its passes; the bound on
+deferring, at `log_retention − CATCH_UP_CAP` ticks, for a region and for the frame before,
+with the starved frames after the one and the await after the other; the four cases of a
+new sink, and no second reset after a full pass that left rows out; a starved frame whose
+`open` fails, hidden with its passes run and counted torn and hidden; the protocol on a
+queue of its own, with a present side that holds its call (no target drawn while a call
+names it, `ready` the last `read`, `queued: false` while a call is in flight, nothing kept
+of a call that reported no read); the protocol on a shared queue, with the same present
+side (no `open` and no `submit` while a call is in flight; a frame that must ask `open`
+busy while one is; `held` where the call had not returned when the frame's job did, that
+frame submitted once it returns, not queued, and its target drawn again by the next frame;
+`queued` in every frame that drew and was not held; `stop` with a render task held; a
+render task held at its await while `block_in_place` holds the gate at
+`RECORD_RESERVATION`, beside a job whose units still run inside the block; and every wait
+of these bounded, at ten seconds, with a message that names what never arrived); the
 policy's two rows; `stop` with a frame and a call in flight, with none after a shutdown,
 and after a lost device; the fraction at a deadline, a period later and while paused; on
-`lactose-rhi-null`, that a run through each state is refused nothing on each queue
-layout, the extent going E1, E2, E1 with the frame at E2 dropped or torn among them; and
-section 6 against `Executor::run_job`, with the stand-in deleted. Once a Vulkan backend
-can run it, a run on one queue under the Khronos layer's synchronisation validation
-("Two rules of the layers below").
+`lactose-rhi-null`, that a run through each state is refused nothing on each queue layout,
+the extent going E1, E2, E1 with the frame at E2 dropped or torn among them, and held
+frames dropped among them on a shared queue; and section 6 against `Executor::run_job`,
+with the stand-in deleted. Once a Vulkan backend can run it, a run on one queue under the
+Khronos layer's synchronisation validation, with held frames in it ("Two rules of the
+layers below").
 
 ## Proof for D142
 

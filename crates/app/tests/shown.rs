@@ -24,6 +24,7 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use lactose_app::{
@@ -46,7 +47,9 @@ use lactose_rhi_api::{
     TimelineHandle, TimelinePoint,
 };
 use lactose_sim::TickInput;
-use lactose_task::{ChaosConfig, Executor, GraphBuilder, GraphNode, JobContext, WorkerClass};
+use lactose_task::{
+    ChaosConfig, Executor, GraphBuilder, GraphNode, JobContext, Sleep, WorkerClass,
+};
 
 const GRAPHICS: QueueRole = QueueRole::Graphics;
 
@@ -542,9 +545,11 @@ async fn ended(failure: ShownError) -> Result<Ended> {
 }
 
 /// The timer root paces the frame and nothing else does (architecture section 5.1): one
-/// sleep to the next tick's deadline, one frame. Where the present role has a queue of its
-/// own the present thread holds no frame; where it shares the graphics queue a present
-/// call still in flight holds the frame's submit, and the root runs the ticks it then owes.
+/// sleep to the next tick's deadline, one frame. The root waits for nothing of the render
+/// side: a frame that finds the frame before it still there runs its ticks, defers its
+/// passes and says `Rendered::Busy`. Where the present role has a queue of its own the
+/// present thread holds no frame; where it shares the graphics queue a present call still
+/// in flight holds one frame's submit, and that frame is dropped after it.
 async fn root(
     executor: &Executor,
     mut shown: Shown,
@@ -562,9 +567,13 @@ async fn root(
                 shown = next;
                 deadline = output.world.next_deadline;
                 if let Some(Rendered::Drew { counts, queued, held, .. }) = output.joined {
-                    // A result file's: what was drawn, what was shown and what was held.
+                    // A result file's: what was drawn, what was queued to be shown, and
+                    // what was held and so dropped.
                     let _ = (counts.server.stale(), queued, held);
                 }
+                // A result file's as well: a frame that ran its ticks alone because the
+                // frame before it was still on the render side.
+                let _busy = matches!(output.deferred, Some(Rendered::Busy));
             }
             Err(failure) => return ended(failure).await,
         }
@@ -666,11 +675,13 @@ fn point(value: u64) -> TimelinePoint {
 #[derive(Default)]
 struct CountingRender {
     frames: u64,
-    /// The frames whose `open` answers `Wait`, for the tests of a deferred frame.
-    busy: Vec<u64>,
+    /// The frames whose `open` answers `Wait`, for the tests of a frame that waits for a
+    /// region.
+    waits: Vec<u64>,
     draws: Vec<Draw>,
     /// Whether the present role shares the graphics queue: the protocol's tests run each
-    /// way, a frame dropped on a queue of its own and held on a shared one.
+    /// way, a frame dropped at its submit on a queue of its own, and on a shared one held
+    /// and then dropped.
     shared: bool,
 }
 
@@ -689,7 +700,7 @@ impl RenderSide for CountingRender {
     }
 
     fn open(&mut self, ctx: &mut JobContext<'_>) -> Result<Region> {
-        if self.busy.contains(&self.frames) {
+        if self.waits.contains(&self.frames) {
             return Ok(Region::Wait(point(self.frames)));
         }
         Ok(Region::Ready)
@@ -857,6 +868,35 @@ where
 /// How many units the render side below forks over.
 const UNITS: usize = 4096;
 
+/// How long either wait of the test below may take before the test fails with a message,
+/// so that a job or a task that never resolves does not hang to the runner's timeout. It
+/// is the bound of a failure: no assertion reads a duration.
+const WAIT_BOUND: Duration = Duration::from_secs(10);
+
+/// A wait raced against the executor's timer: `None` once the timer resolved first.
+struct Bounded<W> {
+    wait: Pin<Box<W>>,
+    bound: Pin<Box<Sleep>>,
+}
+
+impl<W: Future> Future for Bounded<W> {
+    type Output = Option<W::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Poll::Ready(value) = self.wait.as_mut().poll(cx) {
+            return Poll::Ready(Some(value));
+        }
+        self.bound.as_mut().poll(cx).map(|_| None)
+    }
+}
+
+/// `wait`, from the thread that drives the test, within `WAIT_BOUND`.
+fn bounded<W: Future>(executor: &Executor, wait: W, what: &str) -> W::Output {
+    let bound = Box::pin(executor.sleep_until(Instant::now() + WAIT_BOUND));
+    let raced = Bounded { wait: Box::pin(wait), bound };
+    executor.block_on(raced).unwrap_or_else(|| panic!("{what} did not resolve within its bound"))
+}
+
 /// A render side that is `Send` and not `Sync`, and that uses the context its job lends:
 /// `open` forks over a buffer of its own, as a real `draw` forks the remote batch and the
 /// graph's recording.
@@ -947,8 +987,10 @@ fn ask(executor: &Executor, mut side: Box<Moved>) -> JobRun<Box<Moved>> {
 
 #[test]
 fn the_frame_job_is_one_job_with_the_render_side_moved_in_and_out() {
-    // Every range split to single units, every steal and yield seeded: the scopes of the
-    // job fork across both workers whatever the machine is doing.
+    // Every range split to single units, every steal and yield seeded: the range of the
+    // job's second scope is split across both workers whatever the machine is doing. The
+    // chunks of its first scope are not, since a seed may leave every one of them to the
+    // worker that forked them, and nothing below asserts where a child ran.
     let chaos = ChaosConfig {
         seed: 162,
         shuffle_steals: true,
@@ -980,7 +1022,7 @@ fn the_frame_job_is_one_job_with_the_render_side_moved_in_and_out() {
         Ok::<_, Error>((side, submitted))
     });
     let (mut side, submitted) =
-        executor.block_on(task).expect("the task ran").expect("the job ran");
+        bounded(&executor, task, "the render task").expect("the task ran").expect("the job ran");
     assert_eq!(submitted.expect("no error").region, Region::Ready);
     // Between frames the task that drives the frame reads what the job left, with no
     // lock of its own.
@@ -990,8 +1032,12 @@ fn the_frame_job_is_one_job_with_the_render_side_moved_in_and_out() {
     );
 
     // A second job with the same object, from the thread that drives a stepped run: the
-    // job that asks `open` at the start of a frame. It never runs on the calling thread.
-    let mut side = executor.block_on(ask(&executor, side)).expect("the job ran");
+    // job that asks `open` at the start of a frame. That thread is no worker, so the job
+    // cannot run on it. Where a task on a worker starts a job, as above, the job may run
+    // on that worker once the task's poll has returned, and the test does not say which
+    // worker ran it: `Executor::run_job`'s own tests hold "never inside the call".
+    let asked = ask(&executor, side);
+    let mut side = bounded(&executor, asked, "the job that asks `open`").expect("the job ran");
     assert_eq!(
         side.opened.take().expect("the job asked").expect("no error"),
         Region::Wait(point(2))
@@ -1003,6 +1049,8 @@ fn the_frame_job_is_one_job_with_the_render_side_moved_in_and_out() {
     assert_eq!(render.opens.get(), 2);
     assert!(render.marks.iter().all(|&mark| mark == 2), "each unit once in each job");
     assert_eq!(render.threads.len(), 2);
+    // Both jobs ran off the thread that drives the test, which is all that is asserted of
+    // where a job runs.
     assert!(render.threads.iter().all(|&thread| thread != driver));
     assert!(render.slot < executor.slot_count());
     drop(render);
