@@ -40,6 +40,15 @@ undecided point are bounded at one second.
   whether its contents are defined is kept.
 - A role is served by the queue `QueueLayout::serving` names, and records are kept by queue,
   not by role.
+- A resource's record keeps three stamps for each queue: the last submit that names it, the
+  last that writes it or changes its state or owner, and, of a buffer, the last that writes
+  it. A host read and an invalidate wait for the second, a host write for the third. The
+  `no-qfot` use rule compares the second with what the using submit's own waits order it
+  after, through the submits they name and those submits' waits, and not through the
+  earlier submits of its queue. An acquire marks the other queues' changes it ordered the
+  resource after, and those bind no later use. The stamps are of the whole resource, not of
+  each subresource: a `Concurrent` image changed at one mip on one queue holds back a use of
+  another mip on another, and an acquire of one subresource discharges the rest.
 - `read_buffer` reads `Readback` memory, of a buffer in a host-read state, whose written range
   has been invalidated where `coherent_host_memory` is `false` (`unflushed`).
 - A SPIR-V module is checked by its header and its `OpCapability` and `OpExtension`
@@ -85,7 +94,8 @@ walk refuse it `destroyed`, with nothing submitted.
   memoryless depth alone, lost across a local read.
 - `tests/null.rs`: the device loss injected and observed at every call and wait; the
   invalidate a read needs where memory is not coherent; the cache's three starts; a handle
-  whose index a later buffer took, which resolves nothing; and two
+  whose index a later buffer took, which resolves nothing; four refusals null alone makes,
+  each by its rule; and two
   races from several threads, submits on two queues racing a present, each round of which
   fails with a message past three refusals, and a destroy racing a present's wait.
 - `tests/wakes.rs`: the wakes null alone makes, each bounded by how soon its waiter returns

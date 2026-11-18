@@ -203,6 +203,10 @@ pub(crate) struct ImageRec {
     pub(crate) sharing: Sharing,
     pub(crate) subs: Vec<Sub<ImageState>>,
     pub(crate) stamps: Stamps,
+    /// The last submit of each queue that writes it or changes its state or owner.
+    pub(crate) changed: Stamps,
+    /// The submits of each queue an acquire of it ordered after: their changes bind no use.
+    pub(crate) ordered: Stamps,
     /// Heap slots that hold it, the one a write in progress gives it included.
     pub(crate) slots: u32,
     pub(crate) placed: Option<Placed>,
@@ -231,6 +235,8 @@ impl ImageRec {
             sharing,
             subs: vec![Sub::new(ImageState::Undefined); (mips * layers) as usize],
             stamps: [0; QUEUES],
+            changed: [0; QUEUES],
+            ordered: [0; QUEUES],
             slots: 0,
             placed,
             active: false,
@@ -254,9 +260,11 @@ pub(crate) struct BufferRec {
     pub(crate) stamps: Stamps,
     /// The last submit of each queue that writes it: what a host write waits for.
     pub(crate) writers: Stamps,
-    /// The last submit of each queue that writes it or changes its state: what a host read
-    /// and an invalidate wait for.
+    /// The last submit of each queue that writes it or changes its state or owner: what a
+    /// host read and an invalidate wait for, and a use on another queue.
     pub(crate) changed: Stamps,
+    /// The submits of each queue an acquire of it ordered after: their changes bind no use.
+    pub(crate) ordered: Stamps,
     /// Host accesses in progress.
     pub(crate) host: Ranges,
     /// Host-written ranges with no flush since, where memory is not coherent.
@@ -456,6 +464,17 @@ impl Records {
         let mut work = waits.to_vec();
         self.raise(&mut cover, queue, self.queues[queue].next - 1, &mut work);
         self.close(&mut cover, work);
+        cover
+    }
+
+    /// The submits a new submit is ordered after by its waits alone: for each point it
+    /// waits for, each submit that signals that timeline at or below the point and every
+    /// earlier submit of that one's queue, and in turn what each of those waits for. The
+    /// earlier submits of its own queue add nothing, nor do their waits, unlike
+    /// [`cover`](Self::cover)'s.
+    pub(crate) fn waited(&self, waits: &[TimelinePoint]) -> Stamps {
+        let mut cover = self.queues.each_ref().map(|rec| rec.observed);
+        self.close(&mut cover, waits.to_vec());
         cover
     }
 

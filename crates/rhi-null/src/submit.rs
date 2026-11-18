@@ -16,7 +16,8 @@ use lactose_rhi_api::{
 use crate::device::{Shared, exclusive};
 use crate::encoder::{Attach, Cmd, NullEncoder, SlotDecl};
 use crate::records::{
-    BufferRec, CopyBytes, ImageRec, Records, Stamps, Sub, SubmitRec, Transfer, queue_index, stale,
+    BufferRec, CopyBytes, ImageRec, QUEUES, Records, Stamps, Sub, SubmitRec, Transfer, queue_index,
+    stale,
 };
 
 /// What a submit that passed its checks changes.
@@ -28,6 +29,8 @@ pub(crate) struct Plan {
     written: HashSet<BufferHandle>,
     /// The buffers the submit transitions.
     changed: HashSet<BufferHandle>,
+    /// The images the submit writes or transitions.
+    images_changed: HashSet<ImageHandle>,
     slots: BTreeSet<usize>,
     graphics: HashSet<GraphicsPipelineHandle>,
     compute: HashSet<ComputePipelineHandle>,
@@ -88,6 +91,7 @@ pub(crate) fn check(
         layout: shared.caps.queues,
         queue,
         cover: records.cover(queue, submit.waits),
+        waited: records.waited(submit.waits),
         coherent: shared.caps.coherent_host_memory,
         plan: Plan {
             queue,
@@ -95,6 +99,7 @@ pub(crate) fn check(
             buffers: HashMap::new(),
             written: HashSet::new(),
             changed: HashSet::new(),
+            images_changed: HashSet::new(),
             slots: BTreeSet::new(),
             graphics: HashSet::new(),
             compute: HashSet::new(),
@@ -128,6 +133,9 @@ pub(crate) fn commit(records: &mut Records, plan: Plan, submit: &mut Submit<'_>)
     records.queues[queue].next += 1;
     for (handle, mut rec) in plan.images {
         rec.stamps[queue] = seq;
+        if plan.images_changed.contains(&handle) {
+            rec.changed[queue] = seq;
+        }
         if let Some(slot) = records.images.get_mut(handle) {
             *slot = rec;
         }
@@ -187,6 +195,8 @@ struct Replay<'a> {
     layout: QueueLayout,
     queue: usize,
     cover: Stamps,
+    /// What the submit's own waits order it after, as `Records::waited` says.
+    waited: Stamps,
     coherent: bool,
     plan: Plan,
     pass: Option<Pass>,
@@ -262,6 +272,7 @@ impl Replay<'_> {
                     rec.subs[at].written = true;
                     rec.subs[at].defined = true;
                 }
+                self.plan.images_changed.insert(*destination);
             }
             Cmd::CopyToBuffer { source, subresources, destination, ranges } => {
                 for &(mip, layer) in subresources {
@@ -383,6 +394,7 @@ impl Replay<'_> {
             let at = rec.sub(target.mip, target.layer);
             rec.subs[at].written = true;
             rec.subs[at].defined = attach.store;
+            self.plan.images_changed.insert(target.image);
         }
         for reach in pass.buffers {
             if reach.state == BufferState::ShaderWrite {
@@ -421,6 +433,22 @@ impl Replay<'_> {
                 return Err(Rule::Queue.refuse(
                     "a change of state or owner while a pending submit of another queue uses the \
                      resource, with no wait for it",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a use of a resource that a pending submit of another queue wrote or changed
+    /// the state or owner of, unless the submit waits for that one, directly or through
+    /// the submits it waits for, or an acquire ordered the resource after it. The earlier
+    /// submits of the queue, and their waits, order no use of this one.
+    fn waited_for(&self, changed: &Stamps, ordered: &Stamps) -> Result<()> {
+        for other in (0..QUEUES).filter(|&other| other != self.queue) {
+            if changed[other] > ordered[other] && changed[other] > self.waited[other] {
+                return Err(Rule::Queue.refuse(
+                    "a use of a resource a pending submit of another queue wrote or changed, with \
+                     no wait for it in the using submit",
                 ));
             }
         }
@@ -497,6 +525,7 @@ impl Replay<'_> {
             }
         }
         let owner = exclusive(self.image(handle)?.sharing).then_some(queue);
+        self.plan.images_changed.insert(handle);
         let rec = self.image(handle)?;
         rec.active = true;
         rec.ended = false;
@@ -526,7 +555,9 @@ impl Replay<'_> {
         }
         let owned = exclusive(rec.sharing);
         let sub = rec.subs[rec.sub(mip, layer)];
-        use_sub(&sub, owned, queue, need, read, rule)
+        let (changed, ordered) = (rec.changed, rec.ordered);
+        use_sub(&sub, owned, queue, need, read, rule)?;
+        self.waited_for(&changed, &ordered)
     }
 
     fn use_buffer(&mut self, handle: BufferHandle, need: BufferState, read: bool) -> Result<()> {
@@ -538,7 +569,14 @@ impl Replay<'_> {
             return Err(Rule::Unflushed
                 .refuse("a submit that reads a buffer with a written range not flushed"));
         }
-        Ok(())
+        let (changed, ordered) = (rec.changed, rec.ordered);
+        self.waited_for(&changed, &ordered)
+    }
+
+    /// Whether a transition of an `Exclusive` resource is an acquire on this queue, which
+    /// the change rule orders and the use rule does not bind.
+    fn acquires(&self, owned: bool, transition: (usize, usize), undefined: bool) -> bool {
+        owned && !undefined && transition.0 != transition.1 && transition.1 == self.queue
     }
 
     fn image_transition(&mut self, transition: &ImageTransition) -> Result<()> {
@@ -553,6 +591,16 @@ impl Replay<'_> {
                 .refuse("a swapchain image used outside its acquire and its present"));
         }
         let owned = exclusive(rec.sharing);
+        let (changed, ordered) = (rec.changed, rec.ordered);
+        let acquires = self.acquires(owned, layout, transition.from.state == ImageState::Undefined);
+        if !acquires {
+            self.waited_for(&changed, &ordered)?;
+        }
+        self.plan.images_changed.insert(transition.image);
+        let rec = self.image(transition.image)?;
+        if acquires {
+            rec.ordered = rec.changed;
+        }
         let range = transition.range;
         for layer in range.layer..range.layer + range.layers {
             for mip in range.mip..range.mip + range.mips {
@@ -580,6 +628,16 @@ impl Replay<'_> {
         self.covered(&stamps)?;
         let rec = self.buffer(transition.buffer)?;
         let owned = exclusive(rec.sharing);
+        let (changed, ordered) = (rec.changed, rec.ordered);
+        let acquires =
+            self.acquires(owned, layout, transition.from.state == BufferState::Undefined);
+        if !acquires {
+            self.waited_for(&changed, &ordered)?;
+        }
+        let rec = self.buffer(transition.buffer)?;
+        if acquires {
+            rec.ordered = rec.changed;
+        }
         rec.sub = change(
             rec.sub,
             owned,
@@ -655,7 +713,10 @@ fn change<S: Copy + PartialEq + core::fmt::Debug>(
                  resource for",
             ));
         }
-        let moved = owned && sub.owner.is_some_and(|owner| owner != to_queue);
+        // A re-take with a release pending ends the release, and takes the resource with
+        // no transfer: its contents are undefined, as a move's.
+        let moved =
+            owned && (sub.transfer.is_some() || sub.owner.is_some_and(|owner| owner != to_queue));
         return Ok(Sub {
             state: to,
             owner: owned.then_some(to_queue),

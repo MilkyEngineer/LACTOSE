@@ -481,6 +481,14 @@ impl Encoder for NullEncoder {
                 return;
             }
         }
+        let written: Vec<_> = regions
+            .iter()
+            .map(|region| (region.destination_offset, region.destination_offset + region.size))
+            .collect();
+        if overlap(&written) {
+            self.fail(Rule::Bounds, "two regions of one copy that write one destination byte");
+            return;
+        }
         self.commands.push(Cmd::CopyBuffer { source, destination, regions: regions.to_vec() });
     }
 
@@ -496,6 +504,15 @@ impl Encoder for NullEncoder {
         let Some(buffer) = self.buffer_for(source, BufferUsage::COPY_SOURCE) else { return };
         let Some(image) = self.image_for(destination, ImageUsage::COPY_DESTINATION) else { return };
         let Some((subresources, _)) = self.image_regions(&buffer, &image, regions) else { return };
+        let shared = regions.iter().enumerate().any(|(at, one)| {
+            regions[at + 1..].iter().any(|other| {
+                (one.mip, one.layer) == (other.mip, other.layer) && meet(one.rect, other.rect)
+            })
+        });
+        if shared {
+            self.fail(Rule::Bounds, "two regions of one copy that write one destination texel");
+            return;
+        }
         self.commands.push(Cmd::CopyToImage { source, destination, subresources });
     }
 
@@ -515,6 +532,10 @@ impl Encoder for NullEncoder {
         let Some((subresources, ranges)) = self.image_regions(&buffer, &image, regions) else {
             return;
         };
+        if overlap(&ranges) {
+            self.fail(Rule::Bounds, "two regions of one copy that write one destination byte");
+            return;
+        }
         self.commands.push(Cmd::CopyToBuffer { source, subresources, destination, ranges });
     }
 
@@ -1015,7 +1036,21 @@ const fn state_usage(state: ImageState) -> ImageUsage {
     }
 }
 
-/// A breach found by a check of what a pass holds.
+/// Whether two of `ranges`, each a start and an end past it, share a byte.
+fn overlap(ranges: &[(u64, u64)]) -> bool {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable();
+    sorted.windows(2).any(|pair| pair[1].0 < pair[0].1)
+}
+
+/// Whether two rectangles, each inside its mip, share a texel.
+fn meet(one: Rect, other: Rect) -> bool {
+    one.x < other.x + other.extent.width
+        && other.x < one.x + one.extent.width
+        && one.y < other.y + other.extent.height
+        && other.y < one.y + one.extent.height
+}
+
 /// A heap slot a pass declares, and the image it resolved to as the pass began.
 pub(crate) type SlotDecl = (HeapSlot, Option<ImageHandle>);
 
@@ -1026,6 +1061,7 @@ type Reached = (Vec<SlotDecl>, Vec<BufferReach>, Vec<BufferHandle>);
 /// A copy's image subresources, as (mip, layer), and its buffer ranges.
 type Regions = (Vec<(u32, u32)>, Vec<(u64, u64)>);
 
+/// A breach found by a check of what a pass holds, or of a recorded command.
 type Breach = (Rule, String);
 
 /// Refuses a draw or dispatch in a pass that declares an empty slot.
