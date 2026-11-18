@@ -7,10 +7,10 @@
 
 use core::time::Duration;
 
-use lactose_core::{Handle, Result};
+use lactose_core::{Error, ErrorKind, Handle, Result, xxh64};
 
 use crate::resource::{Format, kind};
-use crate::shader::CookedShader;
+use crate::shader::{CookedShader, Reader};
 
 /// A graphics pipeline of a device.
 pub type GraphicsPipelineHandle = Handle<kind::GraphicsPipeline>;
@@ -174,8 +174,24 @@ pub struct CacheIdentity<'a>(pub &'a [u8]);
 /// it. For backends.
 #[must_use]
 pub fn seal_cache(identity: CacheIdentity<'_>, payload: &[u8]) -> Vec<u8> {
-    todo!()
+    let mut out = Vec::with_capacity(CACHE_MAGIC.len() + 24 + identity.0.len() + payload.len());
+    out.extend_from_slice(&CACHE_MAGIC);
+    out.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+    let identity_len = u32::try_from(identity.0.len()).expect("an identity is under 4 GiB");
+    out.extend_from_slice(&identity_len.to_le_bytes());
+    out.extend_from_slice(identity.0);
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(payload);
+    let sum = xxh64(&out, 0);
+    out.extend_from_slice(&sum.to_le_bytes());
+    out
 }
+
+/// The first bytes of a sealed cache.
+const CACHE_MAGIC: [u8; 4] = *b"LPCS";
+
+/// The version [`seal_cache`] writes and [`open_cache`] reads.
+const CACHE_VERSION: u32 = 1;
 
 /// The payload inside `bytes`, exactly as it was sealed. For backends: the bytes it
 /// returns are the only ones a driver is ever handed.
@@ -186,5 +202,32 @@ pub fn seal_cache(identity: CacheIdentity<'_>, payload: &[u8]) -> Vec<u8> {
 /// than their length says, or fail the checksum; `ErrorKind::VersionMismatch` when they
 /// are another version's or were sealed under another identity.
 pub fn open_cache<'a>(bytes: &'a [u8], identity: CacheIdentity<'_>) -> Result<&'a [u8]> {
-    todo!()
+    let invalid = |what: &str| Error::new(ErrorKind::InvalidData, format!("sealed cache: {what}"));
+    if bytes.len() < CACHE_MAGIC.len() + 4 || bytes[..CACHE_MAGIC.len()] != CACHE_MAGIC {
+        return Err(invalid("not a sealed cache"));
+    }
+    let mut reader = Reader { bytes: &bytes[CACHE_MAGIC.len()..] };
+    let version = reader.u32()?;
+    if version != CACHE_VERSION {
+        return Err(Error::new(
+            ErrorKind::VersionMismatch,
+            format!("sealed cache of version {version}; this build reads {CACHE_VERSION}"),
+        ));
+    }
+    let truncated = |_| invalid("truncated");
+    let identity_len = usize::try_from(reader.u32().map_err(truncated)?).unwrap_or(usize::MAX);
+    let sealed_identity = reader.take(identity_len).map_err(truncated)?;
+    let payload_len = usize::try_from(reader.u64().map_err(truncated)?).unwrap_or(usize::MAX);
+    let payload = reader.take(payload_len).map_err(truncated)?;
+    let sum = reader.u64().map_err(truncated)?;
+    if !reader.bytes.is_empty() {
+        return Err(invalid("longer than its length says"));
+    }
+    if xxh64(&bytes[..bytes.len() - 8], 0) != sum {
+        return Err(invalid("checksum"));
+    }
+    if sealed_identity != identity.0 {
+        return Err(Error::new(ErrorKind::VersionMismatch, "sealed cache of another driver"));
+    }
+    Ok(payload)
 }

@@ -9,9 +9,22 @@
 //! and compares it with a reference computed on the CPU, never with a stored image. Only
 //! a device can pass it, and [`run`] skips it for a harness that does not render.
 //!
-//! The bodies are not the facade's: the contract cases' arrive with `lactose-rhi-null`,
-//! the output cases' and their shader sources with `lactose-rhi-vulkan` (milestone 2
-//! plan, section 3). `README.md`, "The conformance suite", says what each case holds.
+//! The contract cases' bodies are here, one function for each, by group, written with
+//! `lactose-rhi-null`; the output cases' and their shader sources arrive with
+//! `lactose-rhi-vulkan` (milestone 2 plan, section 3). `README.md`, "The conformance
+//! suite", says what each case holds.
+
+mod buffers;
+mod encoders;
+mod heap;
+mod images;
+mod kit;
+mod passes;
+mod queues;
+mod shaders;
+mod states;
+mod swapchain;
+mod timelines;
 
 use std::sync::Arc;
 
@@ -118,7 +131,56 @@ pub trait Harness {
 ///
 /// When the case fails, with the case's name and what did not hold.
 pub fn run(harness: &dyn Harness, case: &Case) -> Outcome {
-    todo!()
+    if case.kind == CaseKind::Output {
+        return Outcome::Skipped(if harness.renders() {
+            "an output case, whose body arrives with lactose-rhi-vulkan"
+        } else {
+            "an output case, on a harness that does not render"
+        });
+    }
+    if harness.renders() && !case.devices {
+        return Outcome::Skipped("a case of a check the null backend alone makes");
+    }
+    let Some(body) = body(case.name) else { panic!("{}: a contract case with no body", case.name) };
+    let mut ran = false;
+    let mut skipped = "no capability set of the harness";
+    for set in harness.sets() {
+        let ctx = kit::Ctx::new(harness, case, set);
+        match body(&ctx) {
+            Ok(()) => ran = true,
+            Err(why) => skipped = why,
+        }
+        let messages = ctx.messages();
+        assert!(
+            messages == 0,
+            "{} under {set:?}: {messages} messages a clean run does not send",
+            case.name
+        );
+    }
+    if ran { Outcome::Passed } else { Outcome::Skipped(skipped) }
+}
+
+/// Every contract case's body, by the case's name.
+fn bodies() -> impl Iterator<Item = (&'static str, kit::Body)> {
+    [
+        queues::BODIES,
+        buffers::BODIES,
+        images::BODIES,
+        states::BODIES,
+        heap::BODIES,
+        shaders::BODIES,
+        encoders::BODIES,
+        timelines::BODIES,
+        passes::BODIES,
+        swapchain::BODIES,
+    ]
+    .into_iter()
+    .flatten()
+    .copied()
+}
+
+fn body(name: &str) -> Option<kit::Body> {
+    bodies().find(|(case, _)| *case == name).map(|(_, body)| body)
 }
 
 /// Declares the case table: `contract "name";`, `output "name";`,
@@ -304,3 +366,25 @@ pub const CASES: &[Case] = cases! {
     contract "clean_run_sends_no_message";
     output "each_validator_reports_its_canary";
 };
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{CASES, CaseKind, bodies};
+
+    #[test]
+    fn every_contract_case_has_one_body_and_every_body_one_case() {
+        let mut named = HashSet::new();
+        for (name, _) in bodies() {
+            assert!(named.insert(name), "{name}: two bodies");
+            assert!(
+                CASES.iter().any(|case| case.name == name && case.kind == CaseKind::Contract),
+                "{name}: a body for no contract case"
+            );
+        }
+        for case in CASES.iter().filter(|case| case.kind == CaseKind::Contract) {
+            assert!(named.contains(case.name), "{}: a contract case with no body", case.name);
+        }
+    }
+}

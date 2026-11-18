@@ -1,0 +1,474 @@
+//! Buffers and host access.
+
+use std::sync::mpsc;
+
+use super::kit::{Body, Ctx, PATIENCE, buffer_to, compute_pass};
+use crate::{
+    BufferCopy, BufferHandle, BufferReach, BufferState, BufferUsage, Device, Encoder, MemoryClass,
+    PassReach, QueueRole, Rule, Submit,
+};
+
+type Applies = Result<(), &'static str>;
+
+pub(super) const BODIES: &[(&str, Body)] = &[
+    (
+        "buffer_write_then_copy_then_read_returns_the_bytes",
+        buffer_write_then_copy_then_read_returns_the_bytes,
+    ),
+    ("buffer_address_is_stable_and_distinct", buffer_address_is_stable_and_distinct),
+    (
+        "host_ranges_that_do_not_overlap_are_written_at_once",
+        host_ranges_that_do_not_overlap_are_written_at_once,
+    ),
+    ("overlapping_host_access_is_refused", overlapping_host_access_is_refused),
+    ("destroy_during_host_access_is_refused", destroy_during_host_access_is_refused),
+    ("host_range_outside_the_buffer_is_refused", host_range_outside_the_buffer_is_refused),
+    (
+        "host_access_outside_the_memory_class_is_refused",
+        host_access_outside_the_memory_class_is_refused,
+    ),
+    (
+        "address_of_a_buffer_without_the_usage_is_refused",
+        address_of_a_buffer_without_the_usage_is_refused,
+    ),
+    ("read_under_a_pending_writer_is_refused", read_under_a_pending_writer_is_refused),
+    ("write_under_a_pending_writer_is_refused", write_under_a_pending_writer_is_refused),
+    (
+        "submit_writing_under_a_host_access_is_refused",
+        submit_writing_under_a_host_access_is_refused,
+    ),
+    ("submit_racing_a_host_access_refuses_one", submit_racing_a_host_access_refuses_one),
+    ("unflushed_range_at_a_submit_is_refused", unflushed_range_at_a_submit_is_refused),
+    (
+        "flush_and_invalidate_are_accepted_where_memory_is_coherent",
+        flush_and_invalidate_are_accepted_where_memory_is_coherent,
+    ),
+    ("buffer_use_outside_its_usage_is_refused", buffer_use_outside_its_usage_is_refused),
+];
+
+/// Rounds of each race: enough for both orders to occur on most runs, few enough to be
+/// quick. A race case asserts what holds in either order, so it never fails for want of one.
+const ROUNDS: usize = 24;
+
+const SIZE: u64 = 256;
+
+fn pattern(seed: u8) -> Vec<u8> {
+    (0..SIZE).map(|at| (at as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+}
+
+/// Records a copy of `source`, from `Undefined`, into `destination`, from `Undefined`, of
+/// the whole of both.
+fn copy(encoder: &mut dyn Encoder, source: BufferHandle, destination: BufferHandle) {
+    let queue = encoder.queue();
+    encoder.transition_buffers(&[
+        buffer_to(source, BufferState::Undefined, BufferState::CopySource, queue),
+        buffer_to(destination, BufferState::Undefined, BufferState::CopyDestination, queue),
+    ]);
+    encoder.copy_buffer(
+        source,
+        destination,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+}
+
+fn buffer_write_then_copy_then_read_returns_the_bytes(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let bytes = pattern(1);
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &bytes);
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let mut encoder = ctx.encoder(&*device, queue);
+    copy(&mut *encoder, source, readback);
+    encoder.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        queue,
+    )]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, queue, &mut [encoder], &[], &[done]);
+    ctx.reached(&*device, done);
+    ctx.check(ctx.read(&*device, readback, 0, SIZE) == bytes, "the bytes written are read back");
+    ctx.check(ctx.read(&*device, readback, 16, 8) == bytes[16..24], "a range reads its own bytes");
+    Ok(())
+}
+
+fn buffer_address_is_stable_and_distinct(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let sizes = [256, 1000, 4, 65536];
+    let buffers: Vec<(BufferHandle, u64)> = sizes
+        .iter()
+        .map(|&size| {
+            (ctx.buffer(&*device, size, BufferUsage::DEVICE_ADDRESS, MemoryClass::Device), size)
+        })
+        .collect();
+    let ranges: Vec<(u64, u64)> = buffers
+        .iter()
+        .map(|&(buffer, size)| {
+            let address = ctx.ok(device.buffer_address(buffer), "an address");
+            ctx.check(
+                ctx.ok(device.buffer_address(buffer), "an address") == address,
+                "an address is stable",
+            );
+            (
+                address,
+                address
+                    .checked_add(size)
+                    .unwrap_or_else(|| ctx.fail("an address range that wraps")),
+            )
+        })
+        .collect();
+    for (at, a) in ranges.iter().enumerate() {
+        for b in &ranges[at + 1..] {
+            ctx.check(
+                a.1 <= b.0 || b.1 <= a.0,
+                "no byte of one live buffer has an address in another",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One thread's write is lent while another's, on a range that does not overlap it, runs
+/// in full.
+fn host_ranges_that_do_not_overlap_are_written_at_once(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let buffer = ctx.buffer(&*device, SIZE, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
+    let (lent, lent_seen) = mpsc::channel();
+    let (other_done, other_seen) = mpsc::channel();
+    let device: &dyn Device = &*device;
+    std::thread::scope(|scope| {
+        let first = scope.spawn(move || {
+            device.write_buffer(buffer, 0, 128, &mut |bytes| {
+                bytes.fill(1);
+                lent.send(()).ok();
+                other_seen.recv_timeout(PATIENCE).ok();
+            })
+        });
+        let second = scope.spawn(move || {
+            lent_seen.recv_timeout(PATIENCE).ok();
+            let second = device.write_buffer(buffer, 128, 128, &mut |bytes| bytes.fill(2));
+            other_done.send(()).ok();
+            second
+        });
+        ctx.ok(
+            second.join().unwrap_or_else(|_| ctx.fail("the second writer panicked")),
+            "a write beside another",
+        );
+        ctx.ok(
+            first.join().unwrap_or_else(|_| ctx.fail("the first writer panicked")),
+            "the first write",
+        );
+    });
+    ctx.ok(device.flush_buffer(buffer, 0, SIZE), "a flush");
+    Ok(())
+}
+
+fn overlapping_host_access_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let buffer = ctx.buffer(&*device, SIZE, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
+    let mut inner = None;
+    ctx.ok(
+        device.write_buffer(buffer, 0, 128, &mut |bytes| {
+            bytes.fill(1);
+            inner = Some(device.write_buffer(buffer, 64, 128, &mut |bytes| bytes.fill(2)));
+        }),
+        "the outer write",
+    );
+    ctx.refused(
+        inner.unwrap_or_else(|| ctx.fail("the fill was not called")),
+        "a write overlapping one in progress",
+    );
+    ctx.ok(
+        device.write_buffer(buffer, 64, 128, &mut |bytes| bytes.fill(2)),
+        "the same write once the first returned",
+    );
+    Ok(())
+}
+
+fn destroy_during_host_access_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let buffer = ctx.buffer(&*device, SIZE, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
+    let mut inner = None;
+    ctx.ok(
+        device.write_buffer(buffer, 0, 16, &mut |bytes| {
+            bytes.fill(1);
+            inner = Some(device.destroy_buffer(buffer));
+        }),
+        "the write",
+    );
+    ctx.refused(
+        inner.unwrap_or_else(|| ctx.fail("the fill was not called")),
+        "a destroy under a host write",
+    );
+    ctx.ok(device.destroy_buffer(buffer), "the destroy once the write returned");
+    Ok(())
+}
+
+fn host_range_outside_the_buffer_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let buffer = ctx.buffer(&*device, 64, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
+    let mut called = false;
+    let refused = device.write_buffer(buffer, 60, 8, &mut |_| called = true);
+    ctx.refused(refused, "a write past the end");
+    let refused = device.write_buffer(buffer, u64::MAX, 2, &mut |_| called = true);
+    ctx.refused(refused, "a write whose end wraps");
+    ctx.check(!called, "a refused write lends nothing");
+    let refused = device.flush_buffer(buffer, 32, 64);
+    ctx.refused(refused, "a flush past the end");
+    Ok(())
+}
+
+fn host_access_outside_the_memory_class_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let readback = ctx.buffer(&*device, 64, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let local = ctx.buffer(&*device, 64, BufferUsage::COPY_DESTINATION, MemoryClass::Device);
+    for (buffer, what) in
+        [(readback, "a write of a readback buffer"), (local, "a write of device memory")]
+    {
+        ctx.refused(device.write_buffer(buffer, 0, 16, &mut |bytes| bytes.fill(0)), what);
+    }
+    Ok(())
+}
+
+fn address_of_a_buffer_without_the_usage_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let buffer = ctx.buffer(&*device, 64, BufferUsage::COPY_DESTINATION, MemoryClass::Device);
+    ctx.refused(device.buffer_address(buffer), "the address of a buffer made without the usage");
+    Ok(())
+}
+
+/// A readback buffer, written once by a submit seen complete, is read while a second
+/// submit that writes it again is held pending.
+fn read_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &pattern(2));
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let mut encoder = ctx.encoder(&*device, queue);
+    copy(&mut *encoder, source, readback);
+    encoder.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        queue,
+    )]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, queue, &mut [encoder], &[], &[done]);
+    ctx.reached(&*device, done);
+    let mut writer = ctx.encoder(&*device, queue);
+    writer.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::HostRead,
+        BufferState::CopyDestination,
+        queue,
+    )]);
+    writer.copy_buffer(
+        source,
+        readback,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+    writer.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        queue,
+    )]);
+    let mut writers = [writer];
+    let gate = ctx.held(&*device, queue, &mut writers);
+    ctx.ok(device.invalidate_buffer(readback, 0, SIZE), "an invalidate");
+    let mut called = false;
+    ctx.refused(
+        device.read_buffer(readback, 0, SIZE, &mut |_| called = true),
+        "a read under a pending writer",
+    );
+    ctx.check(!called, "a refused read lends nothing");
+    gate.open(ctx, &*device);
+    ctx.check(
+        ctx.read(&*device, readback, 0, SIZE) == pattern(2),
+        "the read once the writer is seen complete",
+    );
+    Ok(())
+}
+
+fn write_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &pattern(3));
+    let upload = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Upload);
+    let mut encoder = ctx.encoder(&*device, queue);
+    copy(&mut *encoder, source, upload);
+    let mut encoders = [encoder];
+    let gate = ctx.held(&*device, queue, &mut encoders);
+    let mut called = false;
+    ctx.refused(
+        device.write_buffer(upload, 0, 16, &mut |_| called = true),
+        "a write under a pending writer",
+    );
+    ctx.check(!called, "a refused write lends nothing");
+    gate.open(ctx, &*device);
+    ctx.write(&*device, upload, 0, &[9; 16]);
+    Ok(())
+}
+
+fn submit_writing_under_a_host_access_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &pattern(4));
+    let upload = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Upload);
+    let mut encoder = ctx.encoder(&*device, queue);
+    copy(&mut *encoder, source, upload);
+    let mut encoders = [encoder];
+    let mut refused = None;
+    ctx.ok(
+        device.write_buffer(upload, 0, 16, &mut |bytes| {
+            bytes.fill(0);
+            refused = Some(
+                device.submit(queue, Submit { encoders: &mut encoders, waits: &[], signals: &[] }),
+            );
+        }),
+        "the host write",
+    );
+    ctx.refused(
+        refused.unwrap_or_else(|| ctx.fail("the fill was not called")),
+        "a submit that writes under a host write",
+    );
+    ctx.ok(device.flush_buffer(upload, 0, 16), "a flush");
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, queue, &mut encoders, &[], &[done]);
+    ctx.reached(&*device, done);
+    Ok(())
+}
+
+/// A submit that copies into an upload buffer races a write of it whose fill stays until
+/// the submit has returned: exactly one of the two is refused.
+fn submit_racing_a_host_access_refuses_one(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &pattern(5));
+    let mut submits_refused = 0;
+    let mut writes_refused = 0;
+    for _ in 0..ROUNDS {
+        let upload = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Upload);
+        let mut encoder = ctx.encoder(&*device, queue);
+        copy(&mut *encoder, source, upload);
+        let mut encoders = [encoder];
+        let gate = ctx.gate(&*device);
+        let (returned, returned_seen) = mpsc::channel::<()>();
+        let device: &dyn Device = &*device;
+        let (write, submit) = std::thread::scope(|scope| {
+            let write = scope.spawn(move || {
+                device.write_buffer(upload, 0, SIZE, &mut |bytes| {
+                    bytes.fill(1);
+                    returned_seen.recv_timeout(PATIENCE).ok();
+                })
+            });
+            let encoders = &mut encoders;
+            let submit = scope.spawn(move || {
+                let submit = device
+                    .submit(queue, Submit { encoders, waits: &[gate.wait], signals: &[gate.done] });
+                returned.send(()).ok();
+                submit
+            });
+            (
+                write.join().unwrap_or_else(|_| ctx.fail("the writer panicked")),
+                submit.join().unwrap_or_else(|_| ctx.fail("the submitter panicked")),
+            )
+        });
+        match (&write, &submit) {
+            (Ok(()), Err(error)) if Rule::of(error) == Some(Rule::HostOverlap) => {
+                submits_refused += 1
+            }
+            (Err(error), Ok(())) if Rule::of(error) == Some(Rule::Pending) => writes_refused += 1,
+            _ => ctx.fail(format_args!(
+                "not exactly one refused: the write {write:?}, the submit {submit:?}"
+            )),
+        }
+        if submit.is_ok() {
+            gate.open(ctx, device);
+        } else {
+            ctx.ok(device.flush_buffer(upload, 0, SIZE), "a flush");
+        }
+    }
+    ctx.check(submits_refused + writes_refused == ROUNDS, "every round refused one");
+    Ok(())
+}
+
+fn unflushed_range_at_a_submit_is_refused(ctx: &Ctx<'_>) -> Applies {
+    if ctx.set.coherent_host_memory {
+        return Err("host memory is coherent");
+    }
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let source = ctx.buffer(&*device, SIZE, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
+    ctx.ok(device.write_buffer(source, 0, SIZE, &mut |bytes| bytes.fill(4)), "a host write");
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let mut encoder = ctx.encoder(&*device, queue);
+    copy(&mut *encoder, source, readback);
+    let mut encoders = [encoder];
+    let refused =
+        device.submit(queue, Submit { encoders: &mut encoders, waits: &[], signals: &[] });
+    ctx.refused(refused, "a copy from a written range not flushed");
+    ctx.ok(device.flush_buffer(source, 0, SIZE), "the flush");
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, queue, &mut encoders, &[], &[done]);
+    ctx.reached(&*device, done);
+    Ok(())
+}
+
+fn flush_and_invalidate_are_accepted_where_memory_is_coherent(ctx: &Ctx<'_>) -> Applies {
+    if !ctx.set.coherent_host_memory {
+        return Err("host memory is not coherent");
+    }
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let bytes = pattern(6);
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &bytes);
+    ctx.ok(device.flush_buffer(source, 0, SIZE), "a second flush");
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let mut encoder = ctx.encoder(&*device, queue);
+    copy(&mut *encoder, source, readback);
+    encoder.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        queue,
+    )]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, queue, &mut [encoder], &[], &[done]);
+    ctx.reached(&*device, done);
+    ctx.ok(device.invalidate_buffer(readback, 0, SIZE), "an invalidate");
+    ctx.check(ctx.read(&*device, readback, 0, SIZE) == bytes, "the bytes read back");
+    Ok(())
+}
+
+fn buffer_use_outside_its_usage_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let source = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Upload);
+    ctx.write(&*device, source, 0, &pattern(7));
+    let destination =
+        ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Device);
+    let mut encoder = ctx.encoder(&*device, queue);
+    copy(&mut *encoder, source, destination);
+    let refused =
+        device.submit(queue, Submit { encoders: &mut [encoder], waits: &[], signals: &[] });
+    ctx.refused(refused, "a copy from a buffer made without `COPY_SOURCE`");
+    let plain = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Device);
+    let pipeline = ctx.compute(&*device);
+    let mut encoder = ctx.encoder(&*device, queue);
+    encoder.transition_buffers(&[buffer_to(
+        plain,
+        BufferState::Undefined,
+        BufferState::ShaderWrite,
+        queue,
+    )]);
+    let reach = [BufferReach { buffer: plain, state: BufferState::ShaderWrite }];
+    compute_pass(&mut *encoder, pipeline, PassReach { slots: &[], buffers: &reach });
+    encoder.dispatch([1, 1, 1]);
+    encoder.end_pass();
+    let refused =
+        device.submit(queue, Submit { encoders: &mut [encoder], waits: &[], signals: &[] });
+    ctx.refused(refused, "a pass that declares a buffer made without `DEVICE_ADDRESS`");
+    Ok(())
+}

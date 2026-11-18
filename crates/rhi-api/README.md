@@ -13,11 +13,12 @@ timelines; the swapchain; and the shape of the conformance suite every backend r
 | Determinism boundary | outside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final for milestone 2's lanes and every body
-that decides anything is `todo!()`: the cooked shader's `encode` and `decode`, `seal_cache`
-and `open_cache`, and the suite's `run`. The traits have no implementation yet. What runs is
-plain data: the rule names and `Rule::refuse` and `Rule::of`, the queue layout, the flag sets
-and the indirect record. This file is the contract the backends meet (`rhi-null`, `vulkan`,
+**Status: implemented by `lactose-rhi-null`.** Every public signature is final for milestone
+2's lanes. What runs here: the cooked shader's `encode` and `decode`, `seal_cache` and
+`open_cache`, the rule names with `Rule::refuse` and `Rule::of`, the queue layout, the flag
+sets and the indirect record, and, behind `conformance`, the suite's `run` and the bodies of
+its contract cases, written with `lactose-rhi-null`, which implements the traits. The output
+cases' bodies arrive with `lactose-rhi-vulkan`. This file is the contract the backends meet (`rhi-null`, `vulkan`,
 `swapchain`, and `rhi-metal` at milestone 3), and every sentence under "Behaviour the
 signatures cannot express" is one a dependent crate may rely on. Architecture sections 12.1,
 5.1, 19, 20 and 21 are the design, with the milestone 2 plan's decisions 5.6, 5.8, 5.10 to
