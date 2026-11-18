@@ -188,11 +188,18 @@ pub trait Device: Send + Sync {
     /// did not enable ([`Rule::Capability`](crate::Rule::Capability), every backend that
     /// takes SPIR-V; a Metal target declares none); `ErrorKind::InvalidData` for a module
     /// whose magic or version is not its target's, a shader the driver refuses (Metal's
-    /// compiler refuses what the GPU cannot run), a stage in the wrong
-    /// place, a constant the shader does not declare or of another length, a heap array
-    /// whose capacity is not the device's, a colour target with a write mask that is not
-    /// empty which the fragment stage does not write or reads as an input, or a depth
-    /// format that is not one.
+    /// compiler refuses what the GPU cannot run), a stage that breaks the cooked format
+    /// ([`CookedShader::check`](crate::CookedShader::check)), a stage in the wrong place, a
+    /// constant the shader does not declare, given twice, or whose
+    /// [`ConstantValue`](crate::ConstantValue) is not of its slot's type, a heap array whose
+    /// capacity is not the device's, a varying the fragment stage reads that the vertex
+    /// stage does not write at its location with its component type and count
+    /// ([`check_varyings`](crate::check_varyings)), a compute stage whose workgroup is above
+    /// the pipeline's `maxTotalThreadsPerThreadgroup` on Metal or, where a backend checks it,
+    /// whose module's `LocalSize` is another, a colour target with a write
+    /// mask that is not empty which the fragment stage does not write or reads as an input,
+    /// or a depth format that is not one (`README.md`, "Pipelines and the cooked shader
+    /// format").
     fn create_graphics_pipeline(
         &self,
         desc: &GraphicsPipelineDesc<'_>,

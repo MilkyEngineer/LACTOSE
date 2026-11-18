@@ -5,8 +5,10 @@
 #
 # 2026.20 is the newest release of 2026.17 to 2026.22 on which every Slang behaviour the plan
 # records holds: 2026.21 and 2026.22 compile `NonUniformResourceIndex` for the Metal target,
-# which 2026.20 and every release before it refuse when it is written in the entry module
-# (inlined from an imported module, 2026.20 compiles it too).
+# which 2026.20 and every release before it refuse when it is written in the entry module. 2026.20
+# refuses it inlined from an imported `[ForceInline]` helper too, and compiles it only when a
+# generic over an interface reaches it (tools/cook/tests/shader.rs,
+# `non_uniform_resource_index_for_metal_cooks_on_the_pin_only_through_a_generic`).
 version = "2026.20"
 
 [archive.linux-x86_64]
