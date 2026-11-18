@@ -81,6 +81,9 @@ What `frame-design` must still decide, since no signature here does:
 - **A frame with nothing to draw into.** A prepared frame is declared and submitted, or it
   is torn. A client with no target either does not prepare, so that the writers' rows wait
   in the open region and are dropped once it is full, or declares into a target of its own.
+  A region left unprepared, or left open by a refused `prepare`, holds several frames'
+  passes and remote batches, and `prepare` applies the last of those batches alone
+  ("Slots").
 - **Whether extract of the next frame may begin before this frame is submitted.** This crate
   allows it from the moment `open` has returned `Ready` after `prepare`. `open` takes `&mut
   Renderer`, which `declare` lends to the recorders until `RenderGraph::record` returns, so
@@ -96,9 +99,8 @@ What `frame-design` must still decide, since no signature here does:
   D160). `RemoteWriter` borrows the renderer, so the object lends it to the presentation
   schedule inside one of its methods.
 - **The frame's values.** The target and its format, the extent, which is one for the
-  frame (`FrameView::extent`, and `CameraLatch::extent` equal to it), the fraction, the
-  projection, the boom, and in the fixed-frame mode of decision 5.1 the sample the
-  `LatestSample` holds.
+  frame (`FrameView::extent`, which the latch takes too), the fraction, the projection, the
+  boom, and in the fixed-frame mode of decision 5.1 the sample the `LatestSample` holds.
 - **The order of drops.** The renderer after the graph that submitted its frames, off the
   frame-critical workers ("Errors and drops").
 
@@ -145,11 +147,11 @@ Step 1 for the next frame may come any time after step 3.
 - `prepare` first frees every slot of each kind lost in the frame, and applies nothing of
   that kind's passes ("Writers"). It then applies the other passes **kind by kind, in the
   order of `WorldKind`'s variants** (`Server`, `Client`, `Prediction`), and within a kind in
-  the order they began. The remote batch counts as `Client`, applied after that kind's
-  passes. Begin order across kinds is thread timing, since passes of different worlds may
-  be open at once; within a kind it is the program's, since one world's sink begins and
-  ends its passes in turn and the frame ends the `Client` pass before the remote batch
-  begins. Applying one pass:
+  the order they began. At most one remote batch follows the `Client` passes (below).
+  Begin order across kinds is thread timing, since passes of different worlds may be open
+  at once; within a kind it is the program's, since one world's sink begins and ends its
+  passes in turn and the frame ends the `Client` pass before the remote batch begins.
+  Applying one pass:
   1. Each key of the pass's `removed` that holds a slot of the pass's kind frees it; a key
      that holds none is ignored (present-api, "What a pass gives the sink").
   2. Each row whose instance holds a slot keeps it. The slot's mesh becomes the row's.
@@ -165,10 +167,23 @@ Step 1 for the next frame may come any time after step 3.
 - So a key that a pass removes and writes is a new instance, and may take the slot it just
   freed, as may a new instance of a full pass take a slot that pass's step 3 freed. A freed
   slot's record is not drawn from the frame that frees it on ("The scatter").
-- The remote batch is applied as a pass of kind `WorldKind::Client` that is not full and
-  removes nothing. A `Client` world's own passes write no row (present-api): their removed
-  keys and their full passes free remote instances, and the remote batch of the same frame,
-  which is applied after them, gives those that still exist new slots.
+- **The remote batch** is applied as a pass of kind `WorldKind::Client` that is not full
+  and removes nothing, after the `Client` passes. A `Client` world's own passes write no row
+  (present-api): their removed keys and their full passes free remote instances, and the
+  remote batch, applied after them, gives those that still exist new slots.
+- **One remote batch a frame.** A region holds several frames' batches where a frame did
+  not prepare, or its `prepare` was refused. `prepare` applies the last batch the region
+  holds, and that one only where it is whole (its end note is in the region), no `Client`
+  pass began after it, and the `Client` kind is not lost in the frame. Every other batch of
+  the region is left out, its rows counted in `FrameStats::remote_rows` and nowhere else:
+  the batch applied writes every remote instance again. So a batch is never applied over
+  the removals of a `Client` pass that began after it, which would bring back an instance
+  despawned since and count nothing. A lost `Client` kind applies no batch, since a loss
+  has no place in the region to order it by: a pass lost for want of room may have left no
+  note, and one lost with no region open is in no region. The remote instances are then
+  missing until the next frame's batch, as after a batch with no room ("Writers"). Which
+  batch is applied follows from the order the region holds the `Client` passes and the
+  batches in, which is the program's, and from which kinds are lost.
 - `SlotTable::extent` is one more than the highest held slot. The lowest-free rule keeps it
   near `live`.
 - The same passes of each kind, each as a set of keys, give the same table on every run,
@@ -193,8 +208,11 @@ Step 1 for the next frame may come any time after step 3.
   for a remote batch, its opening and its end.
 - Every note and every row a writer leaves carries the region's **open generation**, which
   `open` advances each time it opens a region and which the open word holds beside the
-  region's index. A pass's notes and rows use the region and generation its `begin` read,
-  and a remote batch's those its writer was made under, and neither reads the word again.
+  region's index. The generation is 32 bits and never zero: it repeats after 2^32 - 1 opens,
+  over two years at 60 frames a second, and the entries beside the rows start at zero, a
+  generation no use has. A pass's notes and rows use the region and generation its `begin`
+  read, and a remote batch's those its writer was made under, and neither reads the word
+  again.
   `prepare` reads the sealed region's entries below `min(cursor, rows)` and skips any
   entry of another generation. Such an entry is at an index a writer of this use reserved
   and did not fill, because the device refused the write, and that writer counted the row
@@ -228,16 +246,18 @@ Step 1 for the next frame may come any time after step 3.
   kind's bases and the tick of its last pass, so that its next `begin` is compared with
   none, as its first was, and reports it (`FrameStats::lost`). Nothing stale is drawn. The
   kind shows nothing until a full pass, which the frame brings about with
-  `ExtractState::set_sink`. A lost `Client` pass does not stop the frame's remote batch
-  from being applied after it, so the remote instances are back in the same frame.
+  `ExtractState::set_sink`. A lost `Client` kind applies no remote batch either ("Slots"),
+  so the remote instances are missing until the next frame's batch.
 - **With no region open** there is no region to note a loss in. A pass that begins then,
   and a row written then, are recorded in the renderer-wide record of kinds lost and rows
   dropped, by kind and in all. The next `prepare` takes the record with a swap after it has
   sealed its region, and `open` never resets it, so a loss is reported no later than the
   kind's next pass is applied; reported one `prepare` early, it frees the kind until a full
   pass and shows nothing stale.
-- **A sink dropped with a pass open** leaves that pass lost and gives back the count its
-  `begin` took, so the region can still be sealed (`ExtractSink`'s `Drop`).
+- **A sink dropped with a pass open** leaves that pass lost and, where its `begin` took a
+  count, gives it back, so the region can still be sealed and the `prepare` that seals it
+  sees the loss (`ExtractSink`'s `Drop`; "Concurrency"). Only a pass whose `begin` took a
+  count gives one back, by its `end` or by the drop: a pass lost at its `begin` took none.
 - **The remote batch takes no count** of the open word: the writer borrows the renderer
   mutably, which keeps `prepare` out already. So a `RemoteWriter` passed to `mem::forget`
   cannot keep the renderer from preparing: its batch has no end note, and a remote batch
@@ -315,7 +335,11 @@ Step 1 for the next frame may come any time after step 3.
   remote batch, whose rows together are at most `instances`, fit in `instances + 8` plus
   the keys the passes remove. `RendererDesc::instances` bounds what is drawn, a load that
   replaces a kind's whole key set included, since a full pass frees what it did not write
-  before it places what is new ("Slots"); `rows` bounds what one frame may change.
+  before it places what is new ("Slots"). That holds within one kind: a kind applied
+  earlier that grows in a frame cannot take the slots a later kind's full pass frees in the
+  same frame. Its rows that find none are unplaced and counted (`unplaced_in`), the frame
+  answers with a full pass of that kind's world, and the next frame places them. `rows`
+  bounds what one frame may change.
 - `prepare` is refused (`InvalidData`) when no region is open, while a sink's pass is open,
   and while the frame prepared before it is not ended. It then seals nothing.
 
@@ -377,15 +401,21 @@ Step 1 for the next frame may come any time after step 3.
   "Queues"), and the instance buffer never changes queue.
 - The instance buffer's records are written by the scatter alone. The host never writes or
   reads the buffer; a test reads it through a copy pass of its own.
-- **The instance buffer's import.** Every frame leaves it in `BufferState::ShaderRead` on
-  the graphics queue, and `declare` imports it from there, an `Exclusive` import in the
-  state and on the queue it is in, which needs no `ready` (graph, "Imports"). The
-  renderer's first frame, and the first frame declared after `torn`, import it from
-  `Undefined` instead, which keeps its bytes on the one queue it is used on (graph,
-  "Submission": a torn frame's imports are in no state the graph vouches for). So the
-  scatter of a frame waits for the shader reads of the frame before it, not for every
-  command that frame submitted, and the declaration changes, and is compiled again, once
-  after each of those frames. D160 allows it: `initial` is the caller's word.
+- **The instance buffer's import.** `declare` imports the instance buffer in every frame,
+  whether a pass of the frame uses it or not, with `last` `BufferState::ShaderRead` on the
+  graphics queue. So every frame leaves it there: by its last use, or, where no pass used
+  it, by the one transition the graph makes from `initial` (graph, "Imports").
+  `renderer-impl` keeps the import unconditional, since the rule that follows rests on it.
+  `declare` imports the buffer from `ShaderRead`, an `Exclusive` import in the state and
+  on the queue it is in, which needs no `ready` (graph, "Imports"). The renderer's first
+  frame, and the first frame declared after `torn`, import it from `Undefined` instead,
+  which keeps its bytes on the one queue it is used on (graph, "Submission": a torn
+  frame's imports are in no state the graph vouches for). So the scatter of a frame waits
+  for the earlier work on the queue at its shader stages, every one of them, since
+  `ShaderRead` names no stage and a Vulkan backend gives it all, the previous frame's
+  fragment shading included; it does not wait for that work's attachment writes, copies
+  or tests. The declaration changes, and is compiled again, once after each of those
+  frames. D160 allows it: `initial` is the caller's word.
 
 ### Formats
 
@@ -453,7 +483,8 @@ table, which already holds each instance's mesh; it adds no field to the row.
 - `CameraData::orbit` is the one statement of the camera. `latch` reads
   `LatestSample::read` once, inside the call, takes the yaw and the pitch of what it read,
   and writes `CameraData::orbit(pivot, yaw, pitch, boom, projection, extent)` to the frame's
-  camera buffer, then flushes it. It returns what it wrote.
+  camera buffer, with `extent` the one the frame was declared with, then flushes it. It
+  returns what it wrote.
 - The latch writes that one buffer (architecture section 5.3). It waits for no device and
   no signal and gates no submit; its one loop is `LatestSample::read`'s, which retries only
   while a publish is in flight (`lactose-input-host`). The caller makes it between
@@ -461,9 +492,10 @@ table, which already holds each instance's mesh; it adds no field to the row.
   reads the camera's bytes; shaders reach it through its address.
 - The boom is the caller's value. The recheck of the boom at the latch is not in milestone 2
   (decision 5.4).
-- A declared frame is latched once before it is submitted, at the frame's one extent:
-  `latch` refuses (`InvalidData`) a `CameraLatch::extent` other than the `FrameView::extent`
-  the frame was declared with, so that the aspect ratio is the viewport's.
+- A declared frame is latched once before it is submitted, at the frame's one extent, the
+  `FrameView::extent` `declare` stored, so that the aspect ratio is the viewport's.
+  `CameraLatch` carries no extent. `latch` refuses (`InvalidData`) a prepared frame that was
+  not declared, which has no extent.
 - A frame submitted with no latch is the caller's breach. Where its region's camera buffer
   was never written, null refuses the submit (`undefined-read`); otherwise a device draws
   it with the camera an earlier frame latched into that region.
@@ -517,7 +549,7 @@ table, which already holds each instance's mesh; it adds no field to the row.
 | `ExtractSink::write` | Extract's forked jobs, several at once | `&` sink |
 | `RemoteWriter::write` | The presentation schedule's jobs, several at once | `&` writer, which borrows the renderer mutably |
 | `open`, `prepare`, `latch`, `submitted`, `torn`, `remote`, `add_feature` | The render side's job, one at a time | `&mut Renderer` |
-| `declare`, and the recorders it adds | The declaring job; the graph's recording jobs, several at once | `&'f Renderer` |
+| `declare`, and the recorders it adds | The declaring job; the graph's recording jobs, several at once | `&'f Renderer`; `declare` stores the declared word |
 
 - **What is shared across threads** is `staging::Staging`, between every sink and the
   renderer: the word that says which region is open, under which open generation, and how
@@ -528,18 +560,41 @@ table, which already holds each instance's mesh; it adds no field to the row.
   public conversions, so the crate needs no cell and no `unsafe`. It has no `Mutex`,
   `RwLock`, condition variable or channel, and adds none: architecture section 3 permits
   none here.
+- **The open word** is one `AtomicU64`: the open generation in the high 32 bits, the open
+  region's index in the next 16, all ones while no region is open, so `Renderer::new`
+  refuses more than 65,535 regions, and the count of open passes in the low 16. A `begin`
+  that would take the count past 65,535 is lost. The generation is never zero, and the
+  entries beside the rows start at zero, so no entry a use did not write matches it
+  ("Writers"). Only a pass whose `begin` took a count gives one back, by its `end` or by
+  its sink's drop, so a give-back never borrows from the index or the generation.
+- **The declared word.** Outside `Staging` the renderer holds one more `AtomicU64`: the
+  prepared frame's declared extent, `width << 32 | height`, zero while the frame is not
+  declared, which `declare`'s refusal of a zero side leaves free to mean that. So the word
+  is both the extent `latch` reads and the mark that the frame is declared. `declare`
+  checks its arguments, then stores the extent with one compare-exchange from zero, and
+  only then adds its passes: of two `declare` calls on one `&Renderer` exactly one
+  succeeds, and one refused leaves the word as it was. `Relaxed` is enough: `latch`,
+  `prepare`, `submitted` and `torn` reach the word through `&mut self`, which orders them
+  after every `declare`, and `prepare` clears it.
 - **The orderings.** `open`'s store of the open word is `Release`, so a `begin` that reads
-  the new region also reads its cursor and counts reset. A `begin`'s compare-exchange of
-  the word, which adds its pass to the count, is `Acquire` on success and `Relaxed` on
-  failure. A pass's `end` gives back its count with a `Release` subtraction, after its
-  notes and its rows' shadow entries are stored. The sealing's compare-exchange, which
-  succeeds only at a count of zero, is `Acquire`, so `prepare` then reads every note and
-  shadow entry of every pass that ended. A reservation is a `Relaxed` addition to the
-  region's cursor: what makes a pass's rows visible to `prepare` is its `end`'s release,
-  not the reservation. A row or a pass recorded while no region is open goes to the
-  renderer-wide record with `Relaxed` additions and bit sets, which `prepare` takes with a
-  swap after the sealing's acquire. The remote batch's writes are ordered by the mutable
-  borrow its writer holds, which ends before `prepare` is called.
+  the new region also reads its cursor and counts reset, and every read the previous
+  `prepare` made of that region, of its notes and its rows' shadow entries, comes before
+  the new use's writes to it. A `begin`'s compare-exchange of the word, which adds its
+  pass to the count, is `Acquire` on success and `Relaxed` on failure. A pass's `end`
+  gives back its count with a `Release` subtraction, after its notes and its rows' shadow
+  entries are stored, and a sink dropped with a pass open gives back its count with the
+  same `Release` subtraction, after the pass's lost mark. Every change of the word between
+  `open`'s store and the sealing is a read-modify-write, a `begin`'s compare-exchange or a
+  give-back's subtraction, and never a plain store: the sealing reads only the word's last
+  value, and it reads every give-back's release through that chain. The sealing's
+  compare-exchange, which succeeds only at a count of zero, is `Acquire`, so `prepare` then
+  reads every note, shadow entry and lost mark of every pass that ended or was dropped. A
+  reservation is a `Relaxed` addition to the region's cursor: what makes a pass's rows
+  visible to `prepare` is its `end`'s release, not the reservation. A row or a pass
+  recorded while no region is open goes to the renderer-wide record with `Relaxed`
+  additions and bit sets, which `prepare` takes with a swap after the sealing's acquire.
+  The remote batch's writes are ordered by the mutable borrow its writer holds, which ends
+  before `prepare` is called.
 - **The only locks a call of this crate takes** are the device backend's, inside
   `Device::write_buffer`, `flush_buffer` and `timeline_value`: the lock on its records and
   the lock on a handle's entry, which rhi-api names ("Threads") and section 3 permits on
@@ -630,16 +685,26 @@ member at an offset its standard alignment does not allow:
 | `CameraData` | `float4x4 clip_from_cell` (0), column-major, `int3 cell` (64), `uint reserved` (76) | 80 |
 | A vertex of `TRIANGLE` | `float position[3]` (0) | 12 |
 
+`reviewer-gpu`'s round-2 probe cooked this table as written: valid under `spirv-val` with
+the standard rules and no `scalarBlockLayout`, the camera at offsets 0, 64 and 76 with a
+stride of 80, MSL's `packed_int3` at 64, and the images of a camera declared as scalar
+arrays, bit for bit, under MoltenVK.
+
 The natural `int3 cell; float3 offset; float4 rotation;` puts a `float3` at 12 and a
 `float4` at 24, which Slang emits and which the standard rules call an improper straddle:
 the module is invalid on a device without `scalarBlockLayout`, and the cook does not catch
 it.
 
-**Metal's buffer index.** No stage declares a buffer argument but its push block, so Slang
-assigns the block Metal buffer index 0, `[[buffer(0)]]`, in the scatter and the vertex
-stage; the fragment stage declares none. `rhi-metal` sets the push bytes at the index the
-cook's shader declares, and binds no vertex buffer, so the vertex stage's index 0 is the
-block's.
+**Metal's buffer index.** Each stage's push block is an entry-point `uniform` parameter of
+the stage, never a global shader parameter of its module. Slang then gives it Metal buffer
+index 0, `[[buffer(0)]]`, in the scatter and in the vertex stage, whatever else the module
+declares; the fragment stage declares none. A global push block takes its place among the
+module's globals, so a module that declares the scatter's block and the triangle's gives
+one of them `[[buffer(1)]]`, which the cook (`slang`, at 6b6ab77, not yet merged) refuses:
+it refuses a push block at any index but 0. `reviewer-gpu`'s round-2 probe cooked both
+forms; the entry-point form passed `spirv-val` and `metal -Werror` and rendered the global
+form's images under MoltenVK. `rhi-metal` sets the push bytes at the index the cooked
+shader declares, and binds no vertex buffer, so the vertex stage's index 0 is the block's.
 
 **Scatter, compute.** Workgroup `(64, 1, 1)` (`SCATTER_GROUP`), which `Renderer::new` does
 not check until the cooked format carries it ("Pipelines and shaders"). Push block, 32
@@ -779,13 +844,15 @@ description and report type to plain data, and each format to its size.
 | Slots are allocated on the CPU, freed from despawns and reconciled after a restore, handed over by extract's sink, with a prediction world's rollback | A world with the sink installed; `SlotTable` after each `prepare` | One that ignores `removed`; one that skips the sweep at a full pass's end |
 | (the same) A load that replaces a kind's whole key set at `instances` is placed whole | A full pass of `instances` new keys over `instances` held: `unplaced` zero | One that places before it sweeps |
 | (the same) The table does not depend on which kind's pass began first | Two frames, one with the `Prediction` pass begun before the `Server` pass: equal tables | One that applies in begin order across kinds |
+| (the same) A region that holds two frames applies its last remote batch alone | A region left by a frame that did not prepare, and one left by a refused `prepare`: frame 1's batch holds `gone` and `kept`, frame 2's `Client` pass removes `gone` and its batch holds `kept`. `gone` holds no slot | One that applies every batch after every `Client` pass: `gone` comes back, and no count shows it |
+| (the same) A `Client` pass lost after a batch stops it | The same region, with frame 2's `Client` pass lost for want of room: `lost(Client)`, and no slot of the kind held | One that applies the region's batches whatever kind is lost: frame 1's batch brings `gone` back |
 | A batch names each slot once, resolved in batch order and asserted | On null: duplicate rows through `RemoteWriter::write`, then `ScatterBatch` and `FrameStats::duplicates`. Null's assertion is what proves the resolution | One without the resolution: the assertion fires |
-| Many duplicates in different workgroups of a large batch | On a device: slots made `LIVE` at a known placement `c0` by an earlier frame, then duplicates from a world pass at a new tick, entries `TAKE_BASE \| HAS_BASE` in workgroups far apart; the instance buffer copied out, each record's `base` and `previous` equal to `c0` and `current` to the kept row. It shows that a resolved batch scatters right; an entry with neither flag reads nothing of its record, so remote rows on fresh slots cannot show it | The same build, with the assertion off: the second duplicate reads the first's `current` |
+| Many duplicates in different workgroups of a large batch | On a device: slots made `LIVE` at a known placement `c0` by an earlier frame, then duplicates from a world pass at a new tick, entries `TAKE_BASE \| HAS_BASE`, each instance's two rows at least 2^15 entries apart (row `i` and row `n + i`); the instance buffer copied out, each record's `base` and `previous` equal to `c0` and `current` to the kept row. It shows that a resolved batch scatters right; an entry with neither flag reads nothing of its record, so remote rows on fresh slots cannot show it | Without the resolution and with the assertion off, the second entry of a slot lacks `TAKE_BASE`, and run in order its records match: the host's check of the flags fails that build. The records fail one that marks both entries `TAKE_BASE \| HAS_BASE`, at that spacing. Null's assertion is the proof of the resolution |
 | With the GPU made to lag, the ring never overwrites a region a frame in flight reads | Frames held behind an import's `ready` point; `Opened::Wait`; the readback of a held frame after later writes | One whose `open` ignores the point |
 | Frame N's readback shows N's camera after N + 1's has been written | The same, with two latches | One camera buffer for all regions |
-| An instance in the camera's cell and one in a neighbouring cell, scene and camera moved by 2^25 + 1 cells, render the pixels they render at the origin | Two scenes 2^25 + 1 cells apart, with instances in the camera's cell and the next: equal images | A shader that subtracts after converting to float: at 2^25 + 1 cells the neighbour's difference converts to zero cells. In one cell alone, or below 2^24 cells, where every cell converts exactly, it renders the same pixels and fails nothing |
+| An instance in the camera's cell and one in a neighbouring cell along an axis the scene is moved 2^25 + 1 cells on, its triangle covering pixels at the origin, render the pixels they render at the origin | Two scenes 2^25 + 1 cells apart on that axis, with instances in the camera's cell and the next along it: equal images | A shader that subtracts after converting to float: at 2^25 + 1 cells the neighbour's difference converts to zero cells. In one cell alone, below 2^24 cells, or with the neighbour along an axis the scene was not moved on, where every cell converts exactly, it renders the same pixels and fails nothing |
 | A record without `LIVE` produces no fragment | A slot freed in frame 2: its triangle's pixels are `CLEAR` | One that writes `(0, 0, 0, 0)`, whose result no specification defines |
-| A world stepped, extracted, rendered and compared with the CPU reference | `InstanceRecord::drawn`, `CellTransform::apply`, `CameraData::clip`, `shader::{TRIANGLE, PALETTE, CLEAR}`. Exact at each pixel whose centre is at least 1/16 pixel inside or outside every edge the reference computes in `f64`, the others accepted either way, and the three counts stated: surely drawn, surely clear, in the margin, with zero wrong | One that draws nothing; one that draws every instance in the clear colour |
+| A world stepped, extracted, rendered and compared with the CPU reference | `InstanceRecord::drawn`, `CellTransform::apply`, `CameraData::clip`, `shader::{TRIANGLE, PALETTE, CLEAR}`. Exact at each pixel whose centre is at least a quarter of a pixel inside or outside every edge the reference computes in `f64`, decision 5.1's margin, justified from four bits of sub-pixel snapping and 32-bit error at the scene's extent; the others accepted either way, and the three counts stated: surely drawn, surely clear, in the margin, with zero wrong | One that draws nothing; one that draws every instance in the clear colour |
 | The first frames on null | A renderer's first frame with nothing extracted, and a frame that frees every slot in a region no writer has used: each submitted, none refused (`undefined-read`) | One that declares the instance buffer or the rows in every frame |
 | The sink and the frame agree (present-api's proof row "A rollback in a frame with no step") | present-api's sequences run through `ExtractSink`, the records read back on a device or computed with `InstanceRecord::scatter` on null | One that sets `HAS_BASE` in a dropped tick; one that takes the base at every write |
 
@@ -802,9 +869,10 @@ It also owes:
   through a `sync` shim behind the crate's own `loom` feature, with `lactose-renderer` added
   to xtask's `LOOM_MODELS`: that a `begin` and a sealing cannot both succeed, that a pass
   that ends is read whole by the `prepare` that seals after it, that a pass of an earlier use
-  of a region is never read as a later use's, that a loss with no region open is reported,
-  and that a sink dropped with a pass open does not keep the region from being sealed; and
-  Miri over `Staging`'s tests;
+  of a region is never read as a later use's, that no `prepare` reads an entry of a later
+  use, that a loss with no region open is reported, that a sink dropped with a pass open
+  does not keep the region from being sealed, and that the `prepare` that seals after it
+  reports that pass lost; and Miri over `Staging`'s tests;
 - a test that `ExtractSink::write` from several jobs leaves every row once;
 - as steering, the ring's write cost, and `prepare`'s cost, median and maximum, at 50,000
   incremental rows among 100,000 held, at a full pass of 100,000 held keys, and at a load

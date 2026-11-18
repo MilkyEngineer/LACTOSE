@@ -25,16 +25,21 @@ use lactose_rhi_api::Device;
 ///
 /// Every field a writer and the renderer both touch is an atomic, and the orderings are
 /// `README.md`'s, "Concurrency": `open`'s store of the word is `Release`; a `begin`'s
-/// compare-exchange of it is `Acquire` on success; a pass's `end` gives back its count
-/// with a `Release` subtraction; the sealing's compare-exchange is `Acquire`; and a
-/// reservation is a `Relaxed` addition to the cursor. The implementation adds no `Mutex`,
-/// `RwLock`, condition variable or channel here.
+/// compare-exchange of it is `Acquire` on success; a pass's `end`, and a sink's drop with
+/// a pass open, give back the count with a `Release` subtraction; the sealing's
+/// compare-exchange is `Acquire`; and a reservation is a `Relaxed` addition to the cursor.
+/// Every change of the word between `open`'s store and the sealing is a read-modify-write,
+/// so that the sealing's acquire reads every give-back's release. The implementation adds
+/// no `Mutex`, `RwLock`, condition variable or channel here.
 pub(crate) struct Staging {
     /// The device the writers write through.
     device: Arc<dyn Device>,
     /// Which region is open, its open generation, and how many passes are open on it, in
     /// one word, so that a pass's beginning and the renderer's sealing cannot both
-    /// succeed. The remote batch takes no count.
+    /// succeed: the generation in the high 32 bits, the region's index in the next 16,
+    /// all ones while no region is open, and the count in the low 16. The generation is
+    /// never zero, which the shadow entries start at; a `begin` that would take the count
+    /// past its width is lost. The remote batch takes no count.
     open: AtomicU64,
 }
 
@@ -87,18 +92,21 @@ impl InstanceSink for ExtractSink {
         todo!()
     }
 
-    /// Closes the pass. Nothing of the pass reaches the slot table or the device before
-    /// the frame's [`Renderer::prepare`](crate::Renderer::prepare).
+    /// Closes the pass, and gives back the count its `begin` took, where it took one.
+    /// Nothing of the pass reaches the slot table or the device before the frame's
+    /// [`Renderer::prepare`](crate::Renderer::prepare).
     fn end(&mut self) {
         todo!()
     }
 }
 
 impl Drop for ExtractSink {
-    /// With a pass open, leaves it lost and gives back the count its `begin` took, so
-    /// that the region can be sealed: the next `prepare` applies nothing of the pass's
-    /// kind and frees the kind's slots, as for any lost pass (`README.md`, "Writers").
-    /// With none open, does nothing.
+    /// With a pass open, leaves it lost and, where its `begin` took a count, gives the
+    /// count back with `end`'s `Release` subtraction, after the lost mark, so that the
+    /// region can be sealed and the `prepare` that seals it sees the loss: it applies
+    /// nothing of the pass's kind and frees the kind's slots, as for any lost pass
+    /// (`README.md`, "Writers"). A pass lost at its `begin` took no count and gives none
+    /// back. With none open, does nothing.
     fn drop(&mut self) {
         todo!()
     }
@@ -113,7 +121,9 @@ impl Drop for ExtractSink {
 /// [`prepare`](crate::Renderer::prepare) runs beside it, and the batch takes no count of
 /// the open word; dropping it closes the batch with its end note. A batch whose end note
 /// is missing, as after `mem::forget`, is left out whole and its rows are counted as
-/// dropped.
+/// dropped. Of the batches a region holds, `prepare` applies the last alone, and only where
+/// no `Client` pass began after it and the `Client` kind is not lost (`README.md`,
+/// "Slots").
 pub struct RemoteWriter<'r> {
     /// What the writer shares with the sinks.
     staging: &'r Staging,

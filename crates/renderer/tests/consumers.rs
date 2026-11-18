@@ -198,6 +198,85 @@ fn renderer_impl_places_a_load_at_capacity(
     Ok(())
 }
 
+/// A region that holds two frames' writers: frame 1 left it unprepared, as a client with
+/// no target does, or its `prepare` was refused, since the frame before it was not ended.
+/// Frame 1's remote batch holds `gone` and `kept`; frame 2's `Client` pass removes `gone`,
+/// and its batch holds `kept`. `prepare` applies the region's last batch alone, so `gone`
+/// holds no slot, however the threads ran.
+fn renderer_impl_applies_the_last_remote_batch(
+    device: Arc<dyn Device>,
+    tick: Tick,
+    gone: InstanceRow,
+    kept: InstanceRow,
+    refused: bool,
+) -> Result<()> {
+    let desc = RendererDesc { instances: 16, rows: 64, regions: 2, shaders: None };
+    let mut renderer = Renderer::new(device, &desc)?;
+    if refused {
+        // A frame prepared and not ended; the next region is open beside it.
+        renderer.prepare()?;
+        assert_eq!(renderer.open()?, Opened::Ready);
+    }
+    world_pass(&renderer, WorldKind::Client, tick, false, &[]);
+    renderer.remote().write(&[gone, kept]);
+    if refused {
+        // Refused, the region stays open with frame 1's writes; the frame ends the earlier
+        // frame, as `ClientRender::record` does.
+        assert!(renderer.prepare().is_err());
+        renderer.torn();
+    }
+
+    let mut sink: ExtractSink = renderer.sink();
+    sink.begin(ExtractPass {
+        kind: WorldKind::Client,
+        tick: Tick(tick.0.wrapping_add(1)),
+        full: false,
+    });
+    sink.removed(&[gone.key]);
+    sink.end();
+    renderer.remote().write(&[kept]);
+    let stats = renderer.prepare()?;
+    assert!(!stats.lost(WorldKind::Client));
+    assert_eq!((stats.remote_rows, stats.live), (3, 1));
+    let slots = renderer.slots();
+    assert_eq!(slots.get(WorldKind::Client, gone.key), None);
+    assert!(slots.get(WorldKind::Client, kept.key).is_some());
+    Ok(())
+}
+
+/// The same region, with frame 2's `Client` pass lost for want of room: `rows` holds frame
+/// 1's pass (two notes) and batch (two notes, two rows) and frame 2's `begin`, and not its
+/// removed key. The kind is lost, so no batch is applied: frame 1's would bring `gone`
+/// back, and a loss carries no place in the region to order it by. The frame answers the
+/// loss with a full pass, and the next batch shows the remote instances again.
+fn renderer_impl_lost_client_pass_applies_no_batch(
+    device: Arc<dyn Device>,
+    tick: Tick,
+    gone: InstanceRow,
+    kept: InstanceRow,
+) -> Result<()> {
+    let desc = RendererDesc { instances: 16, rows: 7, regions: 2, shaders: None };
+    let mut renderer = Renderer::new(device, &desc)?;
+    world_pass(&renderer, WorldKind::Client, tick, false, &[]);
+    renderer.remote().write(&[gone, kept]);
+
+    let mut sink: ExtractSink = renderer.sink();
+    sink.begin(ExtractPass {
+        kind: WorldKind::Client,
+        tick: Tick(tick.0.wrapping_add(1)),
+        full: false,
+    });
+    sink.removed(&[gone.key]);
+    sink.end();
+    let stats = renderer.prepare()?;
+    assert!(stats.lost(WorldKind::Client));
+    assert_eq!(stats.live, 0);
+    let slots = renderer.slots();
+    assert_eq!(slots.get(WorldKind::Client, gone.key), None);
+    assert_eq!(slots.get(WorldKind::Client, kept.key), None);
+    Ok(())
+}
+
 /// A batch names each slot once: the builder resolves a duplicate on the host. The test's
 /// rows name `twice` two times, the second time in the batch's last row.
 fn renderer_impl_resolves_duplicates_on_null(
@@ -273,9 +352,10 @@ fn renderer_with_shaders(
     Ok(renderer)
 }
 
-/// One frame of a device test: what the writers left is prepared, declared, recorded,
-/// latched and submitted, with the instance buffer copied out behind the triangle pass.
-/// Returns the frame's point, the records below the table's extent and the camera.
+/// One frame of a device test: what the writers left is prepared, declared at `extent`,
+/// recorded, latched at that extent and submitted, with the instance buffer copied out
+/// behind the triangle pass. Returns the frame's point, the records below the table's
+/// extent and the camera.
 fn frame_with_readback(
     graph: &mut RenderGraph,
     ctx: &mut JobContext<'_>,
@@ -283,6 +363,7 @@ fn frame_with_readback(
     target: ImageHandle,
     held: Option<TimelinePoint>,
     readback: BufferHandle,
+    extent: Extent,
     latch: &CameraLatch<'_>,
 ) -> Result<(TimelinePoint, u64, LatchedCamera)> {
     let stats = renderer.prepare()?;
@@ -298,8 +379,8 @@ fn frame_with_readback(
             last: on(BufferState::HostRead, GRAPHICS),
             ready: None,
         });
-        // The frame's one extent: `latch` refuses a `CameraLatch::extent` other than this.
-        let view = FrameView { target, extent: latch.extent, fraction: 1.0 };
+        // The frame's one extent, which `latch` takes the aspect ratio from.
+        let view = FrameView { target, extent, fraction: 1.0 };
         let declared: DeclaredFrame = renderer.declare(&mut decl, &view)?;
         assert_eq!(declared.scatter.is_some(), stats.entries > 0);
         let instances = declared.instances;
@@ -376,12 +457,15 @@ fn open_waiting(renderer: &mut Renderer) -> Result<()> {
 /// Many duplicates in different workgroups of a large batch. Null's assertion is what
 /// proves the resolution; on a device this shows that a resolved batch scatters right.
 /// So the entries read their records: in frame 1 a world pass places every instance at
-/// `first`, and in frame 2 a pass at the next tick writes each instance twice, workgroups
-/// apart, as `TAKE_BASE | HAS_BASE` entries on slots already `LIVE`. Kept, the later row
-/// gives `base == previous == first`; unresolved, the second duplicate takes its base
-/// from the first one's current placement, which an in-order device such as the M1 shows.
-/// An entry with neither flag, as a remote row on a fresh slot, reads nothing of its
-/// record and would pass either build.
+/// `first`, and in frame 2 a pass at the next tick writes each instance twice, row `i`
+/// and row `n + i` with `n` at least 2^15, so 512 workgroups apart, as
+/// `TAKE_BASE | HAS_BASE` entries on slots already `LIVE`. Kept, the later row gives
+/// `base == previous == first`. Without the resolution the second entry of a slot carries
+/// `HAS_BASE` alone, and run in order it leaves the same records, so the host's check of
+/// the flags is what fails that build; the records fail one that marks both entries
+/// `TAKE_BASE | HAS_BASE`, at this spacing, where the device runs the two in turn. An
+/// entry with neither flag, as a remote row on a fresh slot, reads nothing of its record
+/// and would pass either build.
 fn renderer_impl_duplicates_across_workgroups(
     graph: &mut RenderGraph,
     ctx: &mut JobContext<'_>,
@@ -391,32 +475,32 @@ fn renderer_impl_duplicates_across_workgroups(
     tick: Tick,
     first: &BTreeMap<StableKey, InstanceRow>,
     duplicated: &[InstanceRow],
-    kept: &BTreeMap<StableKey, InstanceRow>,
     input: &LatestSample,
 ) -> Result<()> {
-    // The duplicates lie further apart than a workgroup, and no row is a jump.
-    assert!(duplicated.len() > 4 * shader::SCATTER_GROUP as usize);
+    // Each instance's two rows are `n` rows apart, at least 2^15, and no row is a jump.
+    let n = duplicated.len() / 2;
+    assert!(n >= 1 << 15 && duplicated.len() == 2 * n);
+    assert!((0..n).all(|i| duplicated[i].key == duplicated[n + i].key));
     assert!(duplicated.iter().all(|row| !row.no_interpolate));
-    let latch = CameraLatch {
-        pivot: RenderPosition::default(),
-        input,
-        boom: 4.0,
-        projection: PROJECTION,
-        extent: Extent { width: 256, height: 256 },
-    };
+    let extent = Extent { width: 256, height: 256 };
+    let latch =
+        CameraLatch { pivot: RenderPosition::default(), input, boom: 4.0, projection: PROJECTION };
     let placed: Vec<InstanceRow> = first.values().copied().collect();
     world_pass(renderer, WorldKind::Server, tick, false, &placed);
     let (done, _, _) =
-        frame_with_readback(graph, ctx, renderer, targets[0], None, readback, &latch)?;
+        frame_with_readback(graph, ctx, renderer, targets[0], None, readback, extent, &latch)?;
     assert!(graph.device().wait_timeline(done, Duration::from_secs(5))?);
 
     open_waiting(renderer)?;
     world_pass(renderer, WorldKind::Server, Tick(tick.0.wrapping_add(1)), false, duplicated);
     let (done, size, _) =
-        frame_with_readback(graph, ctx, renderer, targets[1], None, readback, &latch)?;
+        frame_with_readback(graph, ctx, renderer, targets[1], None, readback, extent, &latch)?;
     let both = ScatterEntry::TAKE_BASE | ScatterEntry::HAS_BASE;
     assert!(renderer.batch().entries().iter().all(|entry| entry.flags == both));
     let records = read_records(&**graph.device(), done, readback, size)?;
+    // The row kept is each instance's second, `n + i`.
+    let kept: BTreeMap<StableKey, InstanceRow> =
+        duplicated[n..].iter().map(|row| (row.key, *row)).collect();
     for (slot, holder) in renderer.slots().iter() {
         let record = records[slot.index() as usize];
         let earlier = StagingRow::of(&first[&holder.key]).transform;
@@ -439,6 +523,7 @@ fn renderer_impl_holds_frames_in_flight(
     readbacks: [BufferHandle; 2],
     held: TimelinePoint,
     rows: [&[InstanceRow]; 3],
+    extent: Extent,
     latches: [&CameraLatch<'_>; 2],
 ) -> Result<()> {
     renderer.remote().write(rows[0]);
@@ -449,13 +534,22 @@ fn renderer_impl_holds_frames_in_flight(
         targets[0],
         Some(held),
         readbacks[0],
+        extent,
         latches[0],
     )?;
     // The other region is free, so the next frame's writers run while the first is held.
     assert_eq!(renderer.open()?, Opened::Ready);
     renderer.remote().write(rows[1]);
-    let (second, _, second_camera) =
-        frame_with_readback(graph, ctx, renderer, targets[1], None, readbacks[1], latches[1])?;
+    let (second, _, second_camera) = frame_with_readback(
+        graph,
+        ctx,
+        renderer,
+        targets[1],
+        None,
+        readbacks[1],
+        extent,
+        latches[1],
+    )?;
     assert_ne!(first_camera.data, second_camera.data);
 
     // Both regions are in flight. No region is opened, and a writer that runs anyway
@@ -488,8 +582,8 @@ fn reference_triangle(
 }
 
 /// The camera a test expects of a latch: the one statement of the orbit, from the sample
-/// the test published.
-fn reference_camera(latch: &CameraLatch<'_>, latched: &LatchedCamera) {
+/// the test published, at the extent the frame was declared with.
+fn reference_camera(latch: &CameraLatch<'_>, extent: Extent, latched: &LatchedCamera) {
     let sample = latch.input.read();
     assert_eq!((latched.yaw, latched.pitch), (sample.yaw, sample.pitch));
     let expected = CameraData::orbit(
@@ -498,7 +592,7 @@ fn reference_camera(latch: &CameraLatch<'_>, latched: &LatchedCamera) {
         sample.pitch,
         latch.boom,
         latch.projection,
-        latch.extent,
+        extent,
     );
     assert_eq!(latched.data, expected);
     assert_eq!(latched.data.cell, latch.pivot.cell);
@@ -725,7 +819,8 @@ impl RenderSide for ClientRender {
             .recorded
             .take()
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no frame is recorded"))?;
-        let latch = CameraLatch { pivot, input, boom, projection: PROJECTION, extent: self.extent };
+        // At the extent `record` declared the frame with, `self.extent`.
+        let latch = CameraLatch { pivot, input, boom, projection: PROJECTION };
         if let Err(error) = self.renderer.latch(&latch) {
             self.renderer.torn();
             return Err(error);
@@ -757,8 +852,12 @@ fn as_resource(render: ClientRender) -> Box<dyn Any + Send + Sync> {
 }
 
 /// Runs `step` in one job of the frame's and returns once it has run, so that the frame's
-/// own thread blocks and no worker does. How the frame makes the job is `frame-design`'s.
-type InJob<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&mut JobContext<'_>));
+/// own thread blocks and no worker does. It stands for a system of the world whose
+/// resource the render side is (`as_resource`), which reaches the side through that
+/// resource: lactose-task runs nothing a caller lends that is not `'static`, so a closure
+/// that borrows the frame's locals never runs on a worker, and the frame needs no
+/// `unsafe`. How the frame makes the job is `frame-design`'s.
+type InJob<'a> = &'a mut dyn FnMut(&mut (dyn FnMut(&mut JobContext<'_>) + Send));
 
 /// The frame drives the render side through the `dyn` object from its own thread, in the
 /// order of decision 5.1: open, waiting off the workers; the passes; the presentation

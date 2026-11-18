@@ -1,6 +1,7 @@
 //! The renderer: what it is made with, and the steps a frame takes through it.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use lactose_core::Result;
 use lactose_ecs::WorldKind;
@@ -63,7 +64,9 @@ pub enum Opened {
 pub struct FrameStats {
     /// The rows extract's passes wrote into the region.
     pub pass_rows: u32,
-    /// The rows the remote batch wrote into the region.
+    /// The rows the remote batches wrote into the region, those of a batch left out
+    /// included: a region that holds several frames' batches applies the last one alone
+    /// (`README.md`, "Slots").
     pub remote_rows: u32,
     /// The rows a writer could not write: the region was full, no region was open, or
     /// the device refused the write. Those of each kind's extract passes are also
@@ -200,8 +203,9 @@ pub struct DeclaredFrame {
 /// `Send + Sync + 'static`, so that it sits in a world's resource or behind a `dyn`
 /// object. Every call that changes it takes `&mut self`, one thread at a time by the
 /// borrow, with no lock, but [`declare`](Self::declare): that takes `&self`, so that its
-/// recorders may borrow the renderer, and marks the prepared frame declared in an atomic
-/// of its own (`README.md`, "Concurrency").
+/// recorders may borrow the renderer, and stores the frame's extent in one atomic word,
+/// which is also the mark that the prepared frame is declared (`README.md`,
+/// "Concurrency").
 ///
 /// Its drop waits, with no bound, for the point of the last frame it was told was
 /// submitted, then destroys its buffers and pipelines. It is dropped off the
@@ -215,6 +219,12 @@ pub struct Renderer {
     staging: Arc<Staging>,
     /// The slot table.
     slots: SlotTable,
+    /// The prepared frame's declared extent, `width << 32 | height`, or zero while it is
+    /// not declared: `declare` refuses a side of zero, so zero is free to mean that.
+    /// `declare` sets it with one `Relaxed` compare-exchange from zero, and `prepare`
+    /// clears it; every call but `declare` reaches it through `&mut self`, which orders it
+    /// after every `declare`.
+    declared: AtomicU64,
     /// The providers, in registration order.
     features: Vec<Box<dyn RenderFeature>>,
 }
@@ -234,10 +244,12 @@ impl Renderer {
     /// # Errors
     ///
     /// `ErrorKind::InvalidData` where `desc.instances` or `desc.rows` is zero or
-    /// `desc.regions` is less than two, and for a cooked shader whose reflection is not
-    /// the interface's (its stage, the bytes of its push block, its heap, its constants,
-    /// its inputs and outputs), naming the shader and the field (`README.md`, "Pipelines
-    /// and shaders"); what the device returns for a buffer or a pipeline it cannot make.
+    /// `desc.regions` is less than two or more than 65,535, the most the open word's
+    /// region index holds (`README.md`, "Concurrency"), and for a cooked shader whose
+    /// reflection is not the interface's (its stage, the bytes of its push block, its
+    /// heap, its constants, its inputs and outputs), naming the shader and the field
+    /// (`README.md`, "Pipelines and shaders"); what the device returns for a buffer or a
+    /// pipeline it cannot make.
     /// After an error nothing it made is left on the device. The scatter's workgroup size
     /// is not in the cooked format yet, so it is not checked here: it is the cook's to
     /// hold to [`SCATTER_GROUP`](crate::shader::SCATTER_GROUP) until the format carries
@@ -295,12 +307,13 @@ impl Renderer {
     }
 
     /// Seals the open region and builds the frame's batch from what the writers left in
-    /// it: applies each pass's and the remote batch's frees and rows to the slot table,
-    /// kind by kind in the order of `WorldKind`'s variants and in the order they began
-    /// within a kind, the remote batch after the `Client` passes; writes the batch's
-    /// entries and the draw's arguments to the region's buffers, and flushes what the
-    /// frame's submit will read. After it no region is open until the next
-    /// [`open`](Self::open) (`README.md`, "Slots").
+    /// it: applies each pass's frees and rows to the slot table, kind by kind in the order
+    /// of `WorldKind`'s variants and in the order they began within a kind, and then the
+    /// region's last remote batch, where it is whole, no `Client` pass began after it and
+    /// the `Client` kind is not lost; writes the batch's entries and the draw's arguments
+    /// to the region's buffers, and flushes what the frame's submit will read. After it no
+    /// region is open until the next [`open`](Self::open), and the frame is not declared
+    /// (`README.md`, "Slots").
     ///
     /// # Errors
     ///
@@ -334,15 +347,18 @@ impl Renderer {
     ///
     /// The recorders borrow the renderer for `'f`, which ends when the frame is
     /// recorded, so nothing changes the renderer between this call and the end of
-    /// `RenderGraph::record` but this call's own mark that the frame is declared, which
-    /// is an atomic. A prepared frame is declared once.
+    /// `RenderGraph::record` but this call's own store: once its arguments are checked,
+    /// it stores `view.extent` in the renderer's declared word with one compare-exchange
+    /// from zero, which is also the mark that the frame is declared, and only then adds
+    /// its passes. So a prepared frame is declared once, and of two calls at once exactly
+    /// one succeeds (`README.md`, "Concurrency").
     ///
     /// # Errors
     ///
     /// `ErrorKind::InvalidData` when no frame is prepared, when the prepared frame was
     /// already declared, for a renderer made without shaders, and for a `view.extent`
     /// with a side of zero or beyond the device's `Capabilities::viewport_extent`.
-    /// `frame` is then as it was.
+    /// `frame` and the declared word are then as they were.
     pub fn declare<'f>(
         &'f self,
         frame: &mut FrameDecl<'f>,
@@ -353,20 +369,20 @@ impl Renderer {
 
     /// The late latch (architecture section 5.3): reads `latch.input` once, computes
     /// [`CameraData::orbit`](crate::CameraData::orbit) from the pivot, the yaw and pitch
-    /// it read, the boom and the projection, writes it to the frame's camera buffer and
-    /// flushes it. It writes that one buffer and nothing else. It takes no lock but the
-    /// device backend's on its records and waits for no device and no signal; its one loop is
-    /// `LatestSample::read`'s, which retries only while a publish is in flight. The
+    /// it read, the boom, the projection and the extent the frame was declared with,
+    /// writes it to the frame's camera buffer and flushes it. It writes that one buffer
+    /// and nothing else. It takes no lock but the device backend's on its records and
+    /// waits for no device and no signal; its one loop is `LatestSample::read`'s, which
+    /// retries only while a publish is in flight. The
     /// caller makes it after `RenderGraph::record` has returned and immediately before
     /// `RenderGraph::submit`; nothing recorded depends on the camera's bytes.
     ///
     /// # Errors
     ///
-    /// `ErrorKind::InvalidData` when no frame is prepared, when the frame was already
-    /// latched, and when the frame was declared with a `FrameView::extent` other than
-    /// `latch.extent`, since a frame has one extent; what the device returns for the
-    /// write or the flush. After an error the frame is not submitted, and is ended with
-    /// [`torn`](Self::torn).
+    /// `ErrorKind::InvalidData` when no frame is prepared, when the prepared frame was not
+    /// declared, so that it has no extent, and when it was already latched; what the
+    /// device returns for the write or the flush. After an error the frame is not
+    /// submitted, and is ended with [`torn`](Self::torn).
     pub fn latch(&mut self, latch: &CameraLatch<'_>) -> Result<LatchedCamera> {
         todo!()
     }

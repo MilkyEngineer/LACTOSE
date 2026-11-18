@@ -74,9 +74,9 @@
 //!     let recorded = graph.record(compiled, ctx)?;
 //!
 //!     // The latch: the newest yaw and pitch, read inside the call, after every pass is
-//!     // recorded and immediately before the submit.
+//!     // recorded and immediately before the submit, at the extent declared above.
 //!     let projection = Projection { fov_y: 1.0, near: 0.1, far: 1000.0 };
-//!     renderer.latch(&CameraLatch { pivot, input, boom: 4.0, projection, extent })?;
+//!     renderer.latch(&CameraLatch { pivot, input, boom: 4.0, projection })?;
 //!     graph.submit(recorded)
 //! }
 //!

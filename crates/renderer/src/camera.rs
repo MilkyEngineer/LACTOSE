@@ -17,7 +17,9 @@ pub struct Projection {
     pub far: f32,
 }
 
-/// What [`Renderer::latch`](crate::Renderer::latch) is given.
+/// What [`Renderer::latch`](crate::Renderer::latch) is given. It carries no extent: the
+/// aspect ratio is that of the frame's one extent, the `FrameView::extent` the frame was
+/// declared with.
 #[derive(Clone, Copy, Debug)]
 pub struct CameraLatch<'a> {
     /// The point the camera orbits: the camera rig's pivot from the presentation
@@ -32,9 +34,6 @@ pub struct CameraLatch<'a> {
     pub boom: f32,
     /// The projection.
     pub projection: Projection,
-    /// The extent of the frame's target, for the aspect ratio: the frame's one extent,
-    /// the `FrameView::extent` it was declared with. `Renderer::latch` refuses another.
-    pub extent: Extent,
 }
 
 /// The camera buffer's contents: what a vertex shader of the frame reads through the
