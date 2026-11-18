@@ -269,7 +269,9 @@ const ROUNDS: u64 = 40;
 /// its queue's lock against submits to its queue and another, its wait with no lock held
 /// (on a shared queue a wait under the lock would keep the graphics submit out until the
 /// bound, and the present would be refused), and the order of the locks. Does not cover:
-/// a particular interleaving inside the walk; the unit tests fix those.
+/// a particular interleaving inside the walk; the unit tests fix those. A failed round is
+/// kept, not panicked on, until the other two threads have met every round's barrier, so
+/// that the scope joins and the test fails with its message.
 #[test]
 fn submits_on_two_queues_race_a_present() {
     for queues in LAYOUTS {
@@ -286,6 +288,7 @@ fn submits_on_two_queues_race_a_present() {
         let start = Barrier::new(3);
         let device: &dyn Device = &device;
         let mut refusals = 0;
+        let mut failure = None;
         thread::scope(|scope| {
             scope.spawn(|| {
                 for round in 1..=ROUNDS {
@@ -304,38 +307,50 @@ fn submits_on_two_queues_race_a_present() {
                 }
             });
             for round in 1..=ROUNDS {
+                if failure.is_some() {
+                    start.wait();
+                    continue;
+                }
                 let image = acquire(&mut *swapchain);
                 let mut encoders = [frame(device, image)];
                 start.wait();
                 let waits = [TimelinePoint { timeline: frames, value: round }];
                 let signals = [TimelinePoint { timeline: presented, value: round }];
                 let mut refused = 0;
-                loop {
+                let outcome = loop {
                     let submit =
                         Submit { encoders: &mut encoders, waits: &waits, signals: &signals };
                     match swapchain.present(image, submit) {
-                        Ok(shown) => {
-                            assert_eq!(shown, Presented::Shown);
-                            break;
-                        }
+                        Ok(Presented::Shown) => break Ok(()),
+                        Ok(shown) => break Err(format!("the present returned {shown:?}")),
                         // A loaded machine may keep the graphics thread past the bound:
                         // the caller retries. Three bounds in a row are no load: the frame
                         // submit is kept out, as by a present that waits under the lock.
                         Err(error) if Rule::of(&error) == Some(Rule::Pending) => {
                             refusals += 1;
                             refused += 1;
-                            assert!(
-                                refused < 3,
-                                "round {round} under {queues:?}: the present was refused past \
-                                 its bound {refused} times: {error}"
-                            );
+                            if refused == 3 {
+                                break Err(format!(
+                                    "the present was refused past its bound {refused} times: \
+                                     {error}"
+                                ));
+                            }
                         }
-                        Err(error) => panic!("round {round} under {queues:?}: {error}"),
+                        Err(error) => break Err(error.to_string()),
                     }
-                }
-                reached(device, signals[0]);
+                };
+                let outcome =
+                    outcome.and_then(|()| match device.wait_timeline(signals[0], PATIENCE) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err("the present's signal was not reached".to_owned()),
+                        Err(error) => Err(error.to_string()),
+                    });
+                failure = outcome.err().map(|why| format!("round {round} under {queues:?}: {why}"));
             }
         });
+        if let Some(failure) = failure {
+            panic!("{failure}");
+        }
         for timeline in [frames, work, presented] {
             reached(device, TimelinePoint { timeline, value: ROUNDS });
         }
