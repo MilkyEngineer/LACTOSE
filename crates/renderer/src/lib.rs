@@ -51,7 +51,9 @@
 //!     pivot: RenderPosition,
 //!     input: &LatestSample,
 //! ) -> Result<TimelinePoint> {
-//!     // Extract's passes and the remote upload have written the open region.
+//!     // Extract's passes and the remote upload have written the open region. A kind
+//!     // lost, or rows of a kind dropped or unplaced, the frame answers with a full pass
+//!     // of that world (`README.md`, "What each consumer needs").
 //!     let _counts = renderer.prepare()?;
 //!
 //!     let mut decl = FrameDecl::new(1);
@@ -78,33 +80,18 @@
 //!     graph.submit(recorded)
 //! }
 //!
-//! fn frame(
+//! /// The frame's first step, before its writers run, made again after a frame that
+//! /// failed: a region open, or the point the frame waits for, on its own thread and off
+//! /// the frame-critical workers, before it calls this again.
+//! fn open(
 //!     renderer: &mut Renderer,
 //!     graph: &mut RenderGraph,
 //!     ctx: &mut JobContext<'_>,
-//!     target: ImageHandle,
-//!     extent: Extent,
-//!     pivot: RenderPosition,
-//!     input: &LatestSample,
-//! ) -> Result<()> {
-//!     // The renderer is told how the frame ended, whichever step failed. `torn` does
-//!     // nothing where no frame was prepared.
-//!     match submit_frame(renderer, graph, ctx, target, extent, pivot, input) {
-//!         Ok(point) => renderer.submitted(point),
-//!         Err(error) => {
-//!             renderer.torn();
-//!             return Err(error);
-//!         }
-//!     }
-//!
-//!     // The region the next frame's writers use. A lagging device makes the frame wait
-//!     // here, outside extract's pass.
+//! ) -> Result<Option<TimelinePoint>> {
 //!     loop {
 //!         match renderer.open()? {
-//!             Opened::Ready => break,
-//!             Opened::Wait(point) => {
-//!                 graph.device().wait_timeline(point, std::time::Duration::from_millis(100))?;
-//!             }
+//!             Opened::Ready => return Ok(None),
+//!             Opened::Wait(point) => return Ok(Some(point)),
 //!             // After torn frames alone: a frame with no pass still signals a point.
 //!             Opened::Unsubmitted => {
 //!                 let empty = graph.compile(FrameDecl::new(1))?;
@@ -113,7 +100,30 @@
 //!             }
 //!         }
 //!     }
-//!     Ok(())
+//! }
+//!
+//! /// The frame's last steps, once its writers have run: the renderer is told how the
+//! /// frame ended, whichever step failed, and the next frame begins with `open` either
+//! /// way. `torn` does nothing where no frame was prepared.
+//! fn frame(
+//!     renderer: &mut Renderer,
+//!     graph: &mut RenderGraph,
+//!     ctx: &mut JobContext<'_>,
+//!     target: ImageHandle,
+//!     extent: Extent,
+//!     pivot: RenderPosition,
+//!     input: &LatestSample,
+//! ) -> Result<TimelinePoint> {
+//!     match submit_frame(renderer, graph, ctx, target, extent, pivot, input) {
+//!         Ok(point) => {
+//!             renderer.submitted(point);
+//!             Ok(point)
+//!         }
+//!         Err(error) => {
+//!             renderer.torn();
+//!             Err(error)
+//!         }
+//!     }
 //! }
 //! ```
 

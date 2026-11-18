@@ -10,7 +10,9 @@ use lactose_rhi_api::Extent;
 /// declaration it is handed.
 ///
 /// A later milestone adds what its passes introduce (the heap's slots, the G-buffer), so
-/// the type is not exhaustive: a provider reads its fields and never builds one.
+/// the type is not exhaustive: a provider reads its fields, and builds one only through
+/// [`new`](Self::new), as its own tests do to call its `declare` on a declaration of
+/// theirs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[non_exhaustive]
 pub struct FeatureView {
@@ -26,6 +28,18 @@ pub struct FeatureView {
     pub camera: BufferId,
     /// The target's extent.
     pub extent: Extent,
+}
+
+impl FeatureView {
+    /// A view of a frame's `target`, `depth` and `camera`, ids of the declaration a
+    /// provider's `declare` is handed, at `extent`. What the renderer hands a provider,
+    /// and what a provider's test makes over a declaration of its own, with no renderer
+    /// and no cooked shader. A later milestone that adds a field keeps this constructor's
+    /// signature and adds another beside it.
+    #[must_use]
+    pub const fn new(target: ImageId, depth: ImageId, camera: BufferId, extent: Extent) -> Self {
+        Self { target, depth, camera, extent }
+    }
 }
 
 /// A provider of passes: a crate's part of the frame, registered once with

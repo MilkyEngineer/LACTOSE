@@ -94,6 +94,10 @@ impl ScatterEntry {
 /// base (80), each 40 bytes laid out as a [`StagingRow`]'s first 40; the flags (120); and
 /// four reserved bytes (124). The bytes of a record no entry has written are undefined,
 /// and so is the base of a record whose instance has had none taken.
+///
+/// The record is milestone 2's layout of the instance buffer, and milestone 3's GPU scene
+/// may change it, with the scatter's rule, the shaders and this type in one change.
+/// [`StagingRow`], the ring's row, it does not change.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct InstanceRecord {
     /// Where the instance is drawn at fraction zero.
@@ -150,7 +154,9 @@ impl InstanceRecord {
     /// - each placement's position relative to the cell's centre,
     ///   `RenderPosition::relative_to(cell)`, which subtracts the cells as integers,
     ///   wrapping, before anything becomes a float, then multiplies by the cell size and
-    ///   adds the offset;
+    ///   adds the offset. The shader subtracts them as `uint` and reinterprets the result
+    ///   as `int`, `int(uint(a) - uint(b))`, which wraps on every target: a signed
+    ///   overflow is undefined in MSL;
     /// - the position `p + (c - p) * fraction` of those two;
     /// - the rotation `normalize(p + (c' - p) * fraction)`, where `c'` is the current
     ///   rotation negated when its dot product with the previous one is negative.

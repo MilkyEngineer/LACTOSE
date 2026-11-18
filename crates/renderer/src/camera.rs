@@ -32,7 +32,8 @@ pub struct CameraLatch<'a> {
     pub boom: f32,
     /// The projection.
     pub projection: Projection,
-    /// The extent of the frame's target, for the aspect ratio.
+    /// The extent of the frame's target, for the aspect ratio: the frame's one extent,
+    /// the `FrameView::extent` it was declared with. `Renderer::latch` refuses another.
     pub extent: Extent,
 }
 
@@ -65,8 +66,9 @@ impl CameraData {
     ///   `(-sin(yaw) * cos(pitch), sin(pitch), -cos(yaw) * cos(pitch))`.
     /// - The eye is `pivot - forward * boom`, the camera looks along `forward`, and its
     ///   up direction is the one in the plane of `forward` and `+Y` with a positive `Y`.
-    ///   At a pitch of a quarter turn either way, up is
-    ///   `(-sin(yaw), 0, -cos(yaw)) * sign(pitch)`, the limit of that direction.
+    ///   That direction is `(sin(pitch) * sin(yaw), cos(pitch), sin(pitch) * cos(yaw))`,
+    ///   and at a pitch of a quarter turn either way, up is
+    ///   `(sin(yaw), 0, cos(yaw)) * sign(pitch)`, its limit.
     /// - The cell is `pivot.cell`, and positions are taken relative to its centre, so the
     ///   result does not change when the pivot and every instance move by the same whole
     ///   number of cells.

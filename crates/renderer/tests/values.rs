@@ -25,6 +25,7 @@ fn counts_start_at_zero_with_no_kind_lost() {
     assert!(!stats.any_lost());
     for kind in [WorldKind::Server, WorldKind::Client, WorldKind::Prediction] {
         assert!(!stats.lost(kind));
+        assert_eq!((stats.dropped_in(kind), stats.unplaced_in(kind)), (0, 0));
     }
 }
 

@@ -144,6 +144,60 @@ fn renderer_impl_reconciles_after_a_restore(
     Ok(simulation)
 }
 
+/// The table does not depend on which kind's pass began first: `prepare` applies kind by
+/// kind, `Server` before `Prediction`, so a `Prediction` pass begun first still finds the
+/// `Server` pass's new instance in slot zero. Each pass writes one new instance.
+fn renderer_impl_applies_kind_by_kind(
+    device: Arc<dyn Device>,
+    tick: Tick,
+    server: InstanceRow,
+    predicted: InstanceRow,
+) -> Result<()> {
+    let desc = RendererDesc { instances: 16, rows: 64, regions: 2, shaders: None };
+    let mut renderer = Renderer::new(device, &desc)?;
+    let (mut early, mut late): (ExtractSink, ExtractSink) = (renderer.sink(), renderer.sink());
+    early.begin(ExtractPass { kind: WorldKind::Prediction, tick, full: false });
+    late.begin(ExtractPass { kind: WorldKind::Server, tick, full: false });
+    early.write(&[predicted]);
+    late.write(&[server]);
+    early.end();
+    late.end();
+    let stats = renderer.prepare()?;
+    assert_eq!((stats.allocated, stats.unplaced), (2, 0));
+    let slots = renderer.slots();
+    assert_eq!(slots.get(WorldKind::Server, server.key), Some(Slot::new(0)));
+    assert_eq!(slots.get(WorldKind::Prediction, predicted.key), Some(Slot::new(1)));
+    Ok(())
+}
+
+/// A load that replaces a kind's whole key set, on a renderer sized to what is drawn: the
+/// full pass frees the instances it did not write before it places the new ones, so every
+/// new instance finds a slot. `old` and `new` are `instances` rows each, of disjoint keys.
+fn renderer_impl_places_a_load_at_capacity(
+    device: Arc<dyn Device>,
+    tick: Tick,
+    old: &[InstanceRow],
+    new: &[InstanceRow],
+) -> Result<()> {
+    let instances = u32::try_from(old.len()).expect("a test's instances fit");
+    let desc = RendererDesc { instances, rows: 2 * instances + 8, regions: 2, shaders: None };
+    let mut renderer = Renderer::new(Arc::clone(&device), &desc)?;
+    world_pass(&renderer, WorldKind::Server, tick, false, old);
+    assert_eq!(renderer.prepare()?.live, instances);
+    let timeline = device.create_timeline(0)?;
+    let mut value = 0;
+    end_with_an_empty_submit(&*device, &mut renderer, timeline, &mut value)?;
+    open_waiting(&mut renderer)?;
+
+    world_pass(&renderer, WorldKind::Server, Tick(tick.0.wrapping_add(1)), true, new);
+    let stats = renderer.prepare()?;
+    assert_eq!((stats.unplaced, stats.unplaced_in(WorldKind::Server)), (0, 0));
+    assert_eq!((stats.freed, stats.allocated, stats.live), (instances, instances, instances));
+    let slots = renderer.slots();
+    assert!(new.iter().all(|row| slots.get(WorldKind::Server, row.key).is_some()));
+    Ok(())
+}
+
 /// A batch names each slot once: the builder resolves a duplicate on the host. The test's
 /// rows name `twice` two times, the second time in the batch's last row.
 fn renderer_impl_resolves_duplicates_on_null(
@@ -244,6 +298,7 @@ fn frame_with_readback(
             last: on(BufferState::HostRead, GRAPHICS),
             ready: None,
         });
+        // The frame's one extent: `latch` refuses a `CameraLatch::extent` other than this.
         let view = FrameView { target, extent: latch.extent, fraction: 1.0 };
         let declared: DeclaredFrame = renderer.declare(&mut decl, &view)?;
         assert_eq!(declared.scatter.is_some(), stats.entries > 0);
@@ -296,37 +351,78 @@ fn read_records(
     Ok(records.iter().map(InstanceRecord::from_bytes).collect())
 }
 
-/// Many duplicates in different workgroups of a large batch: each record the device
-/// wrote is what the scatter's rule gives for the row the builder kept.
+/// One pass of a world, written through a sink of the test's own.
+fn world_pass(renderer: &Renderer, kind: WorldKind, tick: Tick, full: bool, rows: &[InstanceRow]) {
+    let mut sink: ExtractSink = renderer.sink();
+    sink.begin(ExtractPass { kind, tick, full });
+    sink.write(rows);
+    sink.end();
+}
+
+/// Opens a region for the next frame's writers, waiting here for the point that frees
+/// one: a test's thread is no worker.
+fn open_waiting(renderer: &mut Renderer) -> Result<()> {
+    loop {
+        match renderer.open()? {
+            Opened::Ready => return Ok(()),
+            Opened::Wait(point) => {
+                renderer.device().wait_timeline(point, Duration::from_secs(5))?;
+            }
+            Opened::Unsubmitted => unreachable!("no frame of this test is torn"),
+        }
+    }
+}
+
+/// Many duplicates in different workgroups of a large batch. Null's assertion is what
+/// proves the resolution; on a device this shows that a resolved batch scatters right.
+/// So the entries read their records: in frame 1 a world pass places every instance at
+/// `first`, and in frame 2 a pass at the next tick writes each instance twice, workgroups
+/// apart, as `TAKE_BASE | HAS_BASE` entries on slots already `LIVE`. Kept, the later row
+/// gives `base == previous == first`; unresolved, the second duplicate takes its base
+/// from the first one's current placement, which an in-order device such as the M1 shows.
+/// An entry with neither flag, as a remote row on a fresh slot, reads nothing of its
+/// record and would pass either build.
 fn renderer_impl_duplicates_across_workgroups(
     graph: &mut RenderGraph,
     ctx: &mut JobContext<'_>,
     renderer: &mut Renderer,
-    target: ImageHandle,
+    targets: [ImageHandle; 2],
     readback: BufferHandle,
-    rows: &[InstanceRow],
+    tick: Tick,
+    first: &BTreeMap<StableKey, InstanceRow>,
+    duplicated: &[InstanceRow],
     kept: &BTreeMap<StableKey, InstanceRow>,
     input: &LatestSample,
 ) -> Result<()> {
-    // The duplicates lie further apart than a workgroup.
-    assert!(rows.len() > 4 * shader::SCATTER_GROUP as usize);
-    renderer.remote().write(rows);
-    let extent = Extent { width: 256, height: 256 };
+    // The duplicates lie further apart than a workgroup, and no row is a jump.
+    assert!(duplicated.len() > 4 * shader::SCATTER_GROUP as usize);
+    assert!(duplicated.iter().all(|row| !row.no_interpolate));
     let latch = CameraLatch {
         pivot: RenderPosition::default(),
         input,
         boom: 4.0,
         projection: PROJECTION,
-        extent,
+        extent: Extent { width: 256, height: 256 },
     };
+    let placed: Vec<InstanceRow> = first.values().copied().collect();
+    world_pass(renderer, WorldKind::Server, tick, false, &placed);
+    let (done, _, _) =
+        frame_with_readback(graph, ctx, renderer, targets[0], None, readback, &latch)?;
+    assert!(graph.device().wait_timeline(done, Duration::from_secs(5))?);
+
+    open_waiting(renderer)?;
+    world_pass(renderer, WorldKind::Server, Tick(tick.0.wrapping_add(1)), false, duplicated);
     let (done, size, _) =
-        frame_with_readback(graph, ctx, renderer, target, None, readback, &latch)?;
+        frame_with_readback(graph, ctx, renderer, targets[1], None, readback, &latch)?;
+    let both = ScatterEntry::TAKE_BASE | ScatterEntry::HAS_BASE;
+    assert!(renderer.batch().entries().iter().all(|entry| entry.flags == both));
     let records = read_records(&**graph.device(), done, readback, size)?;
     for (slot, holder) in renderer.slots().iter() {
         let record = records[slot.index() as usize];
-        let row = StagingRow::of(&kept[&holder.key]);
+        let earlier = StagingRow::of(&first[&holder.key]).transform;
+        let later = StagingRow::of(&kept[&holder.key]).transform;
         assert_eq!(record.flags, InstanceRecord::LIVE);
-        assert_eq!((record.previous, record.current), (row.transform, row.transform));
+        assert_eq!((record.base, record.previous, record.current), (earlier, earlier, later));
     }
     Ok(())
 }
@@ -496,6 +592,12 @@ trait RenderSide: Send + Sync {
     /// Before the frame's writers: whether a region is open, or the point that frees one.
     fn open(&mut self, ctx: &mut JobContext<'_>) -> Result<Option<TimelinePoint>>;
 
+    /// Waits for the point `open` returned, on the frame's own thread: never in a job.
+    fn wait(&self, point: TimelinePoint) -> Result<()>;
+
+    /// The counts of the frame last prepared, zero where its `prepare` failed.
+    fn counts(&self) -> FrameStats;
+
     /// A sink for a world that is shown, or shown again after a lost kind or a torn frame.
     fn sink(&self) -> Box<dyn InstanceSink>;
 
@@ -557,6 +659,15 @@ impl RenderSide for ClientRender {
         }
     }
 
+    fn wait(&self, point: TimelinePoint) -> Result<()> {
+        // `false` is a timeout: the frame calls `open` again either way.
+        self.graph.device().wait_timeline(point, Duration::from_millis(100)).map(|_| ())
+    }
+
+    fn counts(&self) -> FrameStats {
+        self.counts
+    }
+
     fn sink(&self) -> Box<dyn InstanceSink> {
         Box::new(self.renderer.sink())
     }
@@ -573,6 +684,7 @@ impl RenderSide for ClientRender {
         read_done: Option<TimelinePoint>,
         fraction: f32,
     ) -> Result<()> {
+        self.counts = FrameStats::default();
         self.counts = match self.renderer.prepare() {
             Ok(counts) => counts,
             Err(error) => {
@@ -644,25 +756,47 @@ fn as_resource(render: ClientRender) -> Box<dyn Any + Send + Sync> {
     Box::new(render)
 }
 
-/// The frame drives the render side through the `dyn` object, in the order of decision
-/// 5.1: the passes, the presentation schedule's upload, record, latch and submit. After
-/// a frame that failed, every world shown is given a sink again, so its next pass is full.
+/// Runs `step` in one job of the frame's and returns once it has run, so that the frame's
+/// own thread blocks and no worker does. How the frame makes the job is `frame-design`'s.
+type InJob<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&mut JobContext<'_>));
+
+/// The frame drives the render side through the `dyn` object from its own thread, in the
+/// order of decision 5.1: open, waiting off the workers; the passes; the presentation
+/// schedule's upload and record, in a job; latch and submit. It begins with `open` after
+/// a frame that failed as after any other. The world of `kind` is given a sink again,
+/// so that its next pass is full, after a frame that failed and wherever the counts say
+/// it lost instances: a lost kind, dropped rows or unplaced rows.
 fn frame(
     side: &mut dyn RenderSide,
     executor: &Executor,
-    ctx: &mut JobContext<'_>,
+    in_job: InJob<'_>,
     simulation: Simulation,
+    kind: WorldKind,
     sampled: &[InstanceRow],
     target: ImageHandle,
     pivot: RenderPosition,
     input: &LatestSample,
 ) -> Result<Simulation> {
-    let wait: Option<TimelinePoint> = side.open(ctx)?;
+    loop {
+        let mut opened = None;
+        in_job(&mut |ctx| opened = Some(side.open(ctx)));
+        match opened.expect("the job ran")? {
+            None => break,
+            Some(point) => side.wait(point)?,
+        }
+    }
+    // On the frame's own thread, which is no worker: `block_on` is allowed here.
     let mut simulation = passes(executor, simulation);
-    side.upload_remote(ctx, sampled);
+    let mut recorded = None;
+    in_job(&mut |ctx| {
+        side.upload_remote(ctx, sampled);
+        recorded = Some(side.record(ctx, target, None, 0.5));
+    });
     let submitted =
-        side.record(ctx, target, None, 0.5).and_then(|()| side.latch_and_submit(pivot, input, 4.0));
-    if submitted.is_err() {
+        recorded.expect("the job ran").and_then(|()| side.latch_and_submit(pivot, input, 4.0));
+    let counts = side.counts();
+    let missing = counts.lost(kind) || counts.dropped_in(kind) > 0 || counts.unplaced_in(kind) > 0;
+    if submitted.is_err() || missing {
         let state = extract_state(&mut simulation).expect("`setup` inserted it");
         state.set_sink(Some(side.sink()));
     }
@@ -675,10 +809,10 @@ fn frame(
 /// as `crate-tiers.toml` holds `lactose-terrain` and `lactose-debug-ui` to.
 mod provider {
     use lactose_renderer::graph::{
-        BufferAccess, BufferUse, ColourUse, DepthUse, FrameDecl, RenderPassDecl,
+        BufferAccess, BufferId, BufferUse, ColourUse, DepthUse, FrameDecl, ImageId, RenderPassDecl,
     };
     use lactose_renderer::{FeatureView, RenderFeature, Renderer};
-    use lactose_rhi_api::{GraphicsPipelineHandle, Load, Rect, Viewport};
+    use lactose_rhi_api::{Extent, GraphicsPipelineHandle, Load, Rect, Viewport};
 
     /// Made with its pipeline, when the client starts.
     struct Overlay {
@@ -732,5 +866,19 @@ mod provider {
     /// The client binary registers it once.
     fn register(renderer: &mut Renderer, pipeline: GraphicsPipelineHandle) {
         renderer.add_feature(Box::new(Overlay { pipeline }));
+    }
+
+    /// The provider's own test, on null with no renderer and no cooked shader of the
+    /// renderer's: its passes declared into a declaration of the test's, over the ids the
+    /// test imported there.
+    fn provider_declares_alone<'f>(
+        overlay: &'f Overlay,
+        frame: &mut FrameDecl<'f>,
+        target: ImageId,
+        depth: ImageId,
+        camera: BufferId,
+        extent: Extent,
+    ) {
+        overlay.declare(frame, &FeatureView::new(target, depth, camera, extent));
     }
 }
