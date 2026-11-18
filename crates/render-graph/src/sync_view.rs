@@ -5,12 +5,14 @@
 //! `Send + Sync` (`README.md`, "Concurrency"). The value is reached through `&mut` or by
 //! value alone, which already excludes every other thread, so no lock is ever taken:
 //! `Mutex::get_mut` and `Mutex::into_inner` take none, and no guard exists to poison the
-//! mutex. `std::sync::SyncView` (unstable `exclusive_wrapper`) is this type and is not
-//! stable on the pinned toolchain; this module goes when it is.
+//! mutex. The cell is a `Mutex<T>`, so it is `Sync` where `T` is `Send`, which every value
+//! it holds is. `std::sync::SyncView` (unstable `exclusive_wrapper`) does this job, and is
+//! `Sync` for any `T`; it is not stable on the pinned toolchain, and this module goes when
+//! it is.
 
 use std::sync::{Mutex, PoisonError};
 
-/// A value reached through `&mut` alone, and `Sync` whatever it holds.
+/// A value reached through `&mut` alone, and `Sync` for any `Send` value it holds.
 pub(crate) struct SyncView<T>(Mutex<T>);
 
 impl<T> SyncView<T> {

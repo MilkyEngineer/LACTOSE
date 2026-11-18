@@ -160,7 +160,9 @@ impl RenderGraph {
     /// imports the frame's imports next from `Undefined`, relies on no buffer's bytes, and
     /// calls [`History::reset`](crate::History::reset) on every history the frame
     /// imported. The next frame submitted whole waits for what the torn frame submitted,
-    /// and its point covers it (`README.md`, "Submission").
+    /// and its point covers it, but for a submit the torn frame made to the queue of its
+    /// planned last submit: that one is covered by the next point signalled on its queue
+    /// (`README.md`, "Submission").
     pub fn submit(&mut self, frame: RecordedFrame) -> Result<TimelinePoint> {
         todo!()
     }
@@ -182,9 +184,11 @@ impl RenderGraph {
 impl Drop for RenderGraph {
     /// Waits until every submit the graph made has completed, then destroys what the
     /// graph made. An error from a destroy is logged under [`LOG_TARGET`] and dropped. On
-    /// a lost device the wait returns at once. While the thread unwinds a panic it waits
-    /// for nothing: it makes no destroy a pending submit would refuse, and its encoders'
-    /// drops leak what is pending.
+    /// a lost device the wait returns at once. A torn frame's submit that no point covers
+    /// yet is not waited for: its encoders are dropped first, and nothing it used is
+    /// destroyed where the device would refuse it. While the thread unwinds a panic it
+    /// waits for nothing: it makes no destroy a pending submit would refuse, and its
+    /// encoders' drops leak what is pending.
     fn drop(&mut self) {
         todo!()
     }

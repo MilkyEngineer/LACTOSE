@@ -56,10 +56,11 @@ pub struct ImageImport<'a> {
     /// user records the whole change. `None` where the next user is a later frame of a
     /// graph, which records both halves itself.
     pub handoff: Option<StateOn<ImageState>>,
-    /// A point the frame's first submit that names the image waits for, for a use the
+    /// A point every submit of the frame that names the image waits for, for a use the
     /// graph did not make: the point of the last submit outside this graph that used the
     /// image, such as the present thread's read, where that submit may still be pending
-    /// and the image is imported from `Undefined` or is `Concurrent`. `None` otherwise:
+    /// and the image is imported from `Undefined` or is `Concurrent`. A wait for a point
+    /// already reached costs nothing on a timeline. `None` otherwise:
     /// the graph orders its own frames, and an `Exclusive` image imported in the state
     /// and on the queue it is in is ordered by that queue or by its transfer.
     pub ready: Option<TimelinePoint>,
@@ -90,7 +91,7 @@ pub struct BufferImport<'a> {
     /// whether or not a kept pass used it. Never `Undefined`. `HostRead` for a readback,
     /// which the host reads after the frame's point.
     pub last: StateOn<BufferState>,
-    /// A point the frame's first submit that names the buffer waits for, as an image's
+    /// A point every submit of the frame that names the buffer waits for, as an image's
     /// ([`ImageImport::ready`]).
     pub ready: Option<TimelinePoint>,
 }

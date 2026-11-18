@@ -231,7 +231,9 @@ fn graph_impl_key_tells_the_lists_apart(
 /// frame, imported in `ShaderWrite` and left there, is written by the second frame after
 /// the first frame's write. Without the transition before the second frame's first use,
 /// null refuses that frame's submit (`state`). The buffer lives on the queue the pass runs
-/// on, so no transfer stands in for the transition under either layout.
+/// on, so no transfer stands in for the transition under either layout. `written` is
+/// already in `ShaderWrite` on that queue, as its last use left it: a new buffer starts
+/// `Undefined` on no queue, and the first frame's `initial` would then be wrong.
 fn graph_impl_writes_across_the_frame_edge(
     device: Arc<dyn Device>,
     ctx: &mut JobContext<'_>,

@@ -63,17 +63,25 @@ Three things these consumers must know that no signature shows:
 
 - **`frame-design` and the present thread: the present thread never acquires a release it
   skipped.** A target released toward the present role and taken back from `Undefined` by
-  a later frame is accepted whether or not the present thread acquired it (rhi-api,
-  "States"). A present thread that then acquires a release older than the frame's re-take
-  is refused on null (`no-qfot`: an acquire with no equal release submitted), and on Vulkan
-  races the graphics queue's writes.
-- **`frame-design` and `frame-impl`: the lock-free way to call `record`** is a once-per-tick
-  system that holds the graph, or the object that owns it, as a `ResMut` beside a `Job`
-  parameter, whose `context()` is the `&mut JobContext` that `record` takes;
-  `World::insert_service` holds any `Send + Sync + 'static` type. A `GraphNode`'s `run`
-  has `&self` and would need a lock to reach `&mut RenderGraph`, which section 3 does not
-  permit on the per-frame path; a scope child holds a `ChildContext`, not a `JobContext`;
-  and the main thread holds neither.
+  a later frame is accepted whether or not the present thread acquired it: null's
+  transition from `Undefined` ends a release no acquire met. rhi-api's "States" does not
+  say so yet, and its "Between the two the resource is used by nothing" reads against it;
+  the sentence that does is routed to the `rhi-null` lane (D160). A present thread that
+  then acquires a release older than the frame's re-take is refused on null (`no-qfot`:
+  an acquire with no equal release submitted), and on Vulkan races the graphics queue's
+  writes.
+- **`frame-design` and `frame-impl`: the one lock-free way to hold `&mut RenderGraph` and
+  `&mut JobContext` together** is a system with a `Job` parameter, whose `context()` is
+  the `&mut JobContext` that `record` takes, beside a `ResMut` of a `dyn` trait. The trait
+  belongs to a foundation crate and its method takes `&mut JobContext`;
+  `World::insert_service` holds any `Send + Sync + 'static` type. A `#[system]` is shipped
+  only in a boundary crate or a lint-file carrier (decision 5.18), and none of them may
+  name this crate, a backend crate. Where that system and trait are declared, and which
+  world runs the system once a frame, are `frame-design`'s; any other route takes a lock
+  that section 3 would have to permit. A `GraphNode`'s `run` has `&self` and would need a
+  lock to reach `&mut RenderGraph`, which section 3 does not permit on the per-frame path;
+  a scope child holds a `ChildContext`, not a `JobContext`; and the main thread holds
+  neither.
 - **`graph-impl`: a frame of another graph.** `record` and `submit` refuse a frame another
   graph made (`InvalidData`, "Errors and drops"). Two `compile`s may precede a `record`,
   since a `CompiledFrame` borrows no graph, so the second may evict the first frame's plan:
@@ -205,11 +213,15 @@ Three things these consumers must know that no signature shows:
   records the whole change. The present thread's read of a finished target is the case
   (rhi-api, "The present thread"; decision 5.6): `last: ColourAttachment` on `Graphics`,
   `handoff: SampledRead` on `Present`.
-- `ready` is for a use the graph did not make: a point the frame's first submit that names
-  the import waits for. The caller gives the point of the last submit outside this graph
-  that used the import, where that submit may still be pending and the import is declared
-  from `Undefined` or is `Concurrent`: rhi-api's rule that a change of state or owner
-  waits for another queue's pending use (`no-qfot`) is met by this wait. An `Exclusive`
+- `ready` is for a use the graph did not make: a point every submit of the frame that
+  names the import waits for, not the first alone, as each submit that uses an import
+  another queue wrote or changed waits for it (below). A wait for a point already reached
+  costs nothing on a timeline. The caller gives the point of the last submit outside this
+  graph that used the import, where that submit may still be pending and the import is
+  declared from `Undefined` or is `Concurrent`: rhi-api's rule that a change of state or
+  owner waits for another queue's pending use (`no-qfot`) is met by this wait, and so is
+  the rule for a use under another queue's pending write or change, once rhi-api has it
+  ("What `graph-impl` proves on null"). An `Exclusive`
   import declared in the state and on the queue it is in needs none, since its queue or
   its transfer orders it, and a point given where none is needed costs a wait that is
   already met. A target taken back from the present thread is imported from `Undefined`
@@ -225,13 +237,16 @@ Three things these consumers must know that no signature shows:
   submit, of this frame or an earlier frame of this graph, wrote or changed the state or
   owner of waits for a point that submit signals; so does a submit that changes the state
   or owner of an import which another queue's submit of an earlier frame used. A submit
-  uses what rhi-api counts ("States"): a transition's resource, an attachment, a declared
-  buffer, a copy's side, an index or an indirect buffer. For an `Exclusive` import a
-  transfer's wait already orders such a use; for a `Concurrent` one this wait is the only
-  order, and rhi-api has no rule yet that refuses a graph that leaves it out ("What
-  `graph-impl` proves on null"). The graph may make a frame's submit wait for an earlier
-  frame's submits to another queue where it need not; which such waits it makes is not
-  promised.
+  uses what rhi-api counts ("States"): a transition's resource, an attachment, a `sampled`
+  import (the image of a declared slot), a declared buffer, a copy's side, an index or an
+  indirect buffer. Each submit that uses such an import waits, not the first of its queue
+  alone. For an `Exclusive` import the first such use on a queue is ordered by a
+  transfer's wait or, for an image imported from `Undefined`, which moves to another queue
+  with no transfer, by these waits before that transition. For a `Concurrent` one these
+  waits are the only order. rhi-api has no rule yet that refuses a graph that leaves out
+  the wait before a use ("What `graph-impl` proves on null"). The graph may make a
+  frame's submit wait for an earlier frame's submits to another queue where it need not;
+  which such waits it makes is not promised.
 - One handle is imported once in a declaration. The graph cannot see a second import of it.
 - An import is never an image made with a memoryless request: the graph stores every
   import's attachments ("Transitions and store actions"), and storing such an image is
@@ -321,7 +336,10 @@ Three things these consumers must know that no signature shows:
 - The heap is the caller's. The graph writes no slot and reads none. For each image in
   `sampled` the caller keeps a slot holding it, written outside the graph under rhi-api's
   rules (`uuwp-used`), and names the slot in `slots`. A slot that holds an image the frame
-  does not declare is the caller's to keep in `SampledRead` for the pass.
+  does not declare is the caller's to keep in `SampledRead` for the pass, with no pending
+  submit of another queue that wrote it or changed its state or owner: the graph cannot
+  see what a slot holds, so it cannot add that wait. An image that may have one is
+  declared, and named in the pass's `sampled`.
 - A copy pass begins no pass on the encoder and has no reach.
 
 ### Queues
@@ -420,11 +438,15 @@ Three things these consumers must know that no signature shows:
   recorded. Heap slots are passed on unchecked, and the device refuses one the pass did not
   declare (`undeclared`, every backend).
 - A copy pass's recorder writes each destination in one call, which takes as many regions
-  as it needs, every mip and layer of an image among them. A second call that writes a
-  destination the pass already wrote is a breach like the others, reported as above:
-  rhi-api requires a transition between two copies into one resource ("States"), and a
-  recorder cannot record one. Copies into one destination from two sources are two copy
-  passes, and the graph records the transition between them.
+  as it needs, every mip and layer of an image among them, no two of which write one byte
+  of a buffer or one texel of an image. Vulkan forbids it
+  (`VUID-vkCmdCopyBuffer-pRegions-12482`, `VUID-vkCmdCopyBufferToImage-pRegions-12483`,
+  `VUID-vkCmdCopyImageToBuffer-pRegions-12485`), which region lands last is the driver's
+  choice, and nothing refuses it yet (D160). A second call that writes a destination the
+  pass already wrote is a breach like the others, reported as above: rhi-api requires a
+  transition between two copies into one resource ("States"), and a recorder cannot record
+  one. Copies into one destination from two sources are two copy passes, and the graph
+  records the transition between them.
 - A panic in a recorder aborts the process, as any scope child's does.
 - After an error from `record` nothing of the frame is submitted, and its encoders are
   reset and free.
@@ -442,7 +464,8 @@ Three things these consumers must know that no signature shows:
   queue uses in another state or writes, so the frame's queues are ordered against each
   other by three waits alone: a transfer's, where an `Exclusive` import crosses at the
   frame's edge; that of a submit that uses an import under another queue's write or
-  change, or changes a `Concurrent` one under another queue's use ("Imports",
+  change, or changes the state or owner of one under another queue's use, an image
+  imported from `Undefined` that moves to another queue among them ("Imports",
   "Transitions and store actions"); and the frame's last submit's, for the frame's point.
 - A frame all of whose commands are for one queue is one `Device::submit`. That is every
   frame on a device with one queue.
@@ -473,10 +496,17 @@ Three things these consumers must know that no signature shows:
   it. The last submit of the next frame the graph submits whole waits, by the rule above,
   for a point of each submit the torn frame made to another queue, and for the point of
   the last whole frame before it where that is signalled from another queue, so its point
-  covers the torn frame's submits, those on its own queue by submission order. The torn
-  frame's submitted encoders and its plan are held, as a pending frame's are, until that
-  point is seen reached, so nothing is reset or destroyed under a submit the torn frame
-  made; the encoders of the submits it never made are reset and free at once.
+  covers the torn frame's submits, those on its own queue by submission order, but for the
+  one case below. The torn frame's submitted encoders and its plan are held, as a pending
+  frame's are, until that point is seen reached, so nothing is reset or destroyed under a
+  submit the torn frame made; the encoders of the submits it never made are reset and free
+  at once.
+- A submit the torn frame made to the queue of its planned last submit signals no point
+  of its own. It is covered by the next point signalled on that queue, and its encoders
+  and what it used are held until that point is seen reached: a next whole frame with no
+  submit to that queue does not cover it. A drop before such a point drops those encoders
+  first, which on a device waits for the submit, and on null makes no destroy of what it
+  used and leaks it.
 - A `RecordedFrame` dropped unsubmitted drops its encoders, none of which is pending.
 
 ### History
@@ -505,10 +535,11 @@ Three things these consumers must know that no signature shows:
   it.** The locks a frame takes are a device backend's (D158), under the device and
   encoder calls, which section 3 permits; the scope `record` opens takes none.
 - `sync_view::SyncView` holds the graph's and a recorded frame's encoders and a
-  declaration's recorders. It wraps a `std::sync::Mutex` for its `Sync` impl alone and
-  calls only `get_mut` and `into_inner`, which take `&mut` or the value, block nothing and
-  take no lock. `std::sync::SyncView` (unstable `exclusive_wrapper`) is the same type and
-  is not stable on the pinned toolchain.
+  declaration's recorders. It wraps a `std::sync::Mutex` for its `Sync` impl alone, which
+  holds where the value is `Send`, as every value it holds is, and calls only `get_mut` and
+  `into_inner`, which take `&mut` or the value, block nothing and take no lock.
+  `std::sync::SyncView` (unstable `exclusive_wrapper`) does this job and is `Sync` for any
+  value; it is not stable on the pinned toolchain.
 - `RenderGraph`, `RecordedFrame` and `CompiledPlan` are `Send + Sync + 'static`.
   `FrameDecl<'f>` and `CompiledFrame<'f>` are `Send + Sync` whatever their recorders are,
   and `'static` where the recorders are. A recorder type is lent to one call on one worker.
@@ -534,7 +565,8 @@ Three things these consumers must know that no signature shows:
   that did not make it. Every other error is the device's, returned as the device gave it:
   `Unsupported`, `ResourceExhausted`, `DeviceLost`, and a refusal that names its rule.
 - `RenderGraph`'s drop waits, with no bound, until every submit it made has completed,
-  a torn frame's among them, then destroys its transients, blocks, timelines and encoders.
+  a torn frame's among them, then destroys its transients, blocks, timelines and encoders;
+  a torn frame's submit that no point covers is dropped as "Submission" says.
   It is dropped off the frame-critical workers (rhi-api, "Handles and lifetimes"), and
   after the host has signalled every `ready` point a pending frame waits for that the host
   owes: the drop cannot release such a frame. On a lost device the wait ends at once.
@@ -556,7 +588,8 @@ Three things these consumers must know that no signature shows:
 | Record the same-state transition before an import's first use in the frame where its `initial` is that writing state: one declaration, an import written in that state every frame, submitted for two frames | `state` |
 | Record both halves of a transfer, the release submitted first, and wait for it | `no-qfot` |
 | Wait before a change of state while another queue's pending submit uses the resource | `no-qfot` |
-| Wait before a use of an import that another queue's pending submit wrote or changed the state of | none yet: `no-qfot`, once rhi-api amends it |
+| Wait, in every submit that uses an import, a `sampled` one included, for each pending submit of another queue that wrote it or changed its state or owner, and for its `ready` point | none yet: `no-qfot`, once rhi-api amends it |
+| Never record two regions of one copy call that write one byte or texel | none yet: `bounds`, once rhi-api amends it |
 | Record the alias call before the first use of a transient whose bytes another used | `no-fence` |
 | Keep aliasing transients on one queue | `no-qfot` |
 | Begin every transient undefined; store an attachment a later pass uses | `undefined-read` |
@@ -570,12 +603,16 @@ Three things these consumers must know that no signature shows:
 | Give a submit only encoders of its role, each recorded once since its reset, with no pass left open | `encoding` |
 | Never submit to the present role | `present-queue` |
 
-The row with no rule yet is the `Concurrent` path across queues. rhi-api's `no-qfot`
-refuses a change of state or owner under another queue's pending use, not a use under
-another queue's pending write or change, so null accepts a graph that leaves that wait
-out. The facade stands without the amendment that names it (D160), and `graph-impl`
-builds the wait all the same; until the amendment merges, no CI test proves the
-`Concurrent` path.
+The two rows with no rule yet wait on an amendment of rhi-api routed to the `rhi-null`
+lane (D160). rhi-api's `no-qfot` refuses a change of state or owner under another queue's
+pending use, not a use under another queue's pending write or change, so null accepts a
+graph that leaves that wait out; its `bounds` refuses a copy region outside its resource,
+not two regions of one call that overlap in the destination. The facade stands without
+the amendment, and `graph-impl` builds the waits and keeps regions apart all the same.
+Until it merges, no CI test proves the `Concurrent` path across queues, the wait for
+`ready` in a frame's later submits, or a copy's regions apart; and rhi-api's text does
+not yet say that a re-take from `Undefined` ends a release no acquire met, which the
+client's frame relies on ("What each consumer needs").
 
 Some proofs rest on this surface and not on a rule. An unreachable pass is culled and a
 pass whose only output is a readback or an import is kept (`is_culled`, and a culled pass's
