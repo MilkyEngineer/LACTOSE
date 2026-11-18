@@ -27,8 +27,11 @@ pub const WORKGROUP_SIZE_MAX: [u32; 3] = [128, 128, 64];
 /// dimensions: Vulkan's least `maxComputeWorkGroupInvocations`.
 pub const WORKGROUP_INVOCATIONS_MAX: u32 = 128;
 
-/// The locations a varying takes, 0 to 15: sixteen four-component locations are Vulkan's
-/// least `maxVertexOutputComponents` and `maxFragmentInputComponents`, 64.
+/// The locations a varying takes, 0 to 15. The bound is the format's, and no more than
+/// Vulkan's least `maxVertexOutputComponents` and `maxFragmentInputComponents`, 64, allow:
+/// sixteen locations of four components. Those 64 count the built-ins of the interface too,
+/// so a stage that writes `Position` has room for fifteen; the cook holds each stage to the
+/// 64 (`README.md`, "Pipelines and the cooked shader format").
 pub const VARYING_LOCATIONS: u32 = 16;
 
 /// A pipeline stage.
@@ -100,12 +103,11 @@ pub struct HeapUse {
 
 /// The type of a specialisation constant.
 ///
-/// A pipeline's value for it ([`Constant`](crate::Constant)) is [`bytes`](Self::bytes)
-/// long: a `Bool` is one byte, 0 or 1; the others are four, little-endian. A backend hands
-/// the driver a value of exactly this type: on Metal, of the `MTLDataType` of the same
-/// name, since Metal refuses a value of another type than the function constant's; on
-/// Vulkan, a `Bool` widened to a four-byte `VkBool32` and the others as they are
-/// (VUID-VkSpecializationMapEntry-constantID-00776).
+/// A pipeline's value for it is a [`ConstantValue`](crate::ConstantValue) of the same
+/// type. A backend hands the driver a value of exactly this type: on Metal, of the
+/// `MTLDataType` of the same name, since Metal refuses a value of another type than the
+/// function constant's; on Vulkan, a `Bool` widened to a four-byte `VkBool32` and the others
+/// as they are (VUID-VkSpecializationMapEntry-constantID-00776).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ConstantType {
     /// A boolean: SPIR-V's `OpTypeBool`, MSL's `bool`.
@@ -116,17 +118,6 @@ pub enum ConstantType {
     Uint,
     /// A 32-bit float: `OpTypeFloat 32`, `float`.
     Float,
-}
-
-impl ConstantType {
-    /// The bytes of a pipeline's value of this type: 1 for `Bool`, otherwise 4.
-    #[must_use]
-    pub const fn bytes(self) -> u32 {
-        match self {
-            Self::Bool => 1,
-            Self::Int | Self::Uint | Self::Float => 4,
-        }
-    }
 }
 
 /// A specialisation constant a shader declares.
@@ -206,16 +197,10 @@ impl CookedShader {
     ///
     /// # Errors
     ///
-    /// `ErrorKind::InvalidData`, naming the field, for a shader that breaks what its fields'
-    /// documentation states (the list `decode` gives), or with an entry, a module, or a list
-    /// of 4 GiB or more.
+    /// `ErrorKind::InvalidData`, naming the field, for a shader that [`check`](Self::check)
+    /// refuses, or with an entry, a module, or a list of 4 GiB or more.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        if let Some(what) = self.breach() {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("cooked shader to encode: {what}"),
-            ));
-        }
+        self.check()?;
         let mut out = Vec::with_capacity(64 + self.entry.len() + self.code.len());
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&COOKED_SHADER_VERSION.to_le_bytes());
@@ -267,8 +252,28 @@ impl CookedShader {
         Ok(out)
     }
 
-    /// The first rule of the fields' documentation the shader breaks, which `encode` and
-    /// `decode` refuse alike.
+    /// Checks what the fields' documentation states, as [`encode`](Self::encode) and
+    /// [`decode`](Self::decode) do. A device backend calls it on each stage before its
+    /// driver sees the stage, and [`check_varyings`] on a graphics pipeline's two.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::InvalidData`, naming the first rule broken: a heap set other than
+    /// [`HEAP_SET`], a heap array kind twice or at another binding than its kind's,
+    /// constants out of ascending id order, a push block above [`PUSH_BYTES_MAX`], inputs or
+    /// outputs outside the fragment stage, a compute stage without a workgroup or another
+    /// stage with one, a workgroup with a dimension of zero or beyond
+    /// [`WORKGROUP_SIZE_MAX`] or of more than [`WORKGROUP_INVOCATIONS_MAX`] invocations,
+    /// varyings in the compute stage, or varyings out of ascending location order, at a
+    /// location from [`VARYING_LOCATIONS`] or of other than 1 to 4 components.
+    pub fn check(&self) -> Result<()> {
+        match self.breach() {
+            Some(what) => Err(Error::new(ErrorKind::InvalidData, format!("cooked shader: {what}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// The first rule of the fields' documentation the shader breaks.
     fn breach(&self) -> Option<&'static str> {
         if let Some(heap) = &self.heap {
             if heap.set != HEAP_SET {
@@ -330,13 +335,7 @@ impl CookedShader {
     ///
     /// `ErrorKind::VersionMismatch` for another version's bytes; `ErrorKind::InvalidData`
     /// for bytes that are not a cooked shader, that are truncated or fail the checksum, or
-    /// whose fields break what their documentation states (a heap set other than
-    /// [`HEAP_SET`], a kind twice, constants out of order, a push block above
-    /// [`PUSH_BYTES_MAX`], inputs or outputs outside the fragment stage, a compute stage
-    /// without a workgroup or another stage with one, a workgroup with a dimension of zero or
-    /// beyond [`WORKGROUP_SIZE_MAX`] or [`WORKGROUP_INVOCATIONS_MAX`], varyings in the
-    /// compute stage, varyings out of order, at a location from [`VARYING_LOCATIONS`] or of
-    /// other than 1 to 4 components).
+    /// whose shader [`check`](Self::check) refuses.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let invalid =
             |what: &str| Error::new(ErrorKind::InvalidData, format!("cooked shader: {what}"));
@@ -445,10 +444,46 @@ impl CookedShader {
             workgroup,
             varyings,
         };
-        match shader.breach() {
-            Some(what) => Err(invalid(what)),
-            None => Ok(shader),
-        }
+        shader.check()?;
+        Ok(shader)
+    }
+}
+
+/// Checks the varyings rule between a graphics pipeline's vertex and fragment stages: each
+/// varying `fragment` reads is one `vertex` writes, at the same location, of the same
+/// component type and count (`README.md`, "Pipelines and the cooked shader format"). A
+/// varying written and not read is allowed. A device backend calls it before its driver
+/// sees the stages: it is the only guard for a `Uint` read as an `Int`, which Vulkan's
+/// validation does not report and Metal makes.
+///
+/// # Errors
+///
+/// `ErrorKind::InvalidData`, naming the first location read that is not written, or that is
+/// written with another component type or count, and what is written there.
+pub fn check_varyings(vertex: &CookedShader, fragment: &CookedShader) -> Result<()> {
+    for read in &fragment.varyings {
+        let written = vertex.varyings.iter().find(|written| written.location == read.location);
+        let what = match written {
+            Some(written) if written == read => continue,
+            Some(written) => format!("which the vertex stage writes as {}", written.describe()),
+            None => "which the vertex stage does not write".to_owned(),
+        };
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "a fragment stage reading location {} as {}, {what}",
+                read.location,
+                read.describe()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+impl Varying {
+    /// The varying's components, as a message names them: `2 Float`.
+    fn describe(&self) -> String {
+        format!("{} {:?}", self.count, self.component)
     }
 }
 

@@ -55,7 +55,8 @@ included: a change that breaks one is a signature change to list.
 | `RenderPass`, `ComputePass`, `ColourAttachment`, `DepthAttachment`, `Target`, `Load`, `Store`, `Viewport`, `Rect` | A pass and its attachments |
 | `BufferCopy`, `BufferImageCopy`, `IndexedIndirectArgs` | Copy regions, and the twenty-byte record an indirect draw reads |
 | `CookedShader`, `ShaderStage`, `ShaderTarget`, `HeapUse`, `HeapForm`, `HeapArray`, `HeapArrayKind`, `ConstantSlot`, `ConstantType`, `Varying`, `ComponentType`, `COOKED_SHADER_VERSION`, `HEAP_SET`, `PUSH_BYTES_MAX`, `WORKGROUP_SIZE_MAX`, `WORKGROUP_INVOCATIONS_MAX`, `VARYING_LOCATIONS` | The cooked shader format, which names the heap's shader form, each constant's type, a compute stage's workgroup and the varyings |
-| `GraphicsPipelineDesc`, `ComputePipelineDesc`, `StageDesc`, `Constant`, `ColourTargetDesc`, `WriteMask`, `DepthDesc`, `Compare`, `Cull`, the two pipeline handles | Pipelines from cooked shaders, with specialisation |
+| `CookedShader::check`, `check_varyings` | The format's rules for one stage, and the varyings rule for a vertex and a fragment stage: the one copy of each, which `encode`, `decode` and every backend call |
+| `GraphicsPipelineDesc`, `ComputePipelineDesc`, `StageDesc`, `Constant`, `ConstantValue`, `ColourTargetDesc`, `WriteMask`, `DepthDesc`, `Compare`, `Cull`, the two pipeline handles | Pipelines from cooked shaders, with specialisation |
 | `seal_cache`, `open_cache`, `CacheIdentity`, `CacheStart`, `PipelineStats` | The driver cache's bytes under the facade's own length and checksum, and what a device counts |
 | `TimelineHandle`, `TimelinePoint`, `Submit` | Timelines, and a submit with its waits and signals |
 | `SurfaceSource`, `SwapchainDesc`, `Swapchain`, `Acquired`, `Presented` | A surface from `raw-window-handle`'s types, and the swapchain the present thread holds |
@@ -690,60 +691,78 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   (`usage`, every backend): VUID-VkPipelineRenderingCreateInfo-colorAttachmentCount-09533.
 - Each `ConstantSlot` carries its constant's `ConstantType`: `Bool`, or a 32-bit `Int`,
   `Uint` or `Float`, as SPIR-V's `OpSpecConstant*` and MSL's `[[function_constant(i)]]`
-  declare it. A `Constant` names an id the shader declares, and its bytes are a value of
-  that type, `ConstantType::bytes` long: a `Bool` one byte, 0 or 1; the others four,
-  little-endian. Otherwise the pipeline is `InvalidData`. A backend specialises every
-  pipeline, with no values when none are given (Metal refuses an unspecialised function
-  that has constants). Metal takes each value as the `MTLDataType` of its type, `.bool`,
-  `.int`, `.uint` or `.float`, and refuses one of another type than the function
-  constant's; Vulkan takes a map entry of the constant's own size, and a boolean's is
-  `sizeof(VkBool32)` (VUID-VkSpecializationMapEntry-constantID-00776, SDK 1.4.363.1), so the
-  Vulkan backend widens a `Bool`'s byte to a four-byte `VkBool32` of the same value and
-  hands the others as they are.
+  declare it. A `Constant` names an id the shader declares, at most once, and its
+  `ConstantValue` is `Bool(bool)`, `Int(i32)`, `Uint(u32)` or `Float(f32)`, of the type the
+  slot declares (`ConstantValue::ty`). Otherwise the pipeline is `InvalidData`: a `uint`
+  constant given an `f32` fails at creation, not in the shader. The bytes are the backend's.
+  A backend specialises every pipeline, with no values when none are given (Metal refuses an
+  unspecialised function that has constants). Metal takes each value as the `MTLDataType`
+  of its type, `.bool` of one byte, `.int`, `.uint` or `.float`, and refuses one of another
+  type than the function constant's; Vulkan takes a map entry of the constant's own size,
+  and a boolean's is `sizeof(VkBool32)` (VUID-VkSpecializationMapEntry-constantID-00776, SDK
+  1.4.363.1), so the Vulkan backend widens a `Bool` to a four-byte `VkBool32` of 0 or 1 and
+  hands the others as their four little-endian bytes.
 - A compute stage's `workgroup` is its size in x, y and z: the SPIR-V's `OpExecutionMode
   LocalSize`, which the cook reads, refusing `LocalSizeId`. It is `Some` in the compute
-  stage and `None` in the others. The MSL does not state it: Metal's
-  `dispatchThreadgroups` takes it from the host as `threadsPerThreadgroup`, so the Metal
-  backend passes the field with every dispatch, and on every backend `dispatch` runs
-  workgroups of that size. The bound is fixed and portable, not a capability: each
-  dimension 1 to `WORKGROUP_SIZE_MAX`, (128, 128, 64), and the product at most
-  `WORKGROUP_INVOCATIONS_MAX`, 128, Vulkan's least `maxComputeWorkGroupSize` and
-  `maxComputeWorkGroupInvocations` (VUID-RuntimeSpirv-x-06429, -y-06430, -z-06431 and
-  -x-06432). Apple's Metal feature set tables (October 2026, "GPU implementation limits by
-  family", maximum threads per threadgroup) give 1024 for Apple4 to Apple11, the M1 being
-  Apple7, and 512 for Apple2 and Apple3, so the bound is within every family's. Their
-  footnote makes 1024 a theoretical maximum: a pipeline's own is its
+  stage and `None` in the others. The MSL does not state it: Metal's `dispatchThreadgroups`
+  takes it from the host as `threadsPerThreadgroup`, so the Metal backend passes the field
+  with every dispatch, and on every backend `dispatch` runs workgroups of that size. On a
+  `SpirV` target the field is the module's `LocalSize`, and a backend may refuse a stage
+  whose two disagree (`InvalidData`); no case needs one accepted. The bound is fixed and
+  portable, not a capability: each dimension 1 to `WORKGROUP_SIZE_MAX`, (128, 128, 64), and
+  the product at most `WORKGROUP_INVOCATIONS_MAX`, 128, Vulkan's least
+  `maxComputeWorkGroupSize` and `maxComputeWorkGroupInvocations` (VUID-RuntimeSpirv-x-06429,
+  -y-06430, -z-06431 and -x-06432). Apple's Metal feature set tables (October 2026, "GPU
+  implementation limits by family", maximum threads per threadgroup) give 1024 for Apple4 to
+  Apple11, the M1 being Apple7, and 512 for Apple2 and Apple3, so the bound is within every
+  family's. Their footnote makes 1024 a theoretical maximum: a pipeline's own is its
   `maxTotalThreadsPerThreadgroup`, which a function's resource use can lower, so the Metal
   backend refuses a pipeline whose workgroup is above it (`InvalidData`). No milestone 2
   shader needs more: the renderer's scatter is (64, 1, 1). A bound past Vulkan's least
-  becomes a capability when a shader needs one. `encode` and `decode` refuse a compute
-  stage without a workgroup, another stage with one, a dimension of zero and a size past
-  the bound, and so does pipeline creation (`InvalidData`).
+  becomes a capability when a shader needs one. `encode` and `decode` refuse a compute stage
+  without a workgroup, another stage with one, a dimension of zero and a size past the
+  bound, and so does pipeline creation (`InvalidData`).
+- `CookedShader::check` holds every rule of the format's fields, as `encode` and `decode`
+  apply them, and a device backend calls it on each stage before its driver sees the stage;
+  it calls `check_varyings` on a graphics pipeline's two stages. Each refusal is
+  `InvalidData` at `create_graphics_pipeline` or `create_compute_pipeline`.
 - `varyings` are what the vertex stage writes for the fragment stage to read, the built-ins
   aside: the vertex stage's those it writes, the fragment stage's those its code reads, none
-  in a compute stage. Each is a `location` below `VARYING_LOCATIONS`, 16 (Vulkan's least
-  `maxVertexOutputComponents` and `maxFragmentInputComponents`, 64, are sixteen locations of
-  four components; VUID-RuntimeSpirv-Location-06272), a `ComponentType` (a 32-bit `Float`,
-  `Int` or `Uint`) and a count of 1 to 4, and takes that location alone. On SPIR-V a varying
-  is the `Output` or `Input` variable decorated with its `Location`; on Metal it is the field
-  of the vertex function's output or of the fragment function's `[[stage_in]]` with the
-  attribute `[[user(locn)]]`, which Slang writes `[[user(TEXCOORD_n)]]` for location n and
-  `[[user(TEXCOORD)]]` for 0.
+  in a compute stage. Each is a `location` below `VARYING_LOCATIONS`, 16, a `ComponentType`
+  (a 32-bit `Float`, `Int` or `Uint`) and a count of 1 to 4, and takes that location alone.
+  The location bound is the format's. Vulkan's least `maxVertexOutputComponents` and
+  `maxFragmentInputComponents`, 64, count the built-ins of the interface as well
+  (VUID-RuntimeSpirv-Location-06272), so a vertex stage that writes `Position` has room for
+  fifteen four-component locations, and a fragment stage that reads `FragCoord` and
+  `FrontFacing` for less. The format cannot count them, since it does not carry the
+  built-ins; the cook counts each stage's interface, four components a location up to its
+  highest and each built-in's own, and refuses a stage above 64 (`tools/cook/README.md`).
+  The location bound stays 16, the most that 64 components allow with no built-in, since the
+  cook's count is the guard every device needs and a lower bound would refuse no stage the
+  count passes. On SPIR-V a varying is the `Output` or `Input` variable decorated with its
+  `Location`; on Metal it is the field of the vertex function's output or of the fragment
+  function's `[[stage_in]]` with the attribute `[[user(locn)]]`, which Slang writes
+  `[[user(TEXCOORD_n)]]` for location n and `[[user(TEXCOORD)]]` for 0.
 - The varyings rule, at `create_graphics_pipeline`: each varying the fragment stage reads is
-  one the vertex stage writes, at the same location, of the same component type and the
-  same count, or the pipeline is `InvalidData`, naming the location. A varying written and
-  not read is allowed. The rule is the intersection of the two targets'. Vulkan's
-  "Interface Matching" (chapter "Shader Interfaces") requires each input's location and
-  components to be an output's (VUID-RuntimeSpirv-OpEntryPoint-08743) of the same type and
-  width for each component (VUID-RuntimeSpirv-OpEntryPoint-07754), and under `maintenance4`
-  lets the output be a wider vector than the input. Metal refuses that wider output, a float
-  read as an integer or a `half` as a `float`, and a location read and not written, with
-  "Fragment input(s) `user(TEXCOORD)` mismatching vertex shader output type(s) or not
-  written by vertex shader", and makes the pipeline of a `uint` read as an `int`, which
-  Vulkan does not (all on the M1, macOS 27.2.1). Neither refuses an output not read, nor
-  does Metal refuse a `[[stage_in]]` field the code never reads, written or not, of any type;
-  SPIR-V leaves such an input out of the entry point's interface, so a fragment stage's
-  `varyings` are those it reads. Interpolation is not part of the match on either target.
+  one the vertex stage writes, at the same location, of the same component type and the same
+  count, or the pipeline is `InvalidData`, naming the location and what is written there, if
+  anything. `check_varyings` holds it, and a device backend calls it before its driver sees
+  the stages: for a `uint` read as an `int` it is the only guard, since Vulkan's validation
+  layer does not report one and Metal makes the pipeline. A varying written and not read is
+  allowed. The rule is the intersection of the two targets'. Vulkan's "Interface Matching"
+  (chapter "Shader Interfaces") requires each input's location and components to be an
+  output's (VUID-RuntimeSpirv-OpEntryPoint-08743) of the same type and width for each
+  component (VUID-RuntimeSpirv-OpEntryPoint-07754), and under `maintenance4` lets the output
+  be a wider vector than the input. Metal refuses that wider output, a float read as an
+  integer or a `half` as a `float`, and a location read and not written, with "Fragment
+  input(s) `user(TEXCOORD)` mismatching vertex shader output type(s) or not written by
+  vertex shader", and makes the pipeline of a `uint` read as an `int`, which Vulkan does not
+  (all on the M1, macOS 27.2.1). Neither refuses an output not read, nor does Metal refuse a
+  `[[stage_in]]` field the code never reads, written or not, of any type; SPIR-V leaves such
+  an input out of the entry point's interface, so a fragment stage's `varyings` are those it
+  reads. Interpolation is not part of the match on either target, and the cook refuses
+  `centroid` and `sample` interpolation until an attachment can be multisampled: Slang
+  writes `centroid` as Metal's `[[center_perspective]]`.
 - The push-constant block belongs to the pass: it starts as zeros and is what each draw or
   dispatch sees whichever pipeline is bound. `push_address` writes eight bytes and
   `push_slot` four; a write outside `PUSH_BYTES_MAX` is refused (`bounds`).
@@ -1055,7 +1074,7 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 | `create_memory_block`, `image_placement`, `ImageMemory::Placed`, `Encoder::alias` | Byte ranges for each block; which image last used each; refuses `no-fence` | An untracked placement heap; `heapTextureSizeAndAlign`; the block's fence waited on before, and updated after, every encoder that uses a placed image, at the alias call and at every other use | Bound memory at an offset; a barrier from undefined | Metal item 4, point 16 |
 | `write_heap_slot`, `clear_heap_slot` | The image for each slot; the declarations of pending submits; refuses `uuwp-used` | Under the heap's lock, the slot marked, a write of the texture's resource id into the argument buffer, the placeholder's on a clear, and the mark cleared | Under the heap's lock, the slot marked, an update-after-bind descriptor write, and the mark cleared | RHI item 3, point 5; Metal item 1, point 5 |
 | `create_sampler`, `destroy_sampler` | A table of descriptors | A sampler with `supportArgumentBuffers`, its id in the table's argument buffer, the placeholder's in a free entry; at most `maxArgumentBufferSamplerCount` | A sampler in the table's descriptor array, the placeholder in a free entry | Metal item 10, point 15 |
-| `CookedShader`, `create_graphics_pipeline`, `create_compute_pipeline`, the destroys | The cooked fields of a `SpirV` target: stages, constants' types and values, inputs, outputs, the varyings' match, the workgroup's bounds, heap capacity, and the capabilities the module declares. It runs no code | A library from MSL 3.1 or a metallib; functions always specialised, each value of its constant's `MTLDataType`; varyings matched by `[[user(locn)]]`, Slang's `TEXCOORDn`; a pipeline state, with the workgroup kept for its dispatches and checked against its `maxTotalThreadsPerThreadgroup` | Shader modules with specialisation info, a `Bool` widened to a `VkBool32`; the module's `LocalSize` | RHI item 4, point 6; Metal item 6, point 6 |
+| `CookedShader`, `create_graphics_pipeline`, `create_compute_pipeline`, the destroys | The cooked fields of a `SpirV` target through `CookedShader::check` and `check_varyings`: stages, constants' types and values, inputs, outputs, the varyings' match, the workgroup's bounds; heap capacity, and the capabilities the module declares. It runs no code | `check` and `check_varyings` before the driver; a library from MSL 3.1 or a metallib; functions always specialised, each `ConstantValue` as the `MTLDataType` of its type, a `Bool` as a one-byte `.bool`; varyings matched by `[[user(locn)]]`, Slang's `TEXCOORDn`; a pipeline state, with the workgroup kept for its dispatches and checked against its `maxTotalThreadsPerThreadgroup` | `check` and `check_varyings` before the driver; shader modules with specialisation info, each map entry four bytes, a `Bool` widened to a `VkBool32` of 0 or 1; the module's `LocalSize` | RHI item 4, point 6; Metal item 6, point 6 |
 | `pipeline_cache`, the request's bytes, `pipeline_stats`, `seal_cache`, `open_cache` | A payload of its own under the same seal | A binary archive loaded from a private copy of the opened payload; fail-on-miss; never under shader validation | `VkPipelineCache` data; creation feedback | RHI item 5, point 7; Metal item 7, point 7 |
 | `create_encoder`, `Encoder::reset`, recording on a thread | A command list, its scope, whether it is submitted or pending, and its first breach | A command buffer made on first use; `reset` drops it; the open command encoder, the state device backends keep | A command pool and one command buffer; `vkResetCommandPool` | RHI item 6, point 8; Metal item 8, point 8 |
 | `transition_images`, `transition_buffers` | The state and owner of each subresource, applied at the submit in order; whether a pass or copy wrote it since | Nothing, but for placed images, whose every use the block's fence orders | Barriers of synchronisation 2, a same-state one in a writing state included; a release and an acquire across families | RHI item 7, point 9; Metal point 9 |
@@ -1076,8 +1095,8 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 `conformance::CASES` lists every case by name, each a *contract* case or an *output* case,
 and `conformance::run` runs one against a `Harness`. The bodies arrive with the backends:
 the contract cases' with `rhi-null`, the output cases' and their Slang sources with
-`vulkan`. A backend's tests carry one test for each case, named after it. There are 172: 145
-contract cases and 27 output cases.
+`vulkan`. A backend's tests carry one test for each case, named after it. There are 174: 146
+contract cases and 28 output cases.
 
 - A **contract** case asserts what the contract says of calls and results. It needs no
   shader to run and no pixel, so null passes it as a device does. A case that names a rule
@@ -1177,18 +1196,28 @@ column, one or more for each of its clauses, 64 in all: `unreported_capability_i
   a device under `LEAST` would need to report below its driver's limits, which no device
   backend does, so a device runs them against its own.
   `empty_draws_and_dispatches_record_nothing` runs with Metal API validation on.
-- `constant_of_another_type_is_refused` gives a `Bool` four bytes, as a `VkBool32` would
-  be, and a byte of 2, and an `Int` and a `Float` one byte each; it then makes the pipeline
-  of a value of each type. `workgroup_outside_its_stage_or_bounds_is_refused` makes compute
-  pipelines of a stage with no workgroup, a dimension of zero, a dimension past
-  `WORKGROUP_SIZE_MAX` and a size past `WORKGROUP_INVOCATIONS_MAX`, and with varyings, and a
-  graphics pipeline whose vertex stage has a workgroup.
-  `varying_the_vertex_stage_does_not_write_is_refused` reads a varying with more and with
-  fewer components than are written, a `uint` as an `int`, a float as a `uint`, and a
-  location not written, each refused by name; and makes the pipelines whose fragment stage
-  reads none, some or all of what is written. On a device the cooked fields are the
-  suite's own and the module declares no varying: the backend refuses from the format
-  before its driver sees the stages.
+- `cooked_shader_forged_under_a_valid_checksum_is_refused` writes each breach of the
+  version 2 fields into a valid encoding and makes its checksum again, as a writer that
+  skipped `check` would: a compute stage with no workgroup, a workgroup tag of 2, a
+  dimension of zero, past the most in x and in z, more invocations than the most and a
+  product that wraps, a push block past the most, varyings in a compute stage, a constant
+  type code of 4, a vertex stage with a workgroup, a component code of 3, a location of
+  `VARYING_LOCATIONS`, a varying of no components and varyings out of order; `decode`
+  refuses each, and takes the same encodings resealed unchanged.
+- `constant_the_shader_does_not_declare_is_refused` gives an id the shader does not declare
+  and a declared one twice. `constant_of_another_type_is_refused` gives a `Bool` a `Uint` of
+  1, an `Int` a `Uint`, a `Uint` an `Int`, and a `Float` a `Uint` of a float's bits and a
+  `Bool`: each a value whose bits another type holds, which only its type refuses. It then
+  makes the pipeline of a value of each type, and of a false `Bool`.
+  `workgroup_outside_its_stage_or_bounds_is_refused` makes compute pipelines of a stage with
+  no workgroup, a dimension of zero, a dimension past `WORKGROUP_SIZE_MAX` and a size past
+  `WORKGROUP_INVOCATIONS_MAX`, and with varyings, and a graphics pipeline whose vertex stage
+  has a workgroup. `varying_the_vertex_stage_does_not_write_is_refused` reads a varying with
+  more and with fewer components than are written, a `uint` as an `int`, a float as a
+  `uint`, and a location not written, each refused by name; and makes the pipelines whose
+  fragment stage reads none, some or all of what is written. On a device the cooked fields
+  are the suite's own and the module declares no varying: the backend refuses by
+  `check_varyings` before its driver sees the stages.
 - `shader_needing_an_unenabled_capability_is_refused` creates a pipeline from a SPIR-V
   module that declares `Int64Atomics` on a device that does not report `buffer_atomics_64`.
   `rhi-metal` skips it: a Metal target declares no capability, and Metal's compiler refuses
@@ -1264,9 +1293,19 @@ Some output cases count as evidence only in the shape, or on the device, named h
 - `draw_parameters_reach_the_shader` draws indexed with a `base_vertex` and a first
   instance that are not zero, and writes the ids the shader reads.
 - `dispatch_runs_workgroups_of_the_shaders_size` dispatches a stage of workgroup (8, 4, 2)
-  over (3, 2, 1) groups, each invocation writing its local and its global id, and compares
-  every id with the reference: on Metal it fails where the backend passes another size than
-  the cooked `workgroup` as `threadsPerThreadgroup`.
+  over (3, 2, 1) groups into a buffer filled first with a sentinel word no id equals. Each
+  invocation whose global id lies inside (24, 8, 2) writes, at the record its global id
+  flattens to, its local id, its global id and its flattened local index; one outside it
+  writes nothing, so a wrong size cannot write past the buffer. The case compares all 384
+  records exactly with the reference, and checks that the words after them still hold the
+  sentinel: on Metal it fails where the backend passes another size than the cooked
+  `workgroup` as `threadsPerThreadgroup`, a smaller one leaving records at the sentinel.
+- `specialised_constant_of_each_type_is_read_back` specialises a compute stage with a `Bool`
+  true and another false, an `Int` of -3, a `Uint` of 7 and a `Float` of 1.5, and with no
+  value for a `Bool` and a `Uint` it declares defaults for; the stage writes each as it
+  reads it, and the case compares every word exactly. It is the proof of Vulkan's widening
+  of a `Bool` to a `VkBool32`, run under the validation layer, and of each `MTLDataType` on
+  Metal.
 
 | Area | Contract cases | Output cases |
 |---|---|---|
@@ -1275,7 +1314,7 @@ Some output cases count as evidence only in the shape, or on the device, named h
 | Images, memoryless, aliases | `image_use_outside_its_usage_is_refused`, `memoryless_outcome_is_queryable_and_as_reported`, `memoryless_request_without_transient_is_refused`, `memoryless_attachment_stored_is_refused`, `memoryless_attachment_kept_is_refused`, `memoryless_attachment_after_a_local_read_is_refused_where_lost`, `placement_outside_the_block_is_refused`, `destroy_of_a_block_an_image_is_placed_in_is_refused`, `aliased_image_used_without_the_alias_call_is_refused`, `alias_read_before_its_first_write_is_refused`, `aliases_used_in_turn_with_the_alias_call_pass` | `memoryless_g_buffer_is_lit_in_its_pass`, `aliased_transients_render_in_turn`, `image_round_trips_through_copies` |
 | States and queues | `transition_from_another_state_is_refused`, `use_in_another_state_is_refused`, `use_after_a_write_without_a_transition_is_refused`, `state_is_kept_for_each_mip_and_layer`, `state_follows_submission_order_not_recording_order`, `cross_queue_use_without_a_transfer_is_refused`, `acquire_without_a_release_is_refused`, `release_and_acquire_cross_a_resource`, `shared_and_discarded_resources_cross_without_a_transfer`, `roles_on_one_queue_need_no_transfer`, `image_taken_while_another_queue_reads_it_is_refused`, `read_of_contents_left_undefined_is_refused`, `use_under_another_queues_pending_write_is_refused`, `use_under_another_queues_pending_transition_is_refused`, `sampled_read_under_another_queues_pending_write_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused`, `acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused`, `take_of_a_mip_after_an_acquire_of_another_is_refused`, `use_waiting_through_another_submit_passes`, `acquire_of_a_release_a_retake_ended_is_refused`, `read_after_a_retake_of_an_unmet_release_is_refused` | `ownership_transfer_keeps_the_contents`, `retake_after_a_store_on_one_queue_is_clean` |
 | The heap, samplers, declarations | `heap_slot_outside_the_heap_is_refused`, `declared_slot_empty_is_refused`, `slot_written_after_its_pass_began_is_refused`, `declared_slot_not_in_sampled_read_is_refused`, `heap_write_under_a_pending_reader_is_refused`, `heap_write_after_its_reader_completes_passes`, `heap_write_racing_a_submit_refuses_one`, `destroy_of_an_image_a_slot_holds_is_refused`, `sampler_destroyed_under_a_pending_submit_is_refused`, `undeclared_slot_argument_is_refused`, `undeclared_address_argument_is_refused`, `declared_buffer_in_another_state_is_refused`, `buffer_declared_in_two_states_is_refused`, `sampler_table_is_bounded` | `heap_is_sampled_past_slot_zero`, `address_is_read_in_a_shader`, `declared_reader_follows_a_lagging_writer`, `sampler_filters_as_described` |
-| Cooked shaders, pipelines, the cache | `cooked_shader_round_trips`, `cooked_shader_of_another_version_is_refused`, `cooked_shader_corrupt_or_truncated_is_refused`, `shader_for_another_heap_is_refused`, `shader_target_the_backend_does_not_run_is_unsupported`, `constant_of_another_length_is_refused`, `constant_of_another_type_is_refused`, `workgroup_outside_its_stage_or_bounds_is_refused`, `varying_the_vertex_stage_does_not_write_is_refused`, `shader_needing_an_unenabled_capability_is_refused`, `pipeline_of_other_formats_than_its_pass_is_refused`, `sealed_cache_round_trips`, `cache_corrupt_truncated_or_foreign_starts_empty` | `specialised_constant_changes_the_output`, `write_mask_keeps_a_channel`, `depth_state_orders_two_triangles`, `warm_cache_hits_every_stage`, `dispatch_runs_workgroups_of_the_shaders_size` |
+| Cooked shaders, pipelines, the cache | `cooked_shader_round_trips`, `cooked_shader_of_another_version_is_refused`, `cooked_shader_corrupt_or_truncated_is_refused`, `cooked_shader_forged_under_a_valid_checksum_is_refused`, `shader_for_another_heap_is_refused`, `shader_target_the_backend_does_not_run_is_unsupported`, `constant_the_shader_does_not_declare_is_refused`, `constant_of_another_type_is_refused`, `workgroup_outside_its_stage_or_bounds_is_refused`, `varying_the_vertex_stage_does_not_write_is_refused`, `shader_needing_an_unenabled_capability_is_refused`, `pipeline_of_other_formats_than_its_pass_is_refused`, `sealed_cache_round_trips`, `cache_corrupt_truncated_or_foreign_starts_empty` | `specialised_constant_changes_the_output`, `specialised_constant_of_each_type_is_read_back`, `write_mask_keeps_a_channel`, `depth_state_orders_two_triangles`, `warm_cache_hits_every_stage`, `dispatch_runs_workgroups_of_the_shaders_size` |
 | Encoders and submits | `encoder_recorded_on_another_thread_submits`, `encoder_reset_while_pending_is_refused`, `pending_encoder_drop_waits_for_its_submit`, `drop_that_is_not_the_last_returns_at_once`, `encoder_in_two_submits_is_refused`, `encoder_resubmitted_without_reset_is_refused`, `recording_while_pending_records_nothing`, `encoder_of_another_role_or_device_is_refused`, `command_outside_its_scope_is_refused`, `draw_with_nothing_bound_is_refused`, `pass_left_open_is_refused`, `push_outside_the_block_is_refused`, `copy_region_outside_its_resource_is_refused`, `copy_regions_overlapping_in_the_destination_are_refused`, `refused_submit_changes_nothing`, `submit_of_no_encoders_waits_and_signals`, `submit_is_pending_until_its_wait_is_reached`, `empty_draws_and_dispatches_record_nothing` | `two_threads_record_at_once` |
 | Timelines, destroys and races | `timeline_is_signalled_waited_and_read_by_the_host`, `timeline_wait_times_out`, `waits_are_woken_by_the_submit_that_reaches_them`, `wait_is_woken_by_a_host_signal`, `timeline_value_that_does_not_grow_is_refused`, `host_signal_above_a_pending_signal_is_refused`, `host_signal_below_a_promise_that_does_not_wait_for_it_is_refused`, `host_signal_below_a_pending_signal_releases_its_waiter`, `host_signal_below_a_promise_whose_wait_is_met_is_refused`, `submit_signalling_no_more_than_it_waits_for_is_refused`, `timeline_value_beyond_the_difference_limit_is_refused`, `timeline_signalled_from_two_queues_without_a_wait_is_refused`, `destroy_under_a_pending_submit_is_refused`, `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`, `destroy_after_an_unobserved_submit_is_refused`, `destroy_at_once_after_the_wait_is_accepted`, `destroy_racing_a_submit_refuses_one`, `submits_racing_on_one_queue_keep_their_order`, `host_signals_racing_on_one_timeline_keep_it_growing`, `use_after_destruction_is_refused`, `destroyed_after_recording_is_refused_at_submit`, `handle_of_another_device_is_refused` | |
 | Render passes and the local read | `input_read_without_a_local_read_is_refused`, `input_read_of_another_attachment_is_refused`, `attachments_of_unequal_extent_are_refused`, `scissor_outside_the_attachments_is_refused`, `viewport_outside_its_rules_is_refused` | `triangle_matches_the_reference`, `local_read_sees_what_the_pass_wrote`, `clear_and_keep_load_as_described`, `viewport_and_scissor_place_the_triangles`, `draw_parameters_reach_the_shader` |

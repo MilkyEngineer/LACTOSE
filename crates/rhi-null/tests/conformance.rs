@@ -251,9 +251,10 @@ cases! {
     cooked_shader_round_trips
     cooked_shader_of_another_version_is_refused
     cooked_shader_corrupt_or_truncated_is_refused
+    cooked_shader_forged_under_a_valid_checksum_is_refused
     shader_for_another_heap_is_refused
     shader_target_the_backend_does_not_run_is_unsupported
-    constant_of_another_length_is_refused
+    constant_the_shader_does_not_declare_is_refused
     constant_of_another_type_is_refused
     workgroup_outside_its_stage_or_bounds_is_refused
     varying_the_vertex_stage_does_not_write_is_refused
@@ -336,6 +337,7 @@ cases! {
     declared_reader_follows_a_lagging_writer
     sampler_filters_as_described
     specialised_constant_changes_the_output
+    specialised_constant_of_each_type_is_read_back
     write_mask_keeps_a_channel
     depth_state_orders_two_triangles
     warm_cache_hits_every_stage

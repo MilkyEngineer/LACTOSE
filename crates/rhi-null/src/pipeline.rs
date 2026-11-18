@@ -7,9 +7,9 @@ use std::time::Instant;
 
 use lactose_core::{Error, ErrorKind, Result, xxh64};
 use lactose_rhi_api::{
-    CacheIdentity, CacheStart, Capabilities, ComputePipelineDesc, ConstantType,
-    GraphicsPipelineDesc, HEAP_SET, HeapArrayKind, PUSH_BYTES_MAX, Rule, ShaderStage, ShaderTarget,
-    StageDesc, WriteMask, open_cache, seal_cache,
+    CacheIdentity, CacheStart, Capabilities, ComputePipelineDesc, ConstantValue,
+    GraphicsPipelineDesc, HeapArrayKind, Rule, ShaderStage, ShaderTarget, StageDesc, WriteMask,
+    check_varyings, open_cache, seal_cache,
 };
 
 use crate::device::{ComputeObj, GraphicsObj};
@@ -93,23 +93,15 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
         return Err(invalid(format!("a {:?} shader as the {place:?} stage", shader.stage)));
     }
     module(caps, &shader.code)?;
+    shader.check()?;
     for (at, constant) in desc.constants.iter().enumerate() {
         let Some(slot) = shader.constants.iter().find(|slot| slot.id == constant.id) else {
             return Err(invalid(format!("a constant {} the shader does not declare", constant.id)));
         };
-        if constant.bytes.len() != slot.ty.bytes() as usize {
+        if constant.value.ty() != slot.ty {
             return Err(invalid(format!(
-                "a constant {} of {} bytes, declared {:?} of {}",
-                constant.id,
-                constant.bytes.len(),
-                slot.ty,
-                slot.ty.bytes()
-            )));
-        }
-        if slot.ty == ConstantType::Bool && constant.bytes[0] > 1 {
-            return Err(invalid(format!(
-                "a bool constant {} of value {}, neither 0 nor 1",
-                constant.id, constant.bytes[0]
+                "a constant {} given a value of {:?}, declared {:?}",
+                constant.id, constant.value, slot.ty
             )));
         }
         if desc.constants[..at].iter().any(|other| other.id == constant.id) {
@@ -117,9 +109,6 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
         }
     }
     if let Some(heap) = &shader.heap {
-        if heap.set != HEAP_SET {
-            return Err(invalid(format!("a heap in set {}, not {HEAP_SET}", heap.set)));
-        }
         for array in &heap.arrays {
             let capacity = match array.kind {
                 HeapArrayKind::SampledImage2d => caps.heap_slots,
@@ -133,15 +122,22 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
             }
         }
     }
-    if shader.push_bytes > PUSH_BYTES_MAX {
-        return Err(invalid(format!("a push-constant block of {} bytes", shader.push_bytes)));
-    }
     let mut bytes = shader.encode()?;
     for constant in desc.constants {
         bytes.extend_from_slice(&constant.id.to_le_bytes());
-        bytes.extend_from_slice(constant.bytes);
+        bytes.extend_from_slice(&value_bytes(constant.value));
     }
     Ok(xxh64(&bytes, 0))
+}
+
+/// A constant's value as the stage's key holds it, its type being its slot's.
+fn value_bytes(value: ConstantValue) -> [u8; 4] {
+    match value {
+        ConstantValue::Bool(value) => u32::from(value).to_le_bytes(),
+        ConstantValue::Int(value) => value.to_le_bytes(),
+        ConstantValue::Uint(value) => value.to_le_bytes(),
+        ConstantValue::Float(value) => value.to_le_bytes(),
+    }
 }
 
 /// Checks a SPIR-V module's header, and its capabilities and extensions against those the
@@ -203,13 +199,7 @@ pub(crate) fn graphics(
     let mut keys = vec![stage(caps, &desc.vertex, ShaderStage::Vertex)?];
     if let Some(fragment) = &desc.fragment {
         keys.push(stage(caps, fragment, ShaderStage::Fragment)?);
-        let written = &desc.vertex.shader.varyings;
-        if let Some(read) = fragment.shader.varyings.iter().find(|read| !written.contains(read)) {
-            return Err(invalid(format!(
-                "a fragment stage reading location {} as {} {:?}, which the vertex stage does not write",
-                read.location, read.count, read.component
-            )));
-        }
+        check_varyings(desc.vertex.shader, fragment.shader)?;
     }
     let (inputs, outputs) =
         desc.fragment.map_or((0, 0), |fragment| (fragment.shader.inputs, fragment.shader.outputs));

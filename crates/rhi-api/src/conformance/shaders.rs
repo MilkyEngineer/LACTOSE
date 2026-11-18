@@ -1,14 +1,14 @@
 //! Cooked shaders, pipelines and the cache.
 
-use lactose_core::ErrorKind;
+use lactose_core::{ErrorKind, xxh64};
 
 use super::kit::{Body, Ctx, INT64_ATOMICS, attachment, begin, cooked, heap_of, image_to, spirv};
 use crate::shader::MAGIC;
 use crate::{
     COOKED_SHADER_VERSION, CacheIdentity, CacheStart, ColourTargetDesc, ComponentType,
-    ComputePipelineDesc, Constant, ConstantSlot, ConstantType, CookedShader, Cull, Format,
-    GraphicsPipelineDesc, HeapArrayKind, ImageState, Load, PUSH_BYTES_MAX, PassReach, QueueRole,
-    ShaderStage, ShaderTarget, StageDesc, Store, Submit, VARYING_LOCATIONS, Varying,
+    ComputePipelineDesc, Constant, ConstantSlot, ConstantType, ConstantValue, CookedShader, Cull,
+    Format, GraphicsPipelineDesc, HeapArrayKind, ImageState, Load, PUSH_BYTES_MAX, PassReach,
+    QueueRole, ShaderStage, ShaderTarget, StageDesc, Store, Submit, VARYING_LOCATIONS, Varying,
     WORKGROUP_INVOCATIONS_MAX, WORKGROUP_SIZE_MAX, WriteMask, open_cache, seal_cache,
 };
 
@@ -21,12 +21,19 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         "cooked_shader_corrupt_or_truncated_is_refused",
         cooked_shader_corrupt_or_truncated_is_refused,
     ),
+    (
+        "cooked_shader_forged_under_a_valid_checksum_is_refused",
+        cooked_shader_forged_under_a_valid_checksum_is_refused,
+    ),
     ("shader_for_another_heap_is_refused", shader_for_another_heap_is_refused),
     (
         "shader_target_the_backend_does_not_run_is_unsupported",
         shader_target_the_backend_does_not_run_is_unsupported,
     ),
-    ("constant_of_another_length_is_refused", constant_of_another_length_is_refused),
+    (
+        "constant_the_shader_does_not_declare_is_refused",
+        constant_the_shader_does_not_declare_is_refused,
+    ),
     ("constant_of_another_type_is_refused", constant_of_another_type_is_refused),
     (
         "workgroup_outside_its_stage_or_bounds_is_refused",
@@ -71,9 +78,13 @@ fn rich(ctx: &Ctx<'_>) -> CookedShader {
     }
 }
 
-/// A compute stage whose workgroup is `size`.
+/// A compute stage whose workgroup is `size`, its module's `LocalSize`.
 fn group(size: [u32; 3]) -> CookedShader {
-    CookedShader { workgroup: Some(size), ..cooked(ShaderStage::Compute, 0, 0) }
+    CookedShader {
+        code: spirv(ShaderStage::Compute, Some(size), &[]),
+        workgroup: Some(size),
+        ..cooked(ShaderStage::Compute, 0, 0)
+    }
 }
 
 /// Varyings, each a location, a component type and a count.
@@ -105,7 +116,7 @@ fn pair<'a>(vertex: &'a CookedShader, fragment: &'a CookedShader) -> GraphicsPip
 fn compute(
     device: &dyn crate::Device,
     shader: &CookedShader,
-    constants: &[Constant<'_>],
+    constants: &[Constant],
 ) -> lactose_core::Result<crate::ComputePipelineHandle> {
     device.create_compute_pipeline(&ComputePipelineDesc {
         label: "conformance",
@@ -243,6 +254,97 @@ fn cooked_shader_corrupt_or_truncated_is_refused(ctx: &Ctx<'_>) -> Applies {
     Ok(())
 }
 
+/// Writes `words` into `body` from `from_end` bytes before its end.
+fn put(body: &mut [u8], from_end: usize, words: &[u32]) {
+    let at = body.len() - from_end;
+    for (word, bytes) in words.iter().zip(body[at..].as_chunks_mut::<4>().0) {
+        *bytes = word.to_le_bytes();
+    }
+}
+
+/// Replaces the varyings that end `body`, `from_end` bytes from its end with their count,
+/// by `varyings`, each a location, a component type's code and a count.
+fn put_varyings(body: &mut Vec<u8>, from_end: usize, varyings: &[(u32, u8, u32)]) {
+    body.truncate(body.len() - from_end);
+    body.extend_from_slice(&(varyings.len() as u32).to_le_bytes());
+    for &(location, code, count) in varyings {
+        body.extend_from_slice(&location.to_le_bytes());
+        body.push(code);
+        body.extend_from_slice(&count.to_le_bytes());
+    }
+}
+
+fn cooked_shader_forged_under_a_valid_checksum_is_refused(ctx: &Ctx<'_>) -> Applies {
+    // A writer that skipped `check`: each breach is written into a valid encoding, and the
+    // checksum made again. The compute stage's encoding ends with its last constant's type
+    // code, the push block, inputs, outputs, the workgroup's tag and size, and no varyings;
+    // the vertex stage's with no workgroup and one varying.
+    let compute = CookedShader {
+        constants: vec![ConstantSlot { id: 1, ty: ConstantType::Float }],
+        ..group([8, 4, 2])
+    };
+    let vertex = varying(ShaderStage::Vertex, &[(3, ComponentType::Int, 2)]);
+    type Forge = fn(&mut Vec<u8>);
+    let forged: [(&str, &CookedShader, Forge); 15] = [
+        ("a compute stage without a workgroup", &compute, |body| {
+            let at = body.len() - 17;
+            body[at] = 0;
+            body.drain(at + 1..at + 13);
+        }),
+        ("a workgroup tag of 2", &compute, |body| {
+            let at = body.len() - 17;
+            body[at] = 2;
+        }),
+        ("a workgroup of no invocations in x", &compute, |body| put(body, 16, &[0, 1, 1])),
+        ("a workgroup past the most in x", &compute, |body| put(body, 16, &[129, 1, 1])),
+        ("a workgroup past the most in z", &compute, |body| put(body, 16, &[1, 1, 65])),
+        ("a workgroup of more invocations than the most", &compute, |body| {
+            put(body, 16, &[16, 16, 1]);
+        }),
+        ("a workgroup whose product wraps", &compute, |body| put(body, 16, &[65536, 65536, 1])),
+        ("a push block above the most", &compute, |body| put(body, 29, &[PUSH_BYTES_MAX + 1])),
+        ("varyings in the compute stage", &compute, |body| put_varyings(body, 4, &[(0, 0, 1)])),
+        ("a constant type code of 4", &compute, |body| {
+            let at = body.len() - 30;
+            body[at] = 4;
+        }),
+        ("a workgroup in the vertex stage", &vertex, |body| {
+            let at = body.len() - 14;
+            body[at] = 1;
+            let size = [1u32, 1, 1].map(u32::to_le_bytes);
+            body.splice(at + 1..at + 1, size.into_iter().flatten());
+        }),
+        ("a varying component code of 3", &vertex, |body| {
+            let at = body.len() - 5;
+            body[at] = 3;
+        }),
+        ("a varying at VARYING_LOCATIONS", &vertex, |body| put(body, 9, &[VARYING_LOCATIONS])),
+        ("a varying of no components", &vertex, |body| put(body, 4, &[0])),
+        ("varyings out of order", &vertex, |body| {
+            put_varyings(body, 13, &[(3, 0, 1), (2, 0, 1)]);
+        }),
+    ];
+    let seal = |shader: &CookedShader, forge: Forge| {
+        let bytes = ctx.ok(shader.encode(), "an encode");
+        let mut body = bytes[..bytes.len() - 8].to_vec();
+        forge(&mut body);
+        let sum = xxh64(&body, 0);
+        body.extend_from_slice(&sum.to_le_bytes());
+        body
+    };
+    for shader in [&compute, &vertex] {
+        let resealed = seal(shader, |_| {});
+        ctx.check(
+            ctx.ok(CookedShader::decode(&resealed), "a decode") == *shader,
+            "a shader resealed unchanged decodes",
+        );
+    }
+    for (what, shader, forge) in forged {
+        ctx.fails(CookedShader::decode(&seal(shader, forge)), ErrorKind::InvalidData, what);
+    }
+    Ok(())
+}
+
 fn shader_for_another_heap_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     for kind in [HeapArrayKind::SampledImage2d, HeapArrayKind::Sampler] {
@@ -280,26 +382,21 @@ fn shader_target_the_backend_does_not_run_is_unsupported(ctx: &Ctx<'_>) -> Appli
     Ok(())
 }
 
-fn constant_of_another_length_is_refused(ctx: &Ctx<'_>) -> Applies {
+fn constant_the_shader_does_not_declare_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let shader = CookedShader {
         constants: vec![ConstantSlot { id: 2, ty: ConstantType::Uint }],
         ..cooked(ShaderStage::Compute, 0, 0)
     };
-    let short = [Constant { id: 2, bytes: &[1, 0] }];
-    ctx.fails(
-        compute(&*device, &shader, &short),
-        ErrorKind::InvalidData,
-        "a constant of another length",
-    );
-    let undeclared = [Constant { id: 7, bytes: &[1, 0, 0, 0] }];
+    let one = Constant { id: 2, value: ConstantValue::Uint(1) };
+    let undeclared = [Constant { id: 7, value: ConstantValue::Uint(1) }];
     ctx.fails(
         compute(&*device, &shader, &undeclared),
         ErrorKind::InvalidData,
         "a constant the shader does not declare",
     );
-    let right = [Constant { id: 2, bytes: &[1, 0, 0, 0] }];
-    ctx.ok(compute(&*device, &shader, &right), "the declared constant");
+    ctx.fails(compute(&*device, &shader, &[one, one]), ErrorKind::InvalidData, "a constant twice");
+    ctx.ok(compute(&*device, &shader, &[one]), "the declared constant");
     ctx.ok(compute(&*device, &shader, &[]), "no constants");
     Ok(())
 }
@@ -310,29 +407,31 @@ fn constant_of_another_type_is_refused(ctx: &Ctx<'_>) -> Applies {
         constants: vec![
             ConstantSlot { id: 1, ty: ConstantType::Bool },
             ConstantSlot { id: 2, ty: ConstantType::Int },
+            ConstantSlot { id: 3, ty: ConstantType::Uint },
             ConstantSlot { id: 4, ty: ConstantType::Float },
         ],
         ..cooked(ShaderStage::Compute, 0, 0)
     };
-    // A bool's value is one byte: the four of a `VkBool32` are the backend's to widen to.
-    let refused: [(&str, Constant<'_>); 4] = [
-        ("a bool of four bytes", Constant { id: 1, bytes: &[1, 0, 0, 0] }),
-        ("a bool that is neither 0 nor 1", Constant { id: 1, bytes: &[2] }),
-        ("an int of one byte", Constant { id: 2, bytes: &[1] }),
-        ("a float of one byte", Constant { id: 4, bytes: &[0] }),
+    // Each value is one whose bits another type holds as well: the type alone refuses it.
+    let refused = [
+        ("a uint for a bool", Constant { id: 1, value: ConstantValue::Uint(1) }),
+        ("a uint for an int", Constant { id: 2, value: ConstantValue::Uint(3) }),
+        ("an int for a uint", Constant { id: 3, value: ConstantValue::Int(3) }),
+        ("a uint for a float", Constant { id: 4, value: ConstantValue::Uint(1.5f32.to_bits()) }),
+        ("a bool for a float", Constant { id: 4, value: ConstantValue::Bool(true) }),
     ];
     for (what, constant) in refused {
         ctx.fails(compute(&*device, &shader, &[constant]), ErrorKind::InvalidData, what);
     }
-    let int = (-3i32).to_le_bytes();
-    let float = 1.5f32.to_le_bytes();
     let right = [
-        Constant { id: 1, bytes: &[1] },
-        Constant { id: 2, bytes: &int },
-        Constant { id: 4, bytes: &float },
+        Constant { id: 1, value: ConstantValue::Bool(true) },
+        Constant { id: 2, value: ConstantValue::Int(-3) },
+        Constant { id: 3, value: ConstantValue::Uint(7) },
+        Constant { id: 4, value: ConstantValue::Float(1.5) },
     ];
     ctx.ok(compute(&*device, &shader, &right), "a value of each declared type");
-    ctx.ok(compute(&*device, &shader, &[Constant { id: 1, bytes: &[0] }]), "a false bool");
+    let false_bool = [Constant { id: 1, value: ConstantValue::Bool(false) }];
+    ctx.ok(compute(&*device, &shader, &false_bool), "a false bool");
     Ok(())
 }
 
@@ -404,7 +503,7 @@ fn shader_needing_an_unenabled_capability_is_refused(ctx: &Ctx<'_>) -> Applies {
     }
     let device = ctx.device();
     let shader = CookedShader {
-        code: spirv(ShaderStage::Compute, &[INT64_ATOMICS]),
+        code: spirv(ShaderStage::Compute, Some([1, 1, 1]), &[INT64_ATOMICS]),
         ..cooked(ShaderStage::Compute, 0, 0)
     };
     ctx.refused(compute(&*device, &shader, &[]), "a module that declares `Int64Atomics`");

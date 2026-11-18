@@ -243,14 +243,21 @@ a row for each place and a third that removes both.
 | Loss | the injected loss not kept | `conformance::loss_is_returned_and_stays`, `waits_return_at_once_after_a_loss`, `wait_is_woken_by_a_loss`, `teardown_succeeds_after_a_loss`, `null::a_loss_reaches_every_call_and_the_control_outlives_the_device`, and others |
 | Loss, the suite's | a loss case's gate left shut when the harness cannot lose a device, in `waits_return_at_once_after_a_loss` or `teardown_succeeds_after_a_loss` | `conformance::loss_cases_are_skipped_where_the_harness_cannot_lose` (a row each) |
 | The last drop | a device's last drop that does not wait for its submits, or that stops short of its last | `tests::the_last_drop_of_a_device_waits_for_its_pending_submits`, `a_drop_that_is_not_the_last_returns_at_once` (a row each) |
-| The cooked format | `encode` without the checks `decode` makes | `conformance::cooked_shader_round_trips` |
-| The cooked format | the workgroup's checks: its stage and its bounds | `conformance::cooked_shader_round_trips`, `workgroup_outside_its_stage_or_bounds_is_refused` |
-| The cooked format | the varyings' checks: their stage, order, location and count | `conformance::cooked_shader_round_trips`, `workgroup_outside_its_stage_or_bounds_is_refused` |
-| The cooked format, at pipeline creation | a stage's key hashed from its fields with no `encode`, so its breaches pass | `conformance::workgroup_outside_its_stage_or_bounds_is_refused` |
-| A constant's type | its length taken from no type, any length passing | `conformance::constant_of_another_length_is_refused`, `constant_of_another_type_is_refused` |
-| A constant's type | a `Bool` of a value other than 0 or 1 | `conformance::constant_of_another_type_is_refused` |
-| The varyings' match | a fragment stage's read with no vertex output to match | `conformance::varying_the_vertex_stage_does_not_write_is_refused` |
-| The varyings' match | the location alone matched, not the component type and count | `conformance::varying_the_vertex_stage_does_not_write_is_refused` |
+| The cooked format, `rhi-api`'s `check` | `encode` without it | `conformance::cooked_shader_round_trips` |
+| The cooked format, `rhi-api`'s `check` | `decode` without it | `conformance::cooked_shader_forged_under_a_valid_checksum_is_refused` |
+| The cooked format, `rhi-api`'s `decode` | a workgroup tag of 2 read as present, a constant type code of 4 read as `Float`, or a component code of 3 read as `Uint` | `conformance::cooked_shader_forged_under_a_valid_checksum_is_refused` (a row each) |
+| The cooked format, `rhi-api`'s `check` | the workgroup's stage, its dimensions, or its product, unchecked | `conformance::cooked_shader_round_trips`, `cooked_shader_forged_under_a_valid_checksum_is_refused`, `workgroup_outside_its_stage_or_bounds_is_refused` (a row each) |
+| The cooked format, `rhi-api`'s `check` | varyings in a compute stage passing | `conformance::cooked_shader_round_trips`, `cooked_shader_forged_under_a_valid_checksum_is_refused`, `workgroup_outside_its_stage_or_bounds_is_refused` |
+| The cooked format, `rhi-api`'s `check` | the varyings' order, location and count unchecked | `conformance::cooked_shader_round_trips`, `cooked_shader_forged_under_a_valid_checksum_is_refused` |
+| The cooked format, at pipeline creation | neither `check` nor `encode` called, the stage's key hashed from its fields | `conformance::workgroup_outside_its_stage_or_bounds_is_refused` |
+| A constant | a value of another type than its slot's passing | `conformance::constant_of_another_type_is_refused` |
+| A constant | an id the shader does not declare skipped, or an id given twice passing | `conformance::constant_the_shader_does_not_declare_is_refused` (a row each) |
+| The varyings' match | `check_varyings` not called | `conformance::varying_the_vertex_stage_does_not_write_is_refused` |
+| The varyings' match, `rhi-api`'s `check_varyings` | a fragment stage's read with no vertex output to match passing, or the location alone matched, not the component type and count | `conformance::varying_the_vertex_stage_does_not_write_is_refused` (a row each) |
+
+The call to `check` at pipeline creation is not in the table: without it the key's `encode`
+makes the same check, so no test can fail. It is the contract's call, as a device backend
+makes it before its driver sees the stage.
 
 An acquire orders no later submit of its queue, and is itself bound as a use. A stamp that
 let one order the later submits, put back with the acquire's exemption from the use rule,
