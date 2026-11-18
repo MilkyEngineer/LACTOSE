@@ -8,13 +8,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lactose_core::ErrorKind;
 use lactose_rhi_api::{
     BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferReach, BufferState,
-    BufferTransition, BufferUsage, CacheStart, ColourTargetDesc, ComputePass, ComputePipelineDesc,
-    ComputePipelineHandle, Constant, ConstantValue, Cull, Device, DeviceRequest, Encoder, Extent,
-    Format, GraphicsPipelineDesc, ImageDesc, ImageMemory, ImageRange, ImageState, ImageTransition,
-    ImageUsage, MemoryClass, PassReach, QueueRole, Rect, Sharing, StageDesc, StateOn, Submit,
-    TimelinePoint, WriteMask,
+    BufferTransition, BufferUsage, CacheStart, ColourAttachment, ColourTargetDesc, ComputePass,
+    ComputePipelineDesc, ComputePipelineHandle, Constant, ConstantValue, CookedShader, Cull,
+    Device, DeviceRequest, Encoder, Extent, Format, GraphicsPipelineDesc, ImageDesc, ImageMemory,
+    ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryClass, PassReach, QueueRole,
+    Rect, RenderPass, Sharing, StageDesc, StateOn, Store, Submit, Target, TimelinePoint, WriteMask,
 };
 use lactose_rhi_vulkan::VulkanDevice;
 
@@ -213,6 +214,78 @@ fn canary_synchronisation_validation_reports_a_race() {
     run(&device, encoder);
     drop(device);
     heard_alone(&sink, "SYNC-HAZARD-WRITE-AFTER-WRITE");
+}
+
+/// The canary of synchronisation validation's load-after-store check
+/// (`syncval_load_op_after_store_op_validation`, verification row 211): a colour target
+/// stored by one render pass and kept by the next with no transition between them, a breach
+/// of the "Null alone" column. The layer reports a load after a store between two render pass
+/// instances only with the setting on.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn canary_load_after_store_validation_reports_a_kept_target() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    let image = device
+        .create_image(&ImageDesc {
+            label: "canary",
+            format: Format::Rgba8Unorm,
+            extent: Extent { width: 4, height: 4 },
+            mips: 1,
+            layers: 1,
+            usage: ImageUsage::COLOUR,
+            memory: ImageMemory::Own,
+            sharing: Sharing::Exclusive,
+        })
+        .expect("an image");
+    let mut encoder = device.create_encoder(QueueRole::Graphics, "canary").expect("an encoder");
+    encoder.transition_images(&[ImageTransition {
+        image,
+        range: ImageRange::FIRST,
+        from: StateOn { state: ImageState::Undefined, queue: QueueRole::Graphics },
+        to: StateOn { state: ImageState::ColourAttachment, queue: QueueRole::Graphics },
+    }]);
+    let target = Target { image, mip: 0, layer: 0 };
+    for load in [Load::Clear([0.0; 4]), Load::Keep] {
+        let colour = [ColourAttachment { target, load, store: Store::Store, local_read: false }];
+        encoder.begin_render_pass(&RenderPass {
+            label: "canary",
+            colour: &colour,
+            depth: None,
+            reach: PassReach::NOTHING,
+        });
+        encoder.end_pass();
+    }
+    run(&device, encoder);
+    drop(device);
+    heard_alone(&sink, LOAD_AFTER_STORE_CANARY);
+}
+
+/// What the load-after-store canary must say.
+const LOAD_AFTER_STORE_CANARY: &str = "SYNC-HAZARD-READ-AFTER-WRITE";
+
+/// A compute stage whose workgroup is not its module's `LocalSize` is refused before the
+/// driver sees it, since Vulkan dispatches workgroups of the module's size alone; the same
+/// stage of its module's size is made.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn workgroup_other_than_the_modules_is_refused() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    let shader = suite_shader("workgroup.cs_main").expect("the suite's cooked shaders");
+    assert_eq!(shader.workgroup, Some([8, 4, 2]), "workgroup.slang's size");
+    let make = |shader: &CookedShader| {
+        let stage = StageDesc { shader, constants: &[] };
+        device.create_compute_pipeline(&ComputePipelineDesc { label: "device", stage })
+    };
+    for other in [[4, 4, 2], [8, 4, 1], [2, 8, 2]] {
+        let shader = CookedShader { workgroup: Some(other), ..shader.clone() };
+        let refused = make(&shader).expect_err("a workgroup other than the module's");
+        assert_eq!(refused.kind(), ErrorKind::InvalidData, "{refused}");
+    }
+    make(&shader).expect("the module's own workgroup");
+    drop(device);
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
 }
 
 /// A device's cache start from `bytes`.

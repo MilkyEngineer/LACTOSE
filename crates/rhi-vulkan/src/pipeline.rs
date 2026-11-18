@@ -12,8 +12,8 @@ use ash::vk;
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::{
     CacheIdentity, CacheStart, Capabilities, ComputePipelineDesc, ConstantValue,
-    GraphicsPipelineDesc, HEAP_SET, HeapArrayKind, PUSH_BYTES_MAX, PipelineStats, Rule,
-    ShaderStage, ShaderTarget, StageDesc, WriteMask, open_cache, seal_cache,
+    GraphicsPipelineDesc, HeapArrayKind, PipelineStats, Rule, ShaderStage, ShaderTarget, StageDesc,
+    WriteMask, check_varyings, open_cache, seal_cache,
 };
 
 use crate::convert;
@@ -24,9 +24,17 @@ use crate::raw::{Raw, driver};
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 /// The SPIR-V versions a module may declare: 1.0 to 1.6.
 const SPIRV_VERSIONS: core::ops::RangeInclusive<u32> = 0x0001_0000..=0x0001_0600;
-/// `OpExtension` and `OpCapability`.
+/// `OpExtension`, `OpEntryPoint`, `OpExecutionMode`, `OpCapability` and `OpDecorate`.
 const OP_EXTENSION: u32 = 10;
+const OP_ENTRY_POINT: u32 = 15;
+const OP_EXECUTION_MODE: u32 = 16;
 const OP_CAPABILITY: u32 = 17;
+const OP_DECORATE: u32 = 71;
+/// The execution mode `LocalSize`, the decoration `BuiltIn` and the built-in
+/// `WorkgroupSize`.
+const LOCAL_SIZE: u32 = 17;
+const BUILT_IN: u32 = 11;
+const WORKGROUP_SIZE: u32 = 25;
 /// The capabilities the required set enables (`lactose-rhi-api`'s README, "Pipelines and
 /// the cooked shader format"): `Shader`, `Int64`, `InputAttachment`,
 /// `StorageImageReadWithoutFormat`, `ShaderNonUniform`,
@@ -137,7 +145,8 @@ struct Stage {
 }
 
 /// Checks a stage against the contract and the device, and returns it as the driver takes
-/// it.
+/// it. The cooked format's own rules come first ([`CookedShader::check`](lactose_rhi_api::CookedShader::check)): nothing of a stage
+/// that breaks them reaches the driver.
 fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Result<Stage> {
     let shader = desc.shader;
     if shader.target != ShaderTarget::SpirV {
@@ -149,7 +158,17 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
     if shader.stage != place {
         return Err(invalid(format!("a {:?} shader as the {place:?} stage", shader.stage)));
     }
-    let words = module(caps, &shader.code)?;
+    shader.check()?;
+    let module = module(&shader.code, caps.buffer_atomics_64)?;
+    if let Some(size) = shader.workgroup {
+        let stated = module.workgroup(&shader.entry);
+        if stated != Some(size) {
+            return Err(invalid(format!(
+                "a compute stage of workgroup {size:?} whose module states {stated:?} for `{}`",
+                shader.entry
+            )));
+        }
+    }
     let mut entries = Vec::with_capacity(desc.constants.len());
     let mut data = Vec::with_capacity(desc.constants.len() * 4);
     for (at, constant) in desc.constants.iter().enumerate() {
@@ -165,23 +184,14 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
         if desc.constants[..at].iter().any(|other| other.id == constant.id) {
             return Err(invalid(format!("a constant {} given twice", constant.id)));
         }
-        let value = match constant.value {
-            ConstantValue::Bool(value) => vk::Bool32::from(value).to_le_bytes(),
-            ConstantValue::Int(value) => value.to_le_bytes(),
-            ConstantValue::Uint(value) => value.to_le_bytes(),
-            ConstantValue::Float(value) => value.to_le_bytes(),
-        };
         entries.push(vk::SpecializationMapEntry {
             constant_id: constant.id,
             offset: u32::try_from(data.len()).unwrap_or(u32::MAX),
             size: 4,
         });
-        data.extend_from_slice(&value);
+        data.extend_from_slice(&specialisation(constant.value));
     }
     if let Some(heap) = &shader.heap {
-        if heap.set != HEAP_SET {
-            return Err(invalid(format!("a heap in set {}, not {HEAP_SET}", heap.set)));
-        }
         for array in &heap.arrays {
             let capacity = match array.kind {
                 HeapArrayKind::SampledImage2d => caps.heap_slots,
@@ -195,17 +205,62 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
             }
         }
     }
-    if shader.push_bytes > PUSH_BYTES_MAX {
-        return Err(invalid(format!("a push-constant block of {} bytes", shader.push_bytes)));
-    }
     let entry = std::ffi::CString::new(shader.entry.as_str())
         .map_err(|_| invalid("an entry point's name with a zero byte"))?;
-    Ok(Stage { words, entry, entries, data })
+    Ok(Stage { words: module.words, entry, entries, data })
+}
+
+/// A constant's specialisation data: four little-endian bytes, a `Bool` widened to a
+/// `VkBool32` of 0 or 1, since a map entry is of its constant's size and a boolean's is
+/// `sizeof(VkBool32)` (VUID-VkSpecializationMapEntry-constantID-00776).
+fn specialisation(value: ConstantValue) -> [u8; 4] {
+    match value {
+        ConstantValue::Bool(value) => vk::Bool32::from(value).to_le_bytes(),
+        ConstantValue::Int(value) => value.to_le_bytes(),
+        ConstantValue::Uint(value) => value.to_le_bytes(),
+        ConstantValue::Float(value) => value.to_le_bytes(),
+    }
+}
+
+/// A checked SPIR-V module: its words, and what its entry points state of their workgroups.
+struct Module {
+    words: Vec<u32>,
+    /// Each entry point's name and id.
+    entries: Vec<(Vec<u8>, u32)>,
+    /// Each `OpExecutionMode LocalSize`: the entry point's id and its three sizes.
+    local_sizes: Vec<(u32, [u32; 3])>,
+    /// Whether an id is decorated `BuiltIn WorkgroupSize`, which sets the workgroup in place
+    /// of `LocalSize`.
+    workgroup_builtin: bool,
+}
+
+impl Module {
+    /// The workgroup the module states for `entry`: its one `LocalSize`, and `None` where it
+    /// has none, more than one, or a `BuiltIn WorkgroupSize` overrides it.
+    fn workgroup(&self, entry: &str) -> Option<[u32; 3]> {
+        if self.workgroup_builtin {
+            return None;
+        }
+        let mut ids = self.entries.iter().filter(|(name, _)| name == entry.as_bytes());
+        let (_, id) = ids.next()?;
+        let mut sizes = self.local_sizes.iter().filter(|(of, _)| of == id);
+        match (sizes.next(), sizes.next()) {
+            (Some(&(_, size)), None) => Some(size),
+            _ => None,
+        }
+    }
+}
+
+/// The bytes of a SPIR-V literal string, up to its first zero byte.
+fn literal(operands: &[u32]) -> Vec<u8> {
+    let bytes: Vec<u8> = operands.iter().flat_map(|word| word.to_le_bytes()).collect();
+    bytes.split(|&byte| byte == 0).next().unwrap_or_default().to_vec()
 }
 
 /// Checks a SPIR-V module's header, and its capabilities and extensions against those the
-/// device enabled; returns its words.
-fn module(caps: &Capabilities, code: &[u8]) -> Result<Vec<u32>> {
+/// device enabled, `Int64Atomics` where `int64_atomics`; returns its words with what its
+/// entry points state of their workgroups.
+fn module(code: &[u8], int64_atomics: bool) -> Result<Module> {
     if !code.len().is_multiple_of(4) || code.len() < 20 {
         return Err(invalid("a SPIR-V module that is not whole words, or shorter than its header"));
     }
@@ -217,6 +272,9 @@ fn module(caps: &Capabilities, code: &[u8]) -> Result<Vec<u32>> {
     if !SPIRV_VERSIONS.contains(&words[1]) {
         return Err(invalid(format!("a SPIR-V module of version {:#x}", words[1])));
     }
+    let mut entries = Vec::new();
+    let mut local_sizes = Vec::new();
+    let mut workgroup_builtin = false;
     let mut at = 5;
     while at < words.len() {
         let count = (words[at] >> 16) as usize;
@@ -225,32 +283,34 @@ fn module(caps: &Capabilities, code: &[u8]) -> Result<Vec<u32>> {
             return Err(invalid("a SPIR-V instruction whose word count leaves the module"));
         }
         let operands = &words[at + 1..at + count];
-        match opcode {
-            OP_CAPABILITY => {
+        match (opcode, operands) {
+            (OP_CAPABILITY, _) => {
                 let capability = operands.first().copied().unwrap_or(u32::MAX);
-                let enabled = ENABLED.contains(&capability)
-                    || (capability == INT64_ATOMICS && caps.buffer_atomics_64);
+                let enabled =
+                    ENABLED.contains(&capability) || (capability == INT64_ATOMICS && int64_atomics);
                 if !enabled {
                     return Err(Rule::Capability.refuse(format!(
                         "a module that declares capability {capability}, which the device did not enable"
                     )));
                 }
             }
-            OP_EXTENSION => {
-                let bytes: Vec<u8> = operands.iter().flat_map(|word| word.to_le_bytes()).collect();
-                let name = bytes.split(|&byte| byte == 0).next().unwrap_or_default();
+            (OP_EXTENSION, _) => {
+                let name = literal(operands);
                 if name != EXTENSION.as_bytes() {
                     return Err(Rule::Capability.refuse(format!(
                         "a module that names extension {}, which the device did not enable",
-                        String::from_utf8_lossy(name)
+                        String::from_utf8_lossy(&name)
                     )));
                 }
             }
+            (OP_ENTRY_POINT, [_, id, name @ ..]) => entries.push((literal(name), *id)),
+            (OP_EXECUTION_MODE, &[id, LOCAL_SIZE, x, y, z]) => local_sizes.push((id, [x, y, z])),
+            (OP_DECORATE, &[_, BUILT_IN, WORKGROUP_SIZE]) => workgroup_builtin = true,
             _ => {}
         }
         at += count;
     }
-    Ok(words)
+    Ok(Module { words, entries, local_sizes, workgroup_builtin })
 }
 
 /// Shader modules made for one creation, destroyed when it ends however it ends.
@@ -307,6 +367,9 @@ pub(crate) fn graphics(
         .as_ref()
         .map(|fragment| stage(caps, fragment, ShaderStage::Fragment))
         .transpose()?;
+    if let Some(fragment) = &desc.fragment {
+        check_varyings(desc.vertex.shader, fragment.shader)?;
+    }
     let (inputs, outputs) =
         desc.fragment.map_or((0, 0), |fragment| (fragment.shader.inputs, fragment.shader.outputs));
     if desc.colour.len() > caps.colour_attachments as usize {
@@ -478,4 +541,78 @@ pub(crate) fn compute(
     drop(modules);
     let (hits, misses) = feedback(&stage_feedback);
     Ok((ComputeObj { raw: Arc::clone(&shared.raw), pipeline }, hits, misses))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A SPIR-V 1.0 module declaring `Shader`, whose entry points are `entries`, each a
+    /// name and an id, with `rest` after them: execution modes and decorations, each an
+    /// opcode and its operands.
+    fn words(entries: &[(&str, u32)], rest: &[(u32, &[u32])]) -> Vec<u8> {
+        let mut words = vec![SPIRV_MAGIC, 0x0001_0000, 0, 16, 0];
+        let mut op = |code: u32, operands: &[u32]| {
+            words.push(((operands.len() as u32 + 1) << 16) | code);
+            words.extend_from_slice(operands);
+        };
+        op(OP_CAPABILITY, &[1]);
+        for &(name, id) in entries {
+            let mut bytes = name.as_bytes().to_vec();
+            bytes.resize((bytes.len() / 4 + 1) * 4, 0);
+            let mut operands = vec![5, id];
+            operands.extend(bytes.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word)));
+            op(OP_ENTRY_POINT, &operands);
+        }
+        for &(code, operands) in rest {
+            op(code, operands);
+        }
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// The workgroup a module of `entries` and `rest` states for `entry`.
+    fn stated(entries: &[(&str, u32)], rest: &[(u32, &[u32])], entry: &str) -> Option<[u32; 3]> {
+        module(&words(entries, rest), false).expect("a module").workgroup(entry)
+    }
+
+    #[test]
+    fn the_workgroup_is_the_entrys_one_local_size() {
+        let two = [("cs_main", 3), ("cs_other", 4)];
+        let sizes: [(u32, &[u32]); 2] = [
+            (OP_EXECUTION_MODE, &[4, LOCAL_SIZE, 2, 2, 2]),
+            (OP_EXECUTION_MODE, &[3, LOCAL_SIZE, 8, 4, 2]),
+        ];
+        assert_eq!(stated(&two, &sizes, "cs_main"), Some([8, 4, 2]));
+        assert_eq!(stated(&two, &sizes, "cs_other"), Some([2, 2, 2]));
+        assert_eq!(stated(&two, &sizes, "main"), None, "an entry the module does not have");
+    }
+
+    #[test]
+    fn no_size_two_sizes_or_the_built_in_state_no_workgroup() {
+        let one = [("main", 3)];
+        let local: (u32, &[u32]) = (OP_EXECUTION_MODE, &[3, LOCAL_SIZE, 1, 1, 1]);
+        assert_eq!(stated(&one, &[], "main"), None, "no LocalSize");
+        // `LocalSizeId` (38), whose sizes are ids, through `OpExecutionModeId` (331).
+        assert_eq!(stated(&one, &[(331, &[3, 38, 9, 9, 9])], "main"), None, "LocalSizeId");
+        assert_eq!(stated(&one, &[local, local], "main"), None, "two LocalSize modes");
+        let built_in: (u32, &[u32]) = (OP_DECORATE, &[7, BUILT_IN, WORKGROUP_SIZE]);
+        assert_eq!(stated(&one, &[local, built_in], "main"), None, "BuiltIn WorkgroupSize");
+        assert_eq!(stated(&one, &[local], "main"), Some([1, 1, 1]));
+    }
+
+    #[test]
+    fn int64_atomics_is_refused_unless_enabled() {
+        let code = words(&[("main", 3)], &[(OP_CAPABILITY, &[INT64_ATOMICS])]);
+        assert!(module(&code, false).is_err());
+        assert!(module(&code, true).is_ok());
+    }
+
+    #[test]
+    fn a_bool_is_widened_to_a_vk_bool32() {
+        assert_eq!(specialisation(ConstantValue::Bool(true)), [1, 0, 0, 0]);
+        assert_eq!(specialisation(ConstantValue::Bool(false)), [0; 4]);
+        assert_eq!(specialisation(ConstantValue::Int(-3)), (-3i32).to_le_bytes());
+        assert_eq!(specialisation(ConstantValue::Uint(7)), [7, 0, 0, 0]);
+        assert_eq!(specialisation(ConstantValue::Float(1.5)), 1.5f32.to_le_bytes());
+    }
 }

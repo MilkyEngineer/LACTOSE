@@ -181,6 +181,10 @@ impl Validators {
             Self::Plain => &[
                 ("device::canary_core_validation_reports_a_wrong_layout", &[CORE]),
                 ("device::canary_synchronisation_validation_reports_a_race", &[SYNC]),
+                (
+                    "device::canary_load_after_store_validation_reports_a_kept_target",
+                    &["SYNC-HAZARD-READ-AFTER-WRITE"],
+                ),
                 ("conformance::each_validator_reports_its_canary", &[CORE, SYNC]),
             ],
             Self::GpuAssisted => &[(
@@ -662,5 +666,23 @@ mod tests {
         assert!(is_canary("device::canary_core_validation_reports_a_wrong_layout"));
         assert!(is_canary("device::canary_gpu_assisted_validation_reports_a_read_past_a_buffer"));
         assert!(!is_canary("device::device_buffer_is_filled_through_a_staging_copy"));
+    }
+
+    /// A device test named as a canary that no run lists would be judged as a test that must
+    /// send nothing, and fail every run.
+    #[test]
+    fn every_canary_the_device_tests_name_is_listed() {
+        let tests =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/rhi-vulkan/tests/device.rs");
+        let source = fs::read_to_string(&tests).expect("rhi-vulkan's device tests");
+        let named: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("fn canary_"))
+            .filter_map(|rest| rest.split('(').next())
+            .collect();
+        assert_eq!(named.len(), 4, "{named:?}");
+        for name in named {
+            assert!(is_canary(&format!("device::canary_{name}")), "canary_{name} is in no list");
+        }
     }
 }

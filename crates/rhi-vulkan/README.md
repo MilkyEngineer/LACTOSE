@@ -57,11 +57,21 @@ contract leaves to the backend.
   updated after bind, with a placeholder image in each empty slot and a placeholder sampler in
   each free entry, so a slot is never unbound. A slot write and a sampler's free are the
   contract's two holds, under the heap's lock.
-- **Pipelines** are made from cooked SPIR-V (`CookedShader` version 1) with its specialisation
-  constants, one stage module per creation, through one pipeline cache. Before the driver sees
-  a module, its header is checked and its `OpCapability` and `OpExtension` instructions are
-  compared with what the device enabled (`capability`). Each creation asks the driver for its
-  creation feedback; a stage the driver marks as an application cache hit counts as a hit in
+- **Pipelines** are made from cooked SPIR-V (`CookedShader` version 2), one stage module per
+  creation, through one pipeline cache. Before the driver sees a stage, `CookedShader::check`
+  holds it to the format's rules and, for a graphics pipeline, `check_varyings` holds the
+  fragment stage's reads to the vertex stage's writes: the layer reports nothing for a `uint`
+  varying read as an `int` on MoltenVK or KosmicKrisp (the GPU review of `shader-format`), so
+  the format's refusal is the only guard. The module's header is checked and its `OpCapability` and `OpExtension` instructions
+  are compared with what the device enabled (`capability`). Each given constant is one
+  four-byte map entry of its specialisation data, its `ConstantValue` of its slot's type, a
+  `Bool` widened to a `VkBool32` of 0 or 1 (VUID-VkSpecializationMapEntry-constantID-00776);
+  an unwidened one-byte `Bool` reads back right on both Apple drivers, so the layer's message
+  is what shows it. Vulkan runs a compute stage's workgroups at its module's size, so a stage
+  whose `workgroup` is not the one `OpExecutionMode LocalSize` its module states for its entry
+  point is refused `InvalidData`, as is one whose module states none, states two, or decorates
+  an id `BuiltIn WorkgroupSize`. Each creation asks the driver for its creation feedback; a
+  stage the driver marks as an application cache hit counts as a hit in
   `pipeline_cache_stats`.
 - **The pipeline cache** is sealed with `lactose-rhi-api`'s seal under the vendor, the device
   and the driver's cache UUID. Where the sealed bytes are kept is the caller's. A payload that fails the seal, whose Vulkan header names
@@ -108,13 +118,17 @@ process of its own, under the pinned Khronos validation layer, by decision 5.10'
   output cases read their shaders from `$LACTOSE_GPU_SHADERS`, which `cargo xtask gpu` cooks.
 - `tests/device.rs`: the device's facts, sent nothing when clean; a device-only buffer filled
   through a staging copy and read back through a copy; the engine's shader,
-  `shaders/surface.slang` as cooked, making its two pipelines, not run; each validator's canary, a misuse whose
-  message alone the run must hear (core: an image declared in a state it is not in;
-  synchronisation: two copies into one range; GPU-assisted: a shader's read past a buffer, run
-  by `--gpu-assisted` alone); a cache that fails a check (a corrupt payload, a truncated file,
+  `shaders/surface.slang` as cooked, making its two pipelines, not run; a compute stage whose
+  workgroup is not its module's, refused; each validator's canary, a misuse whose message
+  alone the run must hear (core: an image declared in a state it is not in; synchronisation:
+  two copies into one range; synchronisation's load-after-store check: a target stored by one
+  render pass and kept by the next with no transition; GPU-assisted: a shader's read past a
+  buffer, run by `--gpu-assisted` alone); a cache that fails a check (a corrupt payload, a truncated file,
   a wrong checksum, a stale header) starting empty; and a cache whose directory cannot be
   written, which the run reports and goes past.
-- Unit tests in `src/convert.rs`: the re-take from `Undefined`, the transfer within a family
+- Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, a
+  `Bool` widened to four bytes and `Int64Atomics` refused unless enabled. In
+  `src/convert.rs`: the re-take from `Undefined`, the transfer within a family
   as one layout change, the transfer between families as a release and an acquire of equal
   values, a family without `GRAPHICS`, and two writes in one writing state.
 

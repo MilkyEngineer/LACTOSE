@@ -713,15 +713,20 @@ driver selects a Vulkan loader's environment and the Metal step uses none.
      no message about a call.
 5. The run's canaries go first, each in its own process: core validation's (an image
    declared in a state it is not in, `VUID-vkCmdDraw-None-09600`), synchronisation
-   validation's (two copies into one range, `SYNC-HAZARD-WRITE-AFTER-WRITE`) and the suite's
-   `each_validator_reports_its_canary`, which provokes both; with `--gpu-assisted`, GPU-assisted
+   validation's (two copies into one range, `SYNC-HAZARD-WRITE-AFTER-WRITE`), its check of a
+   load after a store (a target stored by one render pass and kept by the next with no
+   transition, `SYNC-HAZARD-READ-AFTER-WRITE`, which the layer sends only with
+   `syncval_load_op_after_store_op_validation` on) and the suite's
+   `each_validator_reports_its_canary`, which provokes the first two; with `--gpu-assisted`, GPU-assisted
    validation's alone (a shader's read past a buffer through its address,
    `VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819`). A canary passes when its test passes
    and every message it sent is one of its identifiers, each heard. Every other test passes
    when it passes, its sinks printed no message and the driver wrote no line of its errors or
    warnings: MoltenVK's `[mvk-error]` and `[mvk-warn]`, Mesa's `MESA: error`, `MESA: warning`
    and any `WARNING: ` line. Thread-safety validation has no canary: an encoder is recorded
-   through `&mut` and a queue is submitted to under its lock, so no safe call can race one.
+   through `&mut` and a queue is submitted to under its lock, so no safe call can race one,
+   and a race made below the contract would be heard only when the two calls overlap in time,
+   which no test can make certain.
 6. It writes `target/gpu/<driver>-vulkan.txt`, or `<driver>-vulkan-gpu-assisted.txt`: the
    driver, the shaders' Slang, the layer, every variable it set, the canaries heard, the
    device's `DeviceInfo` and `Capabilities`, and each test with `passed`, the suite's

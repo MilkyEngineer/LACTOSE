@@ -119,4 +119,6 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
 
 The thread-safety validator of the Khronos layer has no canary: a safe call cannot race a
 command buffer or a queue, so no test provokes the misuse that would show the validator live.
-Its setting is recorded in each run's report with the others.
+A race made below the contract, through `ash`, would be heard only when the two calls are
+inside the layer at the same instant, which no test can make certain. Its setting is recorded
+in each run's report with the others.

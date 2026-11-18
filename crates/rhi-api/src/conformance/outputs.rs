@@ -1388,25 +1388,39 @@ fn ownership_transfer_keeps_the_contents(ctx: &Ctx<'_>) -> Applies {
 
 fn retake_after_a_store_on_one_queue_is_clean(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
-    let image = target(ctx, &*device);
     let pipeline = simple(ctx, &*device, "fill");
-    let mut stores = ctx.encoder(&*device, G);
-    cleared(&mut *stores, image, [0.0; 4], PassReach::NOTHING);
-    fill(&mut *stores, pipeline, [1, 2, 3, 4]);
-    stores.end_pass();
+    let stores = |image: ImageHandle| {
+        let mut encoder = ctx.encoder(&*device, G);
+        cleared(&mut *encoder, image, [0.0; 4], PassReach::NOTHING);
+        fill(&mut *encoder, pipeline, [1, 2, 3, 4]);
+        encoder.end_pass();
+        encoder
+    };
+    let retakes = |image: ImageHandle| {
+        let mut encoder = ctx.encoder(&*device, G);
+        cleared(&mut *encoder, image, colour([200, 100, 50, 25]), PassReach::NOTHING);
+        encoder.end_pass();
+        let out = image_out(ctx, &*device, &mut *encoder, image, ImageState::ColourAttachment);
+        (encoder, out)
+    };
     // A later submit on the same queue, with no wait: the take from `Undefined` orders its
     // clear after the store.
+    let image = target(ctx, &*device);
     let first = ctx.point(&*device, 1);
-    ctx.submit(&*device, G, &mut [stores], &[], &[first]);
-    let mut retakes = ctx.encoder(&*device, G);
-    cleared(&mut *retakes, image, colour([200, 100, 50, 25]), PassReach::NOTHING);
-    retakes.end_pass();
-    let out = image_out(ctx, &*device, &mut *retakes, image, ImageState::ColourAttachment);
-    run(ctx, &*device, G, &mut [retakes]);
+    ctx.submit(&*device, G, &mut [stores(image)], &[], &[first]);
+    let (encoder, later) = retakes(image);
+    run(ctx, &*device, G, &mut [encoder]);
     ctx.reached(&*device, first);
-    compare(ctx, &pixels(ctx, &*device, out), "the clear of the retake", |_, _| {
-        Some([200, 100, 50, 25])
-    });
+    // The same in one submit of the two encoders, which synchronisation validation checks
+    // whatever the host has seen complete: a narrower source scope is a write after a write.
+    let image = target(ctx, &*device);
+    let stored = stores(image);
+    let (encoder, one) = retakes(image);
+    run(ctx, &*device, G, &mut [stored, encoder]);
+    for (out, what) in [(later, "the clear of the later submit"), (one, "the clear in one submit")]
+    {
+        compare(ctx, &pixels(ctx, &*device, out), what, |_, _| Some([200, 100, 50, 25]));
+    }
     Ok(())
 }
 
