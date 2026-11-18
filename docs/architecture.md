@@ -1063,11 +1063,12 @@ lacks them.
 
 ### 12.3 Render graph
 
-- Passes declare reads and writes with usage. The graph derives order, culls unreachable
-  passes, computes transient lifetimes, aliases memory, inserts transitions and assigns queues.
-- Compile is cached by a hash of pass list, edges, resource descriptors, imported initial
-  states, view count and queue configuration. History resources use a ping-pong primitive. The
-  cache is capped.
+- Passes declare reads and writes with usage, in graph order. The graph derives the edges
+  between them from those uses and keeps that order, culls unreachable passes, computes
+  transient lifetimes, aliases memory, inserts transitions and assigns queues.
+- Compile is cached by a hash of pass list, edges, resource descriptors, the states imports
+  arrive and leave in, view count and queue configuration. History resources use a ping-pong
+  primitive. The cache is capped.
 - Each pass records on a frame-critical worker. Submission order is graph order.
 - Async compute is chosen by the graph when a pass has no graphics-queue dependency inside
   its lifetime window.

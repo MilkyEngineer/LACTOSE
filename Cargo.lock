@@ -709,6 +709,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-render-graph"
+version = "0.0.0"
+dependencies = [
+ "lactose-core",
+ "lactose-rhi-api",
+ "lactose-task",
+]
+
+[[package]]
 name = "lactose-rhi-api"
 version = "0.0.0"
 dependencies = [

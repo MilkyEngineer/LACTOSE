@@ -7511,6 +7511,179 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   be `Send`", since the state a present thread owns is `Send` and is moved onto it;
   `crates/app/README.md`'s "`app-client` passes the platform crate's instance at milestone 4".
 
+**D160. `lactose-render-graph`'s facade: a frame is declared afresh in graph order, a plan names no handle, an import states both its ends, a recording job owns its encoder and its recorders, and the crate takes no lock** (§3, §5.3, §12.3, `lactose-render-graph`, `crates/rhi-api/README.md`, `crates/task/README.md`)
+- Why: section 12.3 fixes what the graph derives and what its cache hashes, and the milestone 2
+  plan's row `graph` fixes its scope. They leave open how a pass is declared, what an import
+  says, whose the transients are, what a recorder may touch, what recording jobs share, and what
+  "inside its lifetime window" means. The facade settles each for the lanes written against it:
+  `graph-impl`, `renderer` and `frame-design`.
+  - *A frame is a value declared afresh, and the graph is three calls.* `FrameDecl` borrows no
+    graph and reaches no device. `compile`, `record` and `submit` each consume what the one
+    before returned, and the latch is the caller's write through the device between `record` and
+    `submit`. `RenderGraph` and `RecordedFrame` are `Send + Sync + 'static`, so they wait in a
+    world's resource or behind the `dyn` object `lactose-app` drives (decision 5.11). Rules out
+    a retained graph edited in place, a builder that borrows the graph, a latch call or a camera
+    type in this crate, and one call that records and submits.
+  - *A declaration and a plan name ids, and handles stay in the declaration.* An id is a number
+    in declaration order. The key hashes no handle, no `ready` point, no clear value, no slot
+    list and no recorder, so a frame that draws into another target, and a history's swap,
+    compile to the plan the last frame used, and a hit makes nothing on the device. The key
+    hashes each use under the list it is declared in, and a hit compares what was hashed, so a
+    collision compiles again and two declarations that differ only in a use's list never share a
+    plan. The cache holds `GraphDesc::plans` plans and evicts the one least recently returned.
+    The view count is hashed by itself and instances nothing: the caller declares each view's
+    passes. Rules out a plan for each handle, a hit decided by the hash alone, and a cache
+    without a cap.
+  - *Declaration order is graph order.* A pass sees each resource as the passes declared before
+    it left it, and every write is taken as partial. The edges the graph derives therefore all
+    point forward, their stable topological order is declaration order, and the graph leaves out
+    the culled passes and moves none. Section 3's "Declare access, never order" binds systems,
+    whose registration order is accidental and whose order the scheduler derives; a frame's
+    declaration is one caller's deliberate sequence, the order a pass is declared in is the
+    order its uses are read in, and the edges are still derived from access alone, with a
+    renderer that declares from a map declaring in key order. Rules out resource versions,
+    ordering constraints between passes, a declaration in which a reader comes before its
+    writer, and, at milestone 2, a compile that reorders independent passes.
+  - *A use is a state.* A pass declares attachments, sampled imports, buffers by access and copy
+    sides. The graph tracks one state for a whole image and one access of a buffer in a pass,
+    and derives every transition, the same-state one between two writers across a frame's edge
+    included, where an import's first use in the frame is in the writing state its `initial`
+    names, both halves of a transfer, each attachment's store action, and the `PassReach` of
+    D158: the declaration's slots as given, and each buffer declared read or written with its
+    exact state. An index or an indirect buffer is brought to its state and is not in the reach.
+    The heap is the caller's. Rules out a pass that names a state, a transition or a
+    `PassReach`, a state for each subresource at milestone 2, and a graph that writes heap
+    slots.
+  - *A pass is kept when it writes an import, or a transient a kept pass later uses.* A readback
+    is a buffer import that ends in `HostRead`. Rules out a flag that exempts a pass from
+    culling, and culling by whether anything reads an import.
+  - *An import states both its ends.* `initial` is the caller's word, which null checks. `last`
+    is reached whether or not a pass used the import. `handoff` says where a user that is not
+    the graph takes the image next, and the graph records the release half where that is a
+    transfer. `ready` is a point for a use the graph did not make, which every submit of the
+    frame that names the import waits for, not the first alone; a wait for a point already
+    reached costs no GPU wait. A buffer imported from `Undefined` keeps its bytes on the queue
+    `initial` names. An import is never an image made with a memoryless request, since every
+    import's attachments are stored. The graph orders its own frames, since it alone knows which
+    queue a pass ran on: each submit that uses an import another queue's submit, of the frame or
+    an earlier one, wrote or changed the state or owner of waits for a point that submit, or a
+    later submit to its queue, signals, a `sampled` import counted as a use, and so does a
+    submit that changes an import another queue's submit of an earlier frame used. That wait
+    orders an `Exclusive` image imported from `Undefined`, which moves to another queue with no
+    transfer, as it orders a `Concurrent` import. A heap slot holding an image the frame does
+    not declare has no pending write or change by another queue, or the image is declared in
+    `sampled`. A target released toward the present role and taken back from `Undefined` by a
+    later frame is accepted whether or not the present thread acquired it, since a transition
+    from `Undefined` ends a release no acquire met and leaves the contents undefined, a buffer's
+    as an image's; null ends the release already, and rhi-api's "States" gains the sentence
+    through the `rhi-null` lane under decision 5.13. Rules out a graph that tracks an import's
+    state from frame to frame by handle, a graph that records on another thread's encoder, a
+    `ready` point waited for by one submit of the frame alone, and an import the frame leaves
+    wherever its last pass put it.
+  - *A transient is an image of its plan.* It is made on the miss that compiles the plan,
+    destroyed after the plan is evicted and its last frame has completed, and undefined when
+    each frame begins. Its memory is the plan's choice: memoryless only where the device reports
+    the request honoured and the image is one pass's attachment; else placed by first fit in the
+    plan's blocks, with the alias call recorded every frame; else memory of its own. A transient
+    is never sampled and never leaves the graphics queue. The graph does not judge a read before
+    the first write: null refuses it (`undefined-read`), and a graph that takes every write as
+    partial cannot tell. Rules out a pool of transients shared between plans, transient buffers,
+    a transient in a heap slot before the bindless heap exists (milestone 3), and a second
+    undefined-read rule beside null's.
+  - *The window of section 12.3 is the frame.* On a device whose compute role has a queue of its
+    own, a compute pass runs there when it shares no resource with a graphics-role pass of the
+    frame, a `Concurrent` import excepted that neither pass writes and both need in the state
+    its `initial` names, so that no transition of it falls inside the frame before both uses.
+    What crosses frames is an import's `initial` and `last`, a transfer at the frame's edge.
+    Render and copy passes are the graphics role's, and the graph never submits to the present
+    role. The wait under another queue's write or change binds `graph-impl` with no rule of
+    null's behind it until `rhi-api` amends `no-qfot` to refuse a use under another queue's
+    pending write or change of state or owner, an amendment the `rhi-null` lane makes under
+    decision 5.13, and the facade stands without that amendment. Rules out a pass that chooses
+    its queue, compute-queue work whose output a graphics pass reads in the same frame, and a
+    `Concurrent` resource changed on one queue and then used on another with no wait between.
+  - *A frame's submits are the runs of graph order by queue, and it has one point.* A frame
+    whose commands are all for one queue is one `Device::submit`, so a refusal there changes
+    nothing. The point is a value of one timeline of the graph's, signalled by the frame's last
+    submit, which waits for each submit the graph made to another queue since its last
+    frame-point submit, and for that submit's point where it is on another queue, and a point
+    reached covers every earlier frame. One point a frame makes the last submit wait for the
+    frame's compute work, so at milestone 2 no compute work overlaps graphics across the frame's
+    end; a trailing submit with no encoder that signals the point is a later milestone's.
+    `submit` waits for nothing and returns a device's error unchanged, so `Rule::of` names the
+    rule. An error after the frame's first submit leaves the frame torn, and the error does not
+    say which submit failed, so the caller takes every error as torn: it imports the frame's
+    imports next from `Undefined` and resets each `History` the frame imported. A torn frame's
+    planned last submit is never made, so the graph's next `submit` first makes it in the torn
+    frame's place with no encoders, to the queue it was planned for: it waits as that submit
+    would have, for each submit the torn frame made to another queue and for the last frame
+    point where another queue signalled it, and signals the torn frame's point, which is then
+    reached like any other and waited for by the ordinary rules; the torn frame's encoders and
+    plan are held until it is seen reached. Where that submit is refused, the new frame is not
+    submitted, the graph is as before, still owing it, and the caller has the error. A drop
+    after a torn frame with no `submit` since makes it, then waits as a drop does, but not while
+    the thread unwinds. `submit` still waits for nothing: that submit waits on the device's
+    queue. Rules out a point for each import or each queue at milestone 2, a retry of a failed
+    submit inside the graph, a wait in `submit`, an error type that tells a torn frame from a
+    refused one, a point that is never signalled, and a wait for a point that nothing signals.
+  - *A recording job owns its encoder and the recorders of its passes.* `record` forks the jobs
+    in one scope of the caller's `JobContext`; each is a run of consecutive passes, at most
+    `GraphDesc::jobs` a submit. A recorder is `FnOnce + Send`, called once by the job that owns
+    it, through a type that offers the commands of its kind of pass over ids and cannot
+    transition, alias, begin, end or reset. A recorder does not wait, for another recorder, a
+    lock or a point. A recorder that names an id its pass did not declare for that use fails
+    `record`, and so does a copy pass's recorder that writes one destination in two calls:
+    rhi-api needs a transition between two copies into one resource, a recorder cannot record
+    one, and one call takes every region it needs. No two regions of one call write one byte or
+    texel, which Vulkan forbids (`VUID-vkCmdCopyBuffer-pRegions-12482`,
+    `VUID-vkCmdCopyBufferToImage-pRegions-12483`, `VUID-vkCmdCopyImageToBuffer-pRegions-12485`);
+    `bounds` refuses it once the `rhi-null` lane amends rhi-api under decision 5.13. Each kept
+    pass has one span, target `gouda`. An encoder is reused only after its frame's point is seen
+    reached, read and never waited for. The jobs share, read only, what the declaration copied,
+    the plan and the device. The crate takes no lock and has no `unsafe`: its `Sync` cell for
+    encoders and recorders is a `Mutex` that is never locked, `Sync` because every value it
+    holds is `Send`, and reached through `get_mut` and `into_inner` alone. `std::sync::SyncView`
+    (unstable `exclusive_wrapper`) does this job, `Sync` for any value, and replaces the cell
+    once it is stable. The locks a frame takes are a device backend's (D158); the scope takes
+    none. Section 3 is not amended. Rules out a recorder lent the encoder, recorders shared
+    between jobs, a lock of the graph's on the per-frame path, a recorder that waits, a copy
+    recorder that records its own transition, recording off the frame-critical workers, and a
+    wait for the device in `record`.
+  - *`History` is a value over two imports of the caller's.* Its owner swaps the halves after a
+    submit, resets it after a failed one, and a frame with no previous half has a key of its
+    own. Rules out resources that a graph or a plan keeps from frame to frame.
+  - *The drop waits, but while the thread unwinds.* `RenderGraph`'s drop waits, with no bound,
+    until every submit it made has completed, off the frame-critical workers. A drop made while
+    the thread unwinds a panic does not wait: it makes no destroy a pending submit would refuse,
+    and leaks what is pending, as `rhi-api`'s drops do, so a test that fails holding a pending
+    frame fails instead of hanging. After a torn frame with no `submit` since, the drop first
+    makes the submit in the torn frame's place; where that is refused, it waits for every point
+    it can see signalled, drops its encoders, which waits for their submits unless the device is
+    lost, and destroys what no pending submit uses, and on null, which counts a submit pending
+    until its point is seen, it leaks what the torn frame's submits that signal no point used.
+    Rules out a drop that leaks what a pending submit uses outside an unwind, but for a torn
+    frame's where the submit in its place was refused, a drop that waits while the thread
+    unwinds, and one that gives up.
+  - *The crate is outside the determinism boundary.* It has no `StableKey` and no entity,
+    nothing it reports is fed back into a world, and its one ordering rule is the caller's
+    declaration order. A plan is a function of the declaration and the device, so two runs
+    submit the same commands. Rules out a system inside the boundary that names the crate, and a
+    result that depends on a thread or on the order a hash map iterates in.
+- Driven by: architecture sections 3, 5.1, 5.3, 12.1, 12.3 and 20; the milestone 2 plan's rows
+  `graph`, `graph-impl`, `renderer`, `renderer-impl` and `frame-design` and decisions 5.1, 5.4,
+  5.6, 5.10, 5.11, 5.13, 5.15, 5.17 (D153) and 5.18; `crates/rhi-api/README.md` (D158), "Handles
+  and lifetimes", "Queues by role", "The present thread", "Buffers and host access", "Images and
+  memoryless requests", "Aliased transients", "States", "What a pass declares", "Recording and
+  submitting" and "Timelines"; `crates/task/README.md`, "Scopes" and "Workers"; the two spike
+  results of milestone 2; the facade's three reviews of rounds 1 and 2 (`reviewer`,
+  `reviewer-gpu`, `reviewer-concurrency`); D43, D45, D150 and D159.
+- Replaced: section 12.3's "The graph derives order", where it is read as a graph that reorders
+  passes, and its "imported initial states" as all that an import adds to the key; this merge
+  amends both sentences. Nothing of D158 is replaced: the amendment named above, the `no-qfot`
+  use rule, `bounds` over overlapping copy regions, the re-take from `Undefined` that ends a
+  release no acquire met, and `read_buffer`'s wait for a pending change of state, adds to its
+  rules, is made by the `rhi-null` lane under decision 5.13, and is not made by this merge.
+
 ## 10. Review history
 
 - **Revision 1** (`a29af04`): the design baseline.
