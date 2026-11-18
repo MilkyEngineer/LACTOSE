@@ -188,9 +188,12 @@ impl Drop for RenderGraph {
     /// Waits until every submit the graph made has completed, then destroys what the
     /// graph made. An error from a destroy is logged under [`LOG_TARGET`] and dropped. On
     /// a lost device the wait returns at once. After a torn frame with no `submit`
-    /// since, it first makes the submit in the torn frame's place, as `submit` would;
-    /// where that is refused, the error is logged and the drop waits for nothing, as
-    /// below. While the thread unwinds a panic it makes no submit and waits for nothing:
+    /// since, it first makes the submit in the torn frame's place, as `submit` would.
+    /// Where that is refused, the error is logged; the drop then waits for every point
+    /// it can see signalled, drops its encoders, which waits for their submits unless
+    /// the device is lost, and destroys what no pending submit uses, which on null
+    /// leaks what the torn frame used (`README.md`, "Errors and drops"). While the
+    /// thread unwinds a panic it makes no submit and waits for nothing:
     /// it makes no destroy a pending submit would refuse, and its encoders' drops leak
     /// what is pending.
     fn drop(&mut self) {

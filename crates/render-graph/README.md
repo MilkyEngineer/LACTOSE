@@ -235,18 +235,18 @@ Three things these consumers must know that no signature shows:
 - The graph orders its own frames, with no word from the caller, who cannot give one: the
   graph chooses each pass's queue. A submit that uses an import which another queue's
   submit, of this frame or an earlier frame of this graph, wrote or changed the state or
-  owner of waits for a point that submit signals; so does a submit that changes the state
-  or owner of an import which another queue's submit of an earlier frame used. A submit
-  uses what rhi-api counts ("States"): a transition's resource, an attachment, a `sampled`
-  import (the image of a declared slot), a declared buffer, a copy's side, an index or an
-  indirect buffer. Each submit that uses such an import waits, not the first of its queue
-  alone. For an `Exclusive` import the first such use on a queue is ordered by a
-  transfer's wait or, for an image imported from `Undefined`, which moves to another queue
-  with no transfer, by these waits before that transition. For a `Concurrent` one these
-  waits are the only order. rhi-api has no rule yet that refuses a graph that leaves out
-  the wait before a use ("What `graph-impl` proves on null"). The graph may make a
-  frame's submit wait for an earlier frame's submits to another queue where it need not;
-  which such waits it makes is not promised.
+  owner of waits for a point that submit, or a later submit to its queue, signals; so does
+  a submit that changes the state or owner of an import which another queue's submit of an
+  earlier frame used. A submit uses what rhi-api counts ("States"): a transition's
+  resource, an attachment, a `sampled` import (the image of a declared slot), a declared
+  buffer, a copy's side, an index or an indirect buffer. Each submit that uses such an
+  import waits, not the first of its queue alone. For an `Exclusive` import the first such
+  use on a queue is ordered by a transfer's wait or, for an image imported from
+  `Undefined`, which moves to another queue with no transfer, by these waits before that
+  transition. For a `Concurrent` one these waits are the only order. rhi-api has no rule
+  yet that refuses a graph that leaves out the wait before a use ("What `graph-impl`
+  proves on null"). The graph may make a frame's submit wait for an earlier frame's
+  submits to another queue where it need not; which such waits it makes is not promised.
 - One handle is imported once in a declaration. The graph cannot see a second import of it.
 - An import is never an image made with a memoryless request: the graph stores every
   import's attachments ("Transitions and store actions"), and storing such an image is
@@ -571,9 +571,12 @@ Three things these consumers must know that no signature shows:
 - `RenderGraph`'s drop waits, with no bound, until every submit it made has completed,
   a torn frame's among them, then destroys its transients, blocks, timelines and encoders.
   After a torn frame with no `submit` since, it first makes the submit in the torn frame's
-  place ("Submission"), then waits as above; an error from that submit is logged under
-  `gouda` and dropped, and the drop then waits for nothing: it destroys what no pending
-  submit uses and leaks the rest, as an unwinding drop does.
+  place ("Submission"), then waits as above. An error from that submit is logged under
+  `gouda` and dropped; the drop then waits for every point it can see signalled, drops its
+  encoders, which waits for their submits unless the device is lost (rhi-api, "Handles and
+  lifetimes"), and destroys what no pending submit uses. On null, which counts a submit
+  pending until its point is seen, the torn frame's submits that signal no point stay
+  pending, so what they used is leaked. This is the one drop outside an unwind that leaks.
   It is dropped off the frame-critical workers (rhi-api, "Handles and lifetimes"), and
   after the host has signalled every `ready` point a pending frame waits for that the host
   owes: the drop cannot release such a frame. On a lost device the wait ends at once.
