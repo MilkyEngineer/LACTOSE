@@ -1273,15 +1273,18 @@ Some output cases count as evidence only in the shape, or on the device, named h
   on MoltenVK, whose families share Metal resources: only a discrete GPU shows it, and
   plan decision 5.17 leaves transfers to null.
 - `retake_after_a_store_on_one_queue_is_clean` holds the source scope of a take from
-  `Undefined` ("States") with the roles on one queue: a pass stores a colour attachment, a
-  later submit on the same queue takes the image from `Undefined` and clears it, then the
-  same again with the two encoders in one submit; each readback equals the clear colour
-  exactly, and the run raises no validation message. It counts under synchronization
-  validation, which reports a write after a write where the scope has no write access; the
-  readback alone fails only where the two writes overlap. The one submit is what makes it
-  count: on the M1 the layer reports a re-take narrowed to no source scope in one submit
-  (`SYNC-HAZARD-WRITE-AFTER-WRITE` at `vkQueueSubmit2`, with or without
-  `syncval_load_op_after_store_op_validation`) and not across the two submits.
+  `Undefined` ("States") with the roles on one queue: a pass stores a colour attachment
+  behind a lagging dispatch at the head of its submit, and a later submit on the same
+  queue, made while the first is in flight and before its encoders drop, takes the image
+  from `Undefined` and clears it; then the same again with the two encoders in one submit.
+  Each readback equals the clear colour exactly, and the run raises no validation message.
+  It counts under synchronization validation, which reports a write after a write where
+  the scope has no write access; the readback alone fails only where the two writes
+  overlap. On the M1 a re-take narrowed to no source scope is reported in both forms
+  (`SYNC-HAZARD-WRITE-AFTER-WRITE` at `vkQueueSubmit2`) under MoltenVK and KosmicKrisp. The
+  two-submit form counts only where the first submit is in flight and the backend has not
+  told the layer it complete: a backend that reads a timeline's counter, or waits on a
+  submit before the next is made, silences it.
 - `sampler_filters_as_described` picks among two or more samplers by a non-uniform index
   past zero, in the draw that indexes the image array past slot zero, and compares exactly
   where filtering is exact, with ±1 at a linear midpoint.

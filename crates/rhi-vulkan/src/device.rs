@@ -383,14 +383,52 @@ impl Shared {
         convert::Side { queue: self.roles[queue], family: raw.family, graphics: raw.graphics }
     }
 
-    /// Reads one queue's completed value from the driver, with no lock held. A loss is
-    /// marked; any other failure reads nothing.
+    /// The greatest of `values`, ascending, that `semaphore` has reached, each tried by a
+    /// wait of no time; none if none has. A value is known reached only through a wait that
+    /// succeeds, never a read of the counter: synchronisation validation (layer 1.4.363)
+    /// takes a counter read as the host learning that every batch the queue was given has
+    /// completed, whatever value it returns, and then reports no hazard across submits.
+    ///
+    /// # Safety
+    ///
+    /// `semaphore` is a timeline semaphore of this device, live through the call.
+    unsafe fn reached(
+        &self,
+        semaphore: vk::Semaphore,
+        values: &[u64],
+    ) -> std::result::Result<Option<u64>, vk::Result> {
+        // A timeline's value never falls, so the values reached are a prefix of `values`.
+        let (mut low, mut high, mut best) = (0, values.len(), None);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let semaphores = [semaphore];
+            let value = [values[mid]];
+            let info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&value);
+            // SAFETY: the caller keeps the semaphore alive; a wait of no time blocks nothing.
+            match unsafe { self.raw.device.wait_semaphores(&info, 0) } {
+                Ok(()) => {
+                    best = Some(values[mid]);
+                    low = mid + 1;
+                }
+                Err(vk::Result::TIMEOUT) => high = mid,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(best)
+    }
+
+    /// Reads from the driver, with no lock held, the greatest stamp of a queue's pending
+    /// submits that has completed (`reached`). A loss is marked; any other failure, or no
+    /// pending submit completed, reads nothing.
     pub(crate) fn read_queue(&self, queue: usize) -> Option<u64> {
-        // SAFETY: the semaphore lives as long as the device.
-        let read =
-            unsafe { self.raw.device.get_semaphore_counter_value(self.queue(queue).timeline) };
-        match read {
-            Ok(value) => Some(value),
+        let pending: Vec<u64> = {
+            let records = self.records();
+            let rec = &records.queues[queue];
+            (rec.known + 1..=rec.received).collect()
+        };
+        // SAFETY: the queue's semaphore lives as long as the device.
+        match unsafe { self.reached(self.queue(queue).timeline, &pending) } {
+            Ok(value) => value,
             Err(error) => {
                 self.lost_on(error);
                 None
@@ -411,12 +449,14 @@ impl Shared {
         read
     }
 
-    /// Reads a timeline's value from the driver, with no lock held, if its handle resolves.
+    /// Reads from the driver, with no lock held, the greatest value a timeline is awaited
+    /// to reach that it has reached (`reached`), if its handle resolves.
     pub(crate) fn read_timeline(&self, timeline: TimelineHandle) -> Option<(TimelineHandle, u64)> {
         let object = self.timelines.resolve(timeline)?;
+        let awaited = self.records().awaited(timeline);
         // SAFETY: the count keeps the semaphore alive through the call.
-        match unsafe { self.raw.device.get_semaphore_counter_value(object.semaphore) } {
-            Ok(value) => Some((timeline, value)),
+        match unsafe { self.reached(object.semaphore, &awaited) } {
+            Ok(value) => value.map(|value| (timeline, value)),
             Err(error) => {
                 self.lost_on(error);
                 None
@@ -1308,19 +1348,27 @@ impl Device for VulkanDevice {
         Ok(())
     }
 
+    /// The value the device knows the timeline has reached, after a wait of no time for
+    /// each value it is awaited to reach (`Shared::reached`). Every signal of a timeline is
+    /// the device's, so no other value can be reached.
     fn timeline_value(&self, timeline: TimelineHandle) -> Result<u64> {
-        let object = {
+        let (object, known, awaited) = {
             let records = self.records();
             alive(&records)?;
-            records.timeline(timeline)?;
-            self.shared.timelines.resolve(timeline).ok_or_else(|| stale("a timeline"))?
+            let known = records.timeline(timeline)?.known;
+            let object =
+                self.shared.timelines.resolve(timeline).ok_or_else(|| stale("a timeline"))?;
+            (object, known, records.awaited(timeline))
         };
         // SAFETY: the count keeps the semaphore alive through the call.
-        let value = unsafe { self.shared.raw.device.get_semaphore_counter_value(object.semaphore) };
-        let value = value.map_err(|e| {
+        let reached = unsafe { self.shared.reached(object.semaphore, &awaited) };
+        let reached = reached.map_err(|e| {
             self.shared.lost_on(e);
-            driver(e, "vkGetSemaphoreCounterValue")
+            driver(e, "vkWaitSemaphores")
         })?;
+        let Some(value) = reached else {
+            return Ok(known);
+        };
         let mut records = self.records();
         if self.shared.timelines.resolve(timeline).is_some_and(|now| Arc::ptr_eq(&now, &object)) {
             records.fold_timeline(timeline, value);

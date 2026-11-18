@@ -14,8 +14,9 @@ use lactose_rhi_api::{
     BufferTransition, BufferUsage, CacheStart, ColourAttachment, ColourTargetDesc, ComputePass,
     ComputePipelineDesc, ComputePipelineHandle, Constant, ConstantValue, CookedShader, Cull,
     Device, DeviceRequest, Encoder, Extent, Format, GraphicsPipelineDesc, ImageDesc, ImageMemory,
-    ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryClass, PassReach, QueueRole,
-    Rect, RenderPass, Sharing, StageDesc, StateOn, Store, Submit, Target, TimelinePoint, WriteMask,
+    ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryClass, PassReach, QueuePath,
+    QueueRole, Rect, RenderPass, Sharing, StageDesc, StateOn, Store, Submit, Target, TimelinePoint,
+    WriteMask,
 };
 use lactose_rhi_vulkan::VulkanDevice;
 
@@ -263,6 +264,111 @@ fn canary_load_after_store_validation_reports_a_kept_target() {
 
 /// What the load-after-store canary must say.
 const LOAD_AFTER_STORE_CANARY: &str = "SYNC-HAZARD-READ-AFTER-WRITE";
+
+/// Synchronisation validation's canary across queues: a colour target stored by a graphics
+/// submit that a lagging dispatch holds in flight, and taken from `Undefined` (a layout
+/// transition, a write) by a compute submit with no semaphore between them, a race of the
+/// "Null alone" column. The layer hears it only while it does not know the graphics submit
+/// complete, which the device learns through waits alone (verification row 211). A device
+/// whose compute role shares the graphics queue has no second queue to race on.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn canary_synchronisation_validation_reports_a_race_across_queues() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    if device.capabilities().queues.compute != QueuePath::Own {
+        eprintln!(
+            "canary_synchronisation_validation_reports_a_race_across_queues: skipped, compute \
+             shares the graphics queue"
+        );
+        return;
+    }
+    let image = device
+        .create_image(&ImageDesc {
+            label: "canary",
+            format: Format::Rgba8Unorm,
+            extent: Extent { width: 4, height: 4 },
+            mips: 1,
+            layers: 1,
+            usage: ImageUsage::COLOUR.union(ImageUsage::COPY_SOURCE),
+            memory: ImageMemory::Own,
+            sharing: Sharing::Exclusive,
+        })
+        .expect("an image");
+    let mut graphics = lagging(&device);
+    graphics.transition_images(&[ImageTransition {
+        image,
+        range: ImageRange::FIRST,
+        from: StateOn { state: ImageState::Undefined, queue: QueueRole::Graphics },
+        to: StateOn { state: ImageState::ColourAttachment, queue: QueueRole::Graphics },
+    }]);
+    let target = Target { image, mip: 0, layer: 0 };
+    let colour = [ColourAttachment {
+        target,
+        load: Load::Clear([0.0; 4]),
+        store: Store::Store,
+        local_read: false,
+    }];
+    graphics.begin_render_pass(&RenderPass {
+        label: "canary",
+        colour: &colour,
+        depth: None,
+        reach: PassReach::NOTHING,
+    });
+    graphics.end_pass();
+    let mut compute = device.create_encoder(QueueRole::Compute, "canary").expect("an encoder");
+    compute.transition_images(&[ImageTransition {
+        image,
+        range: ImageRange::FIRST,
+        from: StateOn { state: ImageState::Undefined, queue: QueueRole::Compute },
+        to: StateOn { state: ImageState::CopySource, queue: QueueRole::Compute },
+    }]);
+    let timeline = device.create_timeline(0).expect("a timeline");
+    let done = TimelinePoint { timeline, value: 1 };
+    let mut first = [graphics];
+    device
+        .submit(QueueRole::Graphics, Submit { encoders: &mut first, waits: &[], signals: &[done] })
+        .expect("the graphics submit");
+    let mut second = [compute];
+    device
+        .submit(QueueRole::Compute, Submit { encoders: &mut second, waits: &[], signals: &[] })
+        .expect("the compute submit");
+    assert!(device.wait_timeline(done, PATIENCE).expect("the wait"), "the work did not complete");
+    drop((first, second));
+    drop(device);
+    heard_alone(&sink, CROSS_QUEUE_CANARY);
+}
+
+/// What the cross-queue canary must say.
+const CROSS_QUEUE_CANARY: &str = "SYNC-HAZARD-WRITE-RACING-WRITE";
+
+/// A graphics encoder whose first command is a dispatch that runs for a while (`store.slang`
+/// with a lag), so that what it records after is in flight when its submit returns.
+fn lagging(device: &VulkanDevice) -> Box<dyn Encoder> {
+    let pipeline = kernel(device, "store.cs_main");
+    let scratch = buffer(device, BufferUsage::DEVICE_ADDRESS, MemoryClass::Device);
+    let on = |state| StateOn { state, queue: QueueRole::Graphics };
+    let mut encoder = device.create_encoder(QueueRole::Graphics, "lagging").expect("an encoder");
+    encoder.transition_buffers(&[BufferTransition {
+        buffer: scratch,
+        from: on(BufferState::Undefined),
+        to: on(BufferState::ShaderWrite),
+    }]);
+    let declared = [BufferReach { buffer: scratch, state: BufferState::ShaderWrite }];
+    encoder.begin_compute_pass(&ComputePass {
+        label: "lagging",
+        reach: PassReach { slots: &[], buffers: &declared },
+    });
+    encoder.bind_compute_pipeline(pipeline);
+    // `store.slang`'s block: one word of 7, after 2^25 rounds (about a second on the M1).
+    encoder.push_address(0, scratch, 0);
+    encoder.push_bytes(8, &1u32.to_le_bytes());
+    encoder.push_bytes(12, &(1u32 << 25).to_le_bytes());
+    encoder.push_bytes(16, &7u32.to_le_bytes());
+    encoder.dispatch([1, 1, 1]);
+    encoder.end_pass();
+    encoder
+}
 
 /// A compute stage whose workgroup is not its module's `LocalSize` is refused before the
 /// driver sees it, since Vulkan dispatches workgroups of the module's size alone; the same

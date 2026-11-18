@@ -613,9 +613,12 @@ impl Drop for VulkanEncoder {
         let raw = Arc::clone(&self.shared.raw);
         let mut pending = false;
         if let Some((queue, seq)) = self.submitted {
-            let known = self.shared.read_queue(queue);
-            let lost = self.shared.records().lost;
-            pending = !lost && known.is_none_or(|known| known < seq);
+            let read = self.shared.read_queue(queue);
+            let (lost, known) = {
+                let records = self.shared.records();
+                (records.lost, records.queues[queue].known)
+            };
+            pending = !lost && read.unwrap_or(0).max(known) < seq;
             if pending && !std::thread::panicking() {
                 let semaphores = [self.shared.queue(queue).timeline];
                 let values = [seq];

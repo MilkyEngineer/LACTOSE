@@ -321,6 +321,23 @@ impl Records {
         self.timelines.live(timeline, "a timeline")
     }
 
+    /// The values above a timeline's known value that a kept submit signals or a host signal
+    /// in progress gives it, ascending and once each: the values a read may learn it has
+    /// reached. None for a handle that does not resolve.
+    pub(crate) fn awaited(&self, timeline: TimelineHandle) -> Vec<u64> {
+        let Some(rec) = self.timelines.get(timeline) else {
+            return Vec::new();
+        };
+        let signals = self.queues.iter().flat_map(|queue| &queue.submits).flat_map(|submit| {
+            submit.signals.iter().filter(|p| p.timeline == timeline).map(|p| p.value)
+        });
+        let mut values: Vec<u64> =
+            signals.chain(rec.mark).filter(|&value| value > rec.known).collect();
+        values.sort_unstable();
+        values.dedup();
+        values
+    }
+
     /// Whether a promise of `point`'s timeline is pending: its value not yet known reached.
     fn promise_pending(&self, promise: &TimelinePoint) -> bool {
         self.timelines.get(promise.timeline).is_some_and(|rec| rec.known < promise.value)

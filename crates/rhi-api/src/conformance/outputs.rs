@@ -1054,6 +1054,27 @@ fn push_store(
     encoder.push_bytes(16, &value.to_le_bytes());
 }
 
+/// A graphics encoder whose one pass is a dispatch of `store.slang` that spins `lag` rounds
+/// before it writes a word of a buffer of its own: at the head of a submit, it holds what
+/// the submit records after it in flight.
+fn lagging(ctx: &Ctx<'_>, device: &dyn Device, lag: u32) -> Box<dyn Encoder> {
+    let writer = kernel(ctx, device, "store");
+    let scratch = ctx.buffer(device, 4, BufferUsage::DEVICE_ADDRESS, MemoryClass::Device);
+    let mut encoder = ctx.encoder(device, G);
+    encoder.transition_buffers(&[buffer_to(
+        scratch,
+        BufferState::Undefined,
+        BufferState::ShaderWrite,
+        G,
+    )]);
+    let declared = [BufferReach { buffer: scratch, state: BufferState::ShaderWrite }];
+    compute_pass(&mut *encoder, writer, PassReach { slots: &[], buffers: &declared });
+    push_store(&mut *encoder, scratch, 0, 1, lag, 7);
+    encoder.dispatch([1, 1, 1]);
+    encoder.end_pass();
+    encoder
+}
+
 fn declared_reader_follows_a_lagging_writer(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let image = target(ctx, &*device);
@@ -1403,14 +1424,18 @@ fn retake_after_a_store_on_one_queue_is_clean(ctx: &Ctx<'_>) -> Applies {
         let out = image_out(ctx, &*device, &mut *encoder, image, ImageState::ColourAttachment);
         (encoder, out)
     };
-    // A later submit on the same queue, with no wait: the take from `Undefined` orders its
-    // clear after the store.
+    // A later submit on the same queue, with no wait, made while a lagging dispatch at the
+    // head of the first holds the store in flight: the take from `Undefined` orders its
+    // clear after the store. The first submit's encoders live until the second is made, as
+    // a backend's drop of a submitted encoder may wait for its submit.
     let image = target(ctx, &*device);
     let first = ctx.point(&*device, 1);
-    ctx.submit(&*device, G, &mut [stores(image)], &[], &[first]);
+    let mut earlier = [lagging(ctx, &*device, LAG << 4), stores(image)];
+    ctx.submit(&*device, G, &mut earlier, &[], &[first]);
     let (encoder, later) = retakes(image);
     run(ctx, &*device, G, &mut [encoder]);
     ctx.reached(&*device, first);
+    drop(earlier);
     // The same in one submit of the two encoders, which synchronisation validation checks
     // whatever the host has seen complete: a narrower source scope is a write after a write.
     let image = target(ctx, &*device);

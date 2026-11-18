@@ -15,8 +15,15 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
    another state than the one it is in, a cross-queue use with no transfer, an input read of
    an attachment not marked) reaches the driver unchecked. It breaks a valid-usage rule whose
    effect the specification leaves undefined; what both spikes saw of it is a wrong image.
-   rhi-null refuses each in every consumer's tests, and core and synchronisation validation
-   report each on a GPU (`cargo xtask gpu`).
+   rhi-null refuses each in every consumer's tests. On a GPU (`cargo xtask gpu`) core
+   validation reports a resource in another state, and synchronisation validation a hazard
+   within a submit and across submits and queues: the device learns that a submit has
+   completed only through a wait that succeeds (`Shared::reached`), as the layer (1.4.363)
+   takes any read of a timeline's counter as the host seeing every batch it was given
+   complete, and then hears nothing across submits. The canaries show it live within one
+   command buffer, and across two queues with no semaphore between them. A cross-queue use
+   with the semaphore and without the family transfer is a hazard of neither validator, and
+   no canary shows it reported.
 2. **A shader's code, and what a shader reaches through data alone.** A module's header and
    its `OpCapability` and `OpExtension` instructions are checked; the rest of its code is the
    cook's and is trusted. An address, a slot or sampler index in push bytes or a buffer, an

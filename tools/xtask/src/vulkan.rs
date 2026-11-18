@@ -185,6 +185,10 @@ impl Validators {
                     "device::canary_load_after_store_validation_reports_a_kept_target",
                     &["SYNC-HAZARD-READ-AFTER-WRITE"],
                 ),
+                (
+                    "device::canary_synchronisation_validation_reports_a_race_across_queues",
+                    &["SYNC-HAZARD-WRITE-RACING-WRITE"],
+                ),
                 ("conformance::each_validator_reports_its_canary", &[CORE, SYNC]),
             ],
             Self::GpuAssisted => &[(
@@ -375,20 +379,44 @@ pub fn implicit_manifest(manifest: &str, library: &Path) -> Result<String, Strin
 pub struct Run {
     /// Every variable set, in the order the result file records them.
     pub set: Vec<(String, String)>,
+    /// Every inherited variable the run removes (`cleared`), by name, for the result file.
+    pub cleared: Vec<String>,
 }
 
-/// Variables a run removes from the environment it inherits: each would change which layers
-/// or drivers load, or the layer's settings.
-pub const CLEARED: [&str; 8] = [
+/// Variables a run removes from the environment it inherits, before it sets its own: each
+/// would change which layers or drivers load, the layer's settings, or the tests' device.
+const CLEARED: [&str; 12] = [
     "DYLD_LIBRARY_PATH",
     "VK_INSTANCE_LAYERS",
-    "VK_LOADER_LAYERS_ENABLE",
-    "VK_LOADER_LAYERS_DISABLE",
     "VK_ICD_FILENAMES",
+    "VK_DRIVER_FILES",
     "VK_ADD_DRIVER_FILES",
+    "VK_LAYER_PATH",
+    "VK_ADD_LAYER_PATH",
+    "VK_IMPLICIT_LAYER_PATH",
     "VK_LAYER_SETTINGS_PATH",
-    "VK_KHRONOS_VALIDATION_DEBUG_ACTION",
+    "LACTOSE_VALIDATION_OFF",
+    "LACTOSE_GPU_ADAPTER",
+    "LACTOSE_GPU_SHADERS",
 ];
+
+/// Every family of variables a run removes: the layer's settings and the loader's own.
+const CLEARED_PREFIXES: [&str; 2] = ["VK_KHRONOS_VALIDATION_", "VK_LOADER_"];
+
+/// The names among `inherited` a run removes, sorted.
+#[must_use]
+pub fn cleared(inherited: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut names: Vec<String> = inherited
+        .into_iter()
+        .filter(|name| {
+            CLEARED.contains(&name.as_str())
+                || CLEARED_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
 
 impl Run {
     /// The environment of a run of `driver` on `sdk`, with the layer's implicit manifest in
@@ -441,12 +469,14 @@ impl Run {
         if let Some(adapter) = adapter {
             set.push(("LACTOSE_GPU_ADAPTER".to_owned(), adapter.to_owned()));
         }
-        Ok(Self { set })
+        let names = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok());
+        Ok(Self { set, cleared: cleared(names) })
     }
 
-    /// Applies the run's environment to `command`.
+    /// Applies the run's environment to `command`: the inherited variables it clears
+    /// removed, then its own set.
     pub fn apply<'c>(&self, command: &'c mut Command) -> &'c mut Command {
-        for name in CLEARED {
+        for name in &self.cleared {
             command.env_remove(name);
         }
         command.envs(self.set.iter().map(|(name, value)| (name, value)))
@@ -514,14 +544,20 @@ pub fn judge(test: &str, succeeded: bool, output: &str, expected: Option<&[&str]
         let word = &line[at + name.len() + 2..];
         (word == "passed" || word.starts_with("skipped, ")).then(|| word.to_owned())
     });
+    let skipped = said.as_deref().is_some_and(|word| word.starts_with("skipped, "));
     let failure = if !succeeded {
         Some("the test failed".to_owned())
     } else if !driver.is_empty() {
         Some(format!("{} line(s) of the driver's errors or warnings", driver.len()))
     } else {
         match expected {
+            None | Some(_) if skipped && !messages.is_empty() => {
+                Some(format!("{} message(s) from a skipped case", messages.len()))
+            }
             None if !messages.is_empty() => Some(format!("{} message(s)", messages.len())),
             None => None,
+            // A canary skipped for what its device lacks, which it names.
+            Some(_) if skipped => None,
             Some(ids) => {
                 let says = |message: &String, id: &str| message.contains(&format!("id: \"{id}\""));
                 if let Some(other) =
@@ -662,6 +698,43 @@ mod tests {
     }
 
     #[test]
+    fn a_canary_may_skip_for_a_reason_and_send_nothing() {
+        let ids: &[&str] = &["A"];
+        let skipped = "test device::canary ... canary: skipped, one queue\nok\n";
+        let verdict = judge("device::canary", true, skipped, Some(ids));
+        assert_eq!(verdict.failure, None);
+        assert_eq!(verdict.said.as_deref(), Some("skipped, one queue"));
+        let loud = format!("{skipped}{}", message("A"));
+        assert!(judge("device::canary", true, &loud, Some(ids)).failure.is_some());
+        assert!(judge("conformance::b", true, &loud, None).failure.is_some());
+    }
+
+    #[test]
+    fn a_run_clears_every_inherited_setting_of_the_loader_and_the_layer() {
+        let inherited = [
+            "PATH",
+            "VK_KHRONOS_VALIDATION_MESSAGE_ID_FILTER",
+            "VK_LOADER_DEBUG",
+            "LACTOSE_VALIDATION_OFF",
+            "VK_ADD_LAYER_PATH",
+            "VK_DRIVER_FILES",
+            "MVK_CONFIG_LOG_LEVEL",
+            "VK_KHRONOS_VALIDATION_ENABLES",
+        ];
+        assert_eq!(
+            cleared(inherited.map(str::to_owned)),
+            [
+                "LACTOSE_VALIDATION_OFF",
+                "VK_ADD_LAYER_PATH",
+                "VK_DRIVER_FILES",
+                "VK_KHRONOS_VALIDATION_ENABLES",
+                "VK_KHRONOS_VALIDATION_MESSAGE_ID_FILTER",
+                "VK_LOADER_DEBUG",
+            ]
+        );
+    }
+
+    #[test]
     fn every_canary_is_known_as_one() {
         assert!(is_canary("device::canary_core_validation_reports_a_wrong_layout"));
         assert!(is_canary("device::canary_gpu_assisted_validation_reports_a_read_past_a_buffer"));
@@ -680,9 +753,14 @@ mod tests {
             .filter_map(|line| line.trim().strip_prefix("fn canary_"))
             .filter_map(|rest| rest.split('(').next())
             .collect();
-        assert_eq!(named.len(), 4, "{named:?}");
-        for name in named {
+        for name in &named {
             assert!(is_canary(&format!("device::canary_{name}")), "canary_{name} is in no list");
         }
+        let listed = [Validators::Plain, Validators::GpuAssisted]
+            .iter()
+            .flat_map(|validators| validators.canaries())
+            .filter(|(name, _)| name.starts_with("device::"))
+            .count();
+        assert_eq!(named.len(), listed, "a listed device canary is not in device.rs: {named:?}");
     }
 }

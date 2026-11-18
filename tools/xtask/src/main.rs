@@ -480,6 +480,7 @@ fn run_vulkan(
     let mut lines = Vec::new();
     let mut failed = Vec::new();
     let mut heard = Vec::new();
+    let mut answered = Vec::new();
     for (package, target) in DEVICE_TESTS {
         let binary = test_binary(context, package, target)?;
         let tests = ignored_tests(&binary)?;
@@ -520,7 +521,11 @@ fn run_vulkan(
                 (None, None) => "passed".to_owned(),
             };
             if expected.is_some() && verdict.failure.is_none() {
-                heard.push(format!("{test} heard {}", verdict.messages.len()));
+                answered.push(test.to_owned());
+                heard.push(match &verdict.said {
+                    Some(said) if said.starts_with("skipped, ") => format!("{test} {said}"),
+                    _ => format!("{test} heard {}", verdict.messages.len()),
+                });
             }
             lines.push(format!("{package} {test}: {word}\n"));
             lines.extend(
@@ -532,12 +537,23 @@ fn run_vulkan(
             }
         }
     }
+    // Decision 5.10's "one case for each validator" holds of the run, not of the test
+    // binary: a listed canary the binaries do not hold, or that ran and was not heard, fails.
+    for (canary, _) in args.validators.canaries() {
+        if !answered.iter().any(|test| test == canary) && !failed.iter().any(|test| test == canary)
+        {
+            lines.push(format!("{canary}: FAILED, a listed canary no test binary holds\n"));
+            eprintln!("gpu: {canary}: a listed canary no test binary holds");
+            failed.push((*canary).to_owned());
+        }
+    }
     let file = out.join(format!("{}-vulkan{form}.txt", driver.name()));
     let settings: String =
         run.set.iter().map(|(name, value)| format!("  {name}={value}\n")).collect();
+    let cleared = if run.cleared.is_empty() { "none".to_owned() } else { run.cleared.join(", ") };
     let written = format!(
         "driver: {}\nshaders: {cooked_by}\nlayer: {} {} of the Vulkan SDK {}, library {}\n\
-         environment:\n{settings}canaries: {}\nfailed: {}\n{}",
+         inherited and cleared: {cleared}\nenvironment:\n{settings}canaries: {}\nfailed: {}\n{}",
         driver.name(),
         "VK_LAYER_KHRONOS_validation",
         pin.api_version,
