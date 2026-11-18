@@ -327,6 +327,7 @@ cases! {
     aliased_transients_render_in_turn
     image_round_trips_through_copies
     ownership_transfer_keeps_the_contents
+    retake_after_a_store_on_one_queue_is_clean
     heap_is_sampled_past_slot_zero
     address_is_read_in_a_shader
     declared_reader_follows_a_lagging_writer

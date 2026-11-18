@@ -865,8 +865,8 @@ fn sampled_read_under_another_queues_pending_write_is_refused(ctx: &Ctx<'_>) -> 
 /// `Concurrent` buffers and images, each filled and seen where it is read. Compute only
 /// transitions them, with no write, in a submit held pending. A graphics submit with no wait
 /// for that submit is refused, as under a write, when it copies from a buffer or an image,
-/// draws to an image as an attachment, declares a buffer in a pass, or draws with a buffer
-/// of indices; with the wait it passes.
+/// draws to an image as an attachment, declares a buffer in a pass, draws with a buffer of
+/// indices, or dispatches through a buffer of counts; with the wait it passes.
 fn use_under_another_queues_pending_transition_is_refused(ctx: &Ctx<'_>) -> Applies {
     several_queues(ctx)?;
     let device = ctx.device();
@@ -876,6 +876,9 @@ fn use_under_another_queues_pending_transition_is_refused(ctx: &Ctx<'_>) -> Appl
     let image = shared_image(ctx, &*device);
     let declared = shared_buffer(ctx, &*device, BufferUsage::DEVICE_ADDRESS);
     let indices = shared_buffer(ctx, &*device, BufferUsage::INDEX);
+    let ones: Vec<u8> = [1u32; 3].iter().flat_map(|count| count.to_le_bytes()).collect();
+    let groups = ctx.upload(&*device, BufferUsage::EMPTY, &ones);
+    let counts = shared_buffer(ctx, &*device, BufferUsage::INDIRECT);
     let whole = [BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }];
     let mut setup = ctx.encoder(&*device, C);
     copy_fresh(&mut *setup, source, shared);
@@ -883,9 +886,13 @@ fn use_under_another_queues_pending_transition_is_refused(ctx: &Ctx<'_>) -> Appl
         buffer_to(zeros, BufferState::Undefined, BufferState::CopySource, C),
         buffer_to(declared, BufferState::Undefined, BufferState::CopyDestination, C),
         buffer_to(indices, BufferState::Undefined, BufferState::CopyDestination, C),
+        buffer_to(groups, BufferState::Undefined, BufferState::CopySource, C),
+        buffer_to(counts, BufferState::Undefined, BufferState::CopyDestination, C),
     ]);
     setup.copy_buffer(source, declared, &whole);
     setup.copy_buffer(zeros, indices, &whole);
+    let three = [BufferCopy { source_offset: 0, destination_offset: 0, size: 12 }];
+    setup.copy_buffer(groups, counts, &three);
     fill(&mut *setup, texels(ctx, &*device), image);
     run(ctx, &*device, C, &mut [setup]);
     let mut changer = ctx.encoder(&*device, C);
@@ -983,6 +990,24 @@ fn use_under_another_queues_pending_transition_is_refused(ctx: &Ctx<'_>) -> Appl
         changer,
         user,
         "a draw with indices another queue's pending submit only transitions",
+    );
+    let mut changer = ctx.encoder(&*device, C);
+    changer.transition_buffers(&[buffer_to(
+        counts,
+        BufferState::CopyDestination,
+        BufferState::Indirect,
+        C,
+    )]);
+    let mut user = ctx.encoder(&*device, G);
+    compute_pass(&mut *user, ctx.compute(&*device), PassReach::NOTHING);
+    user.dispatch_indirect(counts, 0);
+    user.end_pass();
+    pending_refused(
+        ctx,
+        &*device,
+        changer,
+        user,
+        "a dispatch through counts another queue's pending submit only transitions",
     );
     Ok(())
 }

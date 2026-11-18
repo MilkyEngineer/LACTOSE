@@ -283,6 +283,7 @@ pub const CASES: &[Case] = cases! {
     contract "acquire_of_a_release_a_retake_ended_is_refused" => Queue;
     contract "read_after_a_retake_of_an_unmet_release_is_refused" => UndefinedRead;
     output "ownership_transfer_keeps_the_contents";
+    output "retake_after_a_store_on_one_queue_is_clean";
     // The heap, the sampler table and what a pass declares.
     contract "heap_slot_outside_the_heap_is_refused" => Bounds everywhere;
     contract "declared_slot_empty_is_refused" => HeapLayout everywhere;
