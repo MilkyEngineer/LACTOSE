@@ -102,7 +102,7 @@ tests = [
 # module and no `cfg` naming `miri` compiles it out. It reports an empty list, and a package
 # that two or more entries name by target or filter that the list leaves out.
 [miri_split]
-packages = ["lactose-ecs"]
+packages = ["lactose-ecs", "lactose-rhi-null"]
 
 # D150: a package with more than one integration test file builds them as one test binary,
 # the target `integration`, whose root `tests/integration.rs` declares every other file of
