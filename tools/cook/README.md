@@ -100,13 +100,17 @@ dependency.
   it is cooked: Slang's reflection of each entry, and the MSL under the stable name
   `<file>.<entry>.metal`, since a metallib records its source's file name.
 - **What a shader is cooked from.** The SPIR-V is read back for each entry
-  (`src/spirv.rs`): the stage, the heap's arrays and capacities, the specialisation
-  constants and their lengths, the push-constant bytes, the input attachments, the varyings
-  and the fragment outputs. The same fields are written for each target of the entry.
-  Slang's reflection of the SPIR-V compile (`-reflection-json`, `src/semantics.rs`) is read
-  for each varying's and output's semantic beside its location, and the MSL
-  (`src/msl.rs`) for its colours, varyings, function constants and buffers; the three must
-  agree.
+  (`src/spirv.rs`): the stage, the heap's arrays and capacities, each specialisation
+  constant's `SpecId` and type (`ConstantType`, from its `OpSpecConstant*`'s result type),
+  the push-constant bytes, the input attachments, each varying's location, component type
+  and count (`Varying`, from each user `Input` or `Output` variable of the entry), the
+  fragment outputs, and a compute entry's workgroup (from its `OpExecutionMode LocalSize`).
+  The same fields are written for each target of the entry: the MSL and metallib assets
+  carry the SPIR-V's values. Slang's reflection of the SPIR-V compile (`-reflection-json`,
+  `src/semantics.rs`) is read for each varying's and output's semantic beside its location
+  and for a compute entry's `threadGroupSize`, and the MSL (`src/msl.rs`) for its colours,
+  its varyings and their types, its function constants and their types, and its buffers;
+  the three must agree where each states a value.
 - **`--code DIR`.** Each shader's code alone, the SPIR-V module, the MSL text or the
   metallib, is also written to `DIR/<asset name>` once every source has cooked, before the
   pack, each file replaced by rename. It is what `cargo xtask gpu` and the `shaders` CI job
@@ -169,13 +173,26 @@ and names the source, the entry and, where one alone is read, the target; nothin
   Metal links the stages by semantic and Vulkan by location, so a varying at another
   location than its index, or of another semantic, would link to another one on each. The
   reflection's `TEXCOORD`s and the MSL's `[[user(TEXCOORD_i)]]` are the same set, and hold
-  the SPIR-V's locations, which leave out a fragment input the entry never reads.
+  the SPIR-V's locations, which leave out a fragment input the entry never reads. Each
+  varying is a 32-bit float, int or uint, or a vector of two to four of them, below
+  location `VARYING_LOCATIONS`; any other type, a `half`, a `bool` or a 64-bit integer among
+  them, is refused, named. The MSL declares each of the SPIR-V's varyings with the same
+  component type and count (`float2`, `int3`, `uint`, after any `[[flat]]`).
+- **Workgroup.** A compute entry has one `OpExecutionMode LocalSize`, of literal sizes, each
+  dimension 1 to `WORKGROUP_SIZE_MAX` and their product at most `WORKGROUP_INVOCATIONS_MAX`;
+  another entry has none. `LocalSizeId`, whose sizes are ids a specialisation may change, is
+  refused: a Vulkan device takes it under `maintenance4` alone
+  (VUID-RuntimeSpirv-LocalSizeId-06434), and the format holds three literals. The MSL does
+  not state the workgroup, which Metal takes at dispatch, so the SPIR-V's is held to Slang's
+  reflection's `threadGroupSize`.
 - **Stage inputs.** A vertex or compute entry reads no input but the built-ins: a pipeline
   has no vertex buffer binding, so vertices are read through a device address, as
   `surface.slang` reads them.
 - **Inputs and constants.** The input attachments the SPIR-V declares are the MSL's
-  `[[color(i)]]` parameters, and its `SpecId`s, each of one byte for a `bool` or four for a
-  32-bit scalar, are the MSL's `[[function_constant(i)]]`s.
+  `[[color(i)]]` parameters, and its `SpecId`s are the MSL's `[[function_constant(i)]]`s,
+  each of the same type: a `bool`, or a 32-bit `int`, `uint` or `float`, the MSL's
+  `constant bool`, `int`, `uint` or `float`. Any other type, a 64-bit or 16-bit scalar among
+  them, is refused, named.
 - **Push bytes.** At most one push-constant block, whose size, a device address counting
   eight bytes, is at most `PUSH_BYTES_MAX`. It holds no 3-component vector at any depth: the
   SPIR-V lays a `float3` out in 12 bytes and the MSL in 16, so a member after one is at
@@ -375,9 +392,10 @@ The tests that run Slang are ignored, and run once `cargo xtask slang` has insta
 | A `slangc` of another version, the SDK's among them, and a missing one, are refused; a shader source with no `slangc`, a link module alone and `--code` without `--slangc` are refused | `tests/shader.rs`, `a_slangc_of_another_version_is_refused`, `a_shader_without_slangc_and_a_lone_link_module_are_refused`, `the_binary_refuses_code_without_slangc` |
 | Two checkouts at different paths cook the same SPIR-V and MSL, no cooked file names a path of either checkout or of the temporary directory, and the metallibs' equality is printed | `tests/shader.rs`, `two_checkouts_at_different_paths_cook_the_same_spirv_and_msl_and_name_no_path` |
 | The link-time constant folds into both targets: `discard_fragment` and `OpKill` with it true, neither with it false, and no specialisation constant for it | `tests/shader.rs`, `the_link_time_constant_folds_into_both_targets` |
-| The engine shader cooks to what its code declares, loaded back from the pack through a store: the heap's two arrays and capacities, the constant, the push bytes, the input attachment and each output | `tests/shader.rs`, `the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack` |
+| The engine shader cooks to what its code declares, loaded back from the pack through a store: the heap's two arrays and capacities, the constant and its type, the push bytes, the input attachment, each output and each varying | `tests/shader.rs`, `the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack` |
+| A compute entry's workgroup, a constant of each type and a varying of each component type cook to the format, each target alike, the fragment entry's varyings the ones it reads; a workgroup above the invocation limit is refused | `tests/shader.rs`, `a_compute_entrys_workgroup_and_each_constant_and_varying_type_cook`, `a_workgroup_out_of_bounds_is_refused` |
 | The shader kind's load against section 5.1's slice (row 136): the store's synchronous call, the version hash and the decode, the median of 101 calls per shader | `tests/shader.rs`, `the_shader_kind_loads_against_the_slice`, with `--release --no-capture` |
-| Each check of the SPIR-V reader, on modules built by hand where Slang cannot emit the case: what is not a module, a capability or an extension off the list and the reason given for three, two entry points, each descriptor rule and image form, each step of a sample without `NonUniform` and each way of using the heap the check cannot follow, the locations of outputs and varyings, a stage input, the constants, and the push block's size and refusals; Slang's reflection read and each of its refusals; the MSL's interface and each of its refusals; the three readings' agreement | `src/spirv.rs`'s, `src/semantics.rs`'s, `src/msl.rs`'s and `src/shader.rs`'s tests |
+| Each check of the SPIR-V reader, on modules built by hand where Slang cannot emit the case: what is not a module, a capability or an extension off the list and the reason given for three, two entry points, each descriptor rule and image form, each step of a sample without `NonUniform` and each way of using the heap the check cannot follow, the locations of outputs and varyings, each varying's type and a type off the format's, a stage input, the constants' types and a type off the format's, the workgroup and `LocalSizeId`, and the push block's size and refusals; Slang's reflection read, its workgroup, and each of its refusals; the MSL's interface, its varyings' and constants' types, and each of its refusals; the three readings' agreement, the types and the workgroup among it | `src/spirv.rs`'s, `src/semantics.rs`'s, `src/msl.rs`'s and `src/shader.rs`'s tests |
 | Every cooked MSL and metallib makes a pipeline state with its function constants, made and not run, under Metal API validation and with shader validation loaded, each shown listening by its canary, on a device with what the code needs of it | `cargo xtask gpu --driver system` (`tools/xtask/README.md`, "GPU runs") |
 
 ## Proof for milestone 1

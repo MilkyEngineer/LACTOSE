@@ -659,7 +659,10 @@ loader's environment and the Metal step uses none; on another host it exits 2.
      code that reads a colour needs an Apple GPU family, for framebuffer fetch: the step
      fails naming each one the device lacks, before it makes any pipeline state;
    - each cooked MSL is compiled at run time as MSL 3.1 and each metallib loaded, and each
-     makes a pipeline state with every function constant given the zero of its type: a
+     makes a pipeline state with every function constant given the zero of its type, the
+     `MTLDataType` of its MSL type, which the cook holds to the cooked format's
+     `ConstantType` (the step reads the code alone, which `--cooked` takes from another
+     runner, and not the pack the format is encoded in): a
      source's fragment entries each with its one vertex entry, a vertex entry alone as a
      depth-only pipeline, a kernel as a compute pipeline. No pipeline is run, so shader
      validation is loaded, as its canary shows, and sees no execution of the engine's code.

@@ -1289,7 +1289,7 @@ the present thread is `lactose-platform`'s to test (`swapchain`'s row), and is n
 drawable made to block, and MoltenVK cannot show it, as it takes the drawable inside the
 submit (plan decision 5.6). `tests/tables.rs` holds the table to itself: names distinct, a
 rule only on a contract case, every rule with a case that provokes it, the device-run
-refusals exactly the 62 named above, and every case named in this file. Every clause of the
+refusals exactly the 64 named above, and every case named in this file. Every clause of the
 rules table's "Every backend" column has a case. A clause of its "Null alone" column with
 none here gets its case from `rhi-null`, with the check, as an amendment to list.
 
@@ -1338,7 +1338,7 @@ consumer's use of the surface, and a backend's implementation of every trait wit
 and not `Sync`, every handle plain data of eight bytes, and the indirect record twenty
 bytes. `tests/tables.rs` runs the rule names, the refusal's round trip (wrapped in other
 errors too), the queue layout, the indirect record's bytes, the suite table's consistency,
-and this file's naming of every case and of the 62 a device runs. The bodies the crate has,
+and this file's naming of every case and of the 64 a device runs. The bodies the crate has,
 the cooked shader's `encode` and `decode`, `seal_cache` and `open_cache`, and the suite's
 contract cases, run in `lactose-rhi-null`'s tests: every contract case under its five
 capability sets, the cooked shader's round trip and refusals, and a device started from

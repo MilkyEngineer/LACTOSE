@@ -1,6 +1,6 @@
 //! The MSL Slang emitted for one entry point, read back for what the SPIR-V of the same entry
-//! must agree with: its colour inputs and outputs, its varyings, its function constants and
-//! its buffers (`README.md`, "The checks").
+//! must agree with: its colour inputs and outputs, its varyings and their types, its function
+//! constants and their types, and its buffers (`README.md`, "The checks").
 //!
 //! The reader knows the form Slang writes an entry point in, `[[fragment]] <type> <name>(`
 //! and its parameters on one line, and the structs it takes and returns with their fields
@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 
 use lactose_core::{Error, ErrorKind, Result};
-use lactose_rhi_api::ShaderStage;
+use lactose_rhi_api::{ComponentType, ConstantSlot, ConstantType, ShaderStage, Varying};
 
 /// The Metal buffer index of the push block.
 const PUSH_BUFFER: u32 = 0;
@@ -24,13 +24,14 @@ const HEAP_TYPE: &str = "Heap_default_";
 pub(crate) struct Interface {
     /// Bit `i` for each `[[color(i)]]` parameter of the entry point.
     pub inputs: u32,
-    /// Bit `i` for each `[[user(TEXCOORD_i)]]` field, `TEXCOORD` for 0: of the struct a vertex
-    /// entry returns, or of the one a fragment entry takes as its stage input.
-    pub varyings: u32,
+    /// Each `[[user(TEXCOORD_i)]]` field, `TEXCOORD` for 0, at location `i`, by location: of
+    /// the struct a vertex entry returns, or of the one a fragment entry takes as its stage
+    /// input.
+    pub varyings: Vec<Varying>,
     /// Bit `i` for each `[[color(i)]]` field of the struct it returns.
     pub outputs: u32,
-    /// The index of each `[[function_constant(i)]]`, ascending.
-    pub constants: Vec<u32>,
+    /// Each `constant <type> <name> [[function_constant(i)]]`, by index.
+    pub constants: Vec<ConstantSlot>,
     /// Whether it takes the push block, at `[[buffer(0)]]`.
     pub push: bool,
     /// Whether it takes the heap's argument buffer, at `[[buffer(1)]]`.
@@ -41,9 +42,9 @@ pub(crate) struct Interface {
 ///
 /// # Errors
 /// `InvalidData` if the entry point is not found once, a colour is named twice, a field has
-/// two colours, a varying is not `TEXCOORD<i>`, a buffer is off its index or taken twice, a
-/// texture or a sampler is bound alone, or a struct it takes or returns is not one the source
-/// declares.
+/// two colours, a varying is not `TEXCOORD<i>` or not of a type the format holds, a function
+/// constant is not, a buffer is off its index or taken twice, a texture or a sampler is bound
+/// alone, or a struct it takes or returns is not one the source declares.
 pub(crate) fn read(source: &str, stage: ShaderStage, entry: &str) -> Result<Interface> {
     let qualifier = match stage {
         ShaderStage::Vertex => "[[vertex]] ",
@@ -57,18 +58,40 @@ pub(crate) fn read(source: &str, stage: ShaderStage, entry: &str) -> Result<Inte
         return Err(invalid(format!("the MSL does not declare `{qualifier}... {entry}(` once")));
     };
     let mut constants = Vec::new();
-    for (index, _) in attributes(source, "function_constant") {
-        constants.push(index?);
+    for (index, line) in attributes(source, "function_constant") {
+        let id = index?;
+        let declared =
+            line.trim().strip_prefix("constant ").and_then(|rest| rest.split(' ').next());
+        let ty = match declared {
+            Some("bool") => ConstantType::Bool,
+            Some("int") => ConstantType::Int,
+            Some("uint") => ConstantType::Uint,
+            Some("float") => ConstantType::Float,
+            _ => {
+                return Err(invalid(format!(
+                    "an MSL function constant of a type the format does not hold, where it \
+                     holds bool, int, uint and float: {}",
+                    line.trim()
+                )));
+            }
+        };
+        constants.push(ConstantSlot { id, ty });
     }
-    constants.sort_unstable();
-    if constants.windows(2).any(|pair| pair[0] == pair[1]) {
+    constants.sort_unstable_by_key(|constant| constant.id);
+    if constants.windows(2).any(|pair| pair[0].id == pair[1].id) {
         return Err(invalid("the MSL declares a function constant index twice"));
     }
     let at = line.find(&call).expect("found by the filter");
     let returned = line[qualifier.len()..at].trim();
     let list = parameters(&line[at + call.len()..]);
-    let mut interface =
-        Interface { inputs: 0, varyings: 0, outputs: 0, constants, push: false, heap: false };
+    let mut interface = Interface {
+        inputs: 0,
+        varyings: Vec::new(),
+        outputs: 0,
+        constants,
+        push: false,
+        heap: false,
+    };
     for &parameter in &list {
         if parameter.contains("[[texture(") || parameter.contains("[[sampler(") {
             return Err(invalid(format!(
@@ -181,11 +204,12 @@ fn colours(text: &str, one_per_line: bool) -> Result<u32> {
     Ok(bits)
 }
 
-/// The bits of the varyings the fields of `body` name, `[[user(TEXCOORD_i)]]` each, or
-/// `[[user(TEXCOORD)]]` for 0.
-fn varyings(body: &str) -> Result<u32> {
+/// The varyings the fields of `body` name, `[[user(TEXCOORD_i)]]` each, or
+/// `[[user(TEXCOORD)]]` for 0, by location, each with the type its field is declared with.
+fn varyings(body: &str) -> Result<Vec<Varying>> {
     let open = "[[user(";
     let mut bits = 0u32;
+    let mut varyings = Vec::new();
     for line in body.lines() {
         let Some(at) = line.find(open) else { continue };
         let name = line[at + open.len()..].split_once(")]]").map_or("", |(name, _)| name);
@@ -204,8 +228,35 @@ fn varyings(body: &str) -> Result<u32> {
             return Err(invalid(format!("MSL varying TEXCOORD_{index} twice")));
         }
         bits |= 1 << index;
+        // The declaration's first word that is not an attribute such as `[[flat]]`.
+        let declared = line[..at].split_whitespace().find(|word| !word.starts_with("[["));
+        let (component, count) = declared.and_then(component_type).ok_or_else(|| {
+            invalid(format!(
+                "an MSL varying of a type the format does not hold, where it holds a float, an \
+                 int or a uint, or a vector of two to four of them: {}",
+                line.trim()
+            ))
+        })?;
+        varyings.push(Varying { location: index, component, count });
     }
-    Ok(bits)
+    varyings.sort_unstable_by_key(|varying| varying.location);
+    Ok(varyings)
+}
+
+/// The component type and count of an MSL scalar or vector type: `float`, `int2`, `uint4`.
+fn component_type(name: &str) -> Option<(ComponentType, u32)> {
+    let (component, count) = [
+        ("float", ComponentType::Float),
+        ("uint", ComponentType::Uint),
+        ("int", ComponentType::Int),
+    ]
+    .into_iter()
+    .find_map(|(prefix, component)| name.strip_prefix(prefix).map(|count| (component, count)))?;
+    match count {
+        "" => Some((component, 1)),
+        "2" | "3" | "4" => Some((component, count.parse().ok()?)),
+        _ => None,
+    }
 }
 
 /// The text between `struct <name>` and its closing `};`.
@@ -229,7 +280,7 @@ struct ROut_0
 struct pixelInput_0
 {
     float2 uv_0 [[user(TEXCOORD)]];
-    float4 tint_0 [[user(TEXCOORD_2)]];
+    [[flat]] uint4 tint_0 [[user(TEXCOORD_2)]];
 };
 
 constant uint fc_TINT_0 [[function_constant(3)]];
@@ -253,9 +304,12 @@ struct vs_main_Result_0
         let fragment = read(RESOLVE, ShaderStage::Fragment, "fs_resolve").unwrap();
         let expected = Interface {
             inputs: 0b1,
-            varyings: 0b101,
+            varyings: vec![
+                Varying { location: 0, component: ComponentType::Float, count: 2 },
+                Varying { location: 2, component: ComponentType::Uint, count: 4 },
+            ],
             outputs: 0b10,
-            constants: vec![3],
+            constants: vec![ConstantSlot { id: 3, ty: ConstantType::Uint }],
             push: true,
             heap: true,
         };
@@ -263,7 +317,7 @@ struct vs_main_Result_0
         let vertex = read(VERTEX, ShaderStage::Vertex, "vs_main").unwrap();
         let expected = Interface {
             inputs: 0,
-            varyings: 0b10,
+            varyings: vec![Varying { location: 1, component: ComponentType::Float, count: 2 }],
             outputs: 0,
             constants: vec![],
             push: true,
@@ -320,7 +374,7 @@ struct vs_main_Result_0
     #[test]
     fn a_varying_that_is_not_texcoord_i_is_refused() {
         for (from, to, says) in [
-            ("[[user(TEXCOORD_2)]]", "[[user(_SLANG_ATTR)]]", "not `TEXCOORD<i>`: float4 tint_0"),
+            ("[[user(TEXCOORD_2)]]", "[[user(_SLANG_ATTR)]]", "not `TEXCOORD<i>`: [[flat]] uint4"),
             ("[[user(TEXCOORD_2)]]", "[[user(TEXCOORDS)]]", "not `TEXCOORD<i>`"),
             ("[[user(TEXCOORD_2)]]", "[[user(TEXCOORD_0)]]", "TEXCOORD_0 twice"),
         ] {
@@ -331,6 +385,47 @@ struct vs_main_Result_0
         let source = VERTEX.replace("[[user(TEXCOORD_1)]]", "[[user(COLOR)]]");
         let error = read(&source, ShaderStage::Vertex, "vs_main").unwrap_err();
         assert!(error.message().contains("not `TEXCOORD<i>`"), "{error}");
+    }
+
+    #[test]
+    fn each_type_is_read_and_one_the_format_does_not_hold_is_refused() {
+        for (declared, expected) in [
+            ("float", (ComponentType::Float, 1)),
+            ("int3", (ComponentType::Int, 3)),
+            ("uint2", (ComponentType::Uint, 2)),
+        ] {
+            let source = RESOLVE.replace("float2 uv_0", &format!("{declared} uv_0"));
+            let fragment = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap();
+            let varying = fragment.varyings[0];
+            assert_eq!(
+                (varying.location, varying.component, varying.count),
+                (0, expected.0, expected.1)
+            );
+        }
+        for declared in ["half2", "float5", "bool", "float2x2", "short"] {
+            let source = RESOLVE.replace("float2 uv_0", &format!("{declared} uv_0"));
+            let error = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap_err();
+            let says = format!(
+                "a type the format does not hold, where it holds a float, an int or a uint, or \
+                 a vector of two to four of them: {declared} uv_0"
+            );
+            assert!(error.message().contains(&says), "{declared}: {error}");
+        }
+        for (declared, ty) in [
+            ("bool", ConstantType::Bool),
+            ("int", ConstantType::Int),
+            ("float", ConstantType::Float),
+        ] {
+            let source = RESOLVE.replace("constant uint fc_", &format!("constant {declared} fc_"));
+            let fragment = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap();
+            assert_eq!(fragment.constants, [ConstantSlot { id: 3, ty }]);
+        }
+        let source = RESOLVE.replace("constant uint fc_", "constant half fc_");
+        let error = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap_err();
+        assert!(
+            error.message().contains("function constant of a type the format does not hold"),
+            "{error}"
+        );
     }
 
     #[test]

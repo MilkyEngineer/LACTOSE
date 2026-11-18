@@ -66,13 +66,16 @@ func attributes(_ text: Substring, _ attribute: String) -> [(index: Int, type: S
     return found
 }
 
+/// The `MTLDataType` of a function constant's MSL type, which is its type in the cooked format:
+/// the cook refuses an MSL whose constants' types are not the format's `ConstantType`s
+/// (tools/cook/README.md, "The checks"). The step reads them from the MSL since it is given
+/// the code `ricotta --code` writes, not the pack the format is encoded in.
 func dataType(_ type: String) -> MTLDataType {
     switch type {
     case "bool": return .bool
     case "int": return .int
     case "uint": return .uint
     case "float": return .float
-    case "half": return .half
     default: fail("a function constant of type \(type), which the step does not give a value")
     }
 }

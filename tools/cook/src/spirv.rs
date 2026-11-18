@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::{
-    ConstantSlot, HEAP_SET, HeapArray, HeapArrayKind, HeapForm, HeapUse, PUSH_BYTES_MAX,
-    ShaderStage,
+    ComponentType, ConstantSlot, ConstantType, HEAP_SET, HeapArray, HeapArrayKind, HeapForm,
+    HeapUse, PUSH_BYTES_MAX, ShaderStage, VARYING_LOCATIONS, Varying, WORKGROUP_INVOCATIONS_MAX,
+    WORKGROUP_SIZE_MAX,
 };
 
 const MAGIC: u32 = 0x0723_0203;
@@ -19,6 +20,7 @@ const MAGIC: u32 = 0x0723_0203;
 // Opcodes.
 const OP_EXTENSION: u16 = 10;
 const OP_ENTRY_POINT: u16 = 15;
+const OP_EXECUTION_MODE: u16 = 16;
 const OP_CAPABILITY: u16 = 17;
 const OP_TYPE_BOOL: u16 = 20;
 const OP_TYPE_INT: u16 = 21;
@@ -55,6 +57,11 @@ const OP_CONVERT_PTR_TO_U: u16 = 117;
 const OP_BITCAST: u16 = 124;
 const OP_SELECT: u16 = 169;
 const OP_PHI: u16 = 245;
+const OP_EXECUTION_MODE_ID: u16 = 331;
+
+// Execution modes.
+const LOCAL_SIZE: u32 = 17;
+const LOCAL_SIZE_ID: u32 = 38;
 
 // Decorations.
 const SPEC_ID: u32 = 1;
@@ -128,10 +135,11 @@ pub(crate) struct Reflection {
     pub constants: Vec<ConstantSlot>,
     pub push_bytes: u32,
     pub inputs: u32,
-    /// Bit `i` for each varying at location `i`: a vertex entry's outputs, a fragment
-    /// entry's inputs.
-    pub varyings: u32,
+    /// A vertex entry's outputs, a fragment entry's inputs, by location.
+    pub varyings: Vec<Varying>,
     pub outputs: u32,
+    /// A compute entry's `LocalSize`.
+    pub workgroup: Option<[u32; 3]>,
 }
 
 /// The names of a module's entry points, in the order the module declares them.
@@ -162,17 +170,17 @@ pub(crate) fn reflect(code: &[u8]) -> Result<Reflection> {
     let (varyings, outputs) = match stage {
         ShaderStage::Vertex => {
             module.check_no_inputs(entry, "vertex")?;
-            (module.locations(entry, OUTPUT, "varying")?, 0)
+            (module.varyings(entry, OUTPUT)?, 0)
         }
-        ShaderStage::Fragment => (
-            module.locations(entry, INPUT, "varying")?,
-            module.locations(entry, OUTPUT, "fragment output")?,
-        ),
+        ShaderStage::Fragment => {
+            (module.varyings(entry, INPUT)?, module.locations(entry, OUTPUT, "fragment output")?)
+        }
         ShaderStage::Compute => {
             module.check_no_inputs(entry, "compute")?;
-            (0, 0)
+            (Vec::new(), 0)
         }
     };
+    let workgroup = module.workgroup(stage)?;
     Ok(Reflection {
         stage,
         entry: entry.name.clone(),
@@ -182,6 +190,7 @@ pub(crate) fn reflect(code: &[u8]) -> Result<Reflection> {
         inputs: descriptors.inputs,
         varyings,
         outputs,
+        workgroup,
     })
 }
 
@@ -192,7 +201,7 @@ fn invalid(message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
 #[derive(Clone, Debug)]
 enum Type {
     Bool,
-    Int { width: u32 },
+    Int { width: u32, signed: bool },
     Float { width: u32 },
     Vector { component: u32, count: u32 },
     Matrix { column: u32, count: u32 },
@@ -240,6 +249,8 @@ struct Module {
     capabilities: Vec<u32>,
     extensions: Vec<String>,
     entries: Vec<Entry>,
+    /// Each `OpExecutionMode` and `OpExecutionModeId`: the mode and its operands.
+    modes: Vec<(u32, Vec<u32>)>,
     decorations: BTreeMap<u32, Decorations>,
     member_decorations: BTreeMap<(u32, u32), Decorations>,
     types: BTreeMap<u32, Type>,
@@ -293,6 +304,11 @@ impl Module {
                 let interface = operands.get(2 + used..).unwrap_or_default().to_vec();
                 self.entries.push(Entry { model: word(0)?, name, interface });
             }
+            // The one entry point a cooked module has is the one each mode is of.
+            OP_EXECUTION_MODE | OP_EXECUTION_MODE_ID => {
+                let operands = operands.get(2..).unwrap_or_default().to_vec();
+                self.modes.push((word(1)?, operands));
+            }
             OP_DECORATE => {
                 let decoration = (word(1)?, operands.get(2..).unwrap_or_default().to_vec());
                 self.decorations.entry(word(0)?).or_default().push(decoration);
@@ -303,7 +319,10 @@ impl Module {
                 self.member_decorations.entry(member).or_default().push(decoration);
             }
             OP_TYPE_BOOL => _ = self.types.insert(word(0)?, Type::Bool),
-            OP_TYPE_INT => _ = self.types.insert(word(0)?, Type::Int { width: word(1)? }),
+            OP_TYPE_INT => {
+                let int = Type::Int { width: word(1)?, signed: word(2)? != 0 };
+                self.types.insert(word(0)?, int);
+            }
             OP_TYPE_FLOAT => _ = self.types.insert(word(0)?, Type::Float { width: word(1)? }),
             OP_TYPE_VECTOR => {
                 let vector = Type::Vector { component: word(1)?, count: word(2)? };
@@ -642,6 +661,88 @@ impl Module {
         Ok(bits)
     }
 
+    /// The varyings of `storage` the entry point declares, by location: each a scalar or a
+    /// vector of 32-bit floats or integers, at a location below `VARYING_LOCATIONS`.
+    fn varyings(&self, entry: &Entry, storage: u32) -> Result<Vec<Varying>> {
+        self.locations(entry, storage, "varying")?;
+        let mut varyings = Vec::new();
+        for &variable in &entry.interface {
+            let Some(&(_, class)) = self.variables.get(&variable) else { continue };
+            if class != storage || self.is_built_in(variable)? {
+                continue;
+            }
+            let (pointee, _) = self.pointee(variable)?;
+            let location = self.decoration(variable, LOCATION).expect("held to one by locations");
+            let (component, count) = match self.types.get(&pointee) {
+                Some(Type::Vector { component, count }) => (*component, *count),
+                _ => (pointee, 1),
+            };
+            let component = match self.types.get(&component) {
+                Some(Type::Float { width: 32 }) => Some(ComponentType::Float),
+                Some(Type::Int { width: 32, signed: true }) => Some(ComponentType::Int),
+                Some(Type::Int { width: 32, signed: false }) => Some(ComponentType::Uint),
+                _ => None,
+            };
+            let Some(component) = component.filter(|_| (1..=4).contains(&count)) else {
+                return Err(invalid(format!(
+                    "the varying at location {location} is {}, where a varying is a float, an \
+                     int or a uint of 32 bits, or a vector of two to four of them",
+                    type_name(self.types.get(&pointee))
+                )));
+            };
+            if location >= VARYING_LOCATIONS {
+                return Err(invalid(format!(
+                    "the varying at location {location}, where a varying is below location \
+                     {VARYING_LOCATIONS}, the sixteen four-component locations every Vulkan \
+                     device has"
+                )));
+            }
+            varyings.push(Varying { location, component, count });
+        }
+        varyings.sort_by_key(|varying| varying.location);
+        Ok(varyings)
+    }
+
+    /// A compute entry's workgroup, from its `LocalSize`, within the format's bounds; `None`
+    /// for another stage.
+    fn workgroup(&self, stage: ShaderStage) -> Result<Option<[u32; 3]>> {
+        if self.modes.iter().any(|(mode, _)| *mode == LOCAL_SIZE_ID) {
+            return Err(invalid(
+                "the entry's workgroup size is `LocalSizeId`, of ids a specialisation may \
+                 change, which a Vulkan device takes under `maintenance4` alone \
+                 (VUID-RuntimeSpirv-LocalSizeId-06434) and the cooked format does not hold: \
+                 give `[numthreads]` literal sizes",
+            ));
+        }
+        let sizes: Vec<&[u32]> = self
+            .modes
+            .iter()
+            .filter(|(mode, _)| *mode == LOCAL_SIZE)
+            .map(|(_, operands)| operands.as_slice())
+            .collect();
+        match (stage, sizes.as_slice()) {
+            (ShaderStage::Compute, [[x, y, z]]) => {
+                let size = [*x, *y, *z];
+                let within =
+                    size.iter().zip(WORKGROUP_SIZE_MAX).all(|(&n, most)| (1..=most).contains(&n));
+                if !within || x * y * z > WORKGROUP_INVOCATIONS_MAX {
+                    return Err(invalid(format!(
+                        "the entry's workgroup is {size:?}, where each dimension is 1 to \
+                         {WORKGROUP_SIZE_MAX:?} and their product at most \
+                         {WORKGROUP_INVOCATIONS_MAX}: Vulkan's least limits"
+                    )));
+                }
+                Ok(Some(size))
+            }
+            (ShaderStage::Compute, _) => Err(invalid(format!(
+                "a compute entry with {} `LocalSize` modes of three sizes, where it has one",
+                sizes.len()
+            ))),
+            (_, []) => Ok(None),
+            (_, _) => Err(invalid("a `LocalSize` outside a compute entry")),
+        }
+    }
+
     /// A vertex or compute entry reads no input but the built-ins: a pipeline has no vertex
     /// buffer binding, and a compute entry has no stage before it.
     fn check_no_inputs(&self, entry: &Entry, stage: &str) -> Result<()> {
@@ -684,16 +785,20 @@ impl Module {
                 }
                 return Err(invalid(format!("a specialisation constant, %{id}, with no id")));
             };
-            let bytes = match self.types.get(&ty) {
-                Some(Type::Bool) => 1,
-                Some(Type::Int { width: 32 } | Type::Float { width: 32 }) => 4,
-                _ => {
+            let ty = match self.types.get(&ty) {
+                Some(Type::Bool) => ConstantType::Bool,
+                Some(Type::Int { width: 32, signed: true }) => ConstantType::Int,
+                Some(Type::Int { width: 32, signed: false }) => ConstantType::Uint,
+                Some(Type::Float { width: 32 }) => ConstantType::Float,
+                other => {
                     return Err(invalid(format!(
-                        "specialisation constant {slot} is neither a boolean nor 32 bits wide"
+                        "specialisation constant {slot} is {}, where the format holds a bool, \
+                         an int, a uint or a float, the last three of 32 bits",
+                        type_name(other)
                     )));
                 }
             };
-            constants.push(ConstantSlot { id: slot, bytes });
+            constants.push(ConstantSlot { id: slot, ty });
         }
         constants.sort_by_key(|constant| constant.id);
         if constants.windows(2).any(|pair| pair[0].id == pair[1].id) {
@@ -740,7 +845,7 @@ impl Module {
             )
         };
         let size = match self.types.get(&ty).ok_or_else(unsized_)? {
-            Type::Int { width } | Type::Float { width } => width / 8,
+            Type::Int { width, .. } | Type::Float { width } => width / 8,
             Type::Vector { count: 3, .. } => return Err(three()),
             Type::Vector { component, count } => self.size(*component, None)? * count,
             Type::Matrix { column, count } => {
@@ -791,6 +896,18 @@ impl Descriptors {
         let mut arrays: Vec<HeapArray> = self.heap.values().copied().collect();
         arrays.sort_by_key(|array| array.binding);
         Some(HeapUse { form: HeapForm::FixedArray, set: HEAP_SET, arrays })
+    }
+}
+
+/// A type's name in a message.
+fn type_name(ty: Option<&Type>) -> String {
+    match ty {
+        Some(Type::Bool) => "a bool".to_owned(),
+        Some(Type::Int { width, signed: true }) => format!("an int of {width} bits"),
+        Some(Type::Int { width, signed: false }) => format!("a uint of {width} bits"),
+        Some(Type::Float { width }) => format!("a float of {width} bits"),
+        Some(Type::Vector { count, .. }) => format!("a vector of {count} of another type"),
+        _ => "of another type".to_owned(),
     }
 }
 
@@ -936,9 +1053,9 @@ mod tests {
 
     type Instructions = Vec<(u16, Vec<u32>)>;
 
-    /// A module of one entry point, `main`, of `model` and with `interface`: the types every
-    /// test shares, then `globals`, then one function of `body`. A later type of an id
-    /// replaces an earlier one.
+    /// A module of one entry point, `main`, of `model` and with `interface`, a compute entry's
+    /// workgroup of one invocation: the types every test shares, then `globals`, then one
+    /// function of `body`. A later type of an id replaces an earlier one.
     fn assemble(
         model: u32,
         interface: &[u32],
@@ -948,9 +1065,11 @@ mod tests {
         let mut entry = vec![model, MAIN];
         entry.extend(literal("main"));
         entry.extend_from_slice(interface);
-        let mut all: Instructions = vec![
-            (OP_CAPABILITY, vec![1]),
-            (OP_ENTRY_POINT, entry),
+        let mut all: Instructions = vec![(OP_CAPABILITY, vec![1]), (OP_ENTRY_POINT, entry)];
+        if model == COMPUTE {
+            all.push((OP_EXECUTION_MODE, vec![MAIN, LOCAL_SIZE, 1, 1, 1]));
+        }
+        all.extend([
             (19, vec![VOID]),
             (OP_TYPE_FLOAT, vec![FLOAT, 32]),
             (OP_TYPE_INT, vec![UINT, 32, 0]),
@@ -963,7 +1082,7 @@ mod tests {
             (27, vec![SAMPLED_IMAGE, IMAGE]),
             (OP_TYPE_POINTER, vec![IMAGE_POINTER, UNIFORM_CONSTANT, IMAGE]),
             (OP_TYPE_POINTER, vec![SAMPLER_POINTER, UNIFORM_CONSTANT, SAMPLER]),
-        ];
+        ]);
         all.extend_from_slice(globals);
         all.push((54, vec![VOID, MAIN, 0, FREE + 100]));
         all.extend_from_slice(body);
@@ -1210,7 +1329,8 @@ mod tests {
         ]);
         let reflection =
             reflect(&assemble(FRAGMENT, &[FREE + 1, FREE + 3, FREE + 4], &globals, &[])).unwrap();
-        assert_eq!((reflection.outputs, reflection.varyings), (0b1000, 0b10));
+        let varying = Varying { location: 1, component: ComponentType::Float, count: 4 };
+        assert_eq!((reflection.outputs, reflection.varyings), (0b1000, vec![varying]));
         let array = (OP_TYPE_ARRAY, vec![FREE + 2, VEC4, N1024]);
         for (mut globals, says) in [
             (stage_variable(OUTPUT, VEC4, &[]), "a fragment output, %41, with 0 locations"),
@@ -1246,7 +1366,100 @@ mod tests {
         // A vertex entry's outputs are its varyings.
         let output = stage_variable(OUTPUT, VEC4, &[&[LOCATION, 2]]);
         let reflection = reflect(&assemble(VERTEX, &[FREE + 1], &output, &[])).unwrap();
-        assert_eq!((reflection.outputs, reflection.varyings), (0, 0b100));
+        let varying = Varying { location: 2, ..varying };
+        assert_eq!((reflection.outputs, reflection.varyings), (0, vec![varying]));
+    }
+
+    #[test]
+    fn each_varying_is_read_with_its_type_and_one_the_format_does_not_hold_is_refused() {
+        // Ids from `FREE + 10`: an int, a bool, a 64-bit uint, a 16-bit float, and vectors.
+        let types = [
+            (OP_TYPE_INT, vec![FREE + 10, 32, 1]),
+            (OP_TYPE_BOOL, vec![FREE + 11]),
+            (OP_TYPE_INT, vec![FREE + 12, 64, 0]),
+            (OP_TYPE_FLOAT, vec![FREE + 13, 16]),
+            (OP_TYPE_VECTOR, vec![FREE + 14, FREE + 10, 3]),
+            (OP_TYPE_VECTOR, vec![FREE + 15, UINT, 2]),
+            (OP_TYPE_VECTOR, vec![FREE + 16, FREE + 13, 2]),
+        ];
+        // Each varying, at locations 0 to 2 of a vertex entry, given in another order.
+        let mut globals = types.to_vec();
+        let mut interface = Vec::new();
+        for (at, (ty, location)) in
+            [(FREE + 14, 2), (UINT, 0), (FREE + 15, 1)].into_iter().enumerate()
+        {
+            let (pointer, variable) = (FREE + 20 + 2 * at as u32, FREE + 21 + 2 * at as u32);
+            globals.extend([
+                (OP_TYPE_POINTER, vec![pointer, OUTPUT, ty]),
+                (OP_VARIABLE, vec![pointer, variable, OUTPUT]),
+                (OP_DECORATE, vec![variable, LOCATION, location]),
+            ]);
+            interface.push(variable);
+        }
+        let reflection = reflect(&assemble(VERTEX, &interface, &globals, &[])).unwrap();
+        let read: Vec<(u32, ComponentType, u32)> = reflection
+            .varyings
+            .iter()
+            .map(|varying| (varying.location, varying.component, varying.count))
+            .collect();
+        assert_eq!(
+            read,
+            [(0, ComponentType::Uint, 1), (1, ComponentType::Uint, 2), (2, ComponentType::Int, 3)]
+        );
+        for (ty, location, says) in [
+            (FREE + 11, 0, "the varying at location 0 is a bool, where a varying is a float"),
+            (FREE + 12, 0, "the varying at location 0 is a uint of 64 bits"),
+            (FREE + 13, 0, "the varying at location 0 is a float of 16 bits"),
+            (FREE + 16, 0, "the varying at location 0 is a vector of 2 of another type"),
+            (UINT, 16, "the varying at location 16, where a varying is below location 16"),
+        ] {
+            let mut globals = types.to_vec();
+            globals.extend(stage_variable(OUTPUT, ty, &[&[LOCATION, location]]));
+            refused(&assemble(VERTEX, &[FREE + 1], &globals, &[]), says);
+        }
+    }
+
+    #[test]
+    fn a_compute_entrys_workgroup_is_read_and_one_of_ids_or_out_of_bounds_is_refused() {
+        // The module `assemble` gives of `model`, with `modes` in place of its own.
+        let with_modes = |model: u32, modes: &[(u16, &[u32])]| {
+            let code = assemble(model, &[], &[], &[]);
+            let mut words: Vec<u32> =
+                code.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+            // After the header, the capability and the entry point.
+            let at = 7 + (words[7] >> 16) as usize;
+            if words[at] & 0xffff == u32::from(OP_EXECUTION_MODE) {
+                words.drain(at..at + (words[at] >> 16) as usize);
+            }
+            let mut inserted = Vec::new();
+            for (opcode, operands) in modes {
+                let count = u32::try_from(operands.len() + 1).unwrap();
+                inserted.push(count << 16 | u32::from(*opcode));
+                inserted.extend_from_slice(operands);
+            }
+            words.splice(at..at, inserted);
+            words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<u8>>()
+        };
+        let size =
+            |x, y, z| with_modes(COMPUTE, &[(OP_EXECUTION_MODE, &[MAIN, LOCAL_SIZE, x, y, z])]);
+        assert_eq!(reflect(&assemble(COMPUTE, &[], &[], &[])).unwrap().workgroup, Some([1, 1, 1]));
+        assert_eq!(reflect(&size(64, 2, 1)).unwrap().workgroup, Some([64, 2, 1]));
+        assert_eq!(reflect(&size(1, 2, 64)).unwrap().workgroup, Some([1, 2, 64]));
+        assert_eq!(reflect(&size(128, 1, 1)).unwrap().workgroup, Some([128, 1, 1]));
+        for (x, y, z) in [(0, 1, 1), (1, 1, 0), (129, 1, 1), (1, 129, 1), (1, 1, 65), (64, 2, 2)] {
+            let says = format!("the entry's workgroup is [{x}, {y}, {z}], where each dimension");
+            refused(&size(x, y, z), &says);
+        }
+        // A vertex or fragment entry has none.
+        assert_eq!(reflect(&assemble(VERTEX, &[], &[], &[])).unwrap().workgroup, None);
+        refused(&with_modes(COMPUTE, &[]), "a compute entry with 0 `LocalSize` modes");
+        let local: (u16, &[u32]) = (OP_EXECUTION_MODE, &[MAIN, LOCAL_SIZE, 1, 1, 1]);
+        refused(&with_modes(COMPUTE, &[local, local]), "a compute entry with 2 `LocalSize` modes");
+        let by_id: (u16, &[u32]) = (OP_EXECUTION_MODE_ID, &[MAIN, LOCAL_SIZE_ID, N0, N0, N0]);
+        let says = "`LocalSizeId`, of ids a specialisation may change";
+        refused(&with_modes(COMPUTE, &[by_id]), says);
+        refused(&with_modes(COMPUTE, &[local, by_id]), says);
+        refused(&with_modes(FRAGMENT, &[local]), "a `LocalSize` outside a compute entry");
     }
 
     #[test]
@@ -1271,20 +1484,31 @@ mod tests {
     }
 
     #[test]
-    fn the_constants_are_read_and_each_has_an_id_and_a_width() {
+    fn the_constants_are_read_and_each_has_an_id_and_a_type() {
         let bool_ = (OP_TYPE_BOOL, vec![FREE]);
         let long = (OP_TYPE_INT, vec![FREE + 1, 64, 0]);
+        let int = (OP_TYPE_INT, vec![FREE + 5, 32, 1]);
         let constants = vec![
             bool_,
+            int,
             (OP_SPEC_CONSTANT_TRUE, vec![FREE, FREE + 2]),
             (OP_DECORATE, vec![FREE + 2, SPEC_ID, 7]),
             (OP_SPEC_CONSTANT, vec![FLOAT, FREE + 3, 0]),
             (OP_DECORATE, vec![FREE + 3, SPEC_ID, 2]),
+            (OP_SPEC_CONSTANT, vec![UINT, FREE + 6, 3]),
+            (OP_DECORATE, vec![FREE + 6, SPEC_ID, 9]),
+            (OP_SPEC_CONSTANT, vec![FREE + 5, FREE + 7, u32::MAX]),
+            (OP_DECORATE, vec![FREE + 7, SPEC_ID, 4]),
             // A composite or an operation of constants has no id of its own.
             (OP_SPEC_CONSTANT_OP, vec![UINT, FREE + 4, 128, FREE + 3]),
         ];
         let reflection = reflect(&assemble(FRAGMENT, &[], &constants, &[])).unwrap();
-        let expected = vec![ConstantSlot { id: 2, bytes: 4 }, ConstantSlot { id: 7, bytes: 1 }];
+        let expected = vec![
+            ConstantSlot { id: 2, ty: ConstantType::Float },
+            ConstantSlot { id: 4, ty: ConstantType::Int },
+            ConstantSlot { id: 7, ty: ConstantType::Bool },
+            ConstantSlot { id: 9, ty: ConstantType::Uint },
+        ];
         assert_eq!(reflection.constants, expected);
         for (globals, says) in [
             (
@@ -1297,7 +1521,8 @@ mod tests {
                     (OP_SPEC_CONSTANT, vec![FREE + 1, FREE + 2, 0, 0]),
                     (OP_DECORATE, vec![FREE + 2, SPEC_ID, 1]),
                 ],
-                "specialisation constant 1 is neither a boolean nor 32 bits wide",
+                "specialisation constant 1 is a uint of 64 bits, where the format holds a bool, \
+                 an int, a uint or a float, the last three of 32 bits",
             ),
             (
                 vec![

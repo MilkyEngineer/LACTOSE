@@ -1,6 +1,7 @@
 //! Slang's reflection of the entry point it compiled to SPIR-V, read for what the module
 //! cannot say: the semantic each varying and each fragment output is declared with, beside
-//! the location Slang gave it (`README.md`, "The checks"). Metal links a varying and writes
+//! the location Slang gave it (`README.md`, "The checks"); and for a compute entry's
+//! workgroup, which the module states and the MSL does not. Metal links a varying and writes
 //! a colour attachment by its semantic, Vulkan by its location, so each is refused unless
 //! the two agree: `SV_Target<i>` and `TEXCOORD<i>` at location `i`, the index 0 when it is
 //! not written.
@@ -18,6 +19,8 @@ pub(crate) struct Semantics {
     pub varyings: u32,
     /// Bit `i` for each `SV_Target<i>`.
     pub outputs: u32,
+    /// Its `threadGroupSize`, which only a compute entry's reflection gives.
+    pub workgroup: Option<[u32; 3]>,
 }
 
 /// Reads the entry point `entry` from the reflection `json` of a compile of it alone.
@@ -39,7 +42,25 @@ pub(crate) fn read(json: &[u8], entry: &str) -> Result<Semantics> {
     if found["name"].as_str() != Some(entry) {
         return Err(invalid(format!("Slang's reflection is not of the entry point {entry}")));
     }
-    let mut semantics = Semantics { varyings: 0, outputs: 0 };
+    let workgroup = match &found["threadGroupSize"] {
+        Value::Null => None,
+        size => {
+            let size: Option<Vec<u32>> = size.as_array().map(|dimensions| {
+                dimensions
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .filter_map(|n| n.try_into().ok())
+                    .collect()
+            });
+            let Some(&[x, y, z]) = size.as_deref() else {
+                return Err(invalid(
+                    "Slang's reflection gives a `threadGroupSize` that does not read",
+                ));
+            };
+            Some([x, y, z])
+        }
+    };
+    let mut semantics = Semantics { varyings: 0, outputs: 0, workgroup };
     let parameters = found["parameters"].as_array().map_or(&[][..], Vec::as_slice);
     for node in parameters.iter().chain(found.get("result")) {
         walk(node, 0, &mut semantics)?;
@@ -190,7 +211,19 @@ mod tests {
         let output =
             fields("", "varyingOutput", 0, &[leaf("c", "varyingOutput", 1, "SV_TARGET", Some(1))]);
         let read = read(&reflection(&input, &output), "fs").unwrap();
-        assert_eq!(read, Semantics { varyings: 0b11, outputs: 0b10 });
+        assert_eq!(read, Semantics { varyings: 0b11, outputs: 0b10, workgroup: None });
+    }
+
+    #[test]
+    fn a_compute_entrys_workgroup_is_read() {
+        let json = br#"{"entryPoints": [{"name": "cs", "threadGroupSize": [64, 2, 1]}]}"#;
+        assert_eq!(read(json, "cs").unwrap().workgroup, Some([64, 2, 1]));
+        for size in ["[64, 2]", "[64, 2, -1]", "64"] {
+            let json =
+                format!(r#"{{"entryPoints": [{{"name": "cs", "threadGroupSize": {size}}}]}}"#);
+            let error = read(json.as_bytes(), "cs").unwrap_err();
+            assert!(error.message().contains("`threadGroupSize` that does not read"), "{error}");
+        }
     }
 
     #[test]
