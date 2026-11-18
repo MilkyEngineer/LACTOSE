@@ -836,6 +836,80 @@ fn a_workgroup_out_of_bounds_is_refused() {
     assert_probe_refused("workgroup", &[], &source, says);
 }
 
+/// A vertex entry writing `SV_Position` and `float4` varyings at locations 0 to
+/// `locations - 1`, and a fragment entry reading every varying, and `SV_Position` (Vulkan's
+/// `FragCoord`) and `SV_IsFrontFace` where asked: the gpu review's probes v14 and v23 to v25.
+fn wide(locations: u32, frag_coord: bool, front_face: bool) -> String {
+    let fields: String =
+        (0..locations).map(|at| format!(" float4 a{at} : TEXCOORD{at};")).collect();
+    let writes: String = (0..locations).map(|at| format!(" v.a{at} = v.p * {at}.0;")).collect();
+    let mut sum: Vec<String> = (0..locations).map(|at| format!("f.a{at}")).collect();
+    if frag_coord {
+        sum.push("f.p".to_owned());
+    }
+    let (face, faced) = if front_face {
+        (", bool front : SV_IsFrontFace", " + (front ? 1.0 : 0.0)")
+    } else {
+        ("", "")
+    };
+    format!(
+        "struct VOut {{ float4 p : SV_Position;{fields} }};\n\
+         [shader(\"vertex\")] VOut vs_p(uint i : SV_VulkanVertexID) {{ VOut v; \
+         v.p = float4(float(i & 1), float(i >> 1), 0, 1);{writes} return v; }}\n\
+         struct FIn {{ float4 p : SV_Position;{fields} }};\n\
+         [shader(\"fragment\")] float4 fs_p(FIn f{face}) : SV_Target0 {{ return {}{faced}; }}\n",
+        sum.join(" + ")
+    )
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn varyings_and_built_ins_past_64_components_are_refused() {
+    // v14: sixteen `float4` and `Position`, 68 components in the vertex entry's outputs.
+    let says = "vs_p (SPIR-V): the vertex entry's outputs take 68 components, 64 for the \
+                locations up to the highest and 4 for the built-ins, above the 64";
+    assert_probe_refused("wide-v14", &[], &wide(16, false, false), says);
+    // v23: the same, and the fragment entry reads `FragCoord`: 68 on each side.
+    assert_probe_refused("wide-v23", &[], &wide(16, true, false), "take 68 components");
+    // v25: fifteen, and the fragment entry reads `FragCoord` and `FrontFacing`.
+    let says = "fs_p (SPIR-V): the fragment entry's inputs take 65 components, 60 for the \
+                locations up to the highest and 5 for the built-ins";
+    assert_probe_refused("wide-v25", &[], &wide(15, true, true), says);
+    // v24: fifteen and `FragCoord`, 64 on each side.
+    assert_probe_cooks("wide-v24", &[], &wide(15, true, false), "fs_p");
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_varying_or_constant_of_16_or_64_bits_or_centroid_or_sample_is_refused_by_name() {
+    for (what, field, says) in [
+        ("half", "nointerpolation half2 v", "capability Float16"),
+        ("int16", "nointerpolation int16_t v", "capability Int16"),
+        ("double", "nointerpolation double v", "capability Float64"),
+        ("centroid", "centroid float2 v", "the varying at location 1 is `centroid`"),
+        ("sample", "sample float2 v", "capability SampleRateShading"),
+    ] {
+        let source = format!(
+            "struct V {{ float4 position : SV_Position; [[vk::location(1)]] {field} : TEXCOORD1; }};\n\
+             [shader(\"vertex\")] V vs_o(uint vertex : SV_VulkanVertexID)\n\
+             {{ V r = (V)0; r.position = float4(float(vertex), 0, 0, 1); return r; }}\n\
+             [shader(\"fragment\")] float4 fs_o(V v) : SV_Target0 {{ return float4(float(v.v.x), 0, 0, 1); }}\n"
+        );
+        assert_probe_refused(&format!("odd-{what}"), &[], &source, says);
+    }
+    for (what, ty, value, says) in [
+        ("half", "half", "1.0h", "capability Float16"),
+        ("int16", "int16_t", "1", "capability Int16"),
+        ("double", "double", "1.0l", "capability Float64"),
+    ] {
+        let source = TYPED.replace(
+            "[[vk::constant_id(7)]] const float SCALE = 1.0;",
+            &format!("[[vk::constant_id(7)]] const {ty} SCALE = {value};"),
+        );
+        assert_probe_refused(&format!("odd-constant-{what}"), &[], &source, says);
+    }
+}
+
 #[test]
 #[ignore = "a measurement: `--run-ignored all --release --no-capture`, after `cargo xtask slang`"]
 fn the_shader_kind_loads_against_the_slice() {

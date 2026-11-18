@@ -69,7 +69,10 @@ const ROW_MAJOR: u32 = 4;
 const ARRAY_STRIDE: u32 = 6;
 const MATRIX_STRIDE: u32 = 7;
 const BUILT_IN: u32 = 11;
+const CENTROID: u32 = 16;
+const SAMPLE: u32 = 17;
 const LOCATION: u32 = 30;
+const COMPONENT: u32 = 31;
 const BINDING: u32 = 33;
 const DESCRIPTOR_SET: u32 = 34;
 const OFFSET: u32 = 35;
@@ -84,6 +87,13 @@ const OUTPUT: u32 = 3;
 const PUSH_CONSTANT: u32 = 9;
 const STORAGE_BUFFER: u32 = 12;
 const PHYSICAL_STORAGE_BUFFER: u32 = 5349;
+
+/// `BuiltIn WorkgroupSize`.
+const WORKGROUP_SIZE: u32 = 25;
+
+/// The components a stage's varyings and the built-ins of its interface take at most:
+/// Vulkan's least `maxVertexOutputComponents` and `maxFragmentInputComponents`.
+const VARYING_COMPONENTS_MAX: u32 = 64;
 
 // Image dimensions.
 const DIM_2D: u32 = 1;
@@ -105,8 +115,8 @@ const ALLOWED: [(u32, &str); 8] = [
 /// The extension the list's `PhysicalStorageBufferAddresses` needs, and the only one.
 const EXTENSION: &str = "SPV_KHR_physical_storage_buffer";
 
-/// What a refused capability most often means, for the three the README names.
-const REFUSED: [(u32, &str, &str); 3] = [
+/// What a refused capability most often means, for those the README names.
+const REFUSED: [(u32, &str, &str); 7] = [
     (
         4427,
         "DrawParameters",
@@ -123,6 +133,30 @@ const REFUSED: [(u32, &str, &str); 3] = [
         12,
         "Int64Atomics",
         "64-bit atomics declare it, and the renderer selects them from milestone 3",
+    ),
+    (
+        9,
+        "Float16",
+        "a `half` declares it, and the format's constants and varyings are of 32 bits: use \
+         `float`",
+    ),
+    (
+        22,
+        "Int16",
+        "a 16-bit integer declares it, and the format's constants and varyings are of 32 \
+         bits: use `int` or `uint`",
+    ),
+    (
+        10,
+        "Float64",
+        "a `double` declares it, and the format's constants and varyings are of 32 bits: use \
+         `float`",
+    ),
+    (
+        35,
+        "SampleRateShading",
+        "`sample` interpolation declares it, which the cook refuses until an attachment can \
+         be multisampled",
     ),
 ];
 
@@ -627,7 +661,7 @@ impl Module {
     }
 
     /// Bit `i` for each variable of the entry's interface in `storage` at location `i`, the
-    /// built-ins aside: each has one location and takes one.
+    /// built-ins aside: each has one location and takes one, with no `Component` of its own.
     fn locations(&self, entry: &Entry, storage: u32, what: &str) -> Result<u32> {
         let mut bits = 0;
         for &variable in &entry.interface {
@@ -644,6 +678,13 @@ impl Module {
                     locations.len()
                 )));
             };
+            if self.is(variable, COMPONENT) {
+                return Err(invalid(format!(
+                    "the {what} at location {location} has a `Component` decoration, which \
+                     places it beside another in one location, where each takes a location of \
+                     its own"
+                )));
+            }
             if matches!(
                 self.types.get(&pointee),
                 Some(Type::Array { .. } | Type::Struct { .. } | Type::Matrix { .. })
@@ -662,7 +703,9 @@ impl Module {
     }
 
     /// The varyings of `storage` the entry point declares, by location: each a scalar or a
-    /// vector of 32-bit floats or integers, at a location below `VARYING_LOCATIONS`.
+    /// vector of 32-bit floats or integers, at a location below `VARYING_LOCATIONS`, neither
+    /// `centroid` nor `sample`. With the built-ins of the interface they take at most
+    /// `VARYING_COMPONENTS_MAX` components, a location's four up to the highest.
     fn varyings(&self, entry: &Entry, storage: u32) -> Result<Vec<Varying>> {
         self.locations(entry, storage, "varying")?;
         let mut varyings = Vec::new();
@@ -693,19 +736,84 @@ impl Module {
             if location >= VARYING_LOCATIONS {
                 return Err(invalid(format!(
                     "the varying at location {location}, where a varying is below location \
-                     {VARYING_LOCATIONS}, the sixteen four-component locations every Vulkan \
-                     device has"
+                     {VARYING_LOCATIONS}, the format's bound"
                 )));
+            }
+            // Slang writes `centroid` as Metal's `[[center_perspective]]`, so under
+            // multisampling the two targets would sample at different points.
+            for (decoration, name) in [(CENTROID, "centroid"), (SAMPLE, "sample")] {
+                if self.is(variable, decoration) {
+                    return Err(invalid(format!(
+                        "the varying at location {location} is `{name}`, which the cook refuses \
+                         until an attachment can be multisampled"
+                    )));
+                }
             }
             varyings.push(Varying { location, component, count });
         }
         varyings.sort_by_key(|varying| varying.location);
+        let locations = varyings.last().map_or(0, |highest| 4 * (highest.location + 1));
+        let mut built_ins = 0;
+        for &variable in &entry.interface {
+            let Some(&(_, class)) = self.variables.get(&variable) else { continue };
+            if class == storage && self.is_built_in(variable)? {
+                built_ins += self.components(self.pointee(variable)?.0)?;
+            }
+        }
+        if locations + built_ins > VARYING_COMPONENTS_MAX {
+            let what = if storage == OUTPUT {
+                "vertex entry's outputs"
+            } else {
+                "fragment entry's inputs"
+            };
+            return Err(invalid(format!(
+                "the {what} take {} components, {locations} for the locations up to the highest \
+                 and {built_ins} for the built-ins, above the {VARYING_COMPONENTS_MAX} of \
+                 Vulkan's least `maxVertexOutputComponents` and `maxFragmentInputComponents`, \
+                 which count both (VUID-RuntimeSpirv-Location-06272)",
+                locations + built_ins
+            )));
+        }
         Ok(varyings)
+    }
+
+    /// The 32-bit components a value of type `ty` takes in an interface: a 64-bit scalar's
+    /// two, each element's and each member's.
+    fn components(&self, ty: u32) -> Result<u32> {
+        let components = match self.types.get(&ty) {
+            Some(Type::Bool) => 1,
+            Some(Type::Int { width, .. } | Type::Float { width }) => width.div_ceil(32),
+            Some(Type::Vector { component, count }) => self.components(*component)? * count,
+            Some(Type::Matrix { column, count }) => self.components(*column)? * count,
+            Some(Type::Array { element, length }) if self.constants.contains_key(length) => {
+                self.components(*element)? * self.constants[length]
+            }
+            Some(Type::Struct { members }) => {
+                members.iter().map(|&member| self.components(member)).sum::<Result<u32>>()?
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "a built-in of type %{ty} in the interface, whose components the cook cannot \
+                     count"
+                )));
+            }
+        };
+        Ok(components)
     }
 
     /// A compute entry's workgroup, from its `LocalSize`, within the format's bounds; `None`
     /// for another stage.
     fn workgroup(&self, stage: ShaderStage) -> Result<Option<[u32; 3]>> {
+        let overridden = self.decorations.values().flatten().any(|(decoration, operands)| {
+            *decoration == BUILT_IN && operands.first() == Some(&WORKGROUP_SIZE)
+        });
+        if overridden {
+            return Err(invalid(
+                "an id decorated `BuiltIn WorkgroupSize`, which sets the workgroup in place of \
+                 `LocalSize`, from a constant a specialisation may change, and which the cooked \
+                 format does not hold: give `[numthreads]` literal sizes",
+            ));
+        }
         if self.modes.iter().any(|(mode, _)| *mode == LOCAL_SIZE_ID) {
             return Err(invalid(
                 "the entry's workgroup size is `LocalSizeId`, of ids a specialisation may \
@@ -1011,6 +1119,10 @@ mod tests {
             (4427, "capability DrawParameters, which is outside rhi-api's list: `SV_VertexID`"),
             (5302, "capability RuntimeDescriptorArray, which is outside rhi-api's list: a runtime"),
             (12, "capability Int64Atomics, which is outside rhi-api's list: 64-bit atomics"),
+            (9, "capability Float16, which is outside rhi-api's list: a `half` declares it"),
+            (22, "capability Int16, which is outside rhi-api's list: a 16-bit integer"),
+            (10, "capability Float64, which is outside rhi-api's list: a `double` declares it"),
+            (35, "capability SampleRateShading, which is outside rhi-api's list: `sample`"),
         ] {
             let error = reflect(&module(&[shader, (OP_CAPABILITY, &[capability])])).unwrap_err();
             assert!(error.message().starts_with(&format!("the module declares {says}")), "{error}");
@@ -1420,6 +1532,86 @@ mod tests {
     }
 
     #[test]
+    fn a_varying_packed_by_component_or_centroid_or_sample_is_refused() {
+        for (decoration, says) in [
+            (&[COMPONENT, 2][..], "the varying at location 1 has a `Component` decoration"),
+            (&[CENTROID], "the varying at location 1 is `centroid`, which the cook refuses"),
+            (&[SAMPLE], "the varying at location 1 is `sample`, which the cook refuses"),
+        ] {
+            let read = stage_variable(INPUT, VEC4, &[&[LOCATION, 1], decoration]);
+            refused(&assemble(FRAGMENT, &[FREE + 1], &read, &[]), says);
+            let written = stage_variable(OUTPUT, VEC4, &[&[LOCATION, 1], decoration]);
+            refused(&assemble(VERTEX, &[FREE + 1], &written, &[]), says);
+        }
+        let output = stage_variable(OUTPUT, VEC4, &[&[LOCATION, 0], &[COMPONENT, 0]]);
+        refused(
+            &assemble(FRAGMENT, &[FREE + 1], &output, &[]),
+            "the fragment output at location 0 has a `Component` decoration",
+        );
+    }
+
+    /// A module of `model` whose interface is a `VEC4` varying of `storage` at each location
+    /// below `locations` and a built-in of each of `built_ins`, its type and its `BuiltIn`.
+    fn interface(model: u32, storage: u32, locations: u32, built_ins: &[(u32, u32)]) -> Vec<u8> {
+        let mut globals = vec![
+            (OP_TYPE_BOOL, vec![FREE]),
+            (OP_TYPE_ARRAY, vec![FREE + 1, FLOAT, FREE + 2]),
+            (OP_CONSTANT, vec![UINT, FREE + 2, 2]),
+            (OP_TYPE_POINTER, vec![FREE + 3, storage, VEC4]),
+        ];
+        let mut interface = Vec::new();
+        for location in 0..locations {
+            let variable = FREE + 10 + location;
+            globals.push((OP_VARIABLE, vec![FREE + 3, variable, storage]));
+            globals.push((OP_DECORATE, vec![variable, LOCATION, location]));
+            interface.push(variable);
+        }
+        for (at, &(ty, built_in)) in (0..).zip(built_ins) {
+            let (pointer, variable) = (FREE + 40 + 2 * at, FREE + 41 + 2 * at);
+            globals.extend([
+                (OP_TYPE_POINTER, vec![pointer, storage, ty]),
+                (OP_VARIABLE, vec![pointer, variable, storage]),
+                (OP_DECORATE, vec![variable, BUILT_IN, built_in]),
+            ]);
+            interface.push(variable);
+        }
+        assemble(model, &interface, &globals, &[])
+    }
+
+    #[test]
+    fn the_varyings_and_the_built_ins_beside_them_take_at_most_64_components() {
+        // `Position` and `FragCoord` a `VEC4`, `FrontFacing` a bool, `ClipDistance` two floats.
+        let (position, frag_coord, front_facing, clip) =
+            ((VEC4, 0), (VEC4, 15), (FREE, 17), (FREE + 1, 3));
+        let count = |code: &[u8]| reflect(code).map(|reflection| reflection.varyings.len());
+        assert_eq!(count(&interface(VERTEX, OUTPUT, 15, &[position])).unwrap(), 15);
+        assert_eq!(count(&interface(FRAGMENT, INPUT, 15, &[frag_coord])).unwrap(), 15);
+        assert_eq!(count(&interface(VERTEX, OUTPUT, 16, &[])).unwrap(), 16);
+        assert_eq!(count(&interface(VERTEX, OUTPUT, 14, &[position, clip])).unwrap(), 14);
+        for (code, says) in [
+            (
+                interface(VERTEX, OUTPUT, 16, &[position]),
+                "the vertex entry's outputs take 68 components, 64 for the locations up to the \
+                 highest and 4 for the built-ins",
+            ),
+            (
+                interface(FRAGMENT, INPUT, 15, &[frag_coord, front_facing]),
+                "the fragment entry's inputs take 65 components, 60 for the locations up to the \
+                 highest and 5 for the built-ins",
+            ),
+            (
+                interface(VERTEX, OUTPUT, 15, &[position, clip]),
+                "the vertex entry's outputs take 66 components, 60 for the locations up to the \
+                 highest and 6 for the built-ins",
+            ),
+        ] {
+            refused(&code, says);
+        }
+        let error = reflect(&interface(VERTEX, OUTPUT, 16, &[position])).unwrap_err();
+        assert!(error.message().contains("VUID-RuntimeSpirv-Location-06272"), "{error}");
+    }
+
+    #[test]
     fn a_compute_entrys_workgroup_is_read_and_one_of_ids_or_out_of_bounds_is_refused() {
         // The module `assemble` gives of `model`, with `modes` in place of its own.
         let with_modes = |model: u32, modes: &[(u16, &[u32])]| {
@@ -1460,6 +1652,12 @@ mod tests {
         refused(&with_modes(COMPUTE, &[by_id]), says);
         refused(&with_modes(COMPUTE, &[local, by_id]), says);
         refused(&with_modes(FRAGMENT, &[local]), "a `LocalSize` outside a compute entry");
+        // A constant decorated `BuiltIn WorkgroupSize` would override the `LocalSize`.
+        let decorated = [(OP_DECORATE, vec![N1024, BUILT_IN, WORKGROUP_SIZE])];
+        refused(
+            &assemble(COMPUTE, &[], &decorated, &[]),
+            "an id decorated `BuiltIn WorkgroupSize`, which sets the workgroup in place of",
+        );
     }
 
     #[test]
