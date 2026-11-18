@@ -1,5 +1,6 @@
 //! What the integration tests share: worlds of each kind built as `app` builds them, with
-//! extract placed and a snapshot channel whose reader a `Presentation` holds; a system that
+//! extract placed and a snapshot channel, whose reader the frame acquires from and hands the
+//! pair to a `Presentation`, as `app`'s frame does; a system that
 //! emits a sound request for every row with a mesh, every tick; an event sink that records;
 //! and a job to run the upload from.
 
@@ -7,6 +8,7 @@
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use lactose_asset_api::{AssetId, AssetRef};
 use lactose_core::{NetId, PlayerId, StableKey, Tick};
@@ -17,9 +19,10 @@ use lactose_ecs::{
 use lactose_math::{Scalar, Vec3};
 use lactose_physics_api::Transform;
 use lactose_present_api::{
-    AudioRequest, MeshInstance, PresentFrame, extract_state, snapshot_channel,
+    AudioRequest, InstanceRow, InstanceSink, MeshInstance, PresentFrame, SnapshotReader,
+    extract_state, snapshot_channel,
 };
-use lactose_presentation::{EventSink, PresentView, Presentation, Shown};
+use lactose_presentation::{CameraPose, EventSink, PresentView, Presentation};
 use lactose_sim::{Registration, Simulation, SimulationBuilder, Stage, TickInput, TypeTable};
 use lactose_task::{Executor, GraphBuilder, GraphNode, JobContext};
 
@@ -75,11 +78,22 @@ pub fn executor(workers: u32) -> Executor {
 // ---- A world shown as `app` shows it ----
 
 /// A world of one kind, with extract placed and a snapshot channel installed, run frame by
-/// frame as `app` runs it, and the presentation schedule on the channel's reader.
+/// frame as `app` runs it: the frame acquires from the channel's reader and hands the pair to
+/// the presentation schedule.
 pub struct Scene {
     simulation: Option<Simulation>,
     pub executor: Executor,
+    pub reader: SnapshotReader,
     pub presentation: Presentation,
+}
+
+/// What a frame of the scene showed: the pair it acquired, and what the schedule placed on
+/// it.
+pub struct Shown<'s> {
+    pub frame: PresentFrame<'s>,
+    pub camera: Option<CameraPose>,
+    pub remote: &'s [InstanceRow],
+    pub missing: usize,
 }
 
 impl Scene {
@@ -103,7 +117,8 @@ impl Scene {
         Self {
             simulation: Some(simulation),
             executor: executor(workers),
-            presentation: Presentation::new(reader),
+            reader,
+            presentation: Presentation::new(),
         }
     }
 
@@ -139,19 +154,29 @@ impl Scene {
         (emitted, cancelled)
     }
 
+    /// Installs `sink` as extract's instance sink: the world's next pass is a full one.
+    pub fn install_sink(&mut self, sink: Box<dyn InstanceSink>) {
+        let simulation = self.simulation.as_mut().expect("between runs");
+        drop(extract_state(simulation).expect("setup ran").set_sink(Some(sink)));
+    }
+
     /// A step, then the publication.
     pub fn tick_publish(&mut self) {
         self.step();
         self.publish();
     }
 
-    /// The schedule's frame at `view`, with the events into `events`.
+    /// A frame as `app` runs one: the pair acquired once, then the schedule on it at `view`,
+    /// with the events into `events`. `None`, and nothing run, before the first publication.
     pub fn frame<'s>(
         &'s mut self,
         view: &PresentView<'_>,
         events: &mut dyn EventSink,
     ) -> Option<Shown<'s>> {
-        self.presentation.frame(view, events)
+        let frame = self.reader.acquire()?;
+        let shown = self.presentation.frame(&frame, view, events);
+        let remote = self.presentation.remote();
+        Some(Shown { frame, camera: shown.camera, remote, missing: shown.missing })
     }
 }
 
@@ -218,11 +243,33 @@ impl GraphNode for Job {
     }
 }
 
+/// The longest a test waits for a job: past it, the test reports the job stuck and exits as
+/// failed, since a stuck scope would also stop the test's own teardown.
+pub const LIMIT: Duration = Duration::from_secs(60);
+
 /// Runs `body` as a job of `executor`'s, as the frame runs the schedule's upload, and returns
-/// once it and every job it forked have finished.
+/// once it and every job it forked have finished, within [`LIMIT`].
 pub fn in_job(executor: &Executor, body: impl FnOnce(&mut JobContext<'_>) + Send + 'static) {
     let mut builder = GraphBuilder::new();
     builder.add_node(Arc::new(Job(Mutex::new(Some(Box::new(body))))));
     let graph = builder.build().expect("one node");
-    executor.block_on(executor.run_graph(graph)).expect("the job runs");
+    let (done, finished) = std::sync::mpsc::channel();
+    let executor = executor.clone();
+    let runner = std::thread::spawn(move || {
+        let ran = executor.block_on(executor.run_graph(graph)).map(drop);
+        let _ = done.send(ran);
+    });
+    match finished.recv_timeout(LIMIT) {
+        Ok(ran) => {
+            runner.join().expect("the runner");
+            ran.expect("the job runs");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(runner.join().expect_err("the runner sent nothing"));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!("a job and its forks did not finish within {LIMIT:?}");
+            std::process::exit(101);
+        }
+    }
 }

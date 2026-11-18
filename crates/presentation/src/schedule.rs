@@ -1,11 +1,11 @@
-//! The schedule per frame on one world's snapshot (architecture section 5.3): acquire the
-//! pair, deliver the events, place the camera, sample the remote rows.
+//! The schedule per frame on one world's snapshot (architecture section 5.3): on the pair the
+//! frame acquired, deliver the events, place the camera, sample the remote rows.
 
 use lactose_core::StableKey;
 use lactose_ecs::{PresentEmission, PresentEventKey};
 use lactose_net_host::InterpolationReader;
 use lactose_net_host::interpolation::PresentationTime;
-use lactose_present_api::{InstanceRow, PresentFrame, SnapshotReader};
+use lactose_present_api::{InstanceRow, PresentFrame};
 
 use crate::camera::CameraPose;
 use crate::remote::RemoteRows;
@@ -43,55 +43,50 @@ pub struct RemoteView<'a> {
     pub at: PresentationTime,
 }
 
-/// What a frame shows.
-#[derive(Clone, Copy, Debug)]
-pub struct Shown<'p> {
-    /// The pair the frame was run on, for what else the frame reads of it (lights, decals,
-    /// the UI's components). Its events are already delivered.
-    pub frame: PresentFrame<'p>,
+/// What a frame's schedule placed, beside the remote rows [`Presentation::remote`] lends.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Shown {
     /// The camera, if the view has a focus and the newer snapshot holds its transform and
     /// its `CameraRig`.
     pub camera: Option<CameraPose>,
-    /// Every remote row with a placement this frame, ascending by key, each key once: what
-    /// [`upload`](crate::upload) writes. Empty without a [`RemoteView`].
-    pub remote: &'p [InstanceRow],
     /// The remote rows left out: their slot held no state and they were not shown in the
-    /// previous frame.
+    /// previous frame. Zero without a [`RemoteView`].
     pub missing: usize,
 }
 
-/// The presentation schedule of one shown world: its snapshot reader, and what the remote
-/// sample keeps between frames. A client showing two worlds holds one for each.
-#[derive(Debug)]
+/// The presentation schedule of one shown world: what the remote sample keeps between
+/// frames. It holds no reader: the frame acquires the world's pair and hands it over. A
+/// client showing two worlds holds one for each.
+#[derive(Debug, Default)]
 pub struct Presentation {
-    reader: SnapshotReader,
     remote: RemoteRows,
 }
 
 impl Presentation {
-    /// The schedule on the snapshots `reader` acquires: the reading half of the world's
-    /// `snapshot_channel`, whose writer `app` installs with `ExtractState::set_snapshot`.
+    /// A schedule with no remote rows yet.
     #[must_use]
-    pub fn new(reader: SnapshotReader) -> Self {
-        Self { reader, remote: RemoteRows::default() }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Runs the schedule once: acquires the newest pair, hands its events to `events`
-    /// (every emission, then every cancellation, in the batch's order), places the camera on
-    /// the focus, and samples the remote rows of the newer snapshot. Returns `None`, and
-    /// delivers nothing, before the world's first publication; its events wait for the
-    /// first frame.
+    /// Runs the schedule once on `frame`, the pair the caller acquired from the world's
+    /// `SnapshotReader`: hands its events to `events` (every emission, then every
+    /// cancellation, in the batch's order), places the camera on the focus, and samples the
+    /// remote rows of the newer snapshot, which [`remote`](Self::remote) then lends. Returns
+    /// the camera and the count of remote rows left out.
     ///
-    /// Each call acquires once, so each event published is delivered by exactly one call,
-    /// whatever the cadence of publications and calls (`lactose-present-api`, "Events and
-    /// publication"). The remote rows are sampled once a call, each slot once, and a call
-    /// with no publication since the last samples again at the view's time.
+    /// The events are those `frame` carries, so the caller gives each pair it acquires to
+    /// one call, once: then each event published is delivered once, whatever the cadence of
+    /// publications and frames (`lactose-present-api`, "Events and publication"). A pair
+    /// given twice delivers its events twice, and a pair acquired and not given drops them.
+    /// The remote rows are sampled once a call, each slot once, and a call on the same pair
+    /// samples again at the view's time.
     pub fn frame(
         &mut self,
+        frame: &PresentFrame<'_>,
         view: &PresentView<'_>,
         events: &mut dyn EventSink,
-    ) -> Option<Shown<'_>> {
-        let frame = self.reader.acquire()?;
+    ) -> Shown {
         let batch = frame.events();
         for emission in &batch.emitted {
             events.emitted(emission);
@@ -99,11 +94,20 @@ impl Presentation {
         for key in &batch.cancelled {
             events.cancelled(*key);
         }
-        let camera = view.focus.and_then(|focus| CameraPose::of(&frame, focus, view.fraction));
+        let camera = view.focus.and_then(|focus| CameraPose::of(frame, focus, view.fraction));
         match view.remote {
             Some(remote) => self.remote.sample(frame.newer(), remote.buffer, remote.at),
             None => self.remote.clear(),
         }
-        Some(Shown { frame, camera, remote: self.remote.rows(), missing: self.remote.missing() })
+        Shown { camera, missing: self.remote.missing() }
+    }
+
+    /// The remote rows of the last [`frame`](Self::frame): every remote row with a
+    /// placement, ascending by key, each key once, what [`upload`](crate::upload) writes.
+    /// Empty before the first call and after a call without a [`RemoteView`]. Lent, so the
+    /// frame's draw uploads them with no copy.
+    #[must_use]
+    pub fn remote(&self) -> &[InstanceRow] {
+        self.remote.rows()
     }
 }

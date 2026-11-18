@@ -12,34 +12,25 @@ use lactose_present_api::{CameraRig, PresentFrame};
 /// [`PresentFrame::transform`] has none (no such row, or a `Client` world's snapshot).
 ///
 /// `fraction` is the frame's, as `lactose-renderer`'s `FrameView::fraction`: from zero, the
-/// tick before the newer snapshot's, to one, the newer snapshot's tick; clamped to `[0, 1]`,
-/// and NaN counts as one. The frame's time is that point, and the pair is interpolated
-/// linearly over its ticks there: with snapshots a tick apart the weight is `fraction`, two
-/// ticks apart `(1 + fraction) / 2`. So a row of the snapshot and an instance the renderer
-/// draws between its two placements at the same fraction are shown at the same time.
+/// older snapshot's transform, to one, the newer's, whatever the ticks between the two
+/// snapshots; clamped to `[0, 1]`, and NaN counts as one. It is the weight: the renderer
+/// draws an instance at `previous + (current - previous) * fraction` over the same pair, so a
+/// row of the snapshot and the instance the renderer draws for it are shown at the same
+/// instant, the camera's pivot with the mesh it follows.
 ///
 /// Where the pair is flagged `no_interpolate` the newer transform is shown. Otherwise the
-/// translation is `lerp` and the rotation `slerp` of `lactose_math`, and a weight of zero or
+/// translation is `lerp` and the rotation `slerp` of `lactose_math`, and a fraction of zero or
 /// one gives the older or the newer transform exactly.
 #[must_use]
 pub fn interpolate(frame: &PresentFrame<'_>, key: StableKey, fraction: f32) -> Option<Transform> {
     let pair = frame.transform(key)?;
-    // A pair a tick or more apart, by the wrapping comparison: anything else is a cut or one
-    // tick, which `no_interpolate` covers; the test is kept so a weight is never divided by
-    // zero or a wrapped span.
-    let span = frame.newer().tick().0.wrapping_sub(frame.older().tick().0);
-    if pair.no_interpolate || span == 0 || span > i32::MAX as u32 {
+    if pair.no_interpolate || fraction.is_nan() || fraction >= 1.0 {
         return Some(pair.current);
     }
-    let fraction = if fraction.is_nan() { 1.0 } else { f64::from(fraction.clamp(0.0, 1.0)) };
-    let weight = (f64::from(span - 1) + fraction) / f64::from(span);
-    if weight >= 1.0 {
-        return Some(pair.current);
-    }
-    if weight <= 0.0 {
+    if fraction <= 0.0 {
         return Some(pair.previous);
     }
-    let weight = Scalar::from_f64(weight);
+    let weight = Scalar::from_f32(fraction);
     let (previous, current) = (pair.previous, pair.current);
     Some(Transform::new(
         previous.translation.lerp(current.translation, weight),

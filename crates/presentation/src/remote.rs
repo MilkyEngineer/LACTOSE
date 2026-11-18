@@ -116,6 +116,10 @@ fn shown_last(last: &[InstanceRow], key: StableKey) -> Option<RenderTransform> {
 /// by `Renderer::remote` once the frame's `Client` pass has ended, and its drop closes the
 /// frame's one remote batch; both are the frame's to order.
 ///
+/// The calls come in no stated order and from no stated thread, the calling job's among
+/// them, so `write` must not need anything the calling job holds across `upload`. A panic in
+/// `write` aborts the process, as any job's does.
+///
 /// ```no_run
 /// use lactose_present_api::InstanceRow;
 /// use lactose_renderer::Renderer;

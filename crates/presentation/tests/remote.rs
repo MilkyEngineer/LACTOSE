@@ -1,12 +1,15 @@
 //! The remote sample and upload (architecture section 5.3): every remote row of a client's
-//! replicated world, a row with a `RemoteSlot` and a `MeshInstance`, is sampled and written
-//! once a frame, shown by counts; a slot with no state shows the row where it was last shown,
-//! and one never shown is left out and counted; the upload writes each row in exactly one
-//! call from the frame's job.
+//! replicated world, a row with a `RemoteSlot` and a `MeshInstance`, is written once a frame,
+//! shown by counts (that it is sampled in one `sample_batch` call is by inspection); a slot
+//! with no state shows the row where it was last shown, and one never shown is left out and
+//! counted; the upload writes each row in exactly one call from the frame's job, and calls
+//! from forked jobs at once.
 
 #![forbid(unsafe_code)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::common;
 
@@ -179,4 +182,45 @@ fn the_upload_writes_each_row_in_one_call() {
         let expected: Vec<StableKey> = rows.iter().map(|row| row.key).collect();
         assert_eq!(written, expected, "{count} rows");
     }
+}
+
+/// How long a call of the overlap test waits for a second call to begin.
+const OVERLAP_WAIT: Duration = Duration::from_secs(10);
+
+/// More rows than two calls take are written from forked jobs at once: on an executor of four
+/// frame workers, each call of 600 rows' upload counts itself in, then waits, for at most
+/// `OVERLAP_WAIT`, until two calls have been in progress at once. They have been, which
+/// an upload that writes its batches one after another never has; every row is still written
+/// once.
+#[test]
+fn the_upload_writes_from_jobs_at_once() {
+    let mut remote = remote();
+    let (rows, _) = remote.frame(9, 0);
+    assert!(rows.len() > 2 * 256);
+    let executor = remote.scene.executor.clone();
+    let rows: Arc<[InstanceRow]> = rows.into();
+    // Calls begun, calls in progress, the most in progress at once, rows written.
+    let counts = Arc::new([const { AtomicUsize::new(0) }; 4]);
+    let (job_rows, job_counts) = (Arc::clone(&rows), Arc::clone(&counts));
+    in_job(&executor, move |ctx| {
+        upload(ctx, &job_rows, |batch| {
+            let [begun, active, most, written] = &*job_counts;
+            begun.fetch_add(1, Ordering::SeqCst);
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            let started = Instant::now();
+            // A call stays in progress until two have been at once, so the second to begin
+            // counts the first.
+            while most.load(Ordering::SeqCst) < 2 && started.elapsed() < OVERLAP_WAIT {
+                std::thread::yield_now();
+            }
+            written.fetch_add(batch.len(), Ordering::SeqCst);
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+    });
+    let [begun, _, most, written] = &*counts;
+    assert_eq!(begun.load(Ordering::SeqCst), rows.len().div_ceil(256));
+    assert_eq!(written.load(Ordering::SeqCst), rows.len());
+    let most = most.load(Ordering::SeqCst);
+    assert!(most >= 2, "no two calls were in progress at once within {OVERLAP_WAIT:?}: {most}");
 }

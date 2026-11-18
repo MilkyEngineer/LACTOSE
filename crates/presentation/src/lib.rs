@@ -11,8 +11,9 @@
 //!
 //! # Where to start
 //!
-//! - [`Presentation`] holds one world's snapshot reader and runs the schedule on it with
-//!   [`Presentation::frame`], given a [`PresentView`]; [`Shown`] is what the frame shows.
+//! - [`Presentation`] runs the schedule of one shown world with [`Presentation::frame`], on
+//!   the pair the frame acquired, given a [`PresentView`]; [`Shown`] is the camera it placed,
+//!   and [`Presentation::remote`] lends the remote rows it sampled.
 //! - [`interpolate`] is the transform a frame shows a presented row at.
 //! - [`CameraPose`] is the pivot and boom a frame's camera is latched with; [`Orbit`] is the
 //!   rig's direction from the newest raw sample.
@@ -36,4 +37,5 @@ const _: () = {
     send::<Presentation>();
     plain::<CameraPose>();
     plain::<Orbit>();
+    plain::<Shown>();
 };

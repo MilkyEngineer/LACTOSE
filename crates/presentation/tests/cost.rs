@@ -4,14 +4,19 @@
 //! converts it, then the upload from the frame's job, with the network thread pushing a state
 //! into every slot at 30 Hz beside it. Frames are paced at 144 Hz for ten seconds, and the
 //! median and the 99th percentile are printed, never asserted, with those of the batch call
-//! alone, made again after the frame, as the interpolation buffer's share:
+//! alone, made a second time after the frame on the same slots (not the batch call's share of
+//! the frame's time):
 //!
 //! `cargo nextest run -p lactose-presentation --run-ignored only --cargo-profile release
 //! --no-capture -E 'test(/cost::/)'`
 //!
 //! The renderer's `RemoteWriter::write` is not built yet, so the upload writes to a closure
-//! that counts the rows: the ring's copy is not in the figure. `measure-m2` makes the gated
-//! measurement.
+//! that counts the rows: the ring's copy is not in the figure. The median is bimodal on the
+//! M1: paced on an otherwise quiet machine the sample took about 1.8 ms, with a core kept busy
+//! beside it or unpaced about 0.3 ms, and the cause is not measured. The network thread here
+//! is a plain thread. `measure-m2` makes the recorded measurement: it runs the writer under
+//! `ThreadClass::Network`, times the batch call inside the frame, and reports the reader's
+//! retry rate.
 
 #![forbid(unsafe_code)]
 
@@ -28,7 +33,8 @@ use lactose_math::{Quat, Scalar, Vec3};
 use lactose_net_api::{InterpolationSlot, RemoteSlot};
 use lactose_net_host::InterpolationBuffer;
 use lactose_net_host::interpolation::{PresentationTime, ReceivedState, RemoteSample};
-use lactose_presentation::{PresentView, Presentation, RemoteView, upload};
+use lactose_present_api::snapshot_channel;
+use lactose_presentation::{PresentView, RemoteView, upload};
 
 const REMOTE: u32 = 5_000;
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 144);
@@ -82,10 +88,10 @@ fn remote_upload_of_5k_rows() {
     }
     scene.publish();
     let executor = scene.executor.clone();
-    let presentation = std::mem::replace(
-        &mut scene.presentation,
-        Presentation::new(lactose_present_api::snapshot_channel().1),
-    );
+    // The frame's half: the snapshot's reader, which acquires the same pair every frame since
+    // nothing is published again, and the schedule.
+    let snapshot = std::mem::replace(&mut scene.reader, snapshot_channel().1);
+    let presentation = std::mem::take(&mut scene.presentation);
 
     // The network thread: a state for every slot at 30 Hz.
     let begun = Instant::now();
@@ -106,7 +112,7 @@ fn remote_upload_of_5k_rows() {
         })
     };
 
-    let shared = Arc::new(Mutex::new((presentation, reader)));
+    let shared = Arc::new(Mutex::new((snapshot, presentation, reader)));
     let written = Arc::new(AtomicUsize::new(0));
     let mut timings = Vec::with_capacity(FRAMES);
     for frame in 0..FRAMES {
@@ -123,15 +129,16 @@ fn remote_upload_of_5k_rows() {
             (Arc::clone(&shared), Arc::clone(&written), Arc::clone(&timing), Arc::clone(&slots));
         in_job(&executor, move |ctx| {
             let mut held = shared.lock().expect("unpoisoned");
-            let (presentation, reader) = &mut *held;
+            let (snapshot, presentation, reader) = &mut *held;
+            let pair = snapshot.acquire().expect("published");
             let started = Instant::now();
             let remote = RemoteView { buffer: reader, at };
             let view = PresentView { fraction: 0.5, focus: None, remote: Some(remote) };
-            let shown = presentation.frame(&view, &mut Ignored).expect("published");
+            let shown = presentation.frame(&pair, &view, &mut Ignored);
             let sampled = started.elapsed();
-            assert_eq!(shown.remote.len() + shown.missing, REMOTE as usize);
+            assert_eq!(presentation.remote().len() + shown.missing, REMOTE as usize);
             let started = Instant::now();
-            upload(ctx, shown.remote, |batch| {
+            upload(ctx, presentation.remote(), |batch| {
                 written.fetch_add(batch.len(), Ordering::Relaxed);
             });
             let uploaded = started.elapsed();
@@ -152,5 +159,8 @@ fn remote_upload_of_5k_rows() {
     report("sample", timings.iter().map(|t| t.sample).collect());
     report("upload", timings.iter().map(|t| t.upload).collect());
     report("frame", timings.iter().map(|t| t.sample + t.upload).collect());
-    report("of which the batch call", timings.iter().map(|t| t.batch).collect());
+    report(
+        "batch call alone, a second call after the frame",
+        timings.iter().map(|t| t.batch).collect(),
+    );
 }

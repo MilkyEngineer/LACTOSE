@@ -1,19 +1,24 @@
 //! Interpolation between the snapshot pair (verification row 99): a body re-spawned under its
 //! key without `Teleported` is interpolated between the two snapshots, and one re-spawned with
-//! it is shown where it now is; and the weight a frame's fraction gives over a pair one and two
-//! ticks apart, at its ends, and for a pair the snapshot flags.
+//! it is shown where it now is; the fraction is the weight over a pair however many ticks
+//! apart, at its ends and for a pair the snapshot flags; and the camera's pivot is where the
+//! renderer draws the mesh it follows, at every fraction, over pairs one, two and five ticks
+//! apart.
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
 use crate::common;
 
-use common::{Ignored, Scene, at, claim, key, scalar, shown_x, view};
-use lactose_core::Tick;
+use common::{Ignored, Scene, at, claim, key, mesh, scalar, shown_x, view};
+use lactose_core::{StableKey, Tick};
 use lactose_ecs::WorldKind;
 use lactose_math::render::RenderPosition;
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_physics_api::{Teleported, Transform};
-use lactose_present_api::CameraRig;
+use lactose_present_api::{CameraRig, ExtractPass, InstanceRow, InstanceSink};
 use lactose_presentation::{PresentView, interpolate};
 
 /// A prediction world with the body `key(1)` at x 0, carrying the camera's rig, its first
@@ -91,9 +96,9 @@ fn a_teleport_before_the_pair_interpolates() {
 }
 
 /// The weight over a pair two ticks apart, as a frame gets when two ticks ran between its
-/// publications: the frame's time is the fraction past the tick before the newer one. The
-/// ends are exact, a fraction out of `[0, 1]` is clamped and NaN shows the newer transform;
-/// the rotation is `slerp`ed.
+/// publications: the fraction, over the whole pair, as the renderer draws. The ends are exact,
+/// a fraction out of `[0, 1]` is clamped and NaN shows the newer transform; the rotation is
+/// `slerp`ed.
 #[test]
 fn the_weight_spans_the_pair() {
     let mut scene = body();
@@ -106,13 +111,15 @@ fn the_weight_spans_the_pair() {
     let shown = scene.frame(&view(0.0), &mut Ignored).unwrap();
     let frame = shown.frame;
     assert_eq!(frame.newer().tick().0 - frame.older().tick().0, 2, "two ticks in one pair");
-    assert_eq!(shown_x(&frame, key(1), 0.0), 4.0);
-    assert_eq!(shown_x(&frame, key(1), 0.5), 6.0);
+    assert_eq!(shown_x(&frame, key(1), 0.0), 0.0);
+    assert_eq!(shown_x(&frame, key(1), 0.25), 2.0);
+    assert_eq!(shown_x(&frame, key(1), 0.5), 4.0);
     assert_eq!(shown_x(&frame, key(1), 1.0), 8.0);
-    assert_eq!(shown_x(&frame, key(1), -3.0), 4.0);
+    assert_eq!(shown_x(&frame, key(1), -3.0), 0.0);
     assert_eq!(shown_x(&frame, key(1), 7.0), 8.0);
     assert_eq!(shown_x(&frame, key(1), f32::NAN), 8.0);
-    let half = interpolate(&frame, key(1), 0.0).unwrap().rotation.to_array();
+    assert_eq!(interpolate(&frame, key(1), 0.0).unwrap().rotation, Quat::IDENTITY);
+    let half = interpolate(&frame, key(1), 0.5).unwrap().rotation.to_array();
     let eighth = Quat::from_rotation_y(Scalar::FRAC_PI_2 * Scalar::HALF).to_array();
     for (a, b) in half.into_iter().zip(eighth) {
         assert!((a - b).abs() < scalar(1e-12), "{half:?}");
@@ -131,4 +138,115 @@ fn a_pair_of_one_tick_is_not_interpolated() {
     let shown = scene.frame(&view(0.5), &mut Ignored).unwrap();
     assert_eq!(shown.frame.older().tick(), shown.frame.newer().tick());
     assert_eq!(shown_x(&shown.frame, key(1), 0.5), 2.0);
+}
+
+/// What the renderer holds of one instance: the placements it draws between, kept by the
+/// rules of `crates/present-api/README.md`, "What the sink keeps".
+#[derive(Default, Clone, Copy)]
+struct Held {
+    previous: Option<RenderPosition>,
+    current: Option<RenderPosition>,
+    base: Option<RenderPosition>,
+}
+
+/// A model of the renderer's sink: at the first pass of a tick each instance's current
+/// placement becomes its base (none after a pass of an earlier tick); a row written makes the
+/// base its previous placement and itself the current one, or both itself where it has no
+/// base or is flagged.
+#[derive(Default)]
+struct Placements {
+    held: Mutex<BTreeMap<StableKey, Held>>,
+    tick: Mutex<Option<Tick>>,
+}
+
+struct Sink(Arc<Placements>);
+
+impl InstanceSink for Sink {
+    fn begin(&mut self, pass: ExtractPass) {
+        let mut tick = self.0.tick.lock().expect("unpoisoned");
+        if *tick != Some(pass.tick) {
+            let earlier = tick.is_some_and(|t| pass.tick.0.wrapping_sub(t.0) > i32::MAX as u32);
+            for held in self.0.held.lock().expect("unpoisoned").values_mut() {
+                held.base = if earlier { None } else { held.current };
+            }
+        }
+        *tick = Some(pass.tick);
+    }
+
+    fn removed(&mut self, keys: &[StableKey]) {
+        let mut held = self.0.held.lock().expect("unpoisoned");
+        for key in keys {
+            held.remove(key);
+        }
+    }
+
+    fn write(&self, rows: &[InstanceRow]) {
+        let mut held = self.0.held.lock().expect("unpoisoned");
+        for row in rows {
+            let entry = held.entry(row.key).or_default();
+            let placed = Some(row.transform.position);
+            entry.previous = if row.no_interpolate { placed } else { entry.base.or(placed) };
+            entry.current = placed;
+        }
+    }
+
+    fn end(&mut self) {}
+}
+
+impl Placements {
+    /// The x the renderer draws `key` at, from cell zero, at `fraction`, by
+    /// `FrameView::fraction`'s rule: the previous placement at zero, the current one at one.
+    fn drawn_x(&self, key: StableKey, fraction: f32) -> f32 {
+        let held = self.held.lock().expect("unpoisoned")[&key];
+        let previous = held.previous.expect("placed").relative_to([0, 0, 0])[0];
+        let current = held.current.expect("placed").relative_to([0, 0, 0])[0];
+        previous + (current - previous) * fraction
+    }
+}
+
+/// The local player is a mesh the renderer draws and a row whose `CameraRig` the camera
+/// follows. Moved 4 m a tick over `span` ticks between two publications, the camera's pivot
+/// is where the mesh is drawn at every fraction of the frame, on one acquired pair.
+fn the_pivot_follows_the_mesh(span: u32) {
+    let mut scene = Scene::new(WorldKind::Prediction, Tick(10), 2);
+    let placements = Arc::new(Placements::default());
+    scene.install_sink(Box::new(Sink(Arc::clone(&placements))));
+    let rig = CameraRig::new(Vec3::ZERO, scalar(3.0));
+    scene.world_mut().spawn(key(1), common::REGION, (at(0.0), rig, mesh(1), claim())).unwrap();
+    scene.publish();
+    scene.frame(&view(0.0), &mut Ignored).unwrap();
+    for n in 1..=span {
+        let x = scalar(4.0 * f64::from(n));
+        scene.world_mut().get_mut::<Transform>(key(1)).unwrap().translation.x = x;
+        scene.step();
+    }
+    scene.publish();
+
+    let frame = scene.reader.acquire().unwrap();
+    assert_eq!(frame.newer().tick().0 - frame.older().tick().0, span);
+    for step in 0..=8u8 {
+        let fraction = f32::from(step) / 8.0;
+        let focus = PresentView { focus: Some(key(1)), ..view(fraction) };
+        let pose = scene.presentation.frame(&frame, &focus, &mut Ignored).camera.unwrap();
+        let pivot = pose.pivot.relative_to([0, 0, 0])[0];
+        let drawn = placements.drawn_x(key(1), fraction);
+        let moved = 4.0 * span as f32 * fraction;
+        assert!((pivot - drawn).abs() < 1e-4, "span {span} at {fraction}: {pivot}, {drawn}");
+        assert!((drawn - moved).abs() < 1e-4, "span {span} at {fraction}: {drawn}");
+    }
+}
+
+#[test]
+fn the_pivot_follows_the_mesh_over_one_tick() {
+    the_pivot_follows_the_mesh(1);
+}
+
+#[test]
+fn the_pivot_follows_the_mesh_over_two_ticks() {
+    the_pivot_follows_the_mesh(2);
+}
+
+#[test]
+fn the_pivot_follows_the_mesh_over_five_ticks() {
+    the_pivot_follows_the_mesh(5);
 }
