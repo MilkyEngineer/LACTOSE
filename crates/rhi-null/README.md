@@ -244,6 +244,13 @@ a row for each place and a third that removes both.
 | Loss, the suite's | a loss case's gate left shut when the harness cannot lose a device, in `waits_return_at_once_after_a_loss` or `teardown_succeeds_after_a_loss` | `conformance::loss_cases_are_skipped_where_the_harness_cannot_lose` (a row each) |
 | The last drop | a device's last drop that does not wait for its submits, or that stops short of its last | `tests::the_last_drop_of_a_device_waits_for_its_pending_submits`, `a_drop_that_is_not_the_last_returns_at_once` (a row each) |
 | The cooked format | `encode` without the checks `decode` makes | `conformance::cooked_shader_round_trips` |
+| The cooked format | the workgroup's checks: its stage and its bounds | `conformance::cooked_shader_round_trips`, `workgroup_outside_its_stage_or_bounds_is_refused` |
+| The cooked format | the varyings' checks: their stage, order, location and count | `conformance::cooked_shader_round_trips`, `workgroup_outside_its_stage_or_bounds_is_refused` |
+| The cooked format, at pipeline creation | a stage's key hashed from its fields with no `encode`, so its breaches pass | `conformance::workgroup_outside_its_stage_or_bounds_is_refused` |
+| A constant's type | its length taken from no type, any length passing | `conformance::constant_of_another_length_is_refused`, `constant_of_another_type_is_refused` |
+| A constant's type | a `Bool` of a value other than 0 or 1 | `conformance::constant_of_another_type_is_refused` |
+| The varyings' match | a fragment stage's read with no vertex output to match | `conformance::varying_the_vertex_stage_does_not_write_is_refused` |
+| The varyings' match | the location alone matched, not the component type and count | `conformance::varying_the_vertex_stage_does_not_write_is_refused` |
 
 An acquire orders no later submit of its queue, and is itself bound as a use. A stamp that
 let one order the later submits, put back with the acquire's exemption from the use rule,

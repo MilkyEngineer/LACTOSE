@@ -7,9 +7,9 @@ use std::time::Instant;
 
 use lactose_core::{Error, ErrorKind, Result, xxh64};
 use lactose_rhi_api::{
-    CacheIdentity, CacheStart, Capabilities, ComputePipelineDesc, GraphicsPipelineDesc, HEAP_SET,
-    HeapArrayKind, PUSH_BYTES_MAX, Rule, ShaderStage, ShaderTarget, StageDesc, WriteMask,
-    open_cache, seal_cache,
+    CacheIdentity, CacheStart, Capabilities, ComputePipelineDesc, ConstantType,
+    GraphicsPipelineDesc, HEAP_SET, HeapArrayKind, PUSH_BYTES_MAX, Rule, ShaderStage, ShaderTarget,
+    StageDesc, WriteMask, open_cache, seal_cache,
 };
 
 use crate::device::{ComputeObj, GraphicsObj};
@@ -97,12 +97,19 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
         let Some(slot) = shader.constants.iter().find(|slot| slot.id == constant.id) else {
             return Err(invalid(format!("a constant {} the shader does not declare", constant.id)));
         };
-        if constant.bytes.len() != slot.bytes as usize {
+        if constant.bytes.len() != slot.ty.bytes() as usize {
             return Err(invalid(format!(
-                "a constant {} of {} bytes, declared {}",
+                "a constant {} of {} bytes, declared {:?} of {}",
                 constant.id,
                 constant.bytes.len(),
-                slot.bytes
+                slot.ty,
+                slot.ty.bytes()
+            )));
+        }
+        if slot.ty == ConstantType::Bool && constant.bytes[0] > 1 {
+            return Err(invalid(format!(
+                "a bool constant {} of value {}, neither 0 nor 1",
+                constant.id, constant.bytes[0]
             )));
         }
         if desc.constants[..at].iter().any(|other| other.id == constant.id) {
@@ -196,6 +203,13 @@ pub(crate) fn graphics(
     let mut keys = vec![stage(caps, &desc.vertex, ShaderStage::Vertex)?];
     if let Some(fragment) = &desc.fragment {
         keys.push(stage(caps, fragment, ShaderStage::Fragment)?);
+        let written = &desc.vertex.shader.varyings;
+        if let Some(read) = fragment.shader.varyings.iter().find(|read| !written.contains(read)) {
+            return Err(invalid(format!(
+                "a fragment stage reading location {} as {} {:?}, which the vertex stage does not write",
+                read.location, read.count, read.component
+            )));
+        }
     }
     let (inputs, outputs) =
         desc.fragment.map_or((0, 0), |fragment| (fragment.shader.inputs, fragment.shader.outputs));

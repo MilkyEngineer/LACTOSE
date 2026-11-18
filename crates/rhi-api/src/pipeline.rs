@@ -22,7 +22,9 @@ pub type ComputePipelineHandle = Handle<kind::ComputePipeline>;
 pub struct Constant<'a> {
     /// The constant's id, one the shader declares.
     pub id: u32,
-    /// Its value, of the length the shader declares for it, little-endian.
+    /// Its value, of the type the shader declares for it
+    /// ([`ConstantType`](crate::ConstantType)): a `Bool` one byte, 0 or 1; an `Int`, a
+    /// `Uint` or a `Float` four bytes, little-endian.
     pub bytes: &'a [u8],
 }
 

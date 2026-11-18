@@ -5,10 +5,11 @@ use lactose_core::ErrorKind;
 use super::kit::{Body, Ctx, INT64_ATOMICS, attachment, begin, cooked, heap_of, image_to, spirv};
 use crate::shader::MAGIC;
 use crate::{
-    COOKED_SHADER_VERSION, CacheIdentity, CacheStart, ColourTargetDesc, ComputePipelineDesc,
-    Constant, ConstantSlot, CookedShader, Cull, Format, GraphicsPipelineDesc, HeapArrayKind,
-    ImageState, Load, PUSH_BYTES_MAX, PassReach, QueueRole, ShaderStage, ShaderTarget, StageDesc,
-    Store, Submit, WriteMask, open_cache, seal_cache,
+    COOKED_SHADER_VERSION, CacheIdentity, CacheStart, ColourTargetDesc, ComponentType,
+    ComputePipelineDesc, Constant, ConstantSlot, ConstantType, CookedShader, Cull, Format,
+    GraphicsPipelineDesc, HeapArrayKind, ImageState, Load, PUSH_BYTES_MAX, PassReach, QueueRole,
+    ShaderStage, ShaderTarget, StageDesc, Store, Submit, VARYING_LOCATIONS, Varying,
+    WORKGROUP_INVOCATIONS_MAX, WORKGROUP_SIZE_MAX, WriteMask, open_cache, seal_cache,
 };
 
 type Applies = Result<(), &'static str>;
@@ -26,6 +27,15 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         shader_target_the_backend_does_not_run_is_unsupported,
     ),
     ("constant_of_another_length_is_refused", constant_of_another_length_is_refused),
+    ("constant_of_another_type_is_refused", constant_of_another_type_is_refused),
+    (
+        "workgroup_outside_its_stage_or_bounds_is_refused",
+        workgroup_outside_its_stage_or_bounds_is_refused,
+    ),
+    (
+        "varying_the_vertex_stage_does_not_write_is_refused",
+        varying_the_vertex_stage_does_not_write_is_refused,
+    ),
     (
         "shader_needing_an_unenabled_capability_is_refused",
         shader_needing_an_unenabled_capability_is_refused,
@@ -45,9 +55,49 @@ pub(super) const BODIES: &[(&str, Body)] = &[
 fn rich(ctx: &Ctx<'_>) -> CookedShader {
     CookedShader {
         heap: Some(heap_of(&ctx.set)),
-        constants: vec![ConstantSlot { id: 0, bytes: 4 }, ConstantSlot { id: 3, bytes: 1 }],
+        constants: vec![
+            ConstantSlot { id: 0, ty: ConstantType::Uint },
+            ConstantSlot { id: 3, ty: ConstantType::Bool },
+            ConstantSlot { id: 4, ty: ConstantType::Int },
+            ConstantSlot { id: 9, ty: ConstantType::Float },
+        ],
         push_bytes: 64,
+        varyings: vec![
+            Varying { location: 0, component: ComponentType::Float, count: 2 },
+            Varying { location: 3, component: ComponentType::Uint, count: 1 },
+            Varying { location: VARYING_LOCATIONS - 1, component: ComponentType::Int, count: 4 },
+        ],
         ..cooked(ShaderStage::Fragment, 0b10, 0b101)
+    }
+}
+
+/// A compute stage whose workgroup is `size`.
+fn group(size: [u32; 3]) -> CookedShader {
+    CookedShader { workgroup: Some(size), ..cooked(ShaderStage::Compute, 0, 0) }
+}
+
+/// Varyings, each a location, a component type and a count.
+type Reads = &'static [(u32, ComponentType, u32)];
+
+/// A vertex or fragment stage of `varyings`.
+fn varying(stage: ShaderStage, varyings: Reads) -> CookedShader {
+    let varyings = varyings
+        .iter()
+        .map(|&(location, component, count)| Varying { location, component, count })
+        .collect();
+    let outputs = u32::from(stage == ShaderStage::Fragment);
+    CookedShader { varyings, ..cooked(stage, 0, outputs) }
+}
+
+/// A graphics pipeline of `vertex` and `fragment` writing one `Rgba8Unorm` target.
+fn pair<'a>(vertex: &'a CookedShader, fragment: &'a CookedShader) -> GraphicsPipelineDesc<'a> {
+    GraphicsPipelineDesc {
+        label: "conformance",
+        vertex: StageDesc { shader: vertex, constants: &[] },
+        fragment: Some(StageDesc { shader: fragment, constants: &[] }),
+        colour: &[ColourTargetDesc { format: Format::Rgba8Unorm, write_mask: WriteMask::ALL }],
+        depth: None,
+        cull: Cull::None,
     }
 }
 
@@ -64,8 +114,18 @@ fn compute(
 }
 
 fn cooked_shader_round_trips(ctx: &Ctx<'_>) -> Applies {
-    for shader in [rich(ctx), cooked(ShaderStage::Vertex, 0, 0), cooked(ShaderStage::Compute, 0, 0)]
-    {
+    let most = WORKGROUP_SIZE_MAX;
+    let shaders = [
+        rich(ctx),
+        cooked(ShaderStage::Vertex, 0, 0),
+        varying(ShaderStage::Vertex, &[(1, ComponentType::Float, 4), (2, ComponentType::Int, 3)]),
+        cooked(ShaderStage::Compute, 0, 0),
+        group([64, 2, 1]),
+        group([most[0], 1, 1]),
+        group([1, most[1], 1]),
+        group([1, 2, most[2]]),
+    ];
+    for shader in shaders {
         let bytes = ctx.ok(shader.encode(), "an encode");
         ctx.check(
             bytes == ctx.ok(shader.encode(), "an encode"),
@@ -92,16 +152,64 @@ fn cooked_shader_round_trips(ctx: &Ctx<'_>) -> Applies {
         (
             "constants out of order",
             CookedShader {
-                constants: vec![ConstantSlot { id: 3, bytes: 4 }, ConstantSlot { id: 0, bytes: 4 }],
+                constants: vec![
+                    ConstantSlot { id: 3, ty: ConstantType::Uint },
+                    ConstantSlot { id: 0, ty: ConstantType::Uint },
+                ],
                 ..rich(ctx)
             },
         ),
-        (
-            "a constant of 2 bytes",
-            CookedShader { constants: vec![ConstantSlot { id: 0, bytes: 2 }], ..rich(ctx) },
-        ),
         ("inputs outside the fragment stage", cooked(ShaderStage::Vertex, 1, 0)),
         ("outputs outside the fragment stage", cooked(ShaderStage::Compute, 0, 1)),
+        (
+            "a compute stage without a workgroup",
+            CookedShader { workgroup: None, ..cooked(ShaderStage::Compute, 0, 0) },
+        ),
+        (
+            "a workgroup in the vertex stage",
+            CookedShader { workgroup: Some([1, 1, 1]), ..cooked(ShaderStage::Vertex, 0, 0) },
+        ),
+        (
+            "a workgroup in the fragment stage",
+            CookedShader { workgroup: Some([1, 1, 1]), ..rich(ctx) },
+        ),
+        ("a workgroup of no invocations in x", group([0, 1, 1])),
+        ("a workgroup of no invocations in z", group([64, 1, 0])),
+        ("a workgroup past the most in x", group([most[0] + 1, 1, 1])),
+        ("a workgroup past the most in y", group([1, most[1] + 1, 1])),
+        ("a workgroup past the most in z", group([1, 1, most[2] + 1])),
+        ("a workgroup of more invocations than the most", group([WORKGROUP_INVOCATIONS_MAX, 2, 1])),
+        ("a workgroup whose product wraps", group([u32::MAX, u32::MAX, 1])),
+        (
+            "varyings in the compute stage",
+            CookedShader { varyings: rich(ctx).varyings, ..cooked(ShaderStage::Compute, 0, 0) },
+        ),
+        (
+            "varyings out of order",
+            varying(
+                ShaderStage::Vertex,
+                &[(2, ComponentType::Float, 1), (1, ComponentType::Float, 1)],
+            ),
+        ),
+        (
+            "a location twice",
+            varying(
+                ShaderStage::Vertex,
+                &[(1, ComponentType::Float, 1), (1, ComponentType::Uint, 1)],
+            ),
+        ),
+        (
+            "a location from VARYING_LOCATIONS",
+            varying(ShaderStage::Fragment, &[(VARYING_LOCATIONS, ComponentType::Float, 1)]),
+        ),
+        (
+            "a varying of no components",
+            varying(ShaderStage::Vertex, &[(0, ComponentType::Float, 0)]),
+        ),
+        (
+            "a varying of five components",
+            varying(ShaderStage::Vertex, &[(0, ComponentType::Int, 5)]),
+        ),
     ];
     for (what, shader) in breaches {
         ctx.fails(shader.encode(), ErrorKind::InvalidData, what);
@@ -175,7 +283,7 @@ fn shader_target_the_backend_does_not_run_is_unsupported(ctx: &Ctx<'_>) -> Appli
 fn constant_of_another_length_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let shader = CookedShader {
-        constants: vec![ConstantSlot { id: 2, bytes: 4 }],
+        constants: vec![ConstantSlot { id: 2, ty: ConstantType::Uint }],
         ..cooked(ShaderStage::Compute, 0, 0)
     };
     let short = [Constant { id: 2, bytes: &[1, 0] }];
@@ -193,6 +301,100 @@ fn constant_of_another_length_is_refused(ctx: &Ctx<'_>) -> Applies {
     let right = [Constant { id: 2, bytes: &[1, 0, 0, 0] }];
     ctx.ok(compute(&*device, &shader, &right), "the declared constant");
     ctx.ok(compute(&*device, &shader, &[]), "no constants");
+    Ok(())
+}
+
+fn constant_of_another_type_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let shader = CookedShader {
+        constants: vec![
+            ConstantSlot { id: 1, ty: ConstantType::Bool },
+            ConstantSlot { id: 2, ty: ConstantType::Int },
+            ConstantSlot { id: 4, ty: ConstantType::Float },
+        ],
+        ..cooked(ShaderStage::Compute, 0, 0)
+    };
+    // A bool's value is one byte: the four of a `VkBool32` are the backend's to widen to.
+    let refused: [(&str, Constant<'_>); 4] = [
+        ("a bool of four bytes", Constant { id: 1, bytes: &[1, 0, 0, 0] }),
+        ("a bool that is neither 0 nor 1", Constant { id: 1, bytes: &[2] }),
+        ("an int of one byte", Constant { id: 2, bytes: &[1] }),
+        ("a float of one byte", Constant { id: 4, bytes: &[0] }),
+    ];
+    for (what, constant) in refused {
+        ctx.fails(compute(&*device, &shader, &[constant]), ErrorKind::InvalidData, what);
+    }
+    let int = (-3i32).to_le_bytes();
+    let float = 1.5f32.to_le_bytes();
+    let right = [
+        Constant { id: 1, bytes: &[1] },
+        Constant { id: 2, bytes: &int },
+        Constant { id: 4, bytes: &float },
+    ];
+    ctx.ok(compute(&*device, &shader, &right), "a value of each declared type");
+    ctx.ok(compute(&*device, &shader, &[Constant { id: 1, bytes: &[0] }]), "a false bool");
+    Ok(())
+}
+
+fn workgroup_outside_its_stage_or_bounds_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let most = WORKGROUP_SIZE_MAX;
+    let refused = [
+        (
+            "a compute stage without a workgroup",
+            CookedShader { workgroup: None, ..group([1, 1, 1]) },
+        ),
+        ("a workgroup of no invocations in y", group([1, 0, 1])),
+        ("a workgroup past the most in x", group([most[0] + 1, 1, 1])),
+        ("a workgroup of more invocations than the most", group([most[0], most[1], 1])),
+        (
+            "varyings in the compute stage",
+            CookedShader { varyings: rich(ctx).varyings, ..group([1, 1, 1]) },
+        ),
+    ];
+    for (what, shader) in refused {
+        ctx.fails(compute(&*device, &shader, &[]), ErrorKind::InvalidData, what);
+    }
+    ctx.ok(compute(&*device, &group([8, 4, 2]), &[]), "a workgroup within the bounds");
+    let vertex = CookedShader { workgroup: Some([1, 1, 1]), ..cooked(ShaderStage::Vertex, 0, 0) };
+    let fragment = cooked(ShaderStage::Fragment, 0, 1);
+    ctx.fails(
+        device.create_graphics_pipeline(&pair(&vertex, &fragment)),
+        ErrorKind::InvalidData,
+        "a vertex stage with a workgroup",
+    );
+    Ok(())
+}
+
+fn varying_the_vertex_stage_does_not_write_is_refused(ctx: &Ctx<'_>) -> Applies {
+    use ComponentType::{Float, Int, Uint};
+    let device = ctx.device();
+    let vertex = varying(ShaderStage::Vertex, &[(0, Float, 2), (1, Uint, 1), (2, Int, 3)]);
+    let refused: [(&str, Reads); 5] = [
+        ("a read of more components than are written", &[(0, Float, 4)]),
+        ("a read of fewer components than are written", &[(2, Int, 2)]),
+        ("a read of a uint as an int", &[(1, Int, 1)]),
+        ("a read of a float as a uint", &[(0, Uint, 2)]),
+        ("a read of a location not written", &[(0, Float, 2), (5, Float, 1)]),
+    ];
+    for (what, read) in refused {
+        let fragment = varying(ShaderStage::Fragment, read);
+        ctx.fails(
+            device.create_graphics_pipeline(&pair(&vertex, &fragment)),
+            ErrorKind::InvalidData,
+            what,
+        );
+    }
+    // A varying written and not read is no breach on either target.
+    let read: [Reads; 3] =
+        [&[], &[(0, Float, 2), (2, Int, 3)], &[(0, Float, 2), (1, Uint, 1), (2, Int, 3)]];
+    for read in read {
+        let fragment = varying(ShaderStage::Fragment, read);
+        ctx.ok(
+            device.create_graphics_pipeline(&pair(&vertex, &fragment)),
+            "a read of what is written",
+        );
+    }
     Ok(())
 }
 

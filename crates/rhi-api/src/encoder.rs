@@ -397,7 +397,8 @@ pub trait Encoder: Any + Send {
 
     /// Runs the bound compute pipeline over `groups` workgroups, each count at most the
     /// device's [`compute_groups`](crate::Capabilities::compute_groups) in its dimension
-    /// ([`Rule::Bounds`](crate::Rule::Bounds), every backend). The dispatches of one
+    /// ([`Rule::Bounds`](crate::Rule::Bounds), every backend), each of the size its cooked
+    /// shader's [`workgroup`](crate::CookedShader::workgroup) gives. The dispatches of one
     /// compute pass run in recording order, each seeing the buffer writes of those before
     /// it.
     fn dispatch(&mut self, groups: [u32; 3]);

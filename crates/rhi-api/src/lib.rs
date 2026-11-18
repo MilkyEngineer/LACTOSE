@@ -102,8 +102,9 @@ pub use resource::{
 };
 pub use rule::{Refusal, Rule};
 pub use shader::{
-    COOKED_SHADER_VERSION, ConstantSlot, CookedShader, HEAP_SET, HeapArray, HeapArrayKind,
-    HeapForm, HeapUse, PUSH_BYTES_MAX, ShaderStage, ShaderTarget,
+    COOKED_SHADER_VERSION, ComponentType, ConstantSlot, ConstantType, CookedShader, HEAP_SET,
+    HeapArray, HeapArrayKind, HeapForm, HeapUse, PUSH_BYTES_MAX, ShaderStage, ShaderTarget,
+    VARYING_LOCATIONS, Varying, WORKGROUP_INVOCATIONS_MAX, WORKGROUP_SIZE_MAX,
 };
 pub use state::{
     BufferReach, BufferState, BufferTransition, ImageState, ImageTransition, PassReach, StateOn,

@@ -581,7 +581,8 @@ pub(super) fn spirv(stage: ShaderStage, capabilities: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-/// A cooked SPIR-V stage with no heap and no constants.
+/// A cooked SPIR-V stage with no heap, no constants and no varyings; a compute stage's
+/// workgroup is the module's one invocation.
 pub(super) fn cooked(stage: ShaderStage, inputs: u32, outputs: u32) -> CookedShader {
     CookedShader {
         stage,
@@ -593,6 +594,8 @@ pub(super) fn cooked(stage: ShaderStage, inputs: u32, outputs: u32) -> CookedSha
         push_bytes: 16,
         inputs,
         outputs,
+        workgroup: (stage == ShaderStage::Compute).then_some([1, 1, 1]),
+        varyings: Vec::new(),
     }
 }
 

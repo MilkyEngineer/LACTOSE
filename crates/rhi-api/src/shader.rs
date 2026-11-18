@@ -9,7 +9,7 @@ use lactose_core::{Error, ErrorKind, Result, xxh64};
 
 /// The version [`CookedShader::encode`] writes. A change to the struct or to what a field
 /// means is a new version, and [`CookedShader::decode`] reads no other.
-pub const COOKED_SHADER_VERSION: u32 = 1;
+pub const COOKED_SHADER_VERSION: u32 = 2;
 
 /// The descriptor set (SPIR-V) the heap's arrays are bound in, on every pipeline. The
 /// input attachments of a fragment stage are set 0, input `i` at binding `i`.
@@ -17,6 +17,19 @@ pub const HEAP_SET: u32 = 1;
 
 /// The bytes of a pipeline's push-constant range at most.
 pub const PUSH_BYTES_MAX: u32 = 128;
+
+/// The invocations of a compute stage's workgroup at most in x, y and z: Vulkan's least
+/// `maxComputeWorkGroupSize`, within every Apple family's (`README.md`, "Pipelines and the
+/// cooked shader format").
+pub const WORKGROUP_SIZE_MAX: [u32; 3] = [128, 128, 64];
+
+/// The invocations of a compute stage's workgroup at most, the product of its three
+/// dimensions: Vulkan's least `maxComputeWorkGroupInvocations`.
+pub const WORKGROUP_INVOCATIONS_MAX: u32 = 128;
+
+/// The locations a varying takes, 0 to 15: sixteen four-component locations are Vulkan's
+/// least `maxVertexOutputComponents` and `maxFragmentInputComponents`, 64.
+pub const VARYING_LOCATIONS: u32 = 16;
 
 /// A pipeline stage.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -85,13 +98,69 @@ pub struct HeapUse {
     pub arrays: Vec<HeapArray>,
 }
 
+/// The type of a specialisation constant.
+///
+/// A pipeline's value for it ([`Constant`](crate::Constant)) is [`bytes`](Self::bytes)
+/// long: a `Bool` is one byte, 0 or 1; the others are four, little-endian. A backend hands
+/// the driver a value of exactly this type: on Metal, of the `MTLDataType` of the same
+/// name, since Metal refuses a value of another type than the function constant's; on
+/// Vulkan, a `Bool` widened to a four-byte `VkBool32` and the others as they are
+/// (VUID-VkSpecializationMapEntry-constantID-00776).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ConstantType {
+    /// A boolean: SPIR-V's `OpTypeBool`, MSL's `bool`.
+    Bool,
+    /// A signed 32-bit integer: `OpTypeInt 32 1`, `int`.
+    Int,
+    /// An unsigned 32-bit integer: `OpTypeInt 32 0`, `uint`.
+    Uint,
+    /// A 32-bit float: `OpTypeFloat 32`, `float`.
+    Float,
+}
+
+impl ConstantType {
+    /// The bytes of a pipeline's value of this type: 1 for `Bool`, otherwise 4.
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        match self {
+            Self::Bool => 1,
+            Self::Int | Self::Uint | Self::Float => 4,
+        }
+    }
+}
+
 /// A specialisation constant a shader declares.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConstantSlot {
     /// Its id: the SPIR-V constant id, and the Metal function-constant index.
     pub id: u32,
-    /// The bytes of its value: 1 for a boolean, otherwise 4.
-    pub bytes: u32,
+    /// Its type.
+    pub ty: ConstantType,
+}
+
+/// The type of a varying's components, each 32 bits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ComponentType {
+    /// A float: SPIR-V's `OpTypeFloat 32`, MSL's `float`.
+    Float,
+    /// A signed integer: `OpTypeInt 32 1`, `int`.
+    Int,
+    /// An unsigned integer: `OpTypeInt 32 0`, `uint`.
+    Uint,
+}
+
+/// A value the vertex stage writes for the fragment stage to read, the built-ins aside: on
+/// SPIR-V the variable decorated `Location`, on Metal the field of attribute
+/// `[[user(TEXCOORD_n)]]` (Apple's `[[user(locn)]]`; location 0 is Slang's
+/// `[[user(TEXCOORD)]]`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Varying {
+    /// Its location, below [`VARYING_LOCATIONS`]. It takes this one alone.
+    pub location: u32,
+    /// The type of its components.
+    pub component: ComponentType,
+    /// Its components: 1 for a scalar, a vector's 2 to 4.
+    pub count: u32,
 }
 
 /// One cooked shader: one stage, for one target.
@@ -117,6 +186,16 @@ pub struct CookedShader {
     /// Bit `i` is set when the stage writes colour attachment `i`. Zero outside the
     /// fragment stage.
     pub outputs: u32,
+    /// The size of a compute stage's workgroup in x, y and z: each dimension at least 1 and
+    /// at most [`WORKGROUP_SIZE_MAX`]'s, and their product at most
+    /// [`WORKGROUP_INVOCATIONS_MAX`]. `Some` in the compute stage and `None` outside it. A
+    /// SPIR-V module states it too; on Metal the backend passes it to each dispatch as
+    /// `threadsPerThreadgroup`.
+    pub workgroup: Option<[u32; 3]>,
+    /// The varyings the vertex stage writes, or those the fragment stage reads, in ascending
+    /// location order. A fragment stage's are those its code reads: one it declares and
+    /// never reads is in neither target's interface. Empty in the compute stage.
+    pub varyings: Vec<Varying>,
 }
 
 impl CookedShader {
@@ -163,10 +242,25 @@ impl CookedShader {
         put_len(&mut out, self.constants.len(), "the constants")?;
         for constant in &self.constants {
             out.extend_from_slice(&constant.id.to_le_bytes());
-            out.extend_from_slice(&constant.bytes.to_le_bytes());
+            out.push(constant_code(constant.ty));
         }
         for word in [self.push_bytes, self.inputs, self.outputs] {
             out.extend_from_slice(&word.to_le_bytes());
+        }
+        match self.workgroup {
+            None => out.push(0),
+            Some(size) => {
+                out.push(1);
+                for dimension in size {
+                    out.extend_from_slice(&dimension.to_le_bytes());
+                }
+            }
+        }
+        put_len(&mut out, self.varyings.len(), "the varyings")?;
+        for varying in &self.varyings {
+            out.extend_from_slice(&varying.location.to_le_bytes());
+            out.push(component_code(varying.component));
+            out.extend_from_slice(&varying.count.to_le_bytes());
         }
         let sum = xxh64(&out, 0);
         out.extend_from_slice(&sum.to_le_bytes());
@@ -189,15 +283,43 @@ impl CookedShader {
                 return Some("a heap array of a kind twice, or at another binding than its kind's");
             }
         }
-        let ascending = self.constants.windows(2).all(|two| two[0].id < two[1].id);
-        if !ascending || self.constants.iter().any(|constant| !matches!(constant.bytes, 1 | 4)) {
-            return Some("constants out of ascending id order, or of a size other than 1 or 4");
+        if !self.constants.windows(2).all(|two| two[0].id < two[1].id) {
+            return Some("constants out of ascending id order");
         }
         if self.push_bytes > PUSH_BYTES_MAX {
             return Some("a push block above PUSH_BYTES_MAX");
         }
         if self.stage != ShaderStage::Fragment && (self.inputs != 0 || self.outputs != 0) {
             return Some("inputs or outputs outside the fragment stage");
+        }
+        match (self.stage, self.workgroup) {
+            (ShaderStage::Compute, None) => return Some("a compute stage without a workgroup"),
+            (ShaderStage::Compute, Some(size)) => {
+                let within =
+                    size.iter().zip(WORKGROUP_SIZE_MAX).all(|(&n, most)| (1..=most).contains(&n));
+                // Within the bounds the product cannot overflow.
+                if !within || size.iter().product::<u32>() > WORKGROUP_INVOCATIONS_MAX {
+                    return Some(
+                        "a workgroup with a dimension of zero or above WORKGROUP_SIZE_MAX, or of \
+                         more than WORKGROUP_INVOCATIONS_MAX invocations",
+                    );
+                }
+            }
+            (_, Some(_)) => return Some("a workgroup outside the compute stage"),
+            (_, None) => {}
+        }
+        if self.stage == ShaderStage::Compute && !self.varyings.is_empty() {
+            return Some("varyings in the compute stage");
+        }
+        let ascending = self.varyings.windows(2).all(|two| two[0].location < two[1].location);
+        let each = self.varyings.iter().all(|varying| {
+            varying.location < VARYING_LOCATIONS && (1..=4).contains(&varying.count)
+        });
+        if !ascending || !each {
+            return Some(
+                "varyings out of ascending location order, at a location from VARYING_LOCATIONS, \
+                 or of other than 1 to 4 components",
+            );
         }
         None
     }
@@ -210,7 +332,11 @@ impl CookedShader {
     /// for bytes that are not a cooked shader, that are truncated or fail the checksum, or
     /// whose fields break what their documentation states (a heap set other than
     /// [`HEAP_SET`], a kind twice, constants out of order, a push block above
-    /// [`PUSH_BYTES_MAX`], inputs or outputs outside the fragment stage).
+    /// [`PUSH_BYTES_MAX`], inputs or outputs outside the fragment stage, a compute stage
+    /// without a workgroup or another stage with one, a workgroup with a dimension of zero or
+    /// beyond [`WORKGROUP_SIZE_MAX`] or [`WORKGROUP_INVOCATIONS_MAX`], varyings in the
+    /// compute stage, varyings out of order, at a location from [`VARYING_LOCATIONS`] or of
+    /// other than 1 to 4 components).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let invalid =
             |what: &str| Error::new(ErrorKind::InvalidData, format!("cooked shader: {what}"));
@@ -270,19 +396,55 @@ impl CookedShader {
             }
             _ => return Err(invalid("heap")),
         };
-        let count = reader.len(8)?;
+        let count = reader.len(5)?;
         let mut constants: Vec<ConstantSlot> = Vec::with_capacity(count);
         for _ in 0..count {
-            constants.push(ConstantSlot { id: reader.u32()?, bytes: reader.u32()? });
+            let id = reader.u32()?;
+            let ty = match reader.u8()? {
+                0 => ConstantType::Bool,
+                1 => ConstantType::Int,
+                2 => ConstantType::Uint,
+                3 => ConstantType::Float,
+                _ => return Err(invalid("constant type")),
+            };
+            constants.push(ConstantSlot { id, ty });
         }
         let push_bytes = reader.u32()?;
         let inputs = reader.u32()?;
         let outputs = reader.u32()?;
+        let workgroup = match reader.u8()? {
+            0 => None,
+            1 => Some([reader.u32()?, reader.u32()?, reader.u32()?]),
+            _ => return Err(invalid("workgroup")),
+        };
+        let count = reader.len(9)?;
+        let mut varyings: Vec<Varying> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let location = reader.u32()?;
+            let component = match reader.u8()? {
+                0 => ComponentType::Float,
+                1 => ComponentType::Int,
+                2 => ComponentType::Uint,
+                _ => return Err(invalid("varying component type")),
+            };
+            varyings.push(Varying { location, component, count: reader.u32()? });
+        }
         if !reader.bytes.is_empty() {
             return Err(invalid("trailing bytes"));
         }
-        let shader =
-            Self { stage, target, entry, code, heap, constants, push_bytes, inputs, outputs };
+        let shader = Self {
+            stage,
+            target,
+            entry,
+            code,
+            heap,
+            constants,
+            push_bytes,
+            inputs,
+            outputs,
+            workgroup,
+            varyings,
+        };
         match shader.breach() {
             Some(what) => Err(invalid(what)),
             None => Ok(shader),
@@ -306,6 +468,23 @@ const fn target_code(target: ShaderTarget) -> u8 {
         ShaderTarget::SpirV => 0,
         ShaderTarget::Msl => 1,
         ShaderTarget::MetalLibrary => 2,
+    }
+}
+
+const fn constant_code(ty: ConstantType) -> u8 {
+    match ty {
+        ConstantType::Bool => 0,
+        ConstantType::Int => 1,
+        ConstantType::Uint => 2,
+        ConstantType::Float => 3,
+    }
+}
+
+const fn component_code(component: ComponentType) -> u8 {
+    match component {
+        ComponentType::Float => 0,
+        ComponentType::Int => 1,
+        ComponentType::Uint => 2,
     }
 }
 

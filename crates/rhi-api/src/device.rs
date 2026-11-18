@@ -189,10 +189,13 @@ pub trait Device: Send + Sync {
     /// takes SPIR-V; a Metal target declares none); `ErrorKind::InvalidData` for a module
     /// whose magic or version is not its target's, a shader the driver refuses (Metal's
     /// compiler refuses what the GPU cannot run), a stage in the wrong
-    /// place, a constant the shader does not declare or of another length, a heap array
-    /// whose capacity is not the device's, a colour target with a write mask that is not
-    /// empty which the fragment stage does not write or reads as an input, or a depth
-    /// format that is not one.
+    /// place, a constant the shader does not declare or whose bytes are not a value of its
+    /// [`ConstantType`](crate::ConstantType), a heap array whose capacity is not the
+    /// device's, a varying the fragment stage reads that the vertex stage does not write at
+    /// its location with its component type and count (`README.md`, "Pipelines and the
+    /// cooked shader format"), a colour target with a write mask that is not empty which
+    /// the fragment stage does not write or reads as an input, or a depth format that is
+    /// not one.
     fn create_graphics_pipeline(
         &self,
         desc: &GraphicsPipelineDesc<'_>,
