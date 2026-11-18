@@ -125,7 +125,7 @@ fn copy(from: &Path, to: &Path) {
 /// Cooks `sources` with the pinned Slang, writing each shader's code below `code`.
 fn cook_shaders(env: &Env, sources: &Path, code: Option<&Path>) -> Result<Vec<String>> {
     let slang = slang();
-    let shaders = Shaders { slang: &slang, code };
+    let shaders = Shaders { slang: &slang, code, cooked: None };
     let pack = env.dir.join(format!("{}.pack", sources.file_name().unwrap().to_string_lossy()));
     let published = env.wait(cook(&env.io, sources, &pack, Some(shaders)))?;
     Ok(published.into_iter().map(|asset| asset.name).collect())
@@ -553,6 +553,14 @@ fn the_binary_refuses_code_without_slangc() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(stderr, "ricotta: InvalidData: --code is given without --slangc\n");
     let output = Command::new(env!("CARGO_BIN_EXE_ricotta"))
+        .args(["--shaders", "out", "sources", "x.pack"])
+        .current_dir(&env.dir)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr, "ricotta: InvalidData: --shaders is given without --slangc\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_ricotta"))
         .args(["--code", "a", "--code", "b", "sources", "x.pack"])
         .output()
         .unwrap();
@@ -575,6 +583,27 @@ fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {
     }
     found.sort();
     found
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn shaders_directory_holds_each_cooked_shader_whole() {
+    let env = Env::new("shaders-whole");
+    let sources = env.dir.join("sources");
+    copy(&root().join("shaders"), &sources);
+    let (code, whole) = (env.dir.join("code"), env.dir.join("whole"));
+    let slang = slang();
+    let shaders = Shaders { slang: &slang, code: Some(&code), cooked: Some(&whole) };
+    let published =
+        env.wait(cook(&env.io, &sources, &env.dir.join("x.pack"), Some(shaders))).unwrap();
+    let (code_files, whole_files) = (files(&code), files(&whole));
+    assert_eq!(whole_files.len(), published.len());
+    for ((name, bytes), (code_name, code_bytes)) in whole_files.iter().zip(&code_files) {
+        assert_eq!(name, code_name);
+        let shader = CookedShader::decode(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(&shader.code, code_bytes, "{name}: the code beside it");
+        assert!(name.contains(&format!(".{}.", shader.entry)), "{name}: {}", shader.entry);
+    }
 }
 
 #[test]
@@ -671,7 +700,7 @@ impl Loader for ShaderLoader {
 fn cook_and_load(env: &Env) -> (Vec<lactose_cook::Published>, Vec<CookedShader>) {
     let pack = env.dir.join("shaders.pack");
     let slang = slang();
-    let shaders = Shaders { slang: &slang, code: None };
+    let shaders = Shaders { slang: &slang, code: None, cooked: None };
     let published = env.wait(cook(&env.io, &root().join("shaders"), &pack, Some(shaders))).unwrap();
     let loaders = vec![ErasedLoader::new(ShaderLoader)];
     let store = Store::new(env.executor.clone(), env.io.clone(), loaders).unwrap();

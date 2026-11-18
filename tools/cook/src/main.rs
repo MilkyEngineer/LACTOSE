@@ -1,5 +1,5 @@
-//! RICOTTA, the asset cooker's binary: `ricotta [--slangc SLANGC] [--code DIR] SOURCES PACK`
-//! cooks every `.gltf` file under the directory `SOURCES` to a skeleton and every Slang
+//! RICOTTA, the asset cooker's binary: `ricotta [--slangc SLANGC] [--code DIR] [--shaders
+//! DIR] SOURCES PACK` cooks every `.gltf` file under the directory `SOURCES` to a skeleton and every Slang
 //! shader to its cooked shaders, and writes them as one pack at `PACK` (`README.md`, "The
 //! command line"). Prints one line per asset written, its name, ID and version, in name
 //! order; exits 1 with the error on stderr when the cook fails, 2 with the usage when the
@@ -17,12 +17,13 @@ use lactose_core::{Error, ErrorKind, Result};
 use lactose_io::{Io, IoConfig};
 use lactose_task::Executor;
 
-const USAGE: &str = "usage: ricotta [--slangc SLANGC] [--code DIR] SOURCES PACK";
+const USAGE: &str = "usage: ricotta [--slangc SLANGC] [--code DIR] [--shaders DIR] SOURCES PACK";
 
 /// The command line, read.
 struct Arguments {
     slangc: Option<PathBuf>,
     code: Option<PathBuf>,
+    shaders: Option<PathBuf>,
     sources: PathBuf,
     pack: PathBuf,
 }
@@ -44,12 +45,13 @@ fn main() -> ExitCode {
 
 /// The options, each at most once and before the two paths, then the two paths.
 fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Arguments> {
-    let (mut slangc, mut code) = (None, None);
+    let (mut slangc, mut code, mut shaders) = (None, None, None);
     let sources = loop {
         let arg = args.next()?;
         let slot = match arg.to_str() {
             Some("--slangc") => &mut slangc,
             Some("--code") => &mut code,
+            Some("--shaders") => &mut shaders,
             _ => break arg,
         };
         if slot.replace(PathBuf::from(args.next()?)).is_some() {
@@ -57,7 +59,7 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Arguments> {
         }
     };
     let (Some(pack), None) = (args.next(), args.next()) else { return None };
-    Some(Arguments { slangc, code, sources: sources.into(), pack: pack.into() })
+    Some(Arguments { slangc, code, shaders, sources: sources.into(), pack: pack.into() })
 }
 
 /// The cook, its futures driven on this thread by `Executor::block_on` (D130): one worker
@@ -66,8 +68,15 @@ fn run(arguments: &Arguments) -> Result<()> {
     if arguments.slangc.is_none() && arguments.code.is_some() {
         return Err(Error::new(ErrorKind::InvalidData, "--code is given without --slangc"));
     }
+    if arguments.slangc.is_none() && arguments.shaders.is_some() {
+        return Err(Error::new(ErrorKind::InvalidData, "--shaders is given without --slangc"));
+    }
     let slang = arguments.slangc.as_deref().map(Slang::new).transpose()?;
-    let shaders = slang.as_ref().map(|slang| Shaders { slang, code: arguments.code.as_deref() });
+    let shaders = slang.as_ref().map(|slang| Shaders {
+        slang,
+        code: arguments.code.as_deref(),
+        cooked: arguments.shaders.as_deref(),
+    });
     let executor = Executor::builder().frame_workers(1).background_workers(1).build()?;
     let platform = executor.platform().as_ref();
     let io = Io::start(platform, IoConfig::for_platform(platform))?;
