@@ -10,7 +10,7 @@ use core::time::Duration;
 use lactose_core::{Error, ErrorKind, Handle, Result, xxh64};
 
 use crate::resource::{Format, kind};
-use crate::shader::{CookedShader, Reader};
+use crate::shader::{ConstantType, CookedShader, Reader};
 
 /// A graphics pipeline of a device.
 pub type GraphicsPipelineHandle = Handle<kind::GraphicsPipeline>;
@@ -19,11 +19,68 @@ pub type ComputePipelineHandle = Handle<kind::ComputePipeline>;
 
 /// A value for one specialisation constant.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Constant<'a> {
+pub struct Constant {
     /// The constant's id, one the shader declares.
     pub id: u32,
-    /// Its value, of the length the shader declares for it, little-endian.
-    pub bytes: &'a [u8],
+    /// Its value, of the type the shader declares for it.
+    pub value: ConstantValue,
+}
+
+/// A specialisation constant's value, of one of the types a shader declares one of
+/// ([`ConstantType`]). How it reaches the driver is the backend's: Vulkan widens a `Bool` to
+/// a four-byte `VkBool32`, Metal takes each as the `MTLDataType` of its type.
+///
+/// Two values are equal when their types and their bits are: a `Float` of `-0.0` is another
+/// value than one of `0.0`, and a NaN equals itself, as a pipeline specialised with either
+/// does.
+#[derive(Clone, Copy, Debug)]
+pub enum ConstantValue {
+    /// A `Bool`.
+    Bool(bool),
+    /// An `Int`.
+    Int(i32),
+    /// A `Uint`.
+    Uint(u32),
+    /// A `Float`.
+    Float(f32),
+}
+
+impl ConstantValue {
+    /// The type of a constant this is a value of.
+    #[must_use]
+    pub const fn ty(self) -> ConstantType {
+        match self {
+            Self::Bool(_) => ConstantType::Bool,
+            Self::Int(_) => ConstantType::Int,
+            Self::Uint(_) => ConstantType::Uint,
+            Self::Float(_) => ConstantType::Float,
+        }
+    }
+
+    /// The value's bits, a `Bool`'s 0 or 1.
+    const fn bits(self) -> u32 {
+        match self {
+            Self::Bool(value) => value as u32,
+            Self::Int(value) => value.cast_unsigned(),
+            Self::Uint(value) => value,
+            Self::Float(value) => value.to_bits(),
+        }
+    }
+}
+
+impl PartialEq for ConstantValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty() == other.ty() && self.bits() == other.bits()
+    }
+}
+
+impl Eq for ConstantValue {}
+
+impl core::hash::Hash for ConstantValue {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.ty().hash(state);
+        self.bits().hash(state);
+    }
 }
 
 /// One stage of a pipeline.
@@ -31,9 +88,9 @@ pub struct Constant<'a> {
 pub struct StageDesc<'a> {
     /// The cooked shader.
     pub shader: &'a CookedShader,
-    /// Values for its constants, each id at most once. A constant with no value keeps the
-    /// default the shader gives it.
-    pub constants: &'a [Constant<'a>],
+    /// Values for its constants, each id at most once and each of the type the shader
+    /// declares for it. A constant with no value keeps the default the shader gives it.
+    pub constants: &'a [Constant],
 }
 
 /// Which channels of a colour attachment a pipeline writes: a set of the four bits.

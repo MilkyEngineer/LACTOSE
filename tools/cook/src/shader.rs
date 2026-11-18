@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use lactose_core::{Error, ErrorKind, Result};
-use lactose_rhi_api::{CookedShader, ShaderTarget};
+use lactose_rhi_api::{ConstantSlot, CookedShader, ShaderTarget, Varying};
 use serde::Deserialize;
 
 use crate::{msl, semantics, spirv};
@@ -173,6 +173,8 @@ pub(crate) fn cook(slang: &Slang, sources: &Path, source: &Source) -> Result<Vec
             push_bytes: reflection.push_bytes,
             inputs: reflection.inputs,
             outputs: reflection.outputs,
+            workgroup: reflection.workgroup,
+            varyings: reflection.varyings.clone(),
         };
         let name = |ending: &str| format!("{stem}.{entry}.{ending}");
         if cfg!(target_os = "macos") {
@@ -213,8 +215,10 @@ impl Slang {
 /// links by semantic where Vulkan links by location: the fragment outputs, at their locations
 /// in the SPIR-V, at their `SV_Target` indices in Slang's reflection, which `semantics` has
 /// held to be the locations it gives, and at their colours in the MSL; the varyings, the same
-/// way by `TEXCOORD` index, but for the inputs the SPIR-V leaves out; the input attachments,
-/// the constants, and the push block and the heap, each taken by both or by neither.
+/// way by `TEXCOORD` index, but for the inputs the SPIR-V leaves out, and each of the SPIR-V's
+/// of the same type in the MSL; the input attachments; the constants, by id and type; the
+/// push block and the heap, each taken by both or by neither; and the workgroup, which the
+/// MSL does not state, as Slang's reflection gives it.
 fn agree(
     reflection: &spirv::Reflection,
     semantics: semantics::Semantics,
@@ -231,15 +235,27 @@ fn agree(
         ));
     }
     // The SPIR-V leaves out an input the entry never reads, which the other two keep.
-    if reflection.varyings & !semantics.varyings != 0 || semantics.varyings != interface.varyings {
+    let (spirv, msl) = (varying_bits(&reflection.varyings), varying_bits(&interface.varyings));
+    if spirv & !semantics.varyings != 0 || semantics.varyings != msl {
         return refuse(format!(
             "the varyings are at locations {} in the SPIR-V, `TEXCOORD` {} in Slang's \
              reflection and `TEXCOORD` {} in the MSL, where the last two are the same and hold \
              the first",
-            bits(reflection.varyings),
+            bits(spirv),
             bits(semantics.varyings),
-            bits(interface.varyings)
+            bits(msl)
         ));
+    }
+    for varying in &reflection.varyings {
+        let at = interface.varyings.iter().find(|msl| msl.location == varying.location);
+        if at != Some(varying) {
+            return refuse(format!(
+                "the varying at location {} is {} in the SPIR-V and {} in the MSL",
+                varying.location,
+                varying_type(Some(varying)),
+                varying_type(at)
+            ));
+        }
     }
     for (what, spirv, msl) in [
         ("the push block", reflection.push_bytes > 0, interface.push),
@@ -261,14 +277,38 @@ fn agree(
             bits(interface.inputs)
         ));
     }
-    let ids: Vec<u32> = reflection.constants.iter().map(|constant| constant.id).collect();
-    if ids != interface.constants {
+    if reflection.constants != interface.constants {
         return refuse(format!(
-            "the specialisation constants are {ids:?} in the SPIR-V and {:?} in the MSL",
-            interface.constants
+            "the specialisation constants are {} in the SPIR-V and {} in the MSL",
+            constants(&reflection.constants),
+            constants(&interface.constants)
+        ));
+    }
+    if reflection.workgroup != semantics.workgroup {
+        return refuse(format!(
+            "the workgroup is {:?} in the SPIR-V and {:?} in Slang's reflection",
+            reflection.workgroup, semantics.workgroup
         ));
     }
     Ok(())
+}
+
+/// Bit `i` for each varying at location `i`.
+fn varying_bits(varyings: &[Varying]) -> u32 {
+    varyings.iter().fold(0, |bits, varying| bits | 1 << varying.location)
+}
+
+/// A varying's type in a message, `2 × Float`, or `none`.
+fn varying_type(varying: Option<&Varying>) -> String {
+    varying
+        .map_or("none".to_owned(), |varying| format!("{} × {:?}", varying.count, varying.component))
+}
+
+/// Constants in a message, `[3: Uint, 7: Bool]`.
+fn constants(constants: &[ConstantSlot]) -> String {
+    let each: Vec<String> =
+        constants.iter().map(|constant| format!("{}: {:?}", constant.id, constant.ty)).collect();
+    format!("[{}]", each.join(", "))
 }
 
 /// The set bits of `bits`, as a list.
@@ -353,9 +393,13 @@ impl Drop for Scratch {
 
 #[cfg(test)]
 mod tests {
-    use lactose_rhi_api::{ConstantSlot, HEAP_SET, HeapForm, HeapUse, ShaderStage};
+    use lactose_rhi_api::{ComponentType, ConstantType, HEAP_SET, HeapForm, HeapUse, ShaderStage};
 
     use super::*;
+
+    const UV: Varying = Varying { location: 0, component: ComponentType::Float, count: 2 };
+    const SLOT: Varying = Varying { location: 2, component: ComponentType::Uint, count: 1 };
+    const TINT: ConstantSlot = ConstantSlot { id: 3, ty: ConstantType::Uint };
 
     /// A fragment entry's three readings, the same: an input, varyings 0 and 2, outputs 0 and
     /// 1, a constant, the push block and the heap.
@@ -365,18 +409,19 @@ mod tests {
             stage: ShaderStage::Fragment,
             entry: "fs".to_owned(),
             heap: Some(heap),
-            constants: vec![ConstantSlot { id: 3, bytes: 4 }],
+            constants: vec![TINT],
             push_bytes: 16,
             inputs: 0b1,
-            varyings: 0b101,
+            varyings: vec![UV, SLOT],
             outputs: 0b11,
+            workgroup: None,
         };
-        let semantics = semantics::Semantics { varyings: 0b101, outputs: 0b11 };
+        let semantics = semantics::Semantics { varyings: 0b101, outputs: 0b11, workgroup: None };
         let interface = msl::Interface {
             inputs: 0b1,
-            varyings: 0b101,
+            varyings: vec![UV, SLOT],
             outputs: 0b11,
-            constants: vec![3],
+            constants: vec![TINT],
             push: true,
             heap: true,
         };
@@ -389,21 +434,51 @@ mod tests {
         agree(&reflection, semantics, &interface).unwrap();
         // An input the SPIR-V leaves out, which the entry does not read, is no disagreement.
         let mut unread = reflection.clone();
-        unread.varyings = 0b1;
+        unread.varyings = vec![UV];
         agree(&unread, semantics, &interface).unwrap();
         type Change = fn(&mut spirv::Reflection, &mut semantics::Semantics, &mut msl::Interface);
-        let changes: [(Change, &str); 11] = [
+        let changes: [(Change, &str); 17] = [
             (|r, _, _| r.outputs = 0b1, "the fragment outputs are at locations 0 in the SPIR-V"),
             (|_, s, _| s.outputs = 0b1, "`SV_Target` 0 in Slang's reflection"),
             (|_, _, i| i.outputs = 0b1, "and colours 0 in the MSL"),
-            (|r, _, _| r.varyings = 0b111, "the varyings are at locations 0, 1, 2 in the SPIR-V"),
+            (
+                |r, _, _| r.varyings.insert(1, Varying { location: 1, ..UV }),
+                "the varyings are at locations 0, 1, 2 in the SPIR-V",
+            ),
             (|_, s, _| s.varyings = 0b1, "`TEXCOORD` 0 in Slang's reflection"),
-            (|_, _, i| i.varyings = 0b1, "and `TEXCOORD` 0 in the MSL"),
+            (|_, _, i| i.varyings = vec![UV], "and `TEXCOORD` 0 in the MSL"),
+            (
+                |r, _, _| r.varyings[1].component = ComponentType::Float,
+                "the varying at location 2 is 1 × Float in the SPIR-V and 1 × Uint in the MSL",
+            ),
+            (
+                |_, _, i| i.varyings[0].count = 4,
+                "the varying at location 0 is 2 × Float in the SPIR-V and 4 × Float in the MSL",
+            ),
             (|r, _, _| r.push_bytes = 0, "the push block is not taken in the SPIR-V and taken"),
             (|_, _, i| i.heap = false, "the heap is taken in the SPIR-V and not taken in the MSL"),
             (|r, _, _| r.inputs = 0, "the input attachments are none in the SPIR-V and colours 0"),
             (|_, _, i| i.inputs = 0b11, "are 0 in the SPIR-V and colours 0, 1 in the MSL"),
-            (|_, _, i| i.constants = vec![4], "constants are [3] in the SPIR-V and [4] in the MSL"),
+            (
+                |_, _, i| i.constants[0].id = 4,
+                "constants are [3: Uint] in the SPIR-V and [4: Uint] in the MSL",
+            ),
+            (
+                |_, _, i| i.constants[0].ty = ConstantType::Int,
+                "constants are [3: Uint] in the SPIR-V and [3: Int] in the MSL",
+            ),
+            (
+                |r, _, _| r.constants[0].ty = ConstantType::Bool,
+                "constants are [3: Bool] in the SPIR-V and [3: Uint] in the MSL",
+            ),
+            (
+                |r, _, _| r.workgroup = Some([64, 1, 1]),
+                "the workgroup is Some([64, 1, 1]) in the SPIR-V and None in Slang's reflection",
+            ),
+            (
+                |_, s, _| s.workgroup = Some([64, 1, 1]),
+                "the workgroup is None in the SPIR-V and Some([64, 1, 1]) in Slang's reflection",
+            ),
         ];
         for (change, says) in changes {
             let (mut reflection, mut semantics, mut interface) = agreeing();

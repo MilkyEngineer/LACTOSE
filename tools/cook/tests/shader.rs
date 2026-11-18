@@ -18,8 +18,9 @@ use lactose_asset_api::{
 use lactose_cook::{SHADER_KIND, Shaders, Slang, cook};
 use lactose_core::{ErrorKind, Result};
 use lactose_rhi_api::{
-    COOKED_SHADER_VERSION, ConstantSlot, CookedShader, HEAP_SET, HEAP_SLOTS_DEFAULT, HeapArray,
-    HeapArrayKind, HeapForm, HeapUse, SAMPLERS_DEFAULT, ShaderStage, ShaderTarget,
+    COOKED_SHADER_VERSION, ComponentType, ConstantSlot, ConstantType, CookedShader, HEAP_SET,
+    HEAP_SLOTS_DEFAULT, HeapArray, HeapArrayKind, HeapForm, HeapUse, SAMPLERS_DEFAULT, ShaderStage,
+    ShaderTarget, Varying,
 };
 
 /// The repository's root.
@@ -666,13 +667,14 @@ impl Loader for ShaderLoader {
     }
 }
 
-/// The engine's shaders cooked into a pack, mounted alone in a store, and each loaded, resolved
-/// and pinned through [`ShaderLoader`]: what the cook published, and each shader in that order.
-fn cook_and_load(env: &Env) -> (Vec<lactose_cook::Published>, Vec<CookedShader>) {
+/// The shaders of `sources` cooked into a pack, mounted alone in a store, and each loaded,
+/// resolved and pinned through [`ShaderLoader`]: what the cook published, and each shader in
+/// that order.
+fn cook_and_load(env: &Env, sources: &Path) -> (Vec<lactose_cook::Published>, Vec<CookedShader>) {
     let pack = env.dir.join("shaders.pack");
     let slang = slang();
     let shaders = Shaders { slang: &slang, code: None };
-    let published = env.wait(cook(&env.io, &root().join("shaders"), &pack, Some(shaders))).unwrap();
+    let published = env.wait(cook(&env.io, sources, &pack, Some(shaders))).unwrap();
     let loaders = vec![ErasedLoader::new(ShaderLoader)];
     let store = Store::new(env.executor.clone(), env.io.clone(), loaders).unwrap();
     env.wait(store.mount(&pack)).expect("the pack mounts");
@@ -695,7 +697,7 @@ fn cook_and_load(env: &Env) -> (Vec<lactose_cook::Published>, Vec<CookedShader>)
 #[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
 fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
     let env = Env::new("engine");
-    let (published, loaded) = cook_and_load(&env);
+    let (published, loaded) = cook_and_load(&env, &root().join("shaders"));
     let targets: &[&str] =
         if cfg!(target_os = "macos") { &["metallib", "msl", "spirv"] } else { &["msl", "spirv"] };
     let mut expected = Vec::new();
@@ -725,17 +727,20 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
         assert_eq!(shader.target, target, "{}", asset.name);
         let entry = asset.name.split('.').nth(1).unwrap();
         assert_eq!(shader.entry, entry);
-        let (stage, heap, constants, push, inputs, outputs) = match entry {
-            "vs_main" => (ShaderStage::Vertex, None, vec![], 16, 0, 0),
+        let uv = Varying { location: 0, component: ComponentType::Float, count: 2 };
+        // `fs_resolve` never reads `uv`, which its SPIR-V leaves out.
+        let (stage, heap, constants, push, inputs, outputs, varyings) = match entry {
+            "vs_main" => (ShaderStage::Vertex, None, vec![], 16, 0, 0, vec![uv]),
             "fs_main" => (
                 ShaderStage::Fragment,
                 Some(heap.clone()),
-                vec![ConstantSlot { id: 0, bytes: 4 }],
+                vec![ConstantSlot { id: 0, ty: ConstantType::Uint }],
                 16,
                 0,
                 0b1,
+                vec![uv],
             ),
-            _ => (ShaderStage::Fragment, None, vec![], 0, 0b1, 0b10),
+            _ => (ShaderStage::Fragment, None, vec![], 0, 0b1, 0b10, vec![]),
         };
         assert_eq!(
             (
@@ -744,12 +749,164 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
                 &shader.constants,
                 shader.push_bytes,
                 shader.inputs,
-                shader.outputs
+                shader.outputs,
+                &shader.varyings,
+                shader.workgroup,
             ),
-            (stage, &heap, &constants, push, inputs, outputs),
+            (stage, &heap, &constants, push, inputs, outputs, &varyings, None),
             "{}",
             asset.name
         );
+    }
+}
+
+/// A compute entry and a vertex and fragment pair, of each constant type and of varyings of
+/// each component type, the fragment entry reading two of the vertex entry's three.
+const TYPED: &str = "struct Push { uint* out; };\n\
+                     [[vk::push_constant]] ConstantBuffer<Push> push;\n\
+                     [[vk::constant_id(1)]] const bool FLAG = false;\n\
+                     [[vk::constant_id(2)]] const int OFFSET = 0;\n\
+                     [[vk::constant_id(4)]] const uint TINT = 0;\n\
+                     [[vk::constant_id(7)]] const float SCALE = 1.0;\n\
+                     [shader(\"compute\")] [numthreads(8, 4, 2)]\n\
+                     void cs_p(uint3 id : SV_DispatchThreadID)\n\
+                     {\n    uint value = id.x * TINT + uint(int(id.y) + OFFSET) + uint(SCALE);\n    \
+                     push.out[id.x + id.y * 8 + id.z * 32] = FLAG ? value : 0;\n}\n\
+                     struct Varyings\n{\n    float4 position : SV_Position;\n    \
+                     float2 uv : TEXCOORD0;\n    nointerpolation int3 cell : TEXCOORD1;\n    \
+                     nointerpolation uint slot : TEXCOORD2;\n};\n\
+                     [shader(\"vertex\")] Varyings vs_p(uint vertex : SV_VulkanVertexID)\n\
+                     {\n    Varyings result;\n    result.position = float4(float(vertex), 0, 0, 1);\n    \
+                     result.uv = result.position.xy;\n    result.cell = int3(vertex, 0, 0);\n    \
+                     result.slot = vertex;\n    return result;\n}\n\
+                     [shader(\"fragment\")] float4 fs_p(Varyings varyings) : SV_Target0\n\
+                     {\n    return float4(varyings.uv, float(varyings.slot), 1);\n}\n";
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_compute_entrys_workgroup_and_each_constant_and_varying_type_cook() {
+    let env = Env::new("typed");
+    let sources = probe(&env, "sources", &[], &[("probe.slang", TYPED)]);
+    let (published, loaded) = cook_and_load(&env, &sources);
+    let float = |location, count| Varying { location, component: ComponentType::Float, count };
+    let (int, uint) = (ComponentType::Int, ComponentType::Uint);
+    let constants = vec![
+        ConstantSlot { id: 1, ty: ConstantType::Bool },
+        ConstantSlot { id: 2, ty: ConstantType::Int },
+        ConstantSlot { id: 4, ty: ConstantType::Uint },
+        ConstantSlot { id: 7, ty: ConstantType::Float },
+    ];
+    let mut entries = Vec::new();
+    for (asset, shader) in published.iter().zip(&loaded) {
+        let expected = match shader.entry.as_str() {
+            "cs_p" => (ShaderStage::Compute, Some([8, 4, 2]), constants.clone(), vec![]),
+            "vs_p" => (
+                ShaderStage::Vertex,
+                None,
+                vec![],
+                vec![
+                    float(0, 2),
+                    Varying { location: 1, component: int, count: 3 },
+                    Varying { location: 2, component: uint, count: 1 },
+                ],
+            ),
+            // The SPIR-V leaves out `cell`, which the fragment entry never reads.
+            _ => (
+                ShaderStage::Fragment,
+                None,
+                vec![],
+                vec![float(0, 2), Varying { location: 2, component: uint, count: 1 }],
+            ),
+        };
+        let read =
+            (shader.stage, shader.workgroup, shader.constants.clone(), shader.varyings.clone());
+        assert_eq!(read, expected, "{}", asset.name);
+        entries.push(shader.entry.as_str());
+    }
+    entries.dedup();
+    assert_eq!(entries, ["cs_p", "fs_p", "vs_p"]);
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_workgroup_out_of_bounds_is_refused() {
+    let source = TYPED.replace("numthreads(8, 4, 2)", "numthreads(8, 4, 8)");
+    let says = "probe.slang: cs_p (SPIR-V): the entry's workgroup is [8, 4, 8], where each \
+                dimension is 1 to [128, 128, 64] and their product at most 128";
+    assert_probe_refused("workgroup", &[], &source, says);
+}
+
+/// A vertex entry writing `SV_Position` and `float4` varyings at locations 0 to
+/// `locations - 1`, and a fragment entry reading every varying, and `SV_Position` (Vulkan's
+/// `FragCoord`) and `SV_IsFrontFace` where asked: the gpu review's probes v14 and v23 to v25.
+fn wide(locations: u32, frag_coord: bool, front_face: bool) -> String {
+    let fields: String =
+        (0..locations).map(|at| format!(" float4 a{at} : TEXCOORD{at};")).collect();
+    let writes: String = (0..locations).map(|at| format!(" v.a{at} = v.p * {at}.0;")).collect();
+    let mut sum: Vec<String> = (0..locations).map(|at| format!("f.a{at}")).collect();
+    if frag_coord {
+        sum.push("f.p".to_owned());
+    }
+    let (face, faced) = if front_face {
+        (", bool front : SV_IsFrontFace", " + (front ? 1.0 : 0.0)")
+    } else {
+        ("", "")
+    };
+    format!(
+        "struct VOut {{ float4 p : SV_Position;{fields} }};\n\
+         [shader(\"vertex\")] VOut vs_p(uint i : SV_VulkanVertexID) {{ VOut v; \
+         v.p = float4(float(i & 1), float(i >> 1), 0, 1);{writes} return v; }}\n\
+         struct FIn {{ float4 p : SV_Position;{fields} }};\n\
+         [shader(\"fragment\")] float4 fs_p(FIn f{face}) : SV_Target0 {{ return {}{faced}; }}\n",
+        sum.join(" + ")
+    )
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn varyings_and_built_ins_past_64_components_are_refused() {
+    // v14: sixteen `float4` and `Position`, 68 components in the vertex entry's outputs.
+    let says = "vs_p (SPIR-V): the vertex entry's outputs take 68 components, 64 for the \
+                locations up to the highest and 4 for the built-ins, above the 64";
+    assert_probe_refused("wide-v14", &[], &wide(16, false, false), says);
+    // v23: the same, and the fragment entry reads `FragCoord`: 68 on each side.
+    assert_probe_refused("wide-v23", &[], &wide(16, true, false), "take 68 components");
+    // v25: fifteen, and the fragment entry reads `FragCoord` and `FrontFacing`.
+    let says = "fs_p (SPIR-V): the fragment entry's inputs take 65 components, 60 for the \
+                locations up to the highest and 5 for the built-ins";
+    assert_probe_refused("wide-v25", &[], &wide(15, true, true), says);
+    // v24: fifteen and `FragCoord`, 64 on each side.
+    assert_probe_cooks("wide-v24", &[], &wide(15, true, false), "fs_p");
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_varying_or_constant_of_16_or_64_bits_or_centroid_or_sample_is_refused_by_name() {
+    for (what, field, says) in [
+        ("half", "nointerpolation half2 v", "capability Float16"),
+        ("int16", "nointerpolation int16_t v", "capability Int16"),
+        ("double", "nointerpolation double v", "capability Float64"),
+        ("centroid", "centroid float2 v", "the varying at location 1 is `centroid`"),
+        ("sample", "sample float2 v", "capability SampleRateShading"),
+    ] {
+        let source = format!(
+            "struct V {{ float4 position : SV_Position; [[vk::location(1)]] {field} : TEXCOORD1; }};\n\
+             [shader(\"vertex\")] V vs_o(uint vertex : SV_VulkanVertexID)\n\
+             {{ V r = (V)0; r.position = float4(float(vertex), 0, 0, 1); return r; }}\n\
+             [shader(\"fragment\")] float4 fs_o(V v) : SV_Target0 {{ return float4(float(v.v.x), 0, 0, 1); }}\n"
+        );
+        assert_probe_refused(&format!("odd-{what}"), &[], &source, says);
+    }
+    for (what, ty, value, says) in [
+        ("half", "half", "1.0h", "capability Float16"),
+        ("int16", "int16_t", "1", "capability Int16"),
+        ("double", "double", "1.0l", "capability Float64"),
+    ] {
+        let source = TYPED.replace(
+            "[[vk::constant_id(7)]] const float SCALE = 1.0;",
+            &format!("[[vk::constant_id(7)]] const {ty} SCALE = {value};"),
+        );
+        assert_probe_refused(&format!("odd-constant-{what}"), &[], &source, says);
     }
 }
 
@@ -759,7 +916,7 @@ fn the_shader_kind_loads_against_the_slice() {
     // Row 136: the store's one synchronous call per load, the version hash and the decode,
     // against section 5.1's 0.5 ms slice, for each cooked shader; the median of 101 calls.
     let env = Env::new("shader-load");
-    let (published, loaded) = cook_and_load(&env);
+    let (published, loaded) = cook_and_load(&env, &root().join("shaders"));
     let loader = ErasedLoader::new(ShaderLoader);
     for (asset, shader) in published.iter().zip(&loaded) {
         // The bytes the pack holds: the format's encoding is a function of the shader.

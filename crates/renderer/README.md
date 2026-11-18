@@ -520,15 +520,17 @@ table, which already holds each instance's mesh; it adds no field to the row.
   and refuses (`InvalidData`, naming the shader and the field) a wrong stage, a push block of
   another size than "The shader interface" gives (32 bytes for the scatter and the vertex
   stage; 0 or 32 for the fragment stage, which reads nothing of it), a heap, a constant the
-  interface does not name or a missing one, an input attachment, or outputs other than
+  interface does not name or a missing one, a `CELL_SIZE_CONSTANT` whose `ConstantSlot::ty`
+  is not `ConstantType::Float`, an input attachment, or outputs other than
   attachment zero.
-- **The scatter's workgroup size is unchecked.** `CookedShader` does not carry it, so `new`
-  cannot refuse a scatter cooked at another size than `(SCATTER_GROUP, 1, 1)`; it is the
-  cook's to hold. Once the format carries it (rhi-api ask (c), D161), `new` refuses a
+- **The scatter's workgroup size is checked.** `CookedShader` carries it as `workgroup` since
+  the format's version 2 (rhi-api ask (c), D161; D158's addendum of lane `shader-format`),
+  and `renderer-impl`'s `new` refuses (`InvalidData`, naming the shader and the field) a
   scatter whose size is not `(SCATTER_GROUP, 1, 1)`. A scatter cooked at a smaller size
   leaves entries unwritten, and one at a larger size runs invocations past a dispatch's
   groups that the count check stops.
-- It sets the vertex stage's constant `CELL_SIZE_CONSTANT` to `RenderPosition::CELL_SIZE`.
+- It sets the vertex stage's constant `CELL_SIZE_CONSTANT` to `RenderPosition::CELL_SIZE`,
+  as a `ConstantValue::Float`.
 - The renderer takes decoded shaders and opens no file. The pipeline cache is the device's:
   the client binary hands last run's bytes to the backend's constructor and writes
   `Device::pipeline_cache` to its file after `Renderer::new` has returned, when the cache
@@ -720,8 +722,8 @@ forms; the entry-point form passed `spirv-val` and `metal -Werror` and rendered 
 form's images under MoltenVK. `rhi-metal` sets the push bytes at the index the cooked
 shader declares, and binds no vertex buffer, so the vertex stage's index 0 is the block's.
 
-**Scatter, compute.** Workgroup `(64, 1, 1)` (`SCATTER_GROUP`), which `Renderer::new` does
-not check until the cooked format carries it ("Pipelines and shaders"). Push block, 32
+**Scatter, compute.** Workgroup `(64, 1, 1)` (`SCATTER_GROUP`), which `Renderer::new` holds
+the cooked `workgroup` to ("Pipelines and shaders"; the format's version 2). Push block, 32
 bytes (`SCATTER_PUSH_BYTES`):
 
 | Offset | Field |

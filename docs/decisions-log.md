@@ -7422,6 +7422,104 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   `Harness::lose` says, and `drop_that_is_not_the_last_returns_at_once` holds on every backend
   that a drop that is not the device's last returns while a submit is held. The suite has 168
   cases, 142 of them contract cases, and a device backend runs 64 of its refusal cases.
+- Addendum (lane `shader-format`, 2026-11-18): the cooked shader format's version 2
+  (`COOKED_SHADER_VERSION` 2) carries three facts a backend needs and version 1 did not: the
+  renderer review's S2 (Metal takes a compute stage's workgroup from the host), and
+  `reviewer-gpu`'s G11 (Metal and Vulkan need each constant's type) and G3 (a vertex and
+  fragment pair that does not match reaches VUID-RuntimeSpirv-OpEntryPoint-08743 through a
+  safe call). `crates/rhi-api/README.md`, "Pipelines and the cooked shader format", states
+  each; the cook reflects each from the SPIR-V (`tools/cook/README.md`, "The checks").
+  - *Each constant's type.* `ConstantSlot { id: u32, ty: ConstantType }`, in place of
+    `bytes`, with `ConstantType` one of `Bool`, `Int`, `Uint` and `Float`. A `Constant` is
+    `{ id: u32, value: ConstantValue }`, in place of raw bytes, with `ConstantValue` one of
+    `Bool(bool)`, `Int(i32)`, `Uint(u32)` and `Float(f32)`: a value of another type than its
+    slot's (`ConstantValue::ty`), an id the shader does not declare and an id given twice are
+    `InvalidData` at pipeline creation, so a `uint` constant given an `f32` fails there, not
+    in the shader. A `ConstantValue` is equal to and hashes as another of the same type and
+    the same bits, so `Constant` keeps `Eq` and `Hash`, and the pipeline descs keep `Eq`.
+    The bytes are the backend's:
+    Metal takes each value as the `MTLDataType` of its type, a `Bool` as a one-byte `.bool`;
+    the Vulkan backend writes each map entry in four bytes, a `Bool` widened to a `VkBool32`
+    of 0 or 1 (VUID-VkSpecializationMapEntry-constantID-00776). The cook refuses any other
+    type, by name: a 64-bit integer by its type, and a `half`, a 16-bit integer or a `double`
+    by the capability it declares (`Float16`, `Int16`, `Float64`). It holds the MSL's
+    `constant <type>` of each `[[function_constant(i)]]` to the SPIR-V's type. Rules out raw
+    bytes, which let a value of another type through as one of the right length.
+  - *The workgroup.* `CookedShader::workgroup: Option<[u32; 3]>`, `Some` in the compute stage
+    alone: the SPIR-V's `OpExecutionMode LocalSize`, which Metal takes at dispatch as
+    `threadsPerThreadgroup` and the MSL does not state, so the cook holds it to Slang's
+    reflection's `threadGroupSize`. `LocalSizeId` is refused, since a Vulkan device takes it
+    under `maintenance4` alone (VUID-RuntimeSpirv-LocalSizeId-06434), and so is an id
+    decorated `BuiltIn WorkgroupSize`, which would set the workgroup in place of `LocalSize`.
+    The bound is fixed and portable, not a capability: each dimension 1 to
+    `WORKGROUP_SIZE_MAX`, (128, 128, 64), and their product at most
+    `WORKGROUP_INVOCATIONS_MAX`, 128, Vulkan's least limits (VUID-RuntimeSpirv-x-06429,
+    -y-06430, -z-06431, -x-06432). Apple's feature set tables give 1024 threads per
+    threadgroup on Apple4 to Apple11 (the M1 is Apple7) and 512 on Apple2 and Apple3, so the
+    bound is within every family's; a pipeline's own limit is its
+    `maxTotalThreadsPerThreadgroup`, which the Metal backend checks. A capability would let a
+    shader cook that a conformant device cannot run, for no milestone 2 shader: the scatter's
+    is (64, 1, 1). Rules out a workgroup the host passes with each dispatch.
+  - *The varyings.* `CookedShader::varyings: Vec<Varying>`, `Varying { location: u32,
+    component: ComponentType, count: u32 }`, `ComponentType` one of `Float`, `Int` and
+    `Uint`, all 32-bit: the vertex stage's outputs and the fragment stage's inputs, the
+    built-ins aside, ascending by location, each below `VARYING_LOCATIONS`, 16, with a count of
+    1 to 4, and none in a compute stage. A fragment stage's are those its code reads, which
+    is the SPIR-V's interface; Metal ignores a `[[stage_in]]` field the code never reads. The
+    cook refuses a `Component` decoration, which would place two varyings in one location.
+  - *The components.* Vulkan's least `maxVertexOutputComponents` and
+    `maxFragmentInputComponents`, 64, count an interface's built-ins as well as its varyings
+    (VUID-RuntimeSpirv-Location-06272): `reviewer-gpu`'s round-1 G1 had the validation layer
+    refuse sixteen `float4` beside `Position`, 68 components. The format does not carry the
+    built-ins, so the cook counts each stage's interface, four components for each location
+    up to the highest varying's and each built-in's own (`Position` and `FragCoord` four,
+    `FrontFacing` one), and refuses a stage above 64, naming the count; the review's probes
+    are its tests, 68 and 65 refused and 64 cooked. `VARYING_LOCATIONS` stays 16, the most
+    that 64 components allow with no built-in: a lower bound would refuse stages every device
+    runs, such as one with a varying at location 15 and no built-in, and the count already
+    refuses those some device cannot run. Rules out a count in the format, which would have
+    to carry the built-ins.
+  - *Interpolation.* The cook refuses `centroid` and `sample` interpolation (the `Centroid`
+    decoration, and the `SampleRateShading` capability `sample` declares) until an
+    attachment can be multisampled: Slang writes `centroid` as Metal's
+    `[[center_perspective]]`, so under multisampling the targets would sample at different
+    points. Comparing each varying's interpolation across the two targets comes with the
+    first multisampled attachment. Interpolation is not part of the varyings' match.
+  - *One copy of each rule.* `CookedShader::check(&self) -> Result<()>` holds every rule of
+    the format's fields, and `encode` and `decode` apply it; `check_varyings(vertex:
+    &CookedShader, fragment: &CookedShader) -> Result<()>` holds the varyings rule. A device
+    backend calls both before its driver sees a stage, and `lactose-rhi-null` calls them in
+    place of copies of its own. For a `uint` read as an `int`, `check_varyings` is the only
+    guard: Vulkan's validation layer does not report one and Metal makes the pipeline.
+  - *The format's rule.* `check` refuses (`InvalidData`) a compute stage without a
+    workgroup, a workgroup outside the compute stage, a dimension of zero or a size past the
+    bound, varyings in the compute stage, and varyings out of ascending order, at a location
+    of 16 or more, or of a count outside 1 to 4; `decode` refuses a tag or a type code
+    outside the format's.
+  - *The varyings rule*, `check_varyings`, at `create_graphics_pipeline`: each varying the
+    fragment stage reads is one the vertex stage writes, at the same location, of the same
+    component type and the same count, or the pipeline is `InvalidData`, naming the location
+    and what is written there. A varying written and not read is allowed. It is the
+    intersection of Vulkan's "Interface Matching" (VUID-RuntimeSpirv-OpEntryPoint-08743 and
+    -07754, a wider output allowed under `maintenance4`) and Metal's, which refuses a wider
+    output, another component type and a location not written, and accepts a `uint` read as
+    an `int` (on the M1, macOS 27.2.1).
+  The suite has 174 cases, 146 of them contract cases. `constant_of_another_length_is_refused`
+  is renamed `constant_the_shader_does_not_declare_is_refused`, since a length no longer
+  exists. `cooked_shader_forged_under_a_valid_checksum_is_refused` writes each breach into a
+  valid encoding under a new checksum, as a writer that skipped `check` would, and `decode`
+  refuses each. It, `constant_of_another_type_is_refused`,
+  `workgroup_outside_its_stage_or_bounds_is_refused` and
+  `varying_the_vertex_stage_does_not_write_is_refused` are the new contract cases, each run
+  by a device too, naming no rule. `dispatch_runs_workgroups_of_the_shaders_size` and
+  `specialised_constant_of_each_type_is_read_back` are the new output cases, their bodies
+  `vulkan`'s: the first shows a dispatch uses the cooked workgroup, the second reads back a
+  value of each type, the proof of the `VkBool32` widening and of each `MTLDataType`. A
+  device backend still runs 64 refusal cases. `lactose-rhi-null` refuses each breach, each
+  check with a build without it that fails a test. `cargo xtask gpu` still takes each
+  constant's `MTLDataType` from the MSL: it is given the code `ricotta --code` writes, which
+  `--cooked` carries between runners, not the pack, and the cook holds the MSL's types to
+  the format's.
 
 **D159. `lactose-platform`: one window whose `Arc` is its lifetime, the two pumps over `lactose-task`'s lanes, a close and a resize as states, and a present thread over the caller's state** (§3, §4, §5.1, §21, `lactose-platform`, `crates/app/README.md`, `crates/task/README.md`)
 - Why: section 4 gives the crate four nouns and section 5.1 two threads, and the milestone 2
@@ -7888,8 +7986,9 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     no run names a slot twice; a run is split into dispatches at
     `min(compute_groups[0], u32::MAX / 64) * 64` entries, computed in `u64`, since the product
     alone overflows `u32` under MoltenVK and on a desktop. The workgroup size, 64, is the
-    cook's to hold: `CookedShader` does not carry it, so `Renderer::new` cannot check it until
-    rhi-api's ask (c) adds it, and then refuses another. Rules out a host copy of every
+    cook's to hold, and `CookedShader` carries it as `workgroup` since the format's version 2
+    (rhi-api's ask (c); D158's addendum of lane `shader-format`), so `Renderer::new` refuses
+    another. Rules out a host copy of every
     placement, a scatter that resolves duplicates on the device, an order between two entries
     of one dispatch, and an assertion a release build drops.
   - *The triangle pass is one indexed indirect draw of every slot below the table's extent.*
@@ -7926,7 +8025,8 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     and the boom's recheck at the latch (decision 5.4).
   - *Pipelines are made in `new`, from shaders the caller decoded.* `Renderer::new` holds each
     `CookedShader`'s reflection to the interface as far as the format carries it, and refuses a
-    mismatch by name; the scatter's workgroup size is not yet carried. The renderer opens no
+    mismatch by name, the scatter's workgroup size among it since the format's version 2
+    (D158's addendum of lane `shader-format`). The renderer opens no
     file: the cache file is the client binary's, written from `Device::pipeline_cache` once
     `new` has returned. `RendererDesc::shaders: None` makes a renderer that stages and prepares
     and declares nothing, which the cost tests are made with. Rules out a pipeline made in a

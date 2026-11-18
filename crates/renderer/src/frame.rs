@@ -251,10 +251,9 @@ impl Renderer {
     /// heap, its constants, its inputs and outputs), naming the shader and the field
     /// (`README.md`, "Pipelines and shaders"); what the device returns for a buffer or a
     /// pipeline it cannot make.
-    /// After an error nothing it made is left on the device. The scatter's workgroup size
-    /// is not in the cooked format yet, so it is not checked here: it is the cook's to
-    /// hold to [`SCATTER_GROUP`](crate::shader::SCATTER_GROUP) until the format carries
-    /// it, and `new` then refuses any other.
+    /// After an error nothing it made is left on the device. The scatter's workgroup, which
+    /// the cooked format carries, is held to
+    /// [`SCATTER_GROUP`](crate::shader::SCATTER_GROUP): `new` refuses any other.
     pub fn new(device: Arc<dyn Device>, desc: &RendererDesc<'_>) -> Result<Self> {
         todo!()
     }

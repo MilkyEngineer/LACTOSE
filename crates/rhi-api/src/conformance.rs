@@ -307,17 +307,23 @@ pub const CASES: &[Case] = cases! {
     contract "cooked_shader_round_trips";
     contract "cooked_shader_of_another_version_is_refused";
     contract "cooked_shader_corrupt_or_truncated_is_refused";
+    contract "cooked_shader_forged_under_a_valid_checksum_is_refused";
     contract "shader_for_another_heap_is_refused";
     contract "shader_target_the_backend_does_not_run_is_unsupported";
-    contract "constant_of_another_length_is_refused";
+    contract "constant_the_shader_does_not_declare_is_refused";
+    contract "constant_of_another_type_is_refused";
+    contract "workgroup_outside_its_stage_or_bounds_is_refused";
+    contract "varying_the_vertex_stage_does_not_write_is_refused";
     contract "shader_needing_an_unenabled_capability_is_refused" => Capability everywhere;
     contract "pipeline_of_other_formats_than_its_pass_is_refused" => Usage everywhere;
     contract "sealed_cache_round_trips";
     contract "cache_corrupt_truncated_or_foreign_starts_empty";
     output "specialised_constant_changes_the_output";
+    output "specialised_constant_of_each_type_is_read_back";
     output "write_mask_keeps_a_channel";
     output "depth_state_orders_two_triangles";
     output "warm_cache_hits_every_stage";
+    output "dispatch_runs_workgroups_of_the_shaders_size";
     // Encoders, submits and timelines.
     contract "encoder_recorded_on_another_thread_submits";
     contract "encoder_reset_while_pending_is_refused" => Pending everywhere;
