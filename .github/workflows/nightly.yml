@@ -64,7 +64,9 @@ jobs:
             key: input-host
             args: -p lactose-input-host
           # The interpolation buffer's sequence lock (crates/net-host): Miri's weak-memory
-          # emulation catches the reader-side orderings the hardware stress test misses.
+          # emulation checks the shipped `Native` orderings, which the loom models (over their
+          # own atomics) do not, and catches what the hardware stress test misses: with any one
+          # of the four orderings weakened, its 150-push test reads torn samples.
           - name: net-host
             key: net-host
             args: '-p lactose-net-host --test integration -- interpolation::'
@@ -86,7 +88,8 @@ jobs:
   # under loom, as are input-host's latest-sample sequence lock and net-host's interpolation
   # slot sequence lock (architecture section 5.3), each switched on by a Cargo feature of its
   # crate and never by a `--cfg` flag in the environment, which would replace the x86-64 pin.
-  # Release, because the models explore every interleaving.
+  # Release, because the models explore every interleaving, or every one within their
+  # preemption bound where they name one (input-host's and net-host's do).
   loom:
     name: loom
     runs-on: ubuntu-latest

@@ -6,10 +6,17 @@
 //! The writer stores the odd sequence (`Relaxed`), issues `fence(Release)`, stores the words
 //! (`Relaxed`), and stores the even sequence with `Release`; a reader loads the sequence with
 //! `Acquire`, loads the words with `Relaxed`, issues `fence(Acquire)`, and reloads the
-//! sequence (`Relaxed`), retrying when the first load was odd or the two differ. Those four
-//! orderings are the lock's only ones stronger than `Relaxed`, and each operation and
-//! ordering pair names exactly one of them, which is how the models' mutants weaken one at a
-//! time. A first load left `Relaxed` admits torn reads on aarch64 (the review measured them);
+//! sequence (`Relaxed`), retrying when the first load was odd or the two differ. The even
+//! store's `Release` pairs with a reader's first `Acquire` load that reads it: every word,
+//! `generation` and `count` of that write and the writes before it happens before the
+//! reader's loads, so none of them reads a value older than that sequence. The writer's
+//! `fence(Release)` pairs with the reader's `fence(Acquire)` through any word, `generation`
+//! or `count` the reader loads from a later write: that write's odd store then happens before
+//! the reader's reload, which reads it or a later value and retries.
+//!
+//! Those four orderings are the lock's only ones stronger than `Relaxed`, and each operation
+//! and ordering pair names exactly one of them, which is how the models' mutants weaken one
+//! at a time; `each_ordering_stronger_than_relaxed_has_one_site` holds both. A first load left `Relaxed` admits torn reads on aarch64 (the review measured them);
 //! `Acquire` admits none. `generation` and `count` are words read inside that window.
 //!
 //! One writer: every store to a slot is the buffer's one writer's, so its own loads of the
@@ -199,5 +206,104 @@ impl<M: Memory, const STATES: usize, const WORDS: usize> Slot<M, STATES, WORDS> 
             }
             M::pause();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::RefCell;
+
+    use super::*;
+
+    std::thread_local! {
+        static CALLS: RefCell<Vec<(&'static str, Ordering)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The standard atomics, recording each call's operation and ordering on this thread.
+    struct Counting;
+
+    fn record(operation: &'static str, order: Ordering) {
+        CALLS.with_borrow_mut(|calls| calls.push((operation, order)));
+    }
+
+    impl Memory for Counting {
+        type U32 = AtomicU32;
+        type U64 = AtomicU64;
+
+        fn new_u32(value: u32) -> AtomicU32 {
+            Native::new_u32(value)
+        }
+
+        fn new_u64(value: u64) -> AtomicU64 {
+            Native::new_u64(value)
+        }
+
+        fn load_u32(atomic: &AtomicU32, order: Ordering) -> u32 {
+            record("load_u32", order);
+            Native::load_u32(atomic, order)
+        }
+
+        fn store_u32(atomic: &AtomicU32, value: u32, order: Ordering) {
+            record("store_u32", order);
+            Native::store_u32(atomic, value, order);
+        }
+
+        fn load_u64(atomic: &AtomicU64, order: Ordering) -> u64 {
+            record("load_u64", order);
+            Native::load_u64(atomic, order)
+        }
+
+        fn store_u64(atomic: &AtomicU64, value: u64, order: Ordering) {
+            record("store_u64", order);
+            Native::store_u64(atomic, value, order);
+        }
+
+        fn fence(order: Ordering) {
+            record("fence", order);
+            Native::fence(order);
+        }
+
+        fn pause() {
+            Native::pause();
+        }
+    }
+
+    /// The calls stronger than `Relaxed` that `run` makes, in order.
+    fn ordered(run: impl FnOnce()) -> Vec<(&'static str, Ordering)> {
+        CALLS.with_borrow_mut(Vec::clear);
+        run();
+        CALLS.with_borrow(|calls| {
+            calls.iter().copied().filter(|&(_, order)| order != Relaxed).collect()
+        })
+    }
+
+    /// The models' mutants find each ordering by its operation and ordering alone, so each of
+    /// the four occurs at one site, and no other ordering stronger than `Relaxed` occurs.
+    #[test]
+    fn each_ordering_stronger_than_relaxed_has_one_site() {
+        const WRITE: [(&str, Ordering); 2] = [("fence", Release), ("store_u32", Release)];
+        const READ: [(&str, Ordering); 2] = [("load_u32", Acquire), ("fence", Acquire)];
+        let slot = Slot::<Counting, 2, 2>::new();
+        assert_eq!(ordered(|| slot.reset(1)), WRITE);
+        // Pushes into the ring at its end, at its front, past a full ring, and replacing.
+        for tick in [2_u32, 1, 3, 4, 4] {
+            let state = [u64::from(tick) << 32, 7];
+            assert_eq!(ordered(|| slot.push(state)), [READ, WRITE].concat());
+        }
+        // A push older than a full ring's oldest is dropped without a write.
+        assert_eq!(ordered(|| slot.push([1 << 32, 7])), READ);
+        assert_eq!(
+            ordered(|| {
+                slot.read();
+            }),
+            READ
+        );
+        assert_eq!(
+            ordered(|| {
+                slot.generation();
+            }),
+            []
+        );
+        assert_eq!(slot.read().count, 2);
     }
 }

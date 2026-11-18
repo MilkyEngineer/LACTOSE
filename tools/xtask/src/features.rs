@@ -1060,6 +1060,22 @@ root v0.0.0 (/ws)|
             ),
             "{found:#?}"
         );
+
+        // Inside the list the exception is loom under its own name and the one feature: loom
+        // renamed, or a second feature turning it on, still fails.
+        let mut renamed = models("lactose-net-host");
+        renamed.deps[0].rename = Some("model_checker".to_owned());
+        renamed.features.insert("loom".to_owned(), vec!["dep:model_checker".to_owned()]);
+        let found: Vec<String> =
+            loom_users(&workspace(vec![renamed])).iter().map(ToString::to_string).collect();
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(found[0].contains("depends on loom (as `model_checker`)"), "{found:#?}");
+        let mut second = models("lactose-net-host");
+        second.features.insert("check".to_owned(), vec!["dep:loom".to_owned()]);
+        let found: Vec<String> =
+            loom_users(&workspace(vec![second])).iter().map(ToString::to_string).collect();
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("has the feature `check` turn on `dep:loom`"), "{found:#?}");
     }
 
     #[test]

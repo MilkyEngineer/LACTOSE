@@ -7,7 +7,11 @@
 //! lists the slot's contents after each of its writes, and every read must equal one of them,
 //! no older than the reader's previous read. No two states the writer pushes share a word, so
 //! a read that mixes two writes fails unless the mix is itself contents a write left, which
-//! no reader can tell from a whole read.
+//! no reader can tell from a whole read. A read may mix three kinds of word, and each model
+//! makes one kind's mixes visible: the ring's wrap the state words, the generation change
+//! `generation` against the count and the states, and the ring growing at its front `count`
+//! against the states, since a stale count over a ring grown at its front is contents no
+//! write left.
 //!
 //! The models run at preemption bound 2 unless `LOOM_MAX_PREEMPTIONS` sets another. Each
 //! `*_without_*` model runs the same functions with one of the lock's four orderings
@@ -179,6 +183,12 @@ fn check(model: impl Fn() + Sync + Send + 'static) {
 // reader: a reader only loads, and loads do not order one another, so a second adds no
 // interleaving against the writer that the first lacks, and a model of two readers and one
 // push exceeded loom's branch limit while both waited out an odd sequence.
+//
+// loom 0.7.2 keeps seven stores of each atomic, its initial value among them, and silently
+// drops the oldest. A reader may read the sequence value it was spawned after and every later
+// one, and each model keeps those within the seven: the ring's wrap and the ring growing at
+// its front five values (6 to 10 and 4 to 8), a margin of two, and the generation change
+// seven, no margin.
 
 /// A full ring of `A` and `B` at generation 1; the writer pushes `C` and `D`, each dropping
 /// the oldest, while a reader reads twice: every read is one of the three rings, in order.
@@ -200,6 +210,10 @@ fn the_ring_wraps<M: Memory + 'static>() {
 /// A slot at generation 1 holding `A` is released, reallocated at generation 2 and pushed
 /// `E` while a reader reads twice: every read is one of the four contents, in order, so a
 /// reader never pairs one generation with another's count or states.
+///
+/// The sequence takes eleven stores, and the reader may read seven of them (4 to 10), loom's
+/// whole history: one more write here would drop value 4 from what loom offers the reader,
+/// which narrows the search without a failure, so a further write needs a model of its own.
 fn the_generation_changes<M: Memory + 'static>() {
     static HISTORY: [Contents; 4] = [
         contents(1, 1, [A, NONE]),
@@ -219,6 +233,24 @@ fn the_generation_changes<M: Memory + 'static>() {
     });
 }
 
+/// A slot at generation 1 holding `B`; the writer pushes `A`, older, so it lands at the
+/// ring's front, then `C`, dropping `A`, while a reader reads twice: every read is one of the
+/// three rings, in order. A count from before `A`'s push read over its states gives `A`
+/// alone, which no write left.
+fn the_ring_grows_at_its_front<M: Memory + 'static>() {
+    static HISTORY: [Contents; 3] =
+        [contents(1, 1, [B, NONE]), contents(1, 2, [A, B]), contents(1, 2, [B, C])];
+    check(|| {
+        let slot = Arc::new(Slot::<M, STATES, WORDS>::new());
+        slot.reset(1);
+        slot.push(B);
+        let reader = reader(&slot, &HISTORY);
+        slot.push(A);
+        slot.push(C);
+        reader.join().unwrap();
+    });
+}
+
 #[test]
 fn the_ring_wraps_under_a_reader() {
     the_ring_wraps::<Loom>();
@@ -227,6 +259,11 @@ fn the_ring_wraps_under_a_reader() {
 #[test]
 fn the_generation_changes_under_a_reader() {
     the_generation_changes::<Loom>();
+}
+
+#[test]
+fn the_ring_grows_at_its_front_under_a_reader() {
+    the_ring_grows_at_its_front::<Loom>();
 }
 
 #[test]
@@ -275,4 +312,28 @@ fn the_generation_change_tears_without_the_readers_first_acquire() {
 #[should_panic(expected = "torn read")]
 fn the_generation_change_tears_without_the_readers_acquire_fence() {
     the_generation_changes::<Weakened<READER_FENCE>>();
+}
+
+#[test]
+#[should_panic(expected = "torn read")]
+fn the_front_growth_tears_without_the_writers_release_fence() {
+    the_ring_grows_at_its_front::<Weakened<WRITER_FENCE>>();
+}
+
+#[test]
+#[should_panic(expected = "torn read")]
+fn the_front_growth_tears_without_the_even_sequences_release() {
+    the_ring_grows_at_its_front::<Weakened<EVEN_RELEASE>>();
+}
+
+#[test]
+#[should_panic(expected = "torn read")]
+fn the_front_growth_tears_without_the_readers_first_acquire() {
+    the_ring_grows_at_its_front::<Weakened<FIRST_ACQUIRE>>();
+}
+
+#[test]
+#[should_panic(expected = "torn read")]
+fn the_front_growth_tears_without_the_readers_acquire_fence() {
+    the_ring_grows_at_its_front::<Weakened<READER_FENCE>>();
 }
