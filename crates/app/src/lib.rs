@@ -56,10 +56,12 @@ pub use world::{Start, WorldConfig};
 /// output and the save future are `Send` for the same reason; the cooked-content stand-in
 /// is shared with background tasks. For the shown frame: the shown world, its run futures
 /// and what `stop` hands back are `Send` like the server's; the render side is `Send +
-/// Sync + 'static`, which is what a world's service must be; the present side is the
-/// `Send + 'static` state of the present thread, and its lane is `Send + Sync` so the
-/// frame's render task may hold it; every value that crosses to the job or to the present
-/// thread is plain data; and the frame has the two targets rhi-api's minimum names.
+/// 'static`, which is what the task and the job it is moved into ask, and `Sync` is not
+/// asked of it (`tests/shown.rs`, section 6, implements the trait for a type that is not);
+/// the present side is the `Send + 'static` state of the present thread; a shown run's
+/// failure does not convert into `lactose_core::Error`, since `?` would then drop what it
+/// kept; every value that crosses to the job or to the present thread is plain data; and
+/// the frame has the two targets rhi-api's minimum names.
 const _: () = {
     const fn send<T: Send>() {}
     const fn send_sync<T: Send + Sync + ?Sized>() {}
@@ -86,8 +88,7 @@ const _: () = {
     send_sync::<dyn Cooked>();
     copy::<ErrorPolicy>();
 
-    const fn service<T: Send + Sync + ?Sized + 'static>() {}
-    const fn present_state<T: Send + 'static>() {}
+    const fn moved<T: Send + 'static>() {}
     send::<Shown>();
     send::<ShownStep<'_>>();
     send::<ShownFrame<'_>>();
@@ -96,10 +97,8 @@ const _: () = {
     send::<ShownOutput>();
     send::<ShownError>();
     send::<Stopped>();
-    service::<dyn RenderSide>();
-    service::<Box<dyn RenderSide>>();
-    present_state::<Box<dyn PresentSide>>();
-    send_sync::<PresentLane>();
+    moved::<Box<dyn RenderSide>>();
+    moved::<Box<dyn PresentSide>>();
     copy::<TargetIndex>();
     copy::<Region>();
     copy::<Draw>();
@@ -114,4 +113,13 @@ const _: () = {
     assert!(TARGETS >= 2);
     assert!(TargetIndex::new(TARGETS - 1).is_some() && TargetIndex::new(TARGETS).is_none());
     assert!(RECORD_RESERVATION >= 1);
+
+    // `ShownError: !Into<lactose_core::Error>`. Both impls below apply to a type that
+    // converts, and the marker then cannot be inferred, which fails the build.
+    trait NoPlainError<Marker> {
+        const HOLDS: () = ();
+    }
+    impl<T: ?Sized> NoPlainError<()> for T {}
+    impl<T: Into<lactose_core::Error>> NoPlainError<u8> for T {}
+    let () = <ShownError as NoPlainError<_>>::HOLDS;
 };

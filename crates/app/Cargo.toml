@@ -40,13 +40,13 @@ lactose-physics-api.workspace = true
 lactose-physics-rapier.workspace = true
 # The prediction world's owner, its registration and its build check.
 lactose-predict.workspace = true
-# The shown frame: the sink and the snapshot pair its render side is handed, the channel
-# and the publication it drives, and the frame job its own world runs (D162). A foundation
-# crate: it names no renderer and no device.
+# The shown frame: the sink and the snapshot pair its render side is handed, and the
+# channel and the publication it drives (D162). A foundation crate: it names no renderer
+# and no device.
 lactose-present-api.workspace = true
 # The shown frame: the points and the extent that cross to the render side and the present
-# thread as plain data, and the count of offscreen targets (decision 5.11, D162). A
-# foundation crate of traits and data: no backend is named here.
+# thread as plain data, the count of offscreen targets and the present role's queue path
+# (decision 5.11, D162). A foundation crate of traits and data: no backend is named here.
 lactose-rhi-api.workspace = true
 # The simulation this crate builds and steps, its registration, its frame and its save point.
 lactose-sim.workspace = true

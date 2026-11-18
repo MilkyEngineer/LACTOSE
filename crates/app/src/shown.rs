@@ -22,9 +22,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lactose_core::{Error, Result, Tick};
-use lactose_ecs::{Executor, Schedule, World, WorldKind};
-use lactose_present_api::{InstanceSink, PresentFrame};
-use lactose_rhi_api::{Extent, ImageHandle, OFFSCREEN_TARGET_IMAGES_MIN, TimelinePoint};
+use lactose_ecs::{Executor, WorldKind};
+use lactose_present_api::{InstanceSink, PresentFrame, SnapshotReader};
+use lactose_rhi_api::{Extent, ImageHandle, OFFSCREEN_TARGET_IMAGES_MIN, QueuePath, TimelinePoint};
 use lactose_sim::TickInput;
 use lactose_task::{JobContext, Lane, LaneCall, Task};
 
@@ -158,26 +158,39 @@ impl FrameCounts {
 
 /// The render side of a shown world, as `lactose-app` drives it: one object the binary
 /// builds over the device, the render graph, the renderer and the presentation schedule
-/// (decision 5.11). `lactose-app` owns it from [`build_shown`] to [`Shown::stop`], calls
-/// it from one task at a time and never from two threads at once: between frames from the
-/// task that drives the frame, and during a frame's render task from that task and the
-/// one job it runs. `Send + Sync` is what `World::insert_service` asks of the service
-/// that carries it into that job; no method is ever called concurrently with another.
+/// (decision 5.11). `lactose-app` owns it from [`build_shown`] to [`Shown::stop`] and moves
+/// it by value between the one owner it has at a time: the task that drives the frame
+/// between frames, a frame's render task from its spawn to its join, and inside either the
+/// one job that task is running (`README.md`, "The render side"). No method is called
+/// while another is and the object is never shared, so `Send` is all that is asked of it:
+/// an implementor may hold a `Cell`, and needs no lock.
 /// `Any` is how the binary takes its own object back as its own type from
 /// [`Stopped::render`]: the fixed-frame mode reads the last target and its dump from it.
+///
+/// A device queue is reached from [`open`](Self::open) and [`submit`](Self::submit) and
+/// from no other method. Where the present role shares the graphics queue
+/// ([`present_queue`](Self::present_queue)) neither is called while a present call is in
+/// flight, so no frame-critical worker takes the queue's lock behind a present's driver
+/// call (`README.md`, "The targets and the present thread").
 ///
 /// An error from any method is the policy's `Source::Render`. After an error from
 /// [`draw`](Self::draw) or [`submit`](Self::submit) the frame is torn: the object has
 /// ended it as `Renderer::torn` and `RenderGraph`'s torn frame do, and every world shown
 /// needs a full pass, which `lactose-app` brings about with a new [`sink`](Self::sink).
-pub trait RenderSide: Any + Send + Sync {
-    /// Opens a region to extract's writers if one is free, and never waits. Called from
-    /// the frame's job at the start of a frame that begins with none open: the first
-    /// frame, a frame after one that was torn, and each frame after a `Wait`. Called with
-    /// a region already open it answers `Ready`. It never answers with no region and no
-    /// point: an implementor over `lactose-renderer` meets `Opened::Unsubmitted` itself,
-    /// by the empty submit that crate's "Regions" names, which is why it is handed the
-    /// job's context, and answers with what `Renderer::open` says after it.
+pub trait RenderSide: Any + Send {
+    /// Which queue the present role has on the device this object submits to:
+    /// `Capabilities::queues.present`. A constant of the object, which [`build_shown`]
+    /// asks once.
+    fn present_queue(&self) -> QueuePath;
+
+    /// Opens a region to extract's writers if one is free, and never waits. Called in a
+    /// job of its own, by the task that drives the frame, at the start of a frame that
+    /// begins with none open: the first frame, a frame after one that was torn, and each
+    /// frame after a `Wait`. Called with a region already open it answers `Ready`. It
+    /// never answers with no region and no point: an implementor over `lactose-renderer`
+    /// meets `Opened::Unsubmitted` itself, by the empty submit that crate's "Regions"
+    /// names, which is why it is handed the job's context, and answers with what
+    /// `Renderer::open` says after it.
     fn open(&mut self, ctx: &mut JobContext<'_>) -> Result<Region>;
 
     /// A sink for the passes of one shown world, whether or not a region is open: a pass
@@ -189,7 +202,7 @@ pub trait RenderSide: Any + Send + Sync {
     /// The presentation schedule on one acquired pair: interpolation, the camera rig, the
     /// remote sample, and the delivery of `frame`'s events (decision 5.5). Called once in
     /// every frame that ran its passes, from the frame's job, whether or not the frame
-    /// draws. It records nothing and reaches no device queue.
+    /// draws. It records nothing, submits nothing and reaches no device queue.
     fn present(
         &mut self,
         ctx: &mut JobContext<'_>,
@@ -203,7 +216,9 @@ pub trait RenderSide: Any + Send + Sync {
     /// The image is declared left as a colour attachment on the graphics role and handed
     /// off to the present role for a sampled read. A region is open when this is called,
     /// and no pass of extract runs from before it until the frame's
-    /// [`submit`](Self::submit) or a later [`open`](Self::open) has answered `Ready`.
+    /// [`submit`](Self::submit) or a later [`open`](Self::open) has answered `Ready`. It
+    /// makes no submit. [`submit`](Self::submit) follows every `draw` that returned `Ok`,
+    /// unless the executor shut down between the two.
     fn draw(&mut self, ctx: &mut JobContext<'_>, draw: Draw) -> Result<FrameCounts>;
 
     /// The latch and the submit of the frame [`draw`](Self::draw) recorded, as late as
@@ -211,6 +226,10 @@ pub trait RenderSide: Any + Send + Sync {
     /// for the next frame's writers, without waiting; after a submit that succeeded
     /// `lactose-renderer` answers `Ready` or `Wait` and never `Unsubmitted`, so no job is
     /// needed for it. It gates no submit on a host signal (architecture section 5.3).
+    /// Called from the render task's own poll, on a frame-critical worker, with no job's
+    /// context. Where the present role shares the graphics queue it is called only once
+    /// the present call in flight has returned, so it takes the queue's lock behind no
+    /// present, and the sample it latches is the newest at the end of that hold.
     fn submit(&mut self) -> Result<Submitted>;
 }
 
@@ -260,9 +279,16 @@ pub struct PresentReport {
 /// lane: the state `S` of `lactose_platform::present_thread`, which the binary builds over
 /// the device's `Swapchain` and the pass that draws a target into its image (decision
 /// 5.6). It is called on the present thread alone, one call at a time, and between calls
-/// no command of its own names a target. A heap slot it wrote may go on holding a target's
-/// image: it puts another image there at the first call that names one for the same
-/// [`TargetIndex`], and empties its slots in [`close`](Self::close).
+/// no command of its own names a target. A heap slot it wrote may go on holding the last
+/// target's image, which keeps the device from taking that image's destroy and does
+/// nothing else: it puts another image there at the first call that names one for the same
+/// [`TargetIndex`], and empties its slots in [`close`](Self::close). Before it puts
+/// another image in a slot it waits, within its bound, for the last `read` it reported,
+/// and reports `read: None` if that is not reached: a pass of an earlier call that
+/// declared the slot may still be pending, and the device refuses a slot's write while one
+/// is. A new image can arrive with no resize before it, when the frame's extent changed
+/// and came back with the frame between dropped or torn, so the resize's wait does not
+/// stand in for this one.
 pub trait PresentSide: Send + 'static {
     /// One present: resize the swapchain when it is stale or `finished.extent` is not the
     /// extent it was last resized to; acquire an image; record on an encoder of the
@@ -279,10 +305,15 @@ pub trait PresentSide: Send + 'static {
     /// this one skipped (`crates/render-graph/README.md`, "What each consumer needs").
     fn present(&mut self, finished: Finished) -> Result<PresentReport>;
 
-    /// Empties the heap slots this side wrote, then drops the swapchain and everything
-    /// of the device this side holds: the last call the frame makes on the present thread
+    /// Empties the heap slots this side wrote, after a wait within its bound for the last
+    /// `read` it reported, then drops the swapchain and everything of the device this side
+    /// holds: the last call the frame makes on the present thread
     /// (`crates/platform/README.md`, "Shutdown"). Its waits are bounded, save the
-    /// swapchain's drop, which waits for the submits that use its images.
+    /// swapchain's drop, which waits for the submits that use its images. Where the wait
+    /// for the read runs past its bound, the device refuses to empty the slot and the slot
+    /// is left: the device then refuses the destroy of the target it holds, and that image
+    /// is freed with the device. On a lost device every wait returns at once and nothing
+    /// is left.
     fn close(&mut self);
 }
 
@@ -300,13 +331,21 @@ pub enum Rendered {
         point: TimelinePoint,
         /// What its prepare left undrawn.
         counts: FrameCounts,
-        /// Whether a present call was queued for the target at the submit: `false` while
-        /// an earlier call was still in flight, and the target is then never shown.
+        /// Whether a present call was queued for the target at the submit. Where the
+        /// present role has a queue of its own: `false` while an earlier call was still in
+        /// flight, and the target is then never shown. Where it shares the graphics queue:
+        /// `true`, since the submit followed that call's return.
         queued: bool,
+        /// Whether the frame's submit was held for a present call that was still in flight
+        /// when the frame's job returned. `false` wherever the present role has a queue of
+        /// its own.
+        held: bool,
     },
-    /// The window had no area, or no region came free while the world's structural log
-    /// could still wait for one: the frame ran its passes with no sink, presented from
-    /// the snapshot and drew nothing.
+    /// The window had no area, or the frame was starved: no region was open and the
+    /// world's structural log could wait no longer for one. The frame ran its passes with
+    /// no sink, presented from the snapshot and drew nothing. A starved frame is hidden
+    /// whatever [`RenderSide::open`] answered, an error the policy logged included, and
+    /// such a frame is counted torn as well.
     Hidden,
     /// No region was free: the frame ran its ticks, deferred its passes and published
     /// nothing. The point frees a region. [`Shown::step`] reports it; a paced frame that
@@ -314,7 +353,7 @@ pub enum Rendered {
     Waited(TimelinePoint),
     /// A method of the render side failed and the policy logged it: the frame is torn.
     /// Where it was the frame's first, `open`, the frame deferred its passes as one that
-    /// waits does.
+    /// waits does, unless it was starved, when it is [`Hidden`](Self::Hidden).
     Torn,
 }
 
@@ -327,10 +366,15 @@ pub struct ShownStats {
     pub hidden: u64,
     /// Frames that deferred their passes for want of a region.
     pub waited: u64,
-    /// Frames torn.
+    /// Frames torn. A starved frame whose `open` failed is counted here and in `hidden`.
     pub torn: u64,
-    /// Present calls queued.
+    /// Present calls queued. Where the present role has a queue of its own, `drawn` less
+    /// this is the frames finished and never shown.
     pub queued: u64,
+    /// Frames whose submit was held for a present call in flight: nonzero only where the
+    /// present role shares the graphics queue, where no frame is dropped and `queued`
+    /// equals `drawn`.
+    pub held: u64,
     /// Present calls that reported `shown`.
     pub shown: u64,
     /// Sinks installed after the first: full passes the render side's counts, a torn
@@ -348,12 +392,20 @@ pub struct ShownOutput {
     pub joined: Option<Rendered>,
     /// `Some` if this frame deferred its passes and started no render task: `Waited` for
     /// want of a region, or `Torn` where asking for one failed and the policy logged it.
+    /// `None` for a starved frame, which runs its passes hidden whatever `open` answered.
     pub deferred: Option<Rendered>,
 }
 
 /// A world that is shown: milestone 2's local world, a [`Server`] built by the one
 /// assembly path, and the render side driven beside it. Owned by the task that drives the
 /// frame; every run takes it by value and hands it back, as [`Server`]'s do.
+///
+/// A `Shown` is ended with [`stop`](Self::stop) and by nothing else. Dropping one, or a
+/// run future that owns one, drops the render side where the drop lands: on the dropping
+/// thread while no frame is in flight or its render task is suspended, and otherwise on
+/// the frame-critical worker that finishes the frame's job or the render task's poll.
+/// That drop waits for the device for as long as it has submits pending, and
+/// [`PresentSide::close`] is never called (`README.md`, "Shutdown").
 pub struct Shown {
     server: Server,
     flight: Flight,
@@ -369,15 +421,17 @@ enum Flight {
     Running(Task<(Box<Side>, Result<Rendered>)>),
 }
 
-/// Everything a frame's render task owns: moved into the task and handed back when it
-/// resolves, so nothing here is shared and nothing is locked.
+/// Everything a frame's render task owns: moved into the task, by the task into each job
+/// it runs (`Executor::run_job`, which `lactose-task` is asked for) and handed back when
+/// each resolves, so nothing here is shared and nothing is locked.
 struct Side {
-    /// The frame's own world, of kind `Client`, with no row and no region: it holds the
-    /// render side and the snapshot's reading half as its one service, and exists to lend
-    /// the frame's job a `JobContext` beside them.
-    world: World,
-    /// One stage, one system: `lactose-present-api`'s frame job.
-    schedule: Schedule,
+    /// The render side.
+    render: Box<dyn RenderSide>,
+    /// The snapshot's reading half: one `acquire` in every frame that published.
+    reader: SnapshotReader,
+    /// The present role's queue, as `render` said at the build: whether the frame's
+    /// submit follows the look at the call in flight or the look follows the submit.
+    queue: QueuePath,
     /// The lane to the present thread.
     present: PresentLane,
     /// The one present call in flight, and the target it names.
@@ -406,15 +460,18 @@ struct Side {
 /// `start` and `cooked`, and on the builder the `lactose-sim` option that leaves a shown
 /// `Server` world's presentation events for the frame; then
 /// `lactose_present_api::snapshot_channel`, the writing half installed with
-/// `ExtractState::set_snapshot` and `render.sink()` with `ExtractState::set_sink`; then the
-/// frame's own world and its schedule, with `render` and the reading half as its service.
-/// It calls no other method of `render` and makes no call on `present`: the first frame
-/// asks for a region. The world it builds is the world `build_server` builds from the same
-/// arguments, and its hash is that world's: no second assembly path exists. What the render
-/// side returns is decided by [`ErrorPolicy::MILESTONE_2`](crate::ErrorPolicy), whose rows
-/// for every other source are milestone 1's. Fails as `build_server` fails, before anything
-/// runs, with `render` and `present` dropped on the calling thread, which is never a
-/// frame-critical worker.
+/// `ExtractState::set_snapshot` and `render.sink()` with `ExtractState::set_sink`. It asks
+/// `render.present_queue()`, calls no other method of `render` and makes no call on
+/// `present`: the first frame asks for a region. The world it builds is the world
+/// `build_server` builds from the same arguments, and its hash is that world's: no second
+/// assembly path exists. What the render side returns is decided by
+/// [`ErrorPolicy::MILESTONE_2`](crate::ErrorPolicy), whose rows for every other source are
+/// milestone 1's. Fails as `build_server` fails, before anything runs, with `render` and
+/// `present` dropped on the calling thread. That thread may be a frame-critical worker,
+/// since a binary may build inside its root task: a render side through which nothing has
+/// been submitted waits for nothing when it drops (`crates/rhi-api/README.md`, "Handles
+/// and lifetimes"), and a caller whose render side has submits pending builds where a
+/// drop may wait.
 pub fn build_shown(
     executor: &Executor,
     game: &Game,
@@ -523,11 +580,15 @@ pub enum ShownKept {
     /// says) and the executor did. The binary drops it as it drops [`Stopped::render`].
     Render(Box<dyn RenderSide>),
     /// Nothing: after `Cancelled`, when the executor shut down during the run, and the
-    /// world and the render side dropped with it, wherever the executor dropped them.
+    /// world and the render side dropped with it, wherever the executor dropped them,
+    /// which may be a frame-critical worker.
     Nothing,
 }
 
-/// How a shown run fails: the error, and what survived it.
+/// How a shown run fails: the error, and what survived it. It does not convert into
+/// `lactose_core::Error`, as `ServerError` does: `?` into a plain `Result` would drop
+/// `kept`, and with it the render side, on the caller's thread, which for a root task is a
+/// frame-critical worker. A caller matches `kept` and ends what it holds in order.
 pub struct ShownError {
     /// What failed.
     pub error: Error,
@@ -553,12 +614,6 @@ impl fmt::Display for ShownError {
 }
 
 impl std::error::Error for ShownError {}
-
-impl From<ShownError> for Error {
-    fn from(failure: ShownError) -> Self {
-        failure.error
-    }
-}
 
 /// A run in flight, owning the shown world until it resolves.
 type Run<'a, T> = Pin<Box<dyn Future<Output = core::result::Result<T, ShownError>> + Send + 'a>>;
@@ -606,7 +661,9 @@ impl Future for ShownFlush {
 }
 
 /// The render side's end in flight. See [`Shown::stop`]. Resolves with an error of kind
-/// `Cancelled`, and nothing handed back, when the executor shut down first.
+/// `Cancelled`, and nothing handed back, when the executor shut down first with a frame
+/// in flight: the join of that frame's render task is what the executor cancels. With no
+/// frame in flight `stop` awaits the present thread alone and resolves as it would have.
 #[must_use = "futures do nothing unless awaited"]
 pub struct ShownStop {
     run: Pin<Box<dyn Future<Output = Result<Stopped>> + Send>>,

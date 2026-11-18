@@ -7,20 +7,23 @@
 //! They pin the surface `README.md` promises: a change that breaks one is a signature
 //! change to list.
 //!
-//! Section 6 runs. It is the route by which the frame holds the render side and a
-//! `JobContext` together with no lock (`crates/render-graph/README.md`, "What each
-//! consumer needs"): a world of the frame's own, with no row and no region, whose one
-//! service is a `dyn` object and whose schedule is one system that takes `Job` beside
-//! `ResMut` of it, run as a pass inside a task, the world moved in and handed back. The
-//! trait, the system and the function that builds that world are the amendment D162 asks
-//! of `lactose-present-api`; the copies here are the test's own, as CLAUDE.md allows a
-//! `#[system]` in tests alone, and they show the route against `lactose-ecs` as merged.
+//! Section 6 runs. It is the shape of the route by which the frame holds the render side
+//! and a `JobContext` together: a closure run once as one job, the render side moved in
+//! and handed back in its value, with no world, no system and no `Sync` bound. The call is
+//! `Executor::run_job`, which D162 asks of `lactose-task` and which does not exist yet, so
+//! the section runs a stand-in of the same signature built on a graph of one node. The
+//! stand-in holds the closure in a mutex, which is the lock the primitive removes and no
+//! shipped code may take: `frame-impl` deletes it and calls `Executor::run_job`.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, missing_docs, clippy::too_many_arguments)]
 
 use std::any::Any;
-use std::sync::Arc;
+use std::cell::Cell;
+use std::ops::Range;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lactose_app::{
@@ -29,24 +32,21 @@ use lactose_app::{
     Stopped, Submitted, TARGETS, TICK_PERIOD, TargetIndex, WorldConfig, build_server, build_shown,
 };
 use lactose_core::{Error, ErrorKind, Handle, Result, StableKey, Tick};
-use lactose_ecs::{
-    ClaimedBy, InRegion, Job, OwnedBy, PredictedOrigin, ResMut, Schedule, World, WorldBuilder,
-    WorldKind, system,
-};
+use lactose_ecs::WorldKind;
 use lactose_input_host::{LatestSample, RawSample};
 use lactose_math::render::RenderPosition;
 use lactose_present_api::{ExtractPass, InstanceRow, InstanceSink, PresentFrame};
-use lactose_reflect::Registry;
 use lactose_render_graph::{FrameDecl, ImageImport, RecordedFrame, RenderGraph};
 use lactose_renderer::{
     CameraLatch, FrameStats, FrameView, Opened, Projection, RemoteWriter, Renderer,
 };
 use lactose_rhi_api::{
-    Acquired, Device, Encoder, Extent, ImageHandle, ImageRange, ImageState, ImageTransition,
-    Presented, QueueRole, Rule, Sharing, StateOn, Submit, Swapchain, TimelineHandle, TimelinePoint,
+    Acquired, Device, Encoder, Extent, HeapSlot, ImageHandle, ImageRange, ImageState,
+    ImageTransition, Presented, QueuePath, QueueRole, Rule, Sharing, StateOn, Submit, Swapchain,
+    TimelineHandle, TimelinePoint,
 };
 use lactose_sim::TickInput;
-use lactose_task::{Executor, JobContext, WorkerClass};
+use lactose_task::{ChaosConfig, Executor, GraphBuilder, GraphNode, JobContext, WorkerClass};
 
 const GRAPHICS: QueueRole = QueueRole::Graphics;
 
@@ -203,6 +203,10 @@ impl ClientRender {
 }
 
 impl RenderSide for ClientRender {
+    fn present_queue(&self) -> QueuePath {
+        self.graph.device().capabilities().queues.present
+    }
+
     fn open(&mut self, ctx: &mut JobContext<'_>) -> Result<Region> {
         loop {
             match self.renderer.open()? {
@@ -210,7 +214,9 @@ impl RenderSide for ClientRender {
                 // The frame asks again at its next frame: nothing here waits.
                 Opened::Wait(point) => return Ok(Region::Wait(point)),
                 // After torn frames alone: a frame with no pass still signals a point,
-                // and the `open` after it answers `Ready` or `Wait`.
+                // and the `open` after it answers `Ready` or `Wait`. This is the one
+                // submit outside `submit`, which is why the frame calls `open` with no
+                // present call in flight where the roles share a queue.
                 Opened::Unsubmitted => {
                     let empty = self.graph.compile(FrameDecl::new(1))?;
                     let recorded = self.graph.record(empty, ctx)?;
@@ -365,6 +371,10 @@ struct ClientPresent {
     /// A swapchain image whose present was refused as pending, presented by the next
     /// call.
     acquired: Option<ImageHandle>,
+    /// The heap slots the binary gives the present pass, one a target, and the image this
+    /// side last put in each.
+    heap: [HeapSlot; TARGETS],
+    slots: [Option<ImageHandle>; TARGETS],
 }
 
 /// The bound the present side gives its own waits, on the present thread alone.
@@ -401,6 +411,21 @@ impl PresentSide for ClientPresent {
             self.acquired = None;
             self.stale = false;
             self.asked = Some(finished.extent);
+        }
+        // The image is not the one this target's slot holds. A slot is written only once
+        // no pending pass declares it, and the pass that last declared this one is covered
+        // by the last read this side reported, since calls name the targets in turn. The
+        // resize's wait above was for the same point, but a new image can come with no
+        // resize: an extent that changed and came back, the frame between dropped or torn.
+        let slot = finished.target.index();
+        if self.slots[slot] != Some(finished.image) {
+            if let Some(last) = self.last
+                && !device.wait_timeline(last, PRESENT_WAIT)?
+            {
+                return Ok(NOTHING);
+            }
+            device.write_heap_slot(self.heap[slot], finished.image)?;
+            self.slots[slot] = Some(finished.image);
         }
         let image = match self.acquired.take() {
             Some(image) => image,
@@ -446,9 +471,22 @@ impl PresentSide for ClientPresent {
     }
 
     fn close(&mut self) {
-        // The heap slots this side wrote are emptied first (`Device::clear_heap_slot`,
-        // behind a bounded wait for its last read), so the render side's drop may destroy
-        // the targets. The swapchain's drop waits for the submits that use its images.
+        // The heap slots this side wrote are emptied first, behind a bounded wait for its
+        // last read, so the render side's drop may destroy the targets. Past the bound
+        // the device refuses the clear (`uuwp-used`) and the slot is left: the device
+        // then refuses the destroy of the target it holds, and that image is freed with
+        // the device. Nothing here retries. On a lost device the wait returns at once.
+        if let Some(device) = &self.device {
+            if let Some(last) = self.last {
+                let _ = device.wait_timeline(last, PRESENT_WAIT);
+            }
+            for (slot, held) in self.heap.iter().zip(&mut self.slots) {
+                if held.take().is_some() {
+                    let _ = device.clear_heap_slot(*slot);
+                }
+            }
+        }
+        // The swapchain's drop waits for the submits that use its images.
         self.swapchain = None;
         self.device = None;
     }
@@ -482,8 +520,31 @@ struct Ended {
     error: Option<Error>,
 }
 
+/// What a failed run leaves, for the binary's shutdown. A `ShownError` does not convert
+/// into a plain error, so a caller cannot `?` it and drop the render side where it stands,
+/// which for the root is a frame-critical worker: it matches `kept`.
+async fn ended(failure: ShownError) -> Result<Ended> {
+    let ShownError { error, kept } = failure;
+    match kept {
+        // A device loss, or a world's run that handed its simulation back: the world is
+        // kept and the render side is ended in order.
+        ShownKept::Shown(kept) => {
+            let Stopped { server, render } = kept.stop().await?;
+            Ok(Ended { server: Some(server), render: Some(render), error: Some(error) })
+        }
+        // The world is lost; the render side was ended as `stop` ends it.
+        ShownKept::Render(render) => {
+            Ok(Ended { server: None, render: Some(render), error: Some(error) })
+        }
+        // The executor shut down first: nothing is left to end.
+        ShownKept::Nothing => Err(error),
+    }
+}
+
 /// The timer root paces the frame and nothing else does (architecture section 5.1): one
-/// sleep to the next tick's deadline, one frame. The present thread paces nothing.
+/// sleep to the next tick's deadline, one frame. Where the present role has a queue of its
+/// own the present thread holds no frame; where it shares the graphics queue a present
+/// call still in flight holds the frame's submit, and the root runs the ticks it then owes.
 async fn root(
     executor: &Executor,
     mut shown: Shown,
@@ -500,26 +561,12 @@ async fn root(
             Ok((next, output)) => {
                 shown = next;
                 deadline = output.world.next_deadline;
-                if let Some(Rendered::Drew { counts, queued, .. }) = output.joined {
-                    // A result file's: what was drawn and what was shown.
-                    let _ = (counts.server.stale(), queued);
+                if let Some(Rendered::Drew { counts, queued, held, .. }) = output.joined {
+                    // A result file's: what was drawn, what was shown and what was held.
+                    let _ = (counts.server.stale(), queued, held);
                 }
             }
-            // A device loss, or a world's run that handed its simulation back: the world
-            // is kept and the render side is ended in order.
-            Err(ShownError { error, kept: ShownKept::Shown(kept) }) => {
-                let Stopped { server, render } = kept.stop().await?;
-                return Ok(Ended {
-                    server: Some(server),
-                    render: Some(render),
-                    error: Some(error),
-                });
-            }
-            // The world is lost; the render side was ended as `stop` ends it.
-            Err(ShownError { error, kept: ShownKept::Render(render) }) => {
-                return Ok(Ended { server: None, render: Some(render), error: Some(error) });
-            }
-            Err(ShownError { error, kept: ShownKept::Nothing }) => return Err(error),
+            Err(failure) => return ended(failure).await,
         }
     }
     let Stopped { server, render } = shown.stop().await?;
@@ -559,10 +606,11 @@ fn shut_down(
 /// stepped, so any fixed fraction is reproducible. The driver is a thread of the binary's
 /// own and never a worker (`Executor::block_on`), so it may wait for each frame's point: a
 /// region is then free at every step and every tick's frame is drawn. When the steps are
-/// done the binary takes its own render side back, as its own type, for the dump of
-/// decision 5.1 and the bytes of the last target, which its last frame copied to a buffer
-/// in a pass of the frame's own declaration, before the hand-off: a target taken back
-/// from the present role afterwards would have no defined contents (rhi-api, "States").
+/// done the binary takes its own render side back, as its own type (`own_render`), for
+/// the dump of decision 5.1 and the bytes of the last target, which its last frame copied
+/// to a buffer in a pass of the frame's own declaration, before the hand-off: a target
+/// taken back from the present role afterwards would have no defined contents (rhi-api,
+/// "States"). A step that fails ends as the root's frame does, by what it kept.
 fn fixed_frames(
     executor: &Executor,
     device: &dyn Device,
@@ -572,28 +620,38 @@ fn fixed_frames(
     extent: Extent,
     fraction: f32,
     steps: u32,
-) -> Result<(Server, Box<ClientRender>)> {
+) -> Result<Ended> {
     let start = Instant::now();
     for step in 0..steps {
         // The fixed sample, published by the binary before the frame that latches it.
         input.publish(fixed);
         let time = FrameTime { now: start + TICK_PERIOD * step, fraction };
-        let (next, output, rendered) =
-            executor.block_on(shown.step(executor, TickInput::default(), time, Some(extent)))?;
+        let stepped =
+            executor.block_on(shown.step(executor, TickInput::default(), time, Some(extent)));
+        let (next, output, rendered) = match stepped {
+            Ok(stepped) => stepped,
+            Err(failure) => return executor.block_on(ended(failure)),
+        };
         shown = next;
         // The mode is reproducible or it has failed: a frame that waited or was torn drew
         // nothing for its tick.
         let Rendered::Drew { point, counts, .. } = rendered else {
-            return Err(Error::new(ErrorKind::Unsupported, "a fixed frame did not draw"));
+            let Stopped { server, render } = executor.block_on(shown.stop())?;
+            let error = Error::new(ErrorKind::Unsupported, "a fixed frame did not draw");
+            return Ok(Ended { server: Some(server), render: Some(render), error: Some(error) });
         };
         assert!(!counts.server.stale());
         // Bounded, and off every worker.
         let _reached = device.wait_timeline(point, Duration::from_secs(1))?;
     }
     let Stopped { server, render } = executor.block_on(shown.stop())?;
+    Ok(Ended { server: Some(server), render: Some(render), error: None })
+}
+
+/// After `stop`, the render side as the type the binary built it with (`RenderSide: Any`).
+fn own_render(render: Box<dyn RenderSide>) -> Box<ClientRender> {
     let render: Box<dyn Any> = render;
-    let render = render.downcast::<ClientRender>().expect("the object `build_shown` was given");
-    Ok((server, render))
+    render.downcast::<ClientRender>().expect("the object `build_shown` was given")
 }
 
 // ---- 5. `frame-impl`'s tests: a render side with no device, and criterion 3(c) ----
@@ -611,6 +669,9 @@ struct CountingRender {
     /// The frames whose `open` answers `Wait`, for the tests of a deferred frame.
     busy: Vec<u64>,
     draws: Vec<Draw>,
+    /// Whether the present role shares the graphics queue: the protocol's tests run each
+    /// way, a frame dropped on a queue of its own and held on a shared one.
+    shared: bool,
 }
 
 struct NoSink;
@@ -623,6 +684,10 @@ impl InstanceSink for NoSink {
 }
 
 impl RenderSide for CountingRender {
+    fn present_queue(&self) -> QueuePath {
+        if self.shared { QueuePath::Shared } else { QueuePath::Own }
+    }
+
     fn open(&mut self, ctx: &mut JobContext<'_>) -> Result<Region> {
         if self.busy.contains(&self.frames) {
             return Ok(Region::Wait(point(self.frames)));
@@ -690,7 +755,12 @@ async fn hashes_match(
         let (next, _) = plain.step(executor, TickInput::default()).await?;
         plain = next;
         let time = FrameTime { now: start + TICK_PERIOD * step, fraction: 1.0 };
-        let (next, _, _) = shown.step(executor, TickInput::default(), time, Some(extent)).await?;
+        // This render side has no device behind it, so what a failure kept may drop where
+        // the test stands. A binary matches `kept` (section 3).
+        let (next, _, _) = shown
+            .step(executor, TickInput::default(), time, Some(extent))
+            .await
+            .map_err(|failure| failure.error)?;
         shown = next;
         assert_eq!(plain.tick(), shown.server().tick());
         assert_eq!(plain.hash()?, shown.server().hash()?);
@@ -717,98 +787,224 @@ fn other(target: TargetIndex) -> TargetIndex {
     TargetIndex::new((target.index() + 1) % TARGETS).expect("below `TARGETS`")
 }
 
-// ---- 6. The frame's job: a world of the frame's own lends it a `JobContext` (runs) ----
+// ---- 6. The frame's job: a closure run as one job, with its `JobContext` (runs) ----
 
-/// What D162 asks `lactose-present-api` to declare: the frame's work, run once in a job.
-trait FrameJob: Any + Send + Sync {
-    fn run(&mut self, job: &mut Job<'_, '_>);
+/// The future of the stand-in below. `lactose-task`'s is a named type, `JobRun<R>`.
+type JobRun<R> = Pin<Box<dyn Future<Output = Result<R>> + Send>>;
+
+/// The node of the stand-in. A `GraphNode` is `Sync` and runs through `&self`, so the
+/// closure and its value sit in two mutexes: the lock the primitive removes.
+struct OneJob<F, R> {
+    job: Mutex<Option<F>>,
+    value: Mutex<Option<R>>,
 }
 
-/// The one system of the frame's own world.
-#[system(name = "sketch::frame_job", worlds = [client])]
-fn frame_job(job: Job, work: ResMut<dyn FrameJob>) {
-    work.run(&mut job);
-}
+impl<F, R> GraphNode for OneJob<F, R>
+where
+    F: FnOnce(&mut JobContext<'_>) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    fn name(&self) -> &'static str {
+        "sketch::job"
+    }
 
-/// What D162 asks `lactose-present-api` to offer: a world that exists to run `work` in a
-/// job, and its schedule. Kind `Client`; no row, no region, no resource but the service.
-fn frame_world(work: Box<dyn FrameJob>) -> Result<(World, Schedule)> {
-    let mut registry = Registry::new();
-    registry.register::<InRegion>()?;
-    registry.register::<OwnedBy>()?;
-    registry.register::<ClaimedBy>()?;
-    registry.register::<PredictedOrigin>()?;
-    let mut world = WorldBuilder::new(WorldKind::Client, Arc::new(registry)).build()?;
-    world.insert_service::<dyn FrameJob>(work);
-    let mut builder = Schedule::builder(WorldKind::Client);
-    builder.stage("frame", &[]).add(&FRAME_JOB);
-    let schedule =
-        builder.build().map_err(|error| Error::new(ErrorKind::InvalidData, error.to_string()))?;
-    Ok((world, schedule))
-}
+    fn units(&self) -> u32 {
+        1
+    }
 
-/// What `lactose-app` keeps in that service: the render side and what one frame asks of
-/// it, written before the pass and read after it.
-struct Work {
-    render: Option<Box<dyn RenderSide>>,
-    opened: Option<Result<Region>>,
-    runs: u32,
-}
-
-impl FrameJob for Work {
-    fn run(&mut self, job: &mut Job<'_, '_>) {
-        self.runs += 1;
-        if let Some(render) = &mut self.render {
-            self.opened = Some(render.open(job.context()));
-        }
+    fn run(&self, _units: Range<u32>, ctx: &mut JobContext<'_>) {
+        let job = self.job.lock().expect("no job panicked").take().expect("one unit, run once");
+        let value = job(ctx);
+        *self.value.lock().expect("no job panicked") = Some(value);
     }
 }
 
-/// The service, as the type `lactose-app` put there: upcast to `Any`, then downcast.
-fn work_of(world: &mut World) -> &mut Work {
-    let work: &mut dyn FrameJob = world.service_mut::<dyn FrameJob>().expect("the service");
-    let any: &mut dyn Any = work;
-    any.downcast_mut::<Work>().expect("`lactose-app` put a `Work` there")
+/// A stand-in for what D162 asks of `lactose-task`, with the signature asked for:
+///
+/// ```text
+/// impl Executor {
+///     pub fn run_job<F, R>(&self, job: F) -> JobRun<R>
+///     where
+///         F: FnOnce(&mut JobContext<'_>) -> R + Send + 'static,
+///         R: Send + 'static;
+/// }
+/// ```
+///
+/// The closure is queued at the call, runs once as one job on a frame-critical worker
+/// with that job's context, and its value comes back through the future. The stand-in is
+/// a graph of one node with one unit, which is where the primitive sits in
+/// `lactose-task`'s model; it differs in the two mutexes above and in resolving
+/// `Cancelled` for a job that ran while the executor shut down. `frame-impl` deletes this
+/// function and `OneJob`, and calls `Executor::run_job` here and in `lactose-app`.
+fn run_job<F, R>(executor: &Executor, job: F) -> JobRun<R>
+where
+    F: FnOnce(&mut JobContext<'_>) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let node = Arc::new(OneJob { job: Mutex::new(Some(job)), value: Mutex::new(None) });
+    let mut builder = GraphBuilder::new();
+    builder.add_node(Arc::clone(&node) as Arc<dyn GraphNode>);
+    let graph = builder.build().expect("one node has no cycle");
+    // Started here and not at the first poll, as the primitive queues its job at the call.
+    let run = executor.run_graph(graph);
+    Box::pin(async move {
+        run.await?;
+        let value = node.value.lock().expect("no job panicked").take();
+        value.ok_or_else(|| Error::new(ErrorKind::Cancelled, "the job did not run"))
+    })
+}
+
+/// How many units the render side below forks over.
+const UNITS: usize = 4096;
+
+/// A render side that is `Send` and not `Sync`, and that uses the context its job lends:
+/// `open` forks over a buffer of its own, as a real `draw` forks the remote batch and the
+/// graph's recording.
+struct ForkingRender {
+    /// One mark a unit, raised once by each `open`.
+    marks: Vec<u32>,
+    /// Calls of `open`. A `Cell`, which a `Sync` bound on the trait would refuse.
+    opens: Cell<u32>,
+    /// The thread each `open` ran on.
+    threads: Vec<std::thread::ThreadId>,
+    /// The largest slot a job's context reported.
+    slot: u32,
+}
+
+impl RenderSide for ForkingRender {
+    fn present_queue(&self) -> QueuePath {
+        QueuePath::Own
+    }
+
+    fn open(&mut self, ctx: &mut JobContext<'_>) -> Result<Region> {
+        self.opens.set(self.opens.get() + 1);
+        self.threads.push(std::thread::current().id());
+        self.slot = self.slot.max(ctx.slot());
+        // One scope over disjoint `&mut` chunks, a child each.
+        let marks = &mut self.marks;
+        ctx.scope(|scope| {
+            for chunk in marks.chunks_mut(256) {
+                scope.fork(move |_| {
+                    for mark in chunk {
+                        *mark += 1;
+                    }
+                });
+            }
+        });
+        // A second scope of the same job, over a range: each unit once, however the
+        // range is split.
+        let seen: Vec<AtomicU32> = (0..UNITS).map(|_| AtomicU32::new(0)).collect();
+        ctx.scope(|scope| {
+            scope.fork_range(0..UNITS as u32, |units, _| {
+                for unit in units {
+                    seen[unit as usize].fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        });
+        assert!(seen.iter().all(|count| count.load(Ordering::Relaxed) == 1));
+        Ok(Region::Wait(point(u64::from(self.opens.get()))))
+    }
+
+    fn sink(&mut self) -> Box<dyn InstanceSink> {
+        Box::new(NoSink)
+    }
+
+    fn present(
+        &mut self,
+        ctx: &mut JobContext<'_>,
+        frame: &PresentFrame<'_>,
+        time: FrameTime,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn draw(&mut self, ctx: &mut JobContext<'_>, draw: Draw) -> Result<FrameCounts> {
+        Ok(FrameCounts::default())
+    }
+
+    fn submit(&mut self) -> Result<Submitted> {
+        let image: ImageHandle = Handle::from_parts(0, core::num::NonZeroU32::MIN);
+        Ok(Submitted { image, point: point(0), region: Region::Ready })
+    }
+}
+
+/// What `lactose-app` moves into a job and takes back from it: `Side`, in the shape it
+/// has, with no lock and no world around the render side.
+struct Moved {
+    render: Box<dyn RenderSide>,
+    /// What the job was asked and what it answered, written in the job and read by the
+    /// task once the job has resolved.
+    opened: Option<Result<Region>>,
+}
+
+/// One job: the render side moved in, asked, and handed back.
+fn ask(executor: &Executor, mut side: Box<Moved>) -> JobRun<Box<Moved>> {
+    run_job(executor, move |ctx| {
+        side.opened = Some(side.render.open(ctx));
+        side
+    })
 }
 
 #[test]
-fn the_frame_job_runs_in_a_world_of_its_own() {
-    let executor =
-        Executor::builder().frame_workers(2).background_workers(1).build().expect("executor");
-    let render: Box<dyn RenderSide> =
-        Box::new(CountingRender { busy: vec![0], ..Default::default() });
-    let work = Box::new(Work { render: Some(render), opened: None, runs: 0 });
-    let (world, schedule) = frame_world(work).expect("the frame's world");
+fn the_frame_job_is_one_job_with_the_render_side_moved_in_and_out() {
+    // Every range split to single units, every steal and yield seeded: the scopes of the
+    // job fork across both workers whatever the machine is doing.
+    let chaos = ChaosConfig {
+        seed: 162,
+        shuffle_steals: true,
+        inject_yields: true,
+        force_split: true,
+        record: false,
+    };
+    let executor = Executor::builder()
+        .frame_workers(2)
+        .background_workers(1)
+        .chaos(chaos)
+        .build()
+        .expect("executor");
+    let driver = std::thread::current().id();
+    let render: Box<dyn RenderSide> = Box::new(ForkingRender {
+        marks: vec![0; UNITS],
+        opens: Cell::new(0),
+        threads: Vec::new(),
+        slot: 0,
+    });
+    let side = Box::new(Moved { render, opened: None });
 
-    // The frame's render task: it owns the world and the schedule, and hands both back.
+    // The frame's render task: it owns the side, moves it into the job, takes it back
+    // and then calls what needs no job from its own poll, as it calls `submit`.
     let handle = executor.clone();
     let task = executor.spawn(WorkerClass::FrameCritical, async move {
-        let mut schedule = schedule;
-        let world = schedule.run_pass(world, &handle).await;
-        (world, schedule)
+        let mut side = ask(&handle, side).await?;
+        let submitted = side.render.submit();
+        Ok::<_, Error>((side, submitted))
     });
-    let (world, mut schedule) = executor.block_on(task).expect("the task ran");
-    let mut world = world.expect("the pass ran");
-
-    // Between frames the frame's task reads what the job left, with no lock.
-    let work = work_of(&mut world);
-    assert_eq!(work.runs, 1);
+    let (mut side, submitted) =
+        executor.block_on(task).expect("the task ran").expect("the job ran");
+    assert_eq!(submitted.expect("no error").region, Region::Ready);
+    // Between frames the task that drives the frame reads what the job left, with no
+    // lock of its own.
     assert_eq!(
-        work.opened.take().expect("the job asked").expect("no error"),
-        Region::Wait(point(0))
+        side.opened.take().expect("the job asked").expect("no error"),
+        Region::Wait(point(1))
     );
 
-    // A second pass of the same world: the tick has not advanced and the service is the
-    // same object.
-    let tick = world.tick();
-    let world = executor.block_on(schedule.run_pass(world, &executor)).expect("the pass ran");
-    let mut world = world;
-    assert_eq!(world.tick(), tick);
-    assert_eq!(work_of(&mut world).runs, 2);
+    // A second job with the same object, from the thread that drives a stepped run: the
+    // job that asks `open` at the start of a frame. It never runs on the calling thread.
+    let mut side = executor.block_on(ask(&executor, side)).expect("the job ran");
+    assert_eq!(
+        side.opened.take().expect("the job asked").expect("no error"),
+        Region::Wait(point(2))
+    );
 
-    // At `Shown::stop` the render side leaves the world by value.
-    let render = work_of(&mut world).render.take().expect("still there");
-    drop(world);
+    // At `Shown::stop` the render side leaves by value, as the type it was built with.
+    let render: Box<dyn Any> = side.render;
+    let render = render.downcast::<ForkingRender>().expect("the object that was moved in");
+    assert_eq!(render.opens.get(), 2);
+    assert!(render.marks.iter().all(|&mark| mark == 2), "each unit once in each job");
+    assert_eq!(render.threads.len(), 2);
+    assert!(render.threads.iter().all(|&thread| thread != driver));
+    assert!(render.slot < executor.slot_count());
     drop(render);
     executor.shutdown();
 }
