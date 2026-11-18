@@ -1083,8 +1083,10 @@ lacks them.
   scalars. Swept culling bounds, the light grid, decals, probes, VFX emitters, cascades, the clipmap
   centre, sky and atmosphere, markers, the audio listener and emitters, GPU picking, debug
   draw and the camera itself all convert through it.
-- Render slots are a renderer-owned side table keyed by `StableKey`, freed from the structural
-  change log, reconciled after any restore or load, never a column in simulation chunks.
+- Render slots are a renderer-owned side table keyed by `StableKey` within each kind of world a
+  client shows, freed from the structural change log's despawns as extract hands them to the
+  render side's sink, reconciled after any restore or load by the full pass that follows it,
+  never a column in simulation chunks.
 - Draw submission: the cull pass bins surviving clusters per pipeline and compacts their
   triangles into one 32-bit index buffer per pipeline over a global vertex pool; each pipeline
   then issues one indexed indirect draw. Post-transform vertex reuse is preserved, no backend

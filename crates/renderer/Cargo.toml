@@ -1,0 +1,43 @@
+[package]
+name = "lactose-renderer"
+description = "The minimal renderer: the render slot table keyed by StableKey, the staging ring extract and the remote upload write, the scatter into the persistent instance buffer, instanced triangles, the latched orbit camera, and the pass-provider trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+# D150: the integration tests are one binary, whose root declares the others as modules.
+autotests = false
+
+[dependencies]
+# `StableKey`, the only identity a slot is keyed by; `Result` and `ErrorKind`.
+lactose-core.workspace = true
+# `RenderPosition`, the cell-plus-offset position of D41, and the scalar, quaternion and
+# matrix types the camera is computed with before it is narrowed to 32-bit floats. The
+# crate takes no other math crate.
+lactose-math.workspace = true
+# `WorldKind`: a slot is keyed by the kind of the world its instance is in, with its key.
+lactose-ecs.workspace = true
+# `AssetRef`: the mesh a slot's instance names.
+lactose-asset-api.workspace = true
+# `InstanceSink`, which `ExtractSink` implements, and the row it is handed.
+lactose-present-api.workspace = true
+# `LatestSample`: the latch reads the newest yaw and pitch itself, inside the call.
+lactose-input-host.workspace = true
+# The one surface the renderer reaches a device through.
+lactose-rhi-api.workspace = true
+# `FrameDecl`: the renderer's passes are declared into the caller's frame.
+lactose-render-graph.workspace = true
+
+[dev-dependencies]
+# The compile-only sketches: a frame recorded from a job, and a world whose extract is
+# handed the renderer's sink.
+lactose-task.workspace = true
+lactose-sim.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true
