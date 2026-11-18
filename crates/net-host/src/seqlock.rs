@@ -16,8 +16,9 @@
 //!
 //! Those four orderings are the lock's only ones stronger than `Relaxed`, and each operation
 //! and ordering pair names exactly one of them, which is how the models' mutants weaken one
-//! at a time; `each_ordering_stronger_than_relaxed_has_one_site` holds both. A first load left `Relaxed` admits torn reads on aarch64 (the review measured them);
-//! `Acquire` admits none. `generation` and `count` are words read inside that window.
+//! at a time; `each_ordering_stronger_than_relaxed_has_one_site` holds both. A first load
+//! left `Relaxed` admits torn reads on aarch64 (the review measured them); `Acquire` admits
+//! none. `generation` and `count` are words read inside that window.
 //!
 //! One writer: every store to a slot is the buffer's one writer's, so its own loads of the
 //! slot (the sequence in `write`, `generation`) need no ordering and its `read` in `push`
@@ -278,7 +279,8 @@ mod tests {
     }
 
     /// The models' mutants find each ordering by its operation and ordering alone, so each of
-    /// the four occurs at one site, and no other ordering stronger than `Relaxed` occurs.
+    /// the four occurs at one site, and no other ordering stronger than `Relaxed` occurs: the
+    /// calls a single thread makes are counted, and the code's sites, retry paths included.
     #[test]
     fn each_ordering_stronger_than_relaxed_has_one_site() {
         const WRITE: [(&str, Ordering); 2] = [("fence", Release), ("store_u32", Release)];
@@ -305,5 +307,19 @@ mod tests {
             []
         );
         assert_eq!(slot.read().count, 2);
+
+        // A site on a path the calls above never take (a reader's retry) is counted in the
+        // code before this module, comments and whitespace aside.
+        let code: String = include_str!("seqlock.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect();
+        for site in ["M::fence(Release)", "M::fence(Acquire)", ",Release)", ",Acquire)"] {
+            assert_eq!(code.matches(site).count(), 1, "`{site}` in seqlock.rs");
+        }
     }
 }

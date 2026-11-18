@@ -88,8 +88,9 @@ jobs:
   # under loom, as are input-host's latest-sample sequence lock and net-host's interpolation
   # slot sequence lock (architecture section 5.3), each switched on by a Cargo feature of its
   # crate and never by a `--cfg` flag in the environment, which would replace the x86-64 pin.
-  # Release, because the models explore every interleaving, or every one within their
-  # preemption bound where they name one (input-host's and net-host's do).
+  # Release, because the models' searches are long: every interleaving, or those loom reaches
+  # within a preemption bound where a model names one (three of task's, and input-host's and
+  # net-host's).
   loom:
     name: loom
     runs-on: ubuntu-latest
