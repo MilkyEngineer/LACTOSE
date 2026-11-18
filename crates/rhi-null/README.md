@@ -93,7 +93,8 @@ walk refuse it `destroyed`, with nothing submitted.
   with memoryless colour lost across a local read; compute shared and present on its own
   queue, with multi-draw indirect and 64-bit atomics but no count draw, and memory not
   coherent; and MoltenVK 1.4.2's shape on the M1, multi-draw indirect with no count draw and
-  memoryless depth alone, lost across a local read.
+  memoryless depth alone, lost across a local read. The four cases that need a loss also
+  run once under a harness that cannot lose a device, and each is skipped and returns.
 - `tests/null.rs`: the device loss injected and observed at every call and wait; the
   invalidate a read needs where memory is not coherent; the cache's three starts; a handle
   whose index a later buffer took, which resolves nothing; four refusals null alone makes,
@@ -140,14 +141,19 @@ a row for each place and a third that removes both.
 | `no-qfot` | a buffer transition under another queue's pending use | `conformance::image_taken_while_another_queue_reads_it_is_refused` |
 | `no-qfot` | an alias call on another queue than the other images' | `conformance::aliased_image_used_without_the_alias_call_is_refused` |
 | `no-qfot` | an alias call on another queue than its own image's | `conformance::aliased_image_used_without_the_alias_call_is_refused` |
-| `no-qfot`, the use rule | at an image use, a copy's and a declared slot's | `conformance::use_under_another_queues_pending_write_is_refused`, `use_under_another_queues_pending_transition_is_refused`, `sampled_read_under_another_queues_pending_write_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused` |
-| `no-qfot`, the use rule | at a buffer use | `conformance::use_under_another_queues_pending_write_is_refused`, `use_under_another_queues_pending_transition_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused` |
-| `no-qfot`, the use rule | at an image transition | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused`, `take_of_a_mip_after_an_acquire_of_another_is_refused` |
-| `no-qfot`, the use rule | at a buffer transition | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused` |
-| `no-qfot`, the use rule | a buffer use, or a buffer transition, waiting for writes alone | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused`, and for a use `use_under_another_queues_pending_transition_is_refused` (a row each) |
-| `no-qfot`, the use rule | the waits only, not the queue's earlier submits and theirs | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused`, `take_of_a_mip_after_an_acquire_of_another_is_refused` |
+| `no-qfot`, the use rule | at an image use: a copy's, an attachment's and a declared slot's | `conformance::use_under_another_queues_pending_write_is_refused`, `use_under_another_queues_pending_transition_is_refused`, `sampled_read_under_another_queues_pending_write_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused` |
+| `no-qfot`, the use rule | at an attachment alone | `conformance::use_under_another_queues_pending_transition_is_refused` |
+| `no-qfot`, the use rule | at a declared slot alone | `conformance::sampled_read_under_another_queues_pending_write_is_refused` |
+| `no-qfot`, the use rule | at a buffer use: a copy's, a declared buffer's, an index or indirect buffer's | `conformance::use_under_another_queues_pending_write_is_refused`, `use_under_another_queues_pending_transition_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused` |
+| `no-qfot`, the use rule | at a declared buffer alone | `conformance::use_under_another_queues_pending_transition_is_refused` |
+| `no-qfot`, the use rule | at an index or indirect buffer alone | `conformance::use_under_another_queues_pending_transition_is_refused` |
+| `no-qfot`, the use rule | at an image transition | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused`, `acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused`, `take_of_a_mip_after_an_acquire_of_another_is_refused` |
+| `no-qfot`, the use rule | at a buffer transition | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused`, `acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused` |
+| `no-qfot`, the use rule | at an acquire, an image's and a buffer's: an acquire bound as a use | `conformance::acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused` (a row each) |
+| `no-qfot`, the use rule | a buffer use, or a buffer transition, waiting for writes alone | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused`, and for a use `use_under_another_queues_pending_transition_is_refused`, for a transition `acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused` (a row each) |
+| `no-qfot`, the use rule | the waits only, not the queue's earlier submits and theirs | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused`, `acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused`, `take_of_a_mip_after_an_acquire_of_another_is_refused` |
 | `no-qfot`, the use rule | an image's change stamped at the commit | `conformance::use_under_another_queues_pending_write_is_refused`, `use_under_another_queues_pending_transition_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused`, `take_of_a_mip_after_an_acquire_of_another_is_refused` |
-| `no-qfot`, the use rule | an image transition as a change | `conformance::use_under_another_queues_pending_transition_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused`, `take_of_a_mip_after_an_acquire_of_another_is_refused` |
+| `no-qfot`, the use rule | an image transition as a change | `conformance::use_under_another_queues_pending_transition_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused`, `acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused`, `take_of_a_mip_after_an_acquire_of_another_is_refused` |
 | `no-qfot`, the use rule | a copy into an image, an attachment's write, an alias call, each as a change with no transition | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused` (a row each) |
 | `no-qfot` and `pending` | a buffer transition as a change | `conformance::use_under_another_queues_pending_transition_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused`, `read_under_a_pending_transition_to_host_read_is_refused` |
 | `no-qfot` and `pending` | a buffer write with no transition as a change, for a later use and for an invalidate | `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused`, `read_under_a_pending_writer_is_refused` |
@@ -235,11 +241,14 @@ a row for each place and a third that removes both.
 | The present's walk | a decided submit taken as in progress | `tests::a_decided_submit_is_not_taken_for_one_in_progress` |
 | The stall | presents run while stalled | `conformance::resize_with_a_present_pending_is_refused` |
 | Loss | the injected loss not kept | `conformance::loss_is_returned_and_stays`, `waits_return_at_once_after_a_loss`, `wait_is_woken_by_a_loss`, `teardown_succeeds_after_a_loss`, `null::a_loss_reaches_every_call_and_the_control_outlives_the_device`, and others |
+| Loss, the suite's | a loss case's gate left shut when the harness cannot lose a device, in `waits_return_at_once_after_a_loss` or `teardown_succeeds_after_a_loss` | `conformance::loss_cases_are_skipped_where_the_harness_cannot_lose` (a row each) |
 | The last drop | a device's last drop that does not wait for its submits, or that stops short of its last | `tests::the_last_drop_of_a_device_waits_for_its_pending_submits`, `a_drop_that_is_not_the_last_returns_at_once` (a row each) |
 | The cooked format | `encode` without the checks `decode` makes | `conformance::cooked_shader_round_trips` |
 
-An acquire orders no later submit of its queue. A stamp that let one do so, put back,
-fails `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused` and
+An acquire orders no later submit of its queue, and is itself bound as a use. A stamp that
+let one order the later submits, put back with the acquire's exemption from the use rule,
+fails `conformance::use_in_a_later_submit_than_the_waiting_change_is_refused`,
+`acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused` and
 `take_of_a_mip_after_an_acquire_of_another_is_refused`.
 
 The threads' rules, each removed alone in the same way:
@@ -257,9 +266,9 @@ The threads' rules, each removed alone in the same way:
 | a present's wait seeing a loss | `wakes::a_loss_during_a_present_wait_returns_lost` |
 | a pending encoder's drop waiting for its submit | `conformance::pending_encoder_drop_waits_for_its_submit` |
 | a swapchain's drop waiting for its present's submit | `tests::a_swapchain_drop_with_its_present_pending_waits_for_its_submit` |
-| the swapchain counted among the device's holders | `tests::a_drop_that_is_not_the_last_returns_at_once`, `a_drop_while_unwinding_does_not_wait` |
-| an encoder counted among the device's holders | `tests::a_drop_that_is_not_the_last_returns_at_once`, `a_drop_while_unwinding_does_not_wait` |
-| only the last drop waiting, not every drop | `tests::a_drop_that_is_not_the_last_returns_at_once`, `a_drop_while_unwinding_does_not_wait` |
+| the swapchain counted among the device's holders | `tests::a_drop_that_is_not_the_last_returns_at_once`, `a_drop_while_unwinding_does_not_wait`, `conformance::drop_that_is_not_the_last_returns_at_once` |
+| an encoder counted among the device's holders | `tests::a_drop_that_is_not_the_last_returns_at_once`, `a_drop_while_unwinding_does_not_wait`, `conformance::drop_that_is_not_the_last_returns_at_once` |
+| only the last drop waiting, not every drop | `tests::a_drop_that_is_not_the_last_returns_at_once`, `a_drop_while_unwinding_does_not_wait`, `conformance::drop_that_is_not_the_last_returns_at_once` |
 | the swapchain letting go of the device after the records' lock, not under it | `tests::a_drop_that_is_not_the_last_returns_at_once` |
 | the last drop's `panicking()` guard, which waits for nothing while a thread unwinds | `tests::a_drop_while_unwinding_does_not_wait` |
 | a pending encoder's drop's `panicking()` guard | `tests::a_drop_while_unwinding_does_not_wait` |
