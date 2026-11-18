@@ -228,6 +228,7 @@ pub const CASES: &[Case] = cases! {
     contract "submit_to_the_present_role_is_refused" => PresentQueue everywhere;
     // Buffers and host access.
     contract "buffer_write_then_copy_then_read_returns_the_bytes";
+    contract "device_buffer_written_by_a_pass_is_read_after_it";
     contract "buffer_address_is_stable_and_distinct";
     contract "host_ranges_that_do_not_overlap_are_written_at_once";
     contract "overlapping_host_access_is_refused" => HostOverlap everywhere;

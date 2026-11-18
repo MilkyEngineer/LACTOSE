@@ -2,10 +2,10 @@
 
 use std::sync::mpsc;
 
-use super::kit::{Body, Ctx, PATIENCE, buffer_to, compute_pass};
+use super::kit::{Body, Ctx, PATIENCE, attachment, begin, buffer_to, compute_pass, image_to};
 use crate::{
-    BufferCopy, BufferHandle, BufferReach, BufferState, BufferUsage, Device, Encoder, MemoryClass,
-    PassReach, QueueRole, Rule, Submit,
+    BufferCopy, BufferHandle, BufferReach, BufferState, BufferUsage, Device, Encoder, ImageState,
+    Load, MemoryClass, PassReach, QueueRole, Rule, Store, Submit,
 };
 
 type Applies = Result<(), &'static str>;
@@ -14,6 +14,10 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     (
         "buffer_write_then_copy_then_read_returns_the_bytes",
         buffer_write_then_copy_then_read_returns_the_bytes,
+    ),
+    (
+        "device_buffer_written_by_a_pass_is_read_after_it",
+        device_buffer_written_by_a_pass_is_read_after_it,
     ),
     ("buffer_address_is_stable_and_distinct", buffer_address_is_stable_and_distinct),
     (
@@ -265,6 +269,74 @@ fn address_of_a_buffer_without_the_usage_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let buffer = ctx.buffer(&*device, 64, BufferUsage::COPY_DESTINATION, MemoryClass::Device);
     ctx.refused(device.buffer_address(buffer), "the address of a buffer made without the usage");
+    Ok(())
+}
+
+/// A `Device` buffer written through its address by a compute pass that declares it
+/// `ShaderWrite` is then read through its address by a draw whose pass declares it
+/// `ShaderRead`, and copied out and read by the host: a pass fills device memory as a copy
+/// does.
+fn device_buffer_written_by_a_pass_is_read_after_it(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let usage = BufferUsage::DEVICE_ADDRESS.union(BufferUsage::COPY_SOURCE);
+    let filled = ctx.buffer(&*device, SIZE, usage, MemoryClass::Device);
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let target = ctx.target(&*device);
+    let mut encoder = ctx.encoder(&*device, queue);
+    encoder.transition_buffers(&[buffer_to(
+        filled,
+        BufferState::Undefined,
+        BufferState::ShaderWrite,
+        queue,
+    )]);
+    let written = [BufferReach { buffer: filled, state: BufferState::ShaderWrite }];
+    let compute = ctx.compute(&*device);
+    compute_pass(&mut *encoder, compute, PassReach { slots: &[], buffers: &written });
+    encoder.push_address(0, filled, 0);
+    encoder.dispatch([1, 1, 1]);
+    encoder.end_pass();
+    encoder.transition_buffers(&[buffer_to(
+        filled,
+        BufferState::ShaderWrite,
+        BufferState::ShaderRead,
+        queue,
+    )]);
+    encoder.transition_images(&[image_to(
+        target,
+        ImageState::Undefined,
+        ImageState::ColourAttachment,
+        queue,
+    )]);
+    let read = [BufferReach { buffer: filled, state: BufferState::ShaderRead }];
+    begin(
+        &mut *encoder,
+        &[attachment(target, Load::Clear([0.0; 4]), Store::Store, false)],
+        PassReach { slots: &[], buffers: &read },
+    );
+    encoder.bind_graphics_pipeline(ctx.plain(&*device));
+    encoder.push_address(0, filled, 0);
+    encoder.draw(0..3, 0..1);
+    encoder.end_pass();
+    encoder.transition_buffers(&[
+        buffer_to(filled, BufferState::ShaderRead, BufferState::CopySource, queue),
+        buffer_to(readback, BufferState::Undefined, BufferState::CopyDestination, queue),
+    ]);
+    encoder.copy_buffer(
+        filled,
+        readback,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+    encoder.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        queue,
+    )]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, queue, &mut [encoder], &[], &[done]);
+    ctx.reached(&*device, done);
+    ctx.check(ctx.read(&*device, readback, 0, SIZE).len() == SIZE as usize, "the read");
     Ok(())
 }
 

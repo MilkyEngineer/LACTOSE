@@ -187,6 +187,7 @@ cases! {
     roles_resolve_as_the_layout_reports
     submit_to_the_present_role_is_refused
     buffer_write_then_copy_then_read_returns_the_bytes
+    device_buffer_written_by_a_pass_is_read_after_it
     buffer_address_is_stable_and_distinct
     host_ranges_that_do_not_overlap_are_written_at_once
     overlapping_host_access_is_refused
