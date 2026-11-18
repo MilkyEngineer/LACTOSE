@@ -44,7 +44,6 @@ impl Heap {
     /// and the layouts for `colour_attachments` inputs. Submits one command buffer to
     /// `queue` and waits for it, to put the placeholder image in its layout: the device's
     /// first submit, made before any caller's.
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn new(
         raw: &Arc<Raw>,
         slots: u32,

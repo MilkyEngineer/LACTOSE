@@ -302,7 +302,6 @@ fn feedback(stages: &[vk::PipelineCreationFeedback]) -> (u64, u64) {
 
 /// Checks a graphics pipeline's description and makes it; returns it with its stages'
 /// cache hits and misses.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn graphics(
     shared: &Shared,
     desc: &GraphicsPipelineDesc<'_>,

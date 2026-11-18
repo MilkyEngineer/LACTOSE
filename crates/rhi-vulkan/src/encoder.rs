@@ -919,7 +919,6 @@ impl Encoder for VulkanEncoder {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn begin_render_pass(&mut self, pass: &RenderPass<'_>) {
         if !self.recording() || !self.outside("a pass begun") {
             return;

@@ -13,7 +13,7 @@ use lactose_rhi_api::{
     MessageSource, QueueLayout, QueuePath, Severity,
 };
 
-use crate::convert::{format, image_usage};
+use crate::convert::{self, image_usage};
 
 /// The vendor id of Apple's GPUs.
 const APPLE: u32 = 0x106B;
@@ -323,7 +323,7 @@ pub(crate) fn image_info(
 ) -> vk::ImageCreateInfo<'static> {
     vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(self::format_of(format))
+        .format(convert::format(format))
         .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
         .mip_levels(mips)
         .array_layers(layers)
@@ -332,10 +332,6 @@ pub(crate) fn image_info(
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-}
-
-fn format_of(value: Format) -> vk::Format {
-    format(value)
 }
 
 /// Opens the loader, makes the instance with its messenger, picks the adapter the request
@@ -456,7 +452,6 @@ impl Drop for Partial {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn device(
     entry: &ash::Entry,
     instance: &ash::Instance,

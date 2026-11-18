@@ -289,6 +289,36 @@ jobs:
               print(f"- `io_uring_setup`: failed with {name}, io_uring is not usable here")
           PROBE
 
+  # The nightly form of the pull request's `gpu (lavapipe)` job (decision 5.10 of the milestone
+  # 2 plan): every device test under GPU-assisted validation, with its own canary
+  # (tools/xtask/README.md, "GPU runs"). Assumed from the layer's documentation until the
+  # `gpu-probe` below records it: GPU-assisted validation loads on lavapipe, whose features
+  # cover what its instrumentation needs, as it does under KosmicKrisp on the M1.
+  gpu-assisted:
+    name: gpu (lavapipe, GPU-assisted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends mesa-vulkan-drivers
+      - uses: actions/cache@v4
+        with:
+          path: target/vulkan-sdk/download
+          key: vulkan-sdk-${{ hashFiles('tools/xtask/vulkan-layer.toml') }}
+      - name: The device tests under GPU-assisted validation
+        run: cargo xtask gpu --driver lavapipe --only vulkan --gpu-assisted
+      - uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: gpu-lavapipe-gpu-assisted
+          path: target/gpu/lavapipe-vulkan-gpu-assisted.txt
+          if-no-files-found: ignore
+
   # docs/plans/milestone-2.md section 3, `gpu-probe`: what lavapipe on the Linux runner offers,
   # for lane `vulkan` (docs/verification.md, the row on lavapipe). It records and never fails.
   # The macOS runners' facts, the oldest image's included, are the `shaders` jobs' own
