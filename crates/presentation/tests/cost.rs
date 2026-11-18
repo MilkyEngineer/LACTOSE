@@ -11,9 +11,10 @@
 //! --no-capture -E 'test(/cost::/)'`
 //!
 //! The renderer's `RemoteWriter::write` is not built yet, so the upload writes to a closure
-//! that counts the rows: the ring's copy is not in the figure. The median is bimodal on the
-//! M1: paced on an otherwise quiet machine the sample took about 1.8 ms, with a core kept busy
-//! beside it or unpaced about 0.3 ms, and the cause is not measured. The network thread here
+//! that counts the rows: the ring's copy is not in the figure. The median varies between runs
+//! on the M1, from about 0.26 to 1.8 ms, and the cause is not measured: paced on an otherwise
+//! quiet machine the sample took about 1.8 ms, with a core kept busy beside it or unpaced about
+//! 0.3 ms, and with other work on the machine about 0.45 ms. The network thread here
 //! is a plain thread. `measure-m2` makes the recorded measurement: it runs the writer under
 //! `ThreadClass::Network`, times the batch call inside the frame, and reports the reader's
 //! retry rate.

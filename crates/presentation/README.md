@@ -31,7 +31,7 @@ against this surface.
 |---|---|
 | `Presentation`, `Presentation::{new, frame, remote}` | The schedule of one shown world: what the remote sample keeps between frames. It runs once a frame on the pair the frame acquired, and lends the remote rows it sampled |
 | `PresentView`, `RemoteView` | What a frame is shown at: the frame's fraction, the row the camera follows, and the interpolation buffer and server time the remote rows are sampled at |
-| `Presented` | What `frame` returns by value: the camera, and the count of remote rows left out |
+| `ScheduleOutput` | What `frame` returns by value: the camera, and the count of remote rows left out |
 | `EventSink` | Where the frame's events go, each once: `emitted`, `cancelled` |
 | `interpolate` | The transform a frame shows a presented row at |
 | `CameraPose` | The pivot and the boom a frame's camera is latched with |
@@ -45,7 +45,7 @@ reshape.
 
 | Consumer | Needs | Given by |
 |---|---|---|
-| `lactose-app` (the client's frame, `frame-impl`): `RenderSide::present` and `draw` | In `present`, on the pair the frame acquired: the frame's events delivered, the camera's pivot and boom for the latch, the remote rows sampled and kept for `draw`; in `draw`, the remote rows uploaded with no copy | `Presentation::new()`; `Presentation::frame(&pair, &view, sink)` with the pair `SnapshotReader::acquire` gave and a `PresentView` at `FrameTime::fraction`; `Presented::{camera, missing}`; `CameraPose::{pivot, boom}` into `CameraLatch`; `upload(ctx, presentation.remote(), \|rows\| writer.write(rows))` with the writer of `Renderer::remote` |
+| `lactose-app` (the client's frame, `frame-impl`), as `frame-design` proposes its facade (D162, not merged yet): the render side's `present` and `draw` | In `present`, on the pair the frame acquired: the frame's events delivered, the camera's pivot and boom for the latch, the remote rows sampled and kept for `draw`; in `draw`, the remote rows uploaded with no copy | `Presentation::new()`; `Presentation::frame(&pair, &view, sink)` with the pair `SnapshotReader::acquire` gave and a `PresentView` at the frame's fraction; `ScheduleOutput::{camera, missing}`; `CameraPose::{pivot, boom}` into `CameraLatch`; `upload(ctx, presentation.remote(), \|rows\| writer.write(rows))` with the writer of `Renderer::remote` |
 | Audio, effects and the debug overlay (milestone 5) | Requests to start, cancellations to stop, each once | `EventSink::{emitted, cancelled}` |
 | Boom collision (milestone 3) | The direction the rig casts along | `Orbit::forward` |
 | `game-present`, lights and decals of a world that simulates | A presented row's placement at the frame's time | `interpolate` on the acquired pair |
@@ -56,7 +56,7 @@ reshape.
 
 - One `Presentation` per shown world. It holds no reader: the frame keeps the world's
   `SnapshotReader`, acquires the pair in its own task and hands it to `frame` inside the
-  frame's job (`crates/app/README.md`, "The render side"). A client that shows its prediction
+  frame's job (the milestone 2 plan, `frame-design`). A client that shows its prediction
   world and its replicated world holds two. The crate declares nothing a world registers: no
   system, component, resource, applier or hand-written `impl Reflect` (decision 5.18). It
   reads the pair, the interpolation buffer and what the caller passes, and writes nothing a
@@ -73,7 +73,7 @@ reshape.
 - The events delivered are those the pair carries: the batch of every event published since
   the previous acquire, folded (present-api, "Events and publication"). So each event
   published is delivered once, whatever the cadence of publications and frames, where the
-  caller hands every pair it acquires to one call of `frame`, once, as `lactose-app`'s frame
+  caller hands every pair it acquires to one call of `frame`, once, as `frame-design`'s frame
   does. A pair handed over twice delivers its events twice; a pair acquired and not handed
   over drops them. A rollback's re-emission of a delivered event is not delivered again; a
   delivered event whose re-simulated tick no longer emits it is cancelled once. Both rest on
@@ -83,15 +83,14 @@ reshape.
 
 - `interpolate(frame, key, fraction)` is `None` where `PresentFrame::transform` is: no such
   row, or a `Client` world's snapshot, which holds no transform.
-- `fraction` is the renderer's `FrameView::fraction`, `lactose-app`'s `FrameTime::fraction`:
-  from zero, the older snapshot's transform, to one, the newer's, whatever the ticks between
-  the two snapshots. It is clamped to `[0, 1]`, and NaN counts as one. It is the weight, over
-  the whole pair: the renderer draws an instance at `previous + (current - previous) *
+- `fraction` is the renderer's `FrameView::fraction`: from zero, the older snapshot's
+  transform, to one, the newer's, whatever the ticks between the two snapshots. It is clamped
+  to `[0, 1]`, and NaN counts as one. It is the weight, over the whole pair: the renderer draws an instance at `previous + (current - previous) *
   fraction`, its previous and current placements those of the same two snapshots where every
   pass is published and every publication acquired (present-api, "What the sink keeps"). So
-  a presented row and the instance the renderer draws for it are shown at the same instant:
-  the camera's pivot is where the mesh it follows is drawn, over a pair one tick apart or
-  several.
+  a presented row and the instance the renderer draws for it are shown at the same instant,
+  apart from the two exceptions that section names: the camera's pivot is where the mesh it
+  follows is drawn, over a pair one tick apart or several.
 - A pair `PresentFrame::transform` flags `no_interpolate` (a cut, a row the older snapshot does
   not hold, a pair of one tick, a `Teleported` after the older snapshot's tick) shows the newer
   transform at every fraction. A body despawned and spawned again under its key between the
@@ -102,10 +101,10 @@ reshape.
 **The camera rig** (architecture section 13)
 
 - With a focus whose row the newer snapshot holds with a `Transform` and a `CameraRig`,
-  `Presented::camera` is `CameraPose { pivot, boom }`: the pivot `RenderPosition::from_sim` of
-  `CameraRig::pivot_of` the row's interpolated transform, by the newer snapshot's rig; the
-  boom its rest length as an `f32`, zero where it is negative or NaN. Without one it is `None`,
-  and the frame keeps whatever camera it had.
+  `ScheduleOutput::camera` is `CameraPose { pivot, boom }`: the pivot
+  `RenderPosition::from_sim` of `CameraRig::pivot_of` the row's interpolated transform, by the
+  newer snapshot's rig; the boom its rest length as an `f32`, zero where it is negative or NaN.
+  Without one it is `None`, and the frame keeps whatever camera it had.
 - The boom is the rest length at milestone 2: boom collision needs the static collision asset
   of milestone 3 (decision 5.5), and `CameraLatch::boom` is the value the collision will
   find.
@@ -139,7 +138,8 @@ reshape.
 - A sampled row's placement is `RenderTransform::from_sim` of the sample's position and
   rotation, `Interpolated` or `Held`. A row whose slot samples `Missing` (no state, or
   released and perhaps reused) keeps the placement it had in the previous frame's rows, as
-  net-host asks; one with none is left out of the rows and counted in `Presented::missing`.
+  net-host asks; one with none is left out of the rows and counted in
+  `ScheduleOutput::missing`.
 - `remote` is ascending by key, each key once, so that each remote instance is written
   once a frame: the renderer counts a second write of one as a duplicate. Every row carries
   `no_interpolate` set: the renderer sets both placements of a remote row to the row's
@@ -188,4 +188,4 @@ timing.
 | Each remote slot written once a frame | `remote.rs`: a client world of 600 remote rows, a row with a slot and no mesh, one with a mesh and no slot, and one whose slot never received a state: every remote row once, ascending, with its mesh, at its sample, frame after frame with and without a publication; a released slot keeps its row where it was shown, one never shown is left out and counted; a despawned row is gone; a frame with no remote view has none. The upload of 0, 1, 256, 257 and 600 rows: each row in exactly one call, none empty, none over 256, the calls together the rows; and of 600 rows on four workers, each call waiting until two have been in progress at once: two were. That the rows are sampled in one `sample_batch` call, each slot once, is by inspection: no test counts the samples |
 | Events delivered once | `events.rs`: a delivered event re-emitted by a rollback is not delivered again, and nothing is published for it; one whose re-simulated tick no longer emits it is cancelled once, in the next frame; a frame with nothing published since delivers nothing. Under four cadences of frames against publications with a two-tick rollback every eighth step: no key emitted or cancelled in two frames, and the net delivered of each key the net published |
 | Outside the boundary | `cargo xtask boundary` passes with the crate outside `[lint_file_carriers]`: it declares nothing a world registers. The tests alone declare one system, `test::chirp`, which emits a sound request and writes no component |
-| Cost (steering) | `cost.rs`, ignored, run by hand in release: 5,000 remote rows sampled and uploaded to a counting closure at 144 Hz for ten seconds, with a network thread pushing a state into every slot at 30 Hz; the median and the 99th percentile of the frame, and of the batch call made a second time after the frame, are printed. The ring's copy is not in it while `RemoteWriter::write` is the facade's. The median is bimodal and its cause is not measured (the test's module comment) |
+| Cost (steering) | `cost.rs`, ignored, run by hand in release: 5,000 remote rows sampled and uploaded to a counting closure at 144 Hz for ten seconds, with a network thread pushing a state into every slot at 30 Hz; the median and the 99th percentile of the frame, and of the batch call made a second time after the frame, are printed. The ring's copy is not in it while `RemoteWriter::write` is the facade's. The median varies between runs, from about 0.26 to 1.8 ms, and the cause is not measured (the test's module comment) |
