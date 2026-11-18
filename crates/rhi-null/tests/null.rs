@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use lactose_core::ErrorKind;
 use lactose_rhi_api::{
-    Acquired, BufferCopy, BufferDesc, BufferHandle, BufferState, BufferTransition, BufferUsage,
-    CacheStart, Capabilities, ColourAttachment, Device, Encoder, ImageHandle, ImageRange,
-    ImageState, ImageTransition, Load, MemoryClass, PassReach, Presented, QueueLayout, QueuePath,
-    QueueRole, RenderPass, Rule, Sharing, StateOn, Store, Submit, Swapchain, SwapchainDesc, Target,
-    TimelinePoint,
+    Acquired, BufferCopy, BufferDesc, BufferHandle, BufferReach, BufferState, BufferTransition,
+    BufferUsage, CacheStart, Capabilities, ColourAttachment, ComputePass, Device, Encoder,
+    ImageHandle, ImageRange, ImageState, ImageTransition, Load, MemoryClass, PassReach, Presented,
+    QueueLayout, QueuePath, QueueRole, RenderPass, Rule, Sharing, StateOn, Store, Submit,
+    Swapchain, SwapchainDesc, Target, TimelinePoint,
 };
 use lactose_rhi_null::NullDevice;
 
@@ -193,7 +193,6 @@ fn a_cache_starts_empty_loaded_or_rejected() {
     assert_eq!(start(b"no cache".to_vec()), CacheStart::Rejected);
 }
 
-/// A present encoder that clears `image` and leaves it in `Present`.
 /// A destroyed buffer's index is taken by the next buffer made: an encoder that records the
 /// old handle resolves nothing through it, and its submit is refused `destroyed`, not by the
 /// new buffer's usage.
@@ -218,6 +217,65 @@ fn a_handle_whose_index_another_buffer_took_resolves_nothing() {
     assert_eq!(rule(&refused), Some(Rule::Destroyed), "{refused:?}");
 }
 
+/// The refusals null makes that the contract does not assign every backend, each by the
+/// rule null's README names for it: a copy from a buffer to itself (`usage`), a copy region
+/// of no bytes and an address past its buffer's end (`bounds`), and a destroy of a
+/// swapchain's image (`swapchain`).
+#[test]
+fn the_refusals_null_alone_makes_name_their_rules() {
+    let device = device(&Capabilities::LEAST, true);
+    let submit = |encoder: Box<dyn Encoder>| {
+        device.submit(
+            QueueRole::Graphics,
+            Submit { encoders: &mut [encoder], waits: &[], signals: &[] },
+        )
+    };
+    let encoder = || device.create_encoder(QueueRole::Graphics, "null").expect("an encoder");
+    let copied = BufferUsage::COPY_SOURCE.union(BufferUsage::COPY_DESTINATION);
+    let both = buffer(&device, copied, MemoryClass::Device);
+    let mut itself = encoder();
+    itself.copy_buffer(
+        both,
+        both,
+        &[BufferCopy { source_offset: 0, destination_offset: 32, size: 16 }],
+    );
+    let refused = submit(itself);
+    assert_eq!(rule(&refused), Some(Rule::Usage), "a copy from a buffer to itself: {refused:?}");
+    let other = buffer(&device, copied, MemoryClass::Device);
+    let mut empty = encoder();
+    empty.copy_buffer(
+        both,
+        other,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: 0 }],
+    );
+    let refused = submit(empty);
+    assert_eq!(rule(&refused), Some(Rule::Bounds), "a copy region of no bytes: {refused:?}");
+    let addressed = buffer(&device, BufferUsage::DEVICE_ADDRESS, MemoryClass::Device);
+    let reach = [BufferReach { buffer: addressed, state: BufferState::ShaderRead }];
+    let mut past = encoder();
+    past.begin_compute_pass(&ComputePass {
+        label: "null",
+        reach: PassReach { slots: &[], buffers: &reach },
+    });
+    past.push_address(0, addressed, SIZE);
+    past.end_pass();
+    let refused = submit(past);
+    assert_eq!(rule(&refused), Some(Rule::Bounds), "an address past the buffer's end: {refused:?}");
+    let mut swapchain = device
+        .create_swapchain(&SwapchainDesc {
+            extent: lactose_rhi_api::Extent { width: 8, height: 8 },
+        })
+        .expect("a swapchain");
+    let image = acquire(&mut *swapchain);
+    let refused = device.destroy_image(image);
+    assert_eq!(
+        rule(&refused),
+        Some(Rule::Swapchain),
+        "a destroy of a swapchain's image: {refused:?}"
+    );
+}
+
+/// A present encoder that clears `image` and leaves it in `Present`.
 fn frame(device: &dyn Device, image: ImageHandle) -> Box<dyn Encoder> {
     let queue = QueueRole::Present;
     let mut encoder = device.create_encoder(queue, "null").expect("an encoder");

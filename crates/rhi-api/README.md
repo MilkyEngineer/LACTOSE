@@ -359,16 +359,18 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   progress, and a submit that writes the buffer while any is in progress are refused
   (`host-overlap`), and a range outside the buffer is refused (`bounds`), all by every
   backend, since a backend's mapped memory is reached through them.
-- `write_buffer`, `read_buffer` and `invalidate_buffer` of a buffer a pending submit writes,
-  by a copy into it or a pass that declares it `ShaderWrite`, or moves into `HostRead`, are
-  refused (`pending`, every backend): the bytes a call lends are never ones the device may be
-  writing, and an invalidate made before the write lands is not the invalidate after it, so
-  is never taken for one. A transition into `HostRead` is the device's last access before
-  the host's, and on Vulkan the barrier that makes the writes visible to the host. An
-  `Upload` buffer may hold
-  `COPY_DESTINATION` and `DEVICE_ADDRESS`, so the write is checked as the read is. A device
-  keeps, for each buffer, the point of the last submit of each queue that writes it. The
-  check is of the whole buffer, as a pass that writes through an address names no range.
+- `write_buffer` of a buffer a pending submit writes, by a copy into it or a pass that
+  declares it `ShaderWrite`, and `read_buffer` and `invalidate_buffer` of one a pending
+  submit writes or changes the state of, are refused (`pending`, every backend): the bytes a
+  call lends are never ones the device may be writing, and an invalidate made before the
+  write or the barrier lands is not the invalidate after it, so is never taken for one. A
+  transition into `HostRead` is the device's last access before the host's, and on Vulkan
+  the barrier that makes the writes visible to the host; a barrier touches no bytes, so a
+  submit that only transitions a buffer holds no host write back. An `Upload` buffer may
+  hold `COPY_DESTINATION` and `DEVICE_ADDRESS`, so the write is checked as the read is. A
+  device keeps, for each buffer, the point of the last submit of each queue that writes it,
+  and of the last that writes it or changes its state. The check is of the whole buffer, as
+  a pass that writes through an address names no range.
   Whichever of a host call and a submit that writes its buffer takes the record's lock
   first, the other is refused: the submit by the range in progress, the host call by the
   stamp ("Threads").
@@ -453,7 +455,7 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   | The image a present shows | `ImageState::Present` |
   | A buffer a pass declares | the `BufferReach`'s state: `ShaderRead` or `ShaderWrite` |
   | The bound index buffer; an indirect draw's or dispatch's argument and count buffers | `BufferState::Index`; `BufferState::Indirect` |
-  | `read_buffer` | `BufferState::HostRead`, with no pending submit that writes the buffer or moves it into `HostRead` (`pending`, every backend) |
+  | `read_buffer` | `BufferState::HostRead`, with no pending submit that writes the buffer or changes its state (`pending`, every backend) |
 
 - A transition's `from` is the state and queue each subresource of its range is in, or the
   transition is refused (`state`). A transition to the state and queue a subresource is
@@ -918,7 +920,7 @@ stale number into a wrong image ("The heap and the sampler table").
 | `State` | `state` | a buffer a pass declares in two states | a transition's `from`, a use's state, by subresource; a use after a write in a writing state with no transition since |
 | `Queue` | `no-qfot` | | a use off the owning queue; an acquire with no release; a change of state or owner under another queue's pending submit with no wait for it; an alias call across queues |
 | `Destroyed` | `destroyed` | a stale handle, at the `Device` call it is given to, or at the submit of the encoder it was recorded into, a resource destroyed since the recording included | a handle another device issued that resolves to a live resource |
-| `Pending` | `pending` | `Encoder::reset` while pending; `resize` with a present pending past its wait; `present` behind a wait that no signal made or submitted meets, past `acquire`'s bound; a destroy under a pending submit of any queue; of an image a slot holds; of a block an image is placed in; of a sampler while any submit made before it is pending; `write_buffer`, `read_buffer` and `invalidate_buffer` of a buffer a pending submit writes or moves into `HostRead` | a submit counted pending until the caller has seen its point ("Queues by role") |
+| `Pending` | `pending` | `Encoder::reset` while pending; `resize` with a present pending past its wait; `present` behind a wait that no signal made or submitted meets, past `acquire`'s bound; a destroy under a pending submit of any queue; of an image a slot holds; of a block an image is placed in; of a sampler while any submit made before it is pending; `write_buffer` of a buffer a pending submit writes; `read_buffer` and `invalidate_buffer` of one a pending submit writes or changes the state of | a submit counted pending until the caller has seen its point ("Queues by role") |
 | `Capability` | `capability` | every call that needs an unreported capability; a SPIR-V module whose `OpCapability` or `OpExtension` instructions name one the device did not enable | |
 | `Usage` | `usage` | host access outside the memory class; `buffer_address` without `DEVICE_ADDRESS`; a descriptor no device could honour; every other use outside a usage, a transition into a state the image's usage does not allow included; a pass's attachments; a pipeline's formats, and colour targets past `colour_attachments` | |
 | `Bounds` | `bounds` | host ranges; heap slots; placements; push-constant offsets; copy regions, a buffer offset of a buffer-image copy that is not a multiple of the texel included; the scissor; the viewport, against `viewport_extent` and `viewport_bounds`; the index buffer's offset and the indices a direct draw reads; indirect offsets and strides, their alignment and the records they span; a dispatch's counts against `compute_groups`; a swapchain extent with a zero dimension | |
@@ -948,7 +950,7 @@ driver call it guards:
 | `destroyed` at a call, and at a submit for every handle the encoder recorded | Its resource tables, by handle, whose entries do not move while the device lives (a fixed capacity, or chunks never moved), each live entry behind a lock of its own; the encoder's copy of what each handle it recorded resolved to, with a count, walked again at the submit | One lookup a handle an encoder, under that handle's entry lock, and a count kept to the encoder's reset; the walk the submit makes anyway, over the encoder's distinct handles |
 | `pending`: a reset, a resize, a destroy under a pending submit, a sampler's destroy | The point each queue's last submit is stamped with, taken under the queue's lock in the order its driver receives them, and the completed value of each queue, read from the driver before the lock and folded into the known value of the queue's own timeline ("Queues by role"); for each queue, the caller's points its pending submits signal, a failed submit's dropped with its promises; for each queue, the stamp of its last submit whose driver call has returned; for each resource, the last submit of each queue that names it, three stamps at most, stamped in the walk; a present's fence for each image the swapchain presents | A stamp a handle and queue at the submit; a read before the lock, folded, and a compare at the destroy; where the queue is behind, a compare of the caller's points with their known values, with no driver read; a hold after each submit's driver call |
 | `pending`: an image a slot holds, a block an image is placed in | A count of the slots holding each image and of the images placed in each block | An increment and a decrement |
-| `pending`: `write_buffer`, `read_buffer` and `invalidate_buffer` under a writer | For each buffer, the last submit of each queue that writes it or moves it into `HostRead`, stamped in the walk | A compare a host call |
+| `pending`: `write_buffer` under a writer; `read_buffer` and `invalidate_buffer` under a writer or a transition | For each buffer, the last submit of each queue that writes it, and the last that writes it or changes its state, stamped in the walk | A compare a host call |
 | `state`: a buffer declared in two states | The open pass's declaration, on the encoder | A compare of the declaration's buffers as the pass begins, with no lock |
 | `host-overlap`: overlapping host access, a destroy or a submit that writes under one | For each buffer, the ranges of the host accesses in progress | An insert and a removal a call, and a lookup for each buffer a submit writes, under the record's lock ("Threads") |
 | `uuwp-used`; `heap-layout`'s empty slot and its slot written since the pass began | For each slot, its image, behind the slot's entry lock, and the last submit of each queue that declares it, stamped in the walk; a mark while a write of the slot is in progress, and the image it writes, held; on the encoder, the image each declared slot resolved to when its pass began, counted | A lookup and a compare for each declared slot of each pass at the submit, at most the heap's slots a pass; a lookup for each declared slot as its pass begins, which `rhi-metal` makes for `useResource` anyway |

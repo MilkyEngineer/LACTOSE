@@ -26,6 +26,8 @@ pub(crate) struct Plan {
     buffers: HashMap<BufferHandle, BufferRec>,
     /// The buffers the submit writes.
     written: HashSet<BufferHandle>,
+    /// The buffers the submit transitions.
+    changed: HashSet<BufferHandle>,
     slots: BTreeSet<usize>,
     graphics: HashSet<GraphicsPipelineHandle>,
     compute: HashSet<ComputePipelineHandle>,
@@ -92,6 +94,7 @@ pub(crate) fn check(
             images: HashMap::new(),
             buffers: HashMap::new(),
             written: HashSet::new(),
+            changed: HashSet::new(),
             slots: BTreeSet::new(),
             graphics: HashSet::new(),
             compute: HashSet::new(),
@@ -133,6 +136,10 @@ pub(crate) fn commit(records: &mut Records, plan: Plan, submit: &mut Submit<'_>)
         rec.stamps[queue] = seq;
         if plan.written.contains(&handle) {
             rec.writers[queue] = seq;
+            rec.changed[queue] = seq;
+        }
+        if plan.changed.contains(&handle) {
+            rec.changed[queue] = seq;
         }
         if let Some(slot) = records.buffers.get_mut(handle) {
             *slot = rec;
@@ -334,14 +341,11 @@ impl Replay<'_> {
             }
             self.plan.slots.insert(at);
         }
+        // A buffer declared `ShaderWrite` under a host access is refused at the pass's end,
+        // as a write.
         for reach in buffers {
             let write = reach.state == BufferState::ShaderWrite;
             self.use_buffer(reach.buffer, reach.state, !write)?;
-            if write && !self.buffer(reach.buffer)?.host.is_empty() {
-                return Err(
-                    Rule::HostOverlap.refuse("a submit that writes a buffer during a host access")
-                );
-            }
         }
         Ok(())
     }
@@ -586,11 +590,9 @@ impl Replay<'_> {
             BufferState::Undefined,
             false,
         )?;
-        // The host reads only once the barrier into `HostRead` has run: a host call counts it
-        // a write.
-        if transition.to.state == BufferState::HostRead {
-            self.plan.written.insert(transition.buffer);
-        }
+        // The host reads only once the barrier into `HostRead` has run, and a barrier
+        // touches no bytes: a host read waits for it, a host write does not.
+        self.plan.changed.insert(transition.buffer);
         Ok(())
     }
 

@@ -578,6 +578,7 @@ impl Device for NullDevice {
             sub: Sub::new(BufferState::Undefined),
             stamps: [0; QUEUES],
             writers: [0; QUEUES],
+            changed: [0; QUEUES],
             host: Default::default(),
             unflushed: Default::default(),
             uninvalidated: Default::default(),
@@ -674,8 +675,10 @@ impl Device for NullDevice {
             if rec.host.overlaps(offset, end) {
                 return Err(Rule::HostOverlap.refuse("a host read over a host access in progress"));
             }
-            if records.pending(&rec.writers) {
-                return Err(Rule::Pending.refuse("a host read of a buffer a pending submit writes"));
+            if records.pending(&rec.changed) {
+                return Err(Rule::Pending.refuse(
+                    "a host read of a buffer a pending submit writes or changes the state of",
+                ));
             }
             if rec.sub.state != BufferState::HostRead {
                 return Err(
@@ -717,9 +720,12 @@ impl Device for NullDevice {
         alive(&records)?;
         let rec = records.buffers.live(buffer, "a buffer")?;
         let end = range(offset, len, rec.size, "an invalidate")?;
-        // An invalidate made before the writer runs makes nothing it writes visible.
-        if records.pending(&rec.writers) {
-            return Err(Rule::Pending.refuse("an invalidate of a buffer a pending submit writes"));
+        // An invalidate made before the writer, or the barrier into `HostRead`, runs makes
+        // nothing it writes visible.
+        if records.pending(&rec.changed) {
+            return Err(Rule::Pending.refuse(
+                "an invalidate of a buffer a pending submit writes or changes the state of",
+            ));
         }
         let rec = records.buffers.live_mut(buffer, "a buffer")?;
         rec.uninvalidated.subtract(offset, end);

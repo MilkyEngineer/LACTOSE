@@ -499,7 +499,11 @@ fn destroy_at_once_after_the_wait_is_accepted(ctx: &Ctx<'_>) -> Applies {
         let releaser: &dyn Device = &*device;
         thread::scope(|scope| {
             let release = scope.spawn(move || releaser.signal_timeline(gate.wait));
+            // Bounded, so that a release that wakes no one fails the first round with a
+            // message rather than each round at the wait's end.
+            let began = Instant::now();
             ctx.reached(&*device, gate.done);
+            ctx.check(began.elapsed() < WOKEN, "the release's host signal woke the wait");
             ctx.ok(device.destroy_buffer(source), "a destroy at once after the wait");
             ctx.ok(device.destroy_buffer(destination), "a destroy at once after the wait");
             ctx.ok(

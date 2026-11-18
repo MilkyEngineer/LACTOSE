@@ -252,8 +252,11 @@ pub(crate) struct BufferRec {
     pub(crate) sharing: Sharing,
     pub(crate) sub: Sub<BufferState>,
     pub(crate) stamps: Stamps,
-    /// The last submit of each queue that writes it.
+    /// The last submit of each queue that writes it: what a host write waits for.
     pub(crate) writers: Stamps,
+    /// The last submit of each queue that writes it or changes its state: what a host read
+    /// and an invalidate wait for.
+    pub(crate) changed: Stamps,
     /// Host accesses in progress.
     pub(crate) host: Ranges,
     /// Host-written ranges with no flush since, where memory is not coherent.

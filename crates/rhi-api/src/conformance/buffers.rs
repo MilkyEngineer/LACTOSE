@@ -183,6 +183,32 @@ fn overlapping_host_access_is_refused(ctx: &Ctx<'_>) -> Applies {
         device.write_buffer(buffer, 64, 128, &mut |bytes| bytes.fill(2)),
         "the same write once the first returned",
     );
+    // A read inside a read of the same range, of a readback the device filled.
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &pattern(6));
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let mut encoder = ctx.encoder(&*device, QueueRole::Graphics);
+    copy(&mut *encoder, source, readback);
+    encoder.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        QueueRole::Graphics,
+    )]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, QueueRole::Graphics, &mut [encoder], &[], &[done]);
+    ctx.reached(&*device, done);
+    ctx.ok(device.invalidate_buffer(readback, 0, SIZE), "an invalidate");
+    let mut inner = None;
+    ctx.ok(
+        device.read_buffer(readback, 0, 128, &mut |_| {
+            inner = Some(device.read_buffer(readback, 64, 128, &mut |_| {}));
+        }),
+        "the outer read",
+    );
+    ctx.refused(
+        inner.unwrap_or_else(|| ctx.fail("the read was not called")),
+        "a read overlapping one in progress",
+    );
     Ok(())
 }
 
@@ -292,8 +318,8 @@ fn read_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
         ctx.read(&*device, readback, 0, SIZE) == pattern(2),
         "the read once the writer is seen complete",
     );
-    // A submit that only moves the buffer into `HostRead` is a writer to the host: its
-    // barrier makes the device's writes visible.
+    // A submit that only changes the buffer's state, here into `HostRead`, holds a host read
+    // back too: its barrier makes the device's writes visible.
     let mut encoder = ctx.encoder(&*device, queue);
     encoder.transition_buffers(&[buffer_to(
         readback,
@@ -332,7 +358,8 @@ fn write_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let queue = QueueRole::Graphics;
     let source = ctx.upload(&*device, BufferUsage::EMPTY, &pattern(3));
-    let upload = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Upload);
+    let usage = BufferUsage::COPY_DESTINATION.union(BufferUsage::COPY_SOURCE);
+    let upload = ctx.buffer(&*device, SIZE, usage, MemoryClass::Upload);
     let mut encoder = ctx.encoder(&*device, queue);
     copy(&mut *encoder, source, upload);
     let mut encoders = [encoder];
@@ -345,6 +372,19 @@ fn write_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
     ctx.check(!called, "a refused write lends nothing");
     gate.open(ctx, &*device);
     ctx.write(&*device, upload, 0, &[9; 16]);
+    // A submit that only changes the buffer's state writes none of its bytes: a host write
+    // under it is accepted, as a staging ring's writes under the frames in flight are.
+    let mut mover = ctx.encoder(&*device, queue);
+    mover.transition_buffers(&[buffer_to(
+        upload,
+        BufferState::CopyDestination,
+        BufferState::CopySource,
+        queue,
+    )]);
+    let mut movers = [mover];
+    let gate = ctx.held(&*device, queue, &mut movers);
+    ctx.write(&*device, upload, 16, &[7; 16]);
+    gate.open(ctx, &*device);
     Ok(())
 }
 
@@ -374,6 +414,36 @@ fn submit_writing_under_a_host_access_is_refused(ctx: &Ctx<'_>) -> Applies {
     let done = ctx.point(&*device, 1);
     ctx.submit(&*device, queue, &mut encoders, &[], &[done]);
     ctx.reached(&*device, done);
+    // A pass that declares the buffer `ShaderWrite` writes it as a copy does.
+    let pipeline = ctx.compute(&*device);
+    let usage = BufferUsage::DEVICE_ADDRESS;
+    let reached = ctx.buffer(&*device, SIZE, usage, MemoryClass::Upload);
+    let mut encoder = ctx.encoder(&*device, queue);
+    encoder.transition_buffers(&[buffer_to(
+        reached,
+        BufferState::Undefined,
+        BufferState::ShaderWrite,
+        queue,
+    )]);
+    let reach = [BufferReach { buffer: reached, state: BufferState::ShaderWrite }];
+    compute_pass(&mut *encoder, pipeline, PassReach { slots: &[], buffers: &reach });
+    encoder.dispatch([1, 1, 1]);
+    encoder.end_pass();
+    let mut encoders = [encoder];
+    let mut refused = None;
+    ctx.ok(
+        device.write_buffer(reached, 0, 16, &mut |bytes| {
+            bytes.fill(0);
+            refused = Some(
+                device.submit(queue, Submit { encoders: &mut encoders, waits: &[], signals: &[] }),
+            );
+        }),
+        "the host write",
+    );
+    ctx.refused(
+        refused.unwrap_or_else(|| ctx.fail("the fill was not called")),
+        "a submit whose pass writes the buffer under a host write",
+    );
     Ok(())
 }
 
