@@ -544,43 +544,51 @@ fn roles_on_one_queue_need_no_transfer(ctx: &Ctx<'_>) -> Applies {
     Ok(())
 }
 
-/// Compute reads an image it owns in a submit held pending; graphics then takes it, from
-/// `Undefined`, with no wait for that submit.
+/// Compute reads an image and a buffer it owns in a submit held pending; graphics then
+/// takes either, from `Undefined`, with no wait for that submit. The reader neither writes
+/// nor changes them, and compute's earlier submit that did is seen complete: the take is
+/// refused for the pending read alone.
 fn image_taken_while_another_queue_reads_it_is_refused(ctx: &Ctx<'_>) -> Applies {
     several_queues(ctx)?;
     let device = ctx.device();
     let image = copyable(ctx, &*device);
-    let readback =
-        ctx.buffer(&*device, SIZE * 64, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
-    let mut reader = ctx.encoder(&*device, C);
-    fill(&mut *reader, texels(ctx, &*device), image);
-    reader.transition_images(&[image_to(
+    let source = texels(ctx, &*device);
+    let mut setup = ctx.encoder(&*device, C);
+    fill(&mut *setup, source, image);
+    setup.transition_images(&[image_to(
         image,
         ImageState::CopyDestination,
         ImageState::CopySource,
         C,
     )]);
-    reader.transition_buffers(&[buffer_to(
-        readback,
-        BufferState::Undefined,
-        BufferState::CopyDestination,
-        C,
-    )]);
+    run(ctx, &*device, C, &mut [setup]);
+    let readback =
+        ctx.buffer(&*device, SIZE * 64, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let scratch = copied(ctx, &*device, Sharing::Exclusive);
+    let mut reader = ctx.encoder(&*device, C);
+    reader.transition_buffers(&[
+        buffer_to(readback, BufferState::Undefined, BufferState::CopyDestination, C),
+        buffer_to(scratch, BufferState::Undefined, BufferState::CopyDestination, C),
+    ]);
     reader.copy_image_to_buffer(image, readback, &[whole_image()]);
+    reader.copy_buffer(
+        source,
+        scratch,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
     let mut readers = [reader];
     let gate = ctx.held(&*device, C, &mut readers);
-    // A buffer's take is checked as an image's is: the buffer the reader writes.
     let mut buffer_taker = ctx.encoder(&*device, G);
     buffer_taker.transition_buffers(&[buffer_to(
-        readback,
+        source,
         BufferState::Undefined,
-        BufferState::CopyDestination,
+        BufferState::CopySource,
         G,
     )]);
     let mut buffer_takers = [buffer_taker];
     ctx.refused(
         submit(&*device, G, &mut buffer_takers),
-        "a buffer's take with no wait for the other queue's writer",
+        "a buffer's take with no wait for the other queue's reader",
     );
     let mut taker = ctx.encoder(&*device, G);
     taker.transition_images(&[image_to(
