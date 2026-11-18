@@ -579,7 +579,6 @@ impl Device for NullDevice {
             stamps: [0; QUEUES],
             writers: [0; QUEUES],
             changed: [0; QUEUES],
-            ordered: [0; QUEUES],
             host: Default::default(),
             unflushed: Default::default(),
             uninvalidated: Default::default(),

@@ -269,7 +269,8 @@ fn address_of_a_buffer_without_the_usage_is_refused(ctx: &Ctx<'_>) -> Applies {
 }
 
 /// A readback buffer, written once by a submit seen complete, is read while a second
-/// submit that writes it again is held pending.
+/// submit that writes it again is held pending, and invalidated while a third, which copies
+/// into it with no transition of it, is.
 fn read_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let queue = QueueRole::Graphics;
@@ -322,6 +323,30 @@ fn read_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
         ctx.read(&*device, readback, 0, SIZE) == pattern(2),
         "the read once the writer is seen complete",
     );
+    // A write is a change whether or not its submit transitions the buffer.
+    let mut encoder = ctx.encoder(&*device, queue);
+    encoder.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::HostRead,
+        BufferState::CopyDestination,
+        queue,
+    )]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, queue, &mut [encoder], &[], &[done]);
+    ctx.reached(&*device, done);
+    let mut copier = ctx.encoder(&*device, queue);
+    copier.copy_buffer(
+        source,
+        readback,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+    let mut copiers = [copier];
+    let gate = ctx.held(&*device, queue, &mut copiers);
+    ctx.refused(
+        device.invalidate_buffer(readback, 0, SIZE),
+        "an invalidate under a pending copy that does not transition the buffer",
+    );
+    gate.open(ctx, &*device);
     Ok(())
 }
 

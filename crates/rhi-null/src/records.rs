@@ -205,8 +205,6 @@ pub(crate) struct ImageRec {
     pub(crate) stamps: Stamps,
     /// The last submit of each queue that writes it or changes its state or owner.
     pub(crate) changed: Stamps,
-    /// The submits of each queue an acquire of it ordered after: their changes bind no use.
-    pub(crate) ordered: Stamps,
     /// Heap slots that hold it, the one a write in progress gives it included.
     pub(crate) slots: u32,
     pub(crate) placed: Option<Placed>,
@@ -236,7 +234,6 @@ impl ImageRec {
             subs: vec![Sub::new(ImageState::Undefined); (mips * layers) as usize],
             stamps: [0; QUEUES],
             changed: [0; QUEUES],
-            ordered: [0; QUEUES],
             slots: 0,
             placed,
             active: false,
@@ -263,8 +260,6 @@ pub(crate) struct BufferRec {
     /// The last submit of each queue that writes it or changes its state or owner: what a
     /// host read and an invalidate wait for, and a use on another queue.
     pub(crate) changed: Stamps,
-    /// The submits of each queue an acquire of it ordered after: their changes bind no use.
-    pub(crate) ordered: Stamps,
     /// Host accesses in progress.
     pub(crate) host: Ranges,
     /// Host-written ranges with no flush since, where memory is not coherent.

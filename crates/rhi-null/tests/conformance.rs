@@ -15,7 +15,7 @@ use lactose_rhi_null::{Control, NullDevice};
 
 use crate::{Silent, request};
 
-/// The harness: four capability sets, and the control of each device it made.
+/// The harness: five capability sets, and the control of each device it made.
 #[derive(Default)]
 struct Null {
     /// Each device's control, by the address of the device while it lives.
@@ -225,7 +225,9 @@ cases! {
     roles_on_one_queue_need_no_transfer
     image_taken_while_another_queue_reads_it_is_refused
     use_under_another_queues_pending_write_is_refused
+    use_under_another_queues_pending_transition_is_refused
     use_in_a_later_submit_than_the_waiting_change_is_refused
+    take_of_a_mip_after_an_acquire_of_another_is_refused
     use_waiting_through_another_submit_passes
     acquire_of_a_release_a_retake_ended_is_refused
     read_after_a_retake_of_an_unmet_release_is_refused

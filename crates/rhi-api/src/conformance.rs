@@ -273,7 +273,9 @@ pub const CASES: &[Case] = cases! {
     contract "image_taken_while_another_queue_reads_it_is_refused" => Queue;
     contract "read_of_contents_left_undefined_is_refused" => UndefinedRead;
     contract "use_under_another_queues_pending_write_is_refused" => Queue;
+    contract "use_under_another_queues_pending_transition_is_refused" => Queue;
     contract "use_in_a_later_submit_than_the_waiting_change_is_refused" => Queue;
+    contract "take_of_a_mip_after_an_acquire_of_another_is_refused" => Queue;
     contract "use_waiting_through_another_submit_passes";
     contract "acquire_of_a_release_a_retake_ended_is_refused" => Queue;
     contract "read_after_a_retake_of_an_unmet_release_is_refused" => UndefinedRead;

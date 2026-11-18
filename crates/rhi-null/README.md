@@ -45,10 +45,10 @@ undecided point are bounded at one second.
   it. A host read and an invalidate wait for the second, a host write for the third. The
   `no-qfot` use rule compares the second with what the using submit's own waits order it
   after, through the submits they name and those submits' waits, and not through the
-  earlier submits of its queue. An acquire marks the other queues' changes it ordered the
-  resource after, and those bind no later use. The stamps are of the whole resource, not of
-  each subresource: a `Concurrent` image changed at one mip on one queue holds back a use of
-  another mip on another, and an acquire of one subresource discharges the rest.
+  earlier submits of its queue, their waits or their acquires: an acquire is held to the
+  change rule alone, and every later use waits for itself. The stamps are of the whole
+  resource, not of each subresource: a `Concurrent` image changed at one mip on one queue
+  holds back a use of another mip on another.
 - `read_buffer` reads `Readback` memory, of a buffer in a host-read state, whose written range
   has been invalidated where `coherent_host_memory` is `false` (`unflushed`).
 - A SPIR-V module is checked by its header and its `OpCapability` and `OpExtension`
@@ -106,8 +106,9 @@ walk refuse it `destroyed`, with nothing submitted.
   through a test-only hook (a host signal, a heap write, a host lend, a present's wait),
   among them a second heap write started inside a first, which the heap's lock holds back,
   and host signals landed inside each other's holds in both orders; the present's walk
-  against queues held from running; and the drops that wait, of the swapchain with a present
-  pending and of the device's last handle.
+  against queues held from running; the drops that wait, of the swapchain with a present
+  pending and of the device's last handle; a drop that is not the last, which returns at
+  once; and the drops made while a thread unwinds, none of which waits.
 
 ## Proof
 
