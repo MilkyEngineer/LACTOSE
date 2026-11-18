@@ -8,6 +8,13 @@ publish.workspace = true
 license.workspace = true
 autotests = false
 
+[features]
+# Builds the loom models of the interpolation slot's sequence lock (`src/models.rs`), which
+# run the shipped `Slot` functions over loom's atomics. Run them with
+# `cargo test -p lactose-net-host --features loom --release`. The feature changes nothing
+# the crate ships: the buffer runs on the standard atomics with or without it.
+loom = ["dep:loom"]
+
 [dependencies]
 # `Pod` for the wire-shaped plain data: handles, quantised values, the handshake.
 bytemuck.workspace = true
@@ -23,6 +30,7 @@ lactose-net-api.workspace = true
 lactose-reflect.workspace = true
 # `AssetFailureEvent`, the tick-stamped failure a resync request names; types only.
 lactose-sim.workspace = true
+loom = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The replication model loads regions from cooked baselines through relevance messages.

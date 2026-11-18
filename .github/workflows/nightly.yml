@@ -83,10 +83,10 @@ jobs:
           MIRIFLAGS: ${{ matrix.miriflags }}
 
   # Architecture section 5.1: the scope latch and the sleep-and-wake protocol are modelled
-  # under loom, as is input-host's latest-sample sequence lock (architecture section 5.3),
-  # each switched on by a Cargo feature of its crate and never by a `--cfg` flag in the
-  # environment, which would replace the x86-64 pin. Release, because the models explore
-  # every interleaving.
+  # under loom, as are input-host's latest-sample sequence lock and net-host's interpolation
+  # slot sequence lock (architecture section 5.3), each switched on by a Cargo feature of its
+  # crate and never by a `--cfg` flag in the environment, which would replace the x86-64 pin.
+  # Release, because the models explore every interleaving.
   loom:
     name: loom
     runs-on: ubuntu-latest
@@ -97,6 +97,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p lactose-task --features loom --release --locked
       - run: cargo test -p lactose-input-host --features loom --release --locked
+      - run: cargo test -p lactose-net-host --features loom --release --locked
 
   # SOUR, the determinism harness (architecture section 8.3): every mode, on every platform
   # of architecture mode. Each platform also emits its baseline hashes, which the next job
