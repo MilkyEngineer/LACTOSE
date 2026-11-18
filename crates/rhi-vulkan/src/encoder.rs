@@ -753,7 +753,7 @@ impl Encoder for VulkanEncoder {
                 buffer_scope(transition.from.state),
                 buffer_scope(transition.to.state),
                 (transition.from.queue, transition.to.queue),
-                false,
+                transition.from.state == BufferState::Undefined,
                 object.exclusive,
             );
             let Some(barrier) = convert::barrier(&change, self.side) else { continue };

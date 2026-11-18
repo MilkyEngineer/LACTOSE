@@ -264,8 +264,8 @@ pub const CASES: &[Case] = cases! {
     contract "transition_from_another_state_is_refused" => State;
     contract "use_in_another_state_is_refused" => State;
     contract "use_after_a_write_without_a_transition_is_refused" => State;
-    contract "state_is_kept_for_each_mip_and_layer";
-    contract "state_follows_submission_order_not_recording_order";
+    contract "state_is_kept_for_each_mip_and_layer" => State;
+    contract "state_follows_submission_order_not_recording_order" => State;
     contract "cross_queue_use_without_a_transfer_is_refused" => Queue;
     contract "acquire_without_a_release_is_refused" => Queue;
     contract "release_and_acquire_cross_a_resource";

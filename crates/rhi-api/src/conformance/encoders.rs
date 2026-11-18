@@ -648,7 +648,8 @@ fn copy_regions_overlapping_in_the_destination_are_refused(ctx: &Ctx<'_>) -> App
 
 /// A submit of a good encoder and a bad one is refused: the good one is still recorded,
 /// the state it would have changed is unchanged, and the point it would have signalled is
-/// free for another submit.
+/// free for another submit. The bad one breaks a rule every backend checks, an encoder of
+/// another role, so that the case holds on a device too.
 fn refused_submit_changes_nothing(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let usage =
@@ -669,18 +670,12 @@ fn refused_submit_changes_nothing(ctx: &Ctx<'_>) -> Applies {
         ImageState::SampledRead,
         G,
     )]);
-    let mut bad = ctx.encoder(&*device, G);
-    bad.transition_images(&[image_to(
-        image,
-        ImageState::ColourAttachment,
-        ImageState::CopySource,
-        G,
-    )]);
+    let bad = ctx.encoder(&*device, QueueRole::Compute);
     let mut encoders = [good, bad];
     let done = ctx.point(&*device, 1);
     let refused =
         device.submit(G, Submit { encoders: &mut encoders, waits: &[], signals: &[done] });
-    ctx.refused_by(refused, Rule::State, "a submit with a bad encoder");
+    ctx.refused_by(refused, Rule::Encoding, "a submit with an encoder of another role");
     ctx.check(
         ctx.ok(device.timeline_value(done.timeline), "a read") == 0,
         "a refused submit signals nothing",

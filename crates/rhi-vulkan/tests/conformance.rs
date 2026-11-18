@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::conformance::{self, CASES, Case, CaseKind, Harness, Outcome};
 use lactose_rhi_api::{
-    Capabilities, CookedShader, Device, DeviceRequest, MessageSink, ShaderStage,
+    Capabilities, CookedShader, Device, DeviceRequest, Message, MessageSink, ShaderStage,
 };
 use lactose_rhi_vulkan::VulkanDevice;
 
@@ -19,6 +19,17 @@ use crate::{Counting, request};
 
 /// The harness: the driver's one capability set.
 struct Vulkan;
+
+/// The suite's sink, with each message also written to standard error, so that a failing
+/// case's log shows what it was sent.
+struct Shown(Arc<dyn MessageSink>);
+
+impl MessageSink for Shown {
+    fn message(&self, message: &Message<'_>) {
+        eprintln!("message: {message:?}");
+        self.0.message(message);
+    }
+}
 
 /// The capabilities the driver reports, read once from a device made for the purpose.
 fn reported() -> Capabilities {
@@ -63,7 +74,7 @@ impl Harness for Vulkan {
                 "a Vulkan device with a surface: this run has no window",
             ));
         }
-        Ok(Box::new(VulkanDevice::new(request(messages))?))
+        Ok(Box::new(VulkanDevice::new(request(Arc::new(Shown(messages))))?))
     }
 
     fn device_with_cache(
@@ -72,7 +83,7 @@ impl Harness for Vulkan {
         messages: Arc<dyn MessageSink>,
         cache: Vec<u8>,
     ) -> Result<Box<dyn Device>> {
-        let request = DeviceRequest { pipeline_cache: cache, ..request(messages) };
+        let request = DeviceRequest { pipeline_cache: cache, ..request(Arc::new(Shown(messages))) };
         Ok(Box::new(VulkanDevice::new(request)?))
     }
 
