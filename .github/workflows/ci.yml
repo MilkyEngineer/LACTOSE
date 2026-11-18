@@ -235,3 +235,120 @@ jobs:
           name: sour-output
           path: target/sour
           if-no-files-found: ignore
+
+  # The shader runner of criterion 7 (milestone 2 plan, decision 5.8): the engine's shaders
+  # cooked with the pinned Slang on both hosts, the two hosts' SPIR-V and MSL compared, and
+  # every MSL and metallib made into a pipeline state on macOS, under Metal API and shader
+  # validation with their canaries (`cargo xtask gpu`, tools/xtask/README.md). What the runners
+  # offer is not assumed: each job first records its Xcode, its `metal`, its `swift` and its
+  # system, and a missing one fails the step with a message that names it. Whether a runner has
+  # a Metal device is the Metal step's first line, and none fails it.
+  shaders:
+    name: shaders (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - name: Runner facts
+        shell: bash
+        run: bash tools/xtask/runner-facts.sh target/gpu/facts.txt
+      # The assignment fails the step when the command does; an `echo` of its output would not.
+      - name: Install the pinned Slang
+        id: slang
+        shell: bash
+        run: |
+          slangc=$(cargo xtask slang)
+          echo "slangc=$slangc" >> "$GITHUB_OUTPUT"
+      # On macOS the Metal step's command cooks too: it is what an owner machine runs. A
+      # failure of either cook still lets the tests and the hashes below run and report.
+      - name: Cook and load the engine shaders
+        if: runner.os == 'macOS'
+        run: cargo xtask gpu --driver system
+      - name: Cook the engine shaders
+        if: runner.os != 'macOS'
+        env:
+          SLANGC: ${{ steps.slang.outputs.slangc }}
+        run: >-
+          cargo run --locked --quiet -p lactose-cook --bin ricotta --
+          --slangc "$SLANGC" --code target/gpu/code shaders target/gpu/shaders.pack
+      # The refusals, the two checkouts' paths, the link-time constant and the load from the
+      # pack; the slice measurement is not a check.
+      - name: Shader tests
+        if: success() || failure()
+        run: >-
+          cargo nextest run --locked -p lactose-cook --run-ignored only
+          -E 'not test(the_shader_kind_loads_against_the_slice)'
+      # Every cooked file but the metallibs, which only macOS writes and whose bytes nothing
+      # rests on.
+      - name: Hashes
+        if: success() || failure()
+        shell: bash
+        run: |
+          cd target/gpu/code
+          find . -type f ! -name '*.metallib' -print | LC_ALL=C sort | xargs shasum -a 256 > ../hashes.txt
+          cat ../hashes.txt
+      - uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: shaders-${{ runner.os }}
+          path: |
+            target/gpu/code
+            target/gpu/hashes.txt
+            target/gpu/facts.txt
+            target/gpu/system-metal.txt
+          if-no-files-found: ignore
+
+  shaders-compare:
+    name: shaders (hashes)
+    needs: shaders
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shaders-*
+      - name: The two hosts' SPIR-V and MSL are equal
+        shell: bash
+        run: |
+          if ! diff shaders-Linux/hashes.txt shaders-macOS/hashes.txt; then
+            echo "::error::the SPIR-V or MSL cooked on Linux and on macOS differ (lines above)"
+            exit 1
+          fi
+
+  # The metallibs macOS cooked, loaded on the oldest macOS image the hosted runners offer:
+  # macos-15, since macos-14 left them on 2 November 2026. The script alone, under both
+  # validators; the canaries are `cargo xtask gpu`'s, which ran on the cooking runner.
+  shaders-oldest:
+    name: shaders (oldest macOS)
+    needs: shaders
+    if: ${{ !cancelled() }}
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools/xtask
+      - uses: actions/download-artifact@v4
+        with:
+          name: shaders-macOS
+          path: cooked
+      - name: Runner facts
+        shell: bash
+        run: bash tools/xtask/runner-facts.sh facts.txt
+      - name: Load each metallib and MSL
+        env:
+          MTL_DEBUG_LAYER: "1"
+          MTL_DEBUG_LAYER_WARNING_MODE: nslog
+          MTL_SHADER_VALIDATION: "1"
+          MTL_SHADER_VALIDATION_REPORT_TO_STDERR: "1"
+        run: swift tools/xtask/metal/pipelines.swift cooked/code

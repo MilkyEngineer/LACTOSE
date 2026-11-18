@@ -1,34 +1,44 @@
 # lactose-cook
 
 The asset cooker, binary `ricotta` (architecture sections 2 and 14): a directory of
-authored sources cooked into one pack of SILO's format. At milestone 1 it cooks one kind,
+authored sources cooked into one pack of SILO's format. It cooks two kinds:
 `lactose-anim`'s sim `Skeleton`, from glTF sources read by the cooker's own reader over
-serde_json, through a `Processor` of `asset-api` and `lactose-asset`'s `PackBuilder`.
+serde_json, through a `Processor` of `asset-api`; and from milestone 2 `rhi-api`'s
+`CookedShader`, one for each entry point of a Slang source and each target, compiled by the
+pinned Slang release and on macOS by Apple's `metal`, and checked on what they emitted
+("The shader kind"). Both go into one pack through `lactose-asset`'s `PackBuilder`.
 
 | | |
 |---|---|
 | Tier | leaf |
 | Determinism boundary | outside |
-| Unsafe | none, `#![forbid(unsafe_code)]` in the library and the binary; architecture section 21 lists `tools/cook` for the FFI to Slang and compression libraries, none of which is here yet: `SAFETY.md` |
+| Unsafe | none, `#![forbid(unsafe_code)]` in the library and the binary; architecture section 21 lists `tools/cook` for the FFI to Slang and compression libraries, and Slang runs as a subprocess instead: `SAFETY.md` |
 
-**Status: the milestone 1 skeleton.** One kind, one pack per run. This file is the
-contract of the command line and the source schema; the cooked pack set, the rule by which
-a process mounts what the cooker writes, is `lactose-asset`'s ("The cooked pack set"
-below).
+**Status: two kinds, one pack per run.** The skeleton of milestone 1, and the shader kind
+of milestone 2's `slang` row. This file is the contract of the command line, the source
+schema and the shader checks; the cooked pack set, the rule by which a process mounts what
+the cooker writes, is `lactose-asset`'s ("The cooked pack set" below).
 
 ## Surface
 
 | Item | What it is |
 |---|---|
-| `ricotta SOURCES PACK` | The binary: "The command line" below |
-| `cook(io, sources, pack)` | The cook as a future over the pool, returning a `Published` per asset written; the binary drives it with `Executor::block_on` (D130) |
+| `ricotta [--slangc SLANGC] [--code DIR] SOURCES PACK` | The binary: "The command line" below |
+| `cook(io, sources, pack, shaders)` | The cook as a future over the pool, returning a `Published` per asset written; the binary drives it with `Executor::block_on` (D130) |
 | `Published` | One asset written: its name, its `AssetId` and its `AssetVersion` |
 | `SkeletonProcessor` | The `Processor` of `Skeleton`: a `.gltf` file's bytes in, the skeleton byte form out |
+| `Slang` | The pinned `slangc`, checked by the version it reports, and on macOS `metal` found |
+| `Shaders` | What a cook of shader sources is given: the `Slang`, and an optional directory that also receives each shader's code as a file |
+| `SHADER_KIND` | The shader's `AssetKind`, `AssetKind::from_name("rhi::shader")`; its format version is `COOKED_SHADER_VERSION` |
+| `slang.toml` | The pin: the Slang version and each host's archive and SHA-256, which `cargo xtask slang` installs from (`tools/xtask/README.md`, "slang") |
 
 ## The command line
 
-`ricotta SOURCES PACK`, both required, nothing else accepted (exit 2 and the usage
-otherwise):
+`ricotta [--slangc SLANGC] [--code DIR] SOURCES PACK`, the two paths required and each
+option at most once, before them; nothing else is accepted (exit 2 and the usage otherwise).
+`--slangc` names the pinned `slangc`, which a tree with a shader source needs
+(`NotFound` without it), and `--code` a directory that also receives each cooked shader's
+code ("The shader kind"); `--code` without `--slangc` is refused (`InvalidData`).
 
 - **Sources.** Every regular file under the directory `SOURCES`, at any depth, whose name
   ends in `.gltf` is a source, hidden files included (a `._knight.gltf` a copy left behind
@@ -40,7 +50,8 @@ otherwise):
   (`InvalidData`). So is a name ending in `.gltf` or `.glb` in any other case, `.GLTF` or
   `.Glb` (`InvalidData`, naming the file renamed): the endings are read in lowercase
   alone, so that a source is a source, and its asset's name the same, on every file
-  system. A tree with no source is refused (`NotFound`).
+  system. `.slang` is held to the same rules. A tree with no source is refused
+  (`NotFound`).
 - **Asset names.** An asset's name is its source's path below `SOURCES`, its components
   joined by `/`, with `.gltf` replaced by `.skeleton`: `SOURCES/characters/knight.gltf` is
   `characters/knight.skeleton`, and its ID is `AssetId::from_name` of that name. Where the
@@ -56,6 +67,86 @@ otherwise):
   path concerned, for a source its path below `SOURCES`, and then names the node), and
   exit status 1. A panic prints a crash report and aborts
   (architecture section 5.1).
+
+## The shader kind
+
+Each Slang source cooks to one `CookedShader` for each of its entry points and each target:
+SPIR-V and MSL on every host, and a metallib on macOS (decision 5.8 of the milestone 2
+plan). The format is `rhi-api`'s ("Pipelines and the cooked shader format"); its bytes are
+`CookedShader::encode`'s, under `SHADER_KIND` and `COOKED_SHADER_VERSION`, with no
+dependency.
+
+- **The layout of the sources.** A `.slang` file below `SOURCES` is a shader source, except
+  below `modules/`, which is the import root (`-I modules`) and whose files are cooked only
+  as a source imports them: the engine's heap is `modules/lactose/heap.slang`, imported as
+  `lactose.heap`. `<stem>.link.slang` beside `<stem>.slang` is that shader's link module: it
+  is compiled to a Slang module and linked into every entry point, which is how a link-time
+  constant (`extern static const`) gets its value. A link module with no shader beside it
+  is refused (`InvalidData`).
+- **Asset names.** `<stem>.<entry>.<target>`, the target `spirv`, `msl` or `metallib`:
+  `SOURCES/surface.slang`'s fragment entry `fs_main` is `surface.fs_main.spirv` and so on.
+  The entries are the module's, in byte order of their names. A source with none is refused.
+- **The toolchain.** `slangc` is the one `--slangc` names, never one on the path, and it
+  must report the version `slang.toml` pins (`VersionMismatch` otherwise, which is what the
+  SDK's copy gives). Every call passes `-warnings-as-errors all`, so a warning fails the
+  cook, and `-line-directive-mode none`, so no path reaches the output. SPIR-V is compiled
+  with `-fvk-use-entrypoint-name`. On macOS the MSL is compiled by
+  `xcrun -sdk macosx metal -std=metal3.1 -mmacosx-version-min=14.0 -Werror`, MSL 3.1 for
+  macOS 14, the oldest client.
+- **Where the toolchain writes.** It runs as subprocesses on the thread that polls the
+  cook, in the sources directory, and reads the sources itself, outside the pool. A link
+  module's compiled form and each metallib's MSL are written to a scratch directory of the
+  cook's under the system's temporary directory, removed when the source is cooked: the MSL
+  under the stable name `<file>.<entry>.metal`, since a metallib records its source's file
+  name.
+- **What a shader is cooked from.** The SPIR-V is read back for each entry
+  (`src/spirv.rs`): the stage, the heap's arrays and capacities, the specialisation
+  constants and their lengths, the push-constant bytes, the input attachments and the
+  fragment outputs. The same fields are written for each target of the entry. The MSL is
+  read for its colours and function constants, and the two must agree.
+- **`--code DIR`.** Each shader's code alone, the SPIR-V module, the MSL text or the
+  metallib, is also written to `DIR/<asset name>` once every source has cooked, before the
+  pack, each file replaced by rename. It is what `cargo xtask gpu` and the `shaders` CI job
+  load through Metal.
+
+## The checks
+
+What the format cannot hold is checked on what Slang emitted, not on the source (decision
+5.8; `rhi-api`'s "Pipelines and the cooked shader format"). Each refusal is `InvalidData`
+and names the source, the entry and, where one alone is read, the target; nothing is written.
+
+- **Capabilities.** The SPIR-V declares only `rhi-api`'s list: `Shader`,
+  `PhysicalStorageBufferAddresses`, `Int64`, `ShaderNonUniform`,
+  `SampledImageArrayNonUniformIndexing`, `InputAttachment` and
+  `StorageImageReadWithoutFormat`, and no extension but `SPV_KHR_physical_storage_buffer`.
+  The refusal of `DrawParameters` says it comes from `SV_VertexID` or `SV_InstanceID`, and
+  that `SV_VulkanVertexID` and `SV_VulkanInstanceID` are the engine's; that of
+  `RuntimeDescriptorArray`, that a runtime descriptor array declares it, such as the one
+  behind `DescriptorHandle`.
+- **One entry point** in each module the cook reads back.
+- **The heap.** Set `HEAP_SET` holds an array of 2D sampled images at binding 0 and an array
+  of samplers at binding 1, each of a constant length, which is its capacity in `HeapUse`
+  (`HeapForm::FixedArray`); nothing else is in that set, and an unsized array is refused.
+  Set 0 holds the fragment stage's input attachments alone, input `i` at binding `i`. Any
+  other resource, a uniform or storage buffer among them, is refused: a buffer is reached
+  through its device address in the push block.
+- **Non-uniform access.** Every access chain into the heap, and every load through one,
+  carries the `NonUniform` decoration. So does an access whose index is uniform: the cook
+  cannot tell, and the heap's index is data. An array of the heap loaded whole, stored,
+  copied, or passed through a call, a copy, a conversion, a select or a phi is refused,
+  since the check could not follow it. The marker is `nonuniform_slot` of
+  `modules/lactose/heap.slang`, which is `NonUniformResourceIndex` on SPIR-V and the index
+  itself elsewhere, and is `[ForceInline]`: a helper that is not inlined takes the index
+  as a parameter and the decoration is lost.
+- **Fragment outputs.** Each output has exactly one location, is neither an array nor a
+  struct, and no two share one; the MSL's `[[color(i)]]` must be the same set. Slang gives an
+  output without `[[vk::location(i)]]` location 0 on SPIR-V whatever its `SV_Target<i>`, so a
+  lone `SV_Target1` is refused by the comparison, and the message says to write both.
+- **Inputs and constants.** The input attachments the SPIR-V declares are the MSL's
+  `[[color(i)]]` parameters, and its `SpecId`s, each of one byte for a `bool` or four for a
+  32-bit scalar, are the MSL's `[[function_constant(i)]]`s.
+- **Push bytes.** At most one push-constant block, whose size, a device address counting
+  eight bytes, is at most `PUSH_BYTES_MAX`.
 
 ## The glTF reader
 
@@ -194,7 +285,11 @@ name, with no version the set shadows named in between; how is milestone 3's to 
 ## Determinism
 
 The same sources and the same build write the same bytes: the pack and every asset
-version (`tests/skeleton.rs`).
+version (`tests/skeleton.rs`). For shaders, the same sources, the same pinned Slang and the
+same host write the same SPIR-V and MSL from checkouts at different paths, and no path of
+the machine's reaches a cooked file (`tests/shader.rs`). Whether two cooks write the same
+metallib is recorded by that test and nothing rests on it: the `shaders` CI job compares
+the SPIR-V and MSL of two hosts, and loads the macOS host's metallibs.
 
 - **Directory order.** The sources are listed through `Io::read_dir`, then sorted by their
   paths below `SOURCES` as UTF-8 bytes, and read, cooked and added in that order. No
@@ -218,12 +313,34 @@ version (`tests/skeleton.rs`).
 ## Not in this crate yet
 
 - The other kinds: clips and state machines from glTF animations and the machine's
-  source, meshes, textures, materials, shaders, scenes and collision (architecture
-  section 2's list), and `.glb`.
+  source, meshes, textures, materials, scenes and collision (architecture section 2's
+  list), and `.glb`.
+- For shaders: a compute shader, which the reader takes and `xtask gpu` makes a pipeline
+  of, but which no engine shader is and no test cooks; the Metal buffer indices of the
+  push block and the heap's argument buffer, which the format does not carry (Slang gives
+  them in declaration order, the push block at `[[buffer(0)]]` and the heap at
+  `[[buffer(1)]]` in the engine shader); and the constants' types, which the format
+  carries as lengths.
 - A processor registry and a choice of processor by anything but the `.gltf` ending.
 - Incremental cooks, a cache, and the directory watch of milestone 3 (D153).
 - Dependencies between assets: a skeleton has none, so the cycle check of
   `CookedHeader::dependencies` is the clip processor's to add.
+
+## Proof for milestone 2
+
+The tests that run Slang are ignored, and run once `cargo xtask slang` has installed it:
+`cargo nextest run -p lactose-cook --run-ignored all`, in the `shaders` CI job and by hand.
+
+| Property | Where |
+|---|---|
+| Each refusal decision 5.8 names, on the engine shader mutated: the marker removed; the marker in a helper that is not inlined; `NonUniformResourceIndex` on a `DescriptorHandle`, which Slang only warns of, and the handle with Slang's own marker; a lone `SV_Target1`; `SV_VertexID`; a warning | `tests/shader.rs`, `the_marker_removed_is_refused`, `the_marker_in_a_helper_not_inlined_is_refused`, `non_uniform_resource_index_on_a_descriptor_handle_is_refused_and_so_is_the_handle`, `a_lone_sv_target1_is_refused`, `sv_vertex_id_is_refused`, `a_warning_is_an_error` |
+| A `slangc` of another version, the SDK's among them, and a missing one, are refused; a shader source with no `slangc`, a link module alone and `--code` without `--slangc` are refused | `tests/shader.rs`, `a_slangc_of_another_version_is_refused`, `a_shader_without_slangc_and_a_lone_link_module_are_refused`, `the_binary_refuses_code_without_slangc` |
+| Two checkouts at different paths cook the same SPIR-V and MSL, no cooked file names a path of either checkout or of the temporary directory, and the metallibs' equality is printed | `tests/shader.rs`, `two_checkouts_at_different_paths_cook_the_same_spirv_and_msl_and_name_no_path` |
+| The link-time constant folds into both targets: `discard_fragment` and `OpKill` with it true, neither with it false, and no specialisation constant for it | `tests/shader.rs`, `the_link_time_constant_folds_into_both_targets` |
+| The engine shader cooks to what its code declares, loaded back from the pack through a store: the heap's two arrays and capacities, the constant, the push bytes, the input attachment and each output | `tests/shader.rs`, `the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack` |
+| The shader kind's load against section 5.1's slice (row 136): the store's synchronous call, the version hash and the decode, the median of 101 calls per shader | `tests/shader.rs`, `the_shader_kind_loads_against_the_slice`, with `--release --no-capture` |
+| The SPIR-V reader refuses what is not a module, a capability or an extension off the list, and a module of two entry points | `src/spirv.rs`'s tests |
+| Every cooked MSL and metallib makes a pipeline state with its function constants under Metal API and shader validation, each shown listening by its canary | `cargo xtask gpu --driver system` (`tools/xtask/README.md`, "gpu") |
 
 ## Proof for milestone 1
 

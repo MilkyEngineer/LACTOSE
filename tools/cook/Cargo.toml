@@ -1,6 +1,6 @@
 [package]
 name = "lactose-cook"
-description = "The asset cooker: a directory of authored sources cooked into one pack of the store's format, a sim skeleton from each glTF source at milestone 1."
+description = "The asset cooker: a directory of authored sources cooked into one pack of the store's format, a sim skeleton from each glTF source and a shader from each Slang entry point."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -28,6 +28,9 @@ lactose-io.workspace = true
 lactose-math.workspace = true
 # A bone body's parts and the tolerance of a unit value.
 lactose-physics-api.workspace = true
+# The cooked shader format the shader kind writes, and the heap's form and limits its checks
+# hold Slang's output to (decision 5.8 of the milestone 2 plan).
+lactose-rhi-api.workspace = true
 # `Executor::block_on` drives the pool's futures in the binary (D130).
 lactose-task.workspace = true
 # The glTF reader is the cooker's own, over serde_json; `float_roundtrip` makes every number
@@ -35,6 +38,8 @@ lactose-task.workspace = true
 # selects.
 serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }
+# The Slang pin, `slang.toml`, read for its version.
+toml.workspace = true
 
 # The integration tests as one test binary, whose root declares the files of tests/ as
 # modules (D150).
