@@ -4,13 +4,13 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::kit::{
-    Body, Ctx, EXTENT, WOKEN, attachment, begin, buffer_to, clear, compute_pass, image_desc,
-    image_to, whole_image,
+    Body, Ctx, EXTENT, WOKEN, attachment, begin, buffer_to, clear, compute_pass, image_across,
+    image_desc, image_to, whole_image,
 };
 use crate::{
     BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferUsage, Device,
-    Encoder, Format, ImageState, ImageUsage, Load, MemoryClass, PUSH_BYTES_MAX, PassReach,
-    QueueRole, Rect, Rule, Store, Submit,
+    Encoder, Format, ImageDesc, ImageRange, ImageState, ImageUsage, Load, MemoryClass,
+    PUSH_BYTES_MAX, PassReach, QueueRole, Rect, Rule, Store, Submit,
 };
 
 type Applies = Result<(), &'static str>;
@@ -522,7 +522,7 @@ fn copy_regions_overlapping_in_the_destination_are_refused(ctx: &Ctx<'_>) -> App
     let buffer_copies = [
         ("two regions that share a destination byte", [region(0, 0), region(32, 15)], false),
         ("two regions, the later first, that share one", [region(32, 40), region(0, 32)], false),
-        ("two regions that read one source byte twice", [region(0, 0), region(0, 16)], true),
+        ("two regions, the later first, that read one byte", [region(0, 16), region(0, 0)], true),
     ];
     for (what, regions, accepted) in buffer_copies {
         let mut encoder = ctx.encoder(&*device, G);
@@ -538,7 +538,9 @@ fn copy_regions_overlapping_in_the_destination_are_refused(ctx: &Ctx<'_>) -> App
         }
     }
     let usage = ImageUsage::COPY_DESTINATION.union(ImageUsage::COPY_SOURCE);
-    let image = ctx.image(&*device, &image_desc(Format::Rgba8Unorm, EXTENT, usage));
+    let desc = ImageDesc { layers: 2, ..image_desc(Format::Rgba8Unorm, EXTENT, usage) };
+    let image = ctx.image(&*device, &desc);
+    let layers = ImageRange { layers: 2, ..ImageRange::FIRST };
     let half = u64::from(EXTENT.width / 2 * EXTENT.height * 4);
     let texels = ctx.upload(&*device, BufferUsage::EMPTY, &vec![3; half as usize]);
     let rect = |x| Rect {
@@ -554,17 +556,31 @@ fn copy_regions_overlapping_in_the_destination_are_refused(ctx: &Ctx<'_>) -> App
             BufferState::CopySource,
             G,
         )]);
-        encoder.transition_images(&[image_to(
+        encoder.transition_images(&[image_across(
             image,
-            ImageState::Undefined,
-            ImageState::CopyDestination,
-            G,
+            layers,
+            (ImageState::Undefined, G),
+            (ImageState::CopyDestination, G),
         )]);
         encoder.copy_buffer_to_image(texels, image, regions);
     };
     let mut encoder = ctx.encoder(&*device, G);
     write(&mut *encoder, &[at(0, 0), at(0, EXTENT.width / 4)]);
     ctx.refused(submit(&*device, G, &mut [encoder]), "two regions that share a texel");
+    // Rectangles apart by their rows alone, and one rectangle of two layers, share none.
+    let rows = |y| Rect {
+        x: 0,
+        y,
+        extent: crate::Extent { width: EXTENT.width / 2, height: EXTENT.height / 2 },
+    };
+    let top = BufferImageCopy { rect: rows(0), ..whole_image() };
+    let bottom = BufferImageCopy { rect: rows(EXTENT.height / 2), ..whole_image() };
+    let mut encoder = ctx.encoder(&*device, G);
+    write(&mut *encoder, &[top, bottom]);
+    run(ctx, &*device, &mut [encoder]);
+    let mut encoder = ctx.encoder(&*device, G);
+    write(&mut *encoder, &[at(0, 0), BufferImageCopy { layer: 1, ..at(0, 0) }]);
+    run(ctx, &*device, &mut [encoder]);
     let mut encoder = ctx.encoder(&*device, G);
     write(&mut *encoder, &[at(0, 0), at(0, EXTENT.width / 2)]);
     run(ctx, &*device, &mut [encoder]);

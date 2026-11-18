@@ -217,10 +217,9 @@ fn a_handle_whose_index_another_buffer_took_resolves_nothing() {
     assert_eq!(rule(&refused), Some(Rule::Destroyed), "{refused:?}");
 }
 
-/// The refusals null makes that the contract does not assign every backend, each by the
-/// rule null's README names for it: a copy from a buffer to itself (`usage`), a copy region
-/// of no bytes and an address past its buffer's end (`bounds`), and a destroy of a
-/// swapchain's image (`swapchain`).
+/// Refusals null makes that no contract case provokes, each by the rule null gives it: a
+/// copy from a buffer to itself (`usage`), a copy region of no bytes and an address past
+/// its buffer's end (`bounds`), and a destroy of a swapchain's image (`swapchain`).
 #[test]
 fn the_refusals_null_alone_makes_name_their_rules() {
     let device = device(&Capabilities::LEAST, true);

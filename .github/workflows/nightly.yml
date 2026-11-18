@@ -68,6 +68,12 @@ jobs:
           - name: net-host
             key: net-host
             args: '-p lactose-net-host --test integration -- interpolation::'
+          # The null RHI backend's threads: its races, and the drops that wait for a pending
+          # submit. The whole crate took 28 minutes under Miri on a loaded M1, too near this
+          # job's timeout on a runner of unknown speed, so the entry takes these alone.
+          - name: rhi-null, races and drops
+            key: rhi-null
+            args: '-p lactose-rhi-null -- race racing drop'
     steps:
       - uses: actions/checkout@v4
       # Miri is the one sanctioned use of a nightly toolchain (architecture section 8.3).
