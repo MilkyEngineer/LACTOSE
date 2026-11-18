@@ -19,4 +19,5 @@ mod protocol;
 mod cost;
 mod headless;
 mod schema_record;
+mod shown;
 mod spike;

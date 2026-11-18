@@ -40,6 +40,14 @@ lactose-physics-api.workspace = true
 lactose-physics-rapier.workspace = true
 # The prediction world's owner, its registration and its build check.
 lactose-predict.workspace = true
+# The shown frame: the sink and the snapshot pair its render side is handed, the channel
+# and the publication it drives, and the frame job its own world runs (D162). A foundation
+# crate: it names no renderer and no device.
+lactose-present-api.workspace = true
+# The shown frame: the points and the extent that cross to the render side and the present
+# thread as plain data, and the count of offscreen targets (decision 5.11, D162). A
+# foundation crate of traits and data: no backend is named here.
+lactose-rhi-api.workspace = true
 # The simulation this crate builds and steps, its registration, its frame and its save point.
 lactose-sim.workspace = true
 # The executor, its builder and the pacer: this crate is the timer root.
@@ -54,11 +62,20 @@ tracing.workspace = true
 # The sketch game the headless binary runs, which `tests/headless.rs` links so that its
 # recorded run steps the system that ships (D152).
 game-sim.workspace = true
+# `tests/shown.rs`: the sample the render side latches, which the binary publishes and
+# `lactose-app` never names.
+lactose-input-host.workspace = true
 # The SOUR sketch's body: where it starts, the shape it has, how fast its input steers it.
 lactose-math.workspace = true
 # The compile-only sketches in `tests/` write a game crate the way `game-sim` will: its
 # components through the reflect macros.
 lactose-reflect.workspace = true
+# `tests/shown.rs` alone, compile-only: the render side `lactose-app-client` builds, written
+# over the graph and the renderer as merged, so that `RenderSide` is shown implementable.
+# Both are on `[server_denylist]`, which binds normal and build edges: no library code of
+# this crate names either (D162).
+lactose-render-graph.workspace = true
+lactose-renderer.workspace = true
 
 # The integration tests as one test binary, whose root declares the files of tests/ as
 # modules (D150).

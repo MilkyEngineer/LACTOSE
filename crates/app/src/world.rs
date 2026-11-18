@@ -7,6 +7,7 @@ use lactose_sim::{RegionControl, RegionPolicy};
 
 use crate::runtime::LOG_RETENTION;
 use crate::save::SavedWorld;
+use crate::shown::RECORD_RESERVATION;
 
 /// What the assembly decides for one world: the storage layout, who decides which regions
 /// are loaded, the region policy, the physics configuration and the log retention. The
@@ -45,6 +46,17 @@ impl WorldConfig {
             physics: PhysicsConfig::default(),
             log_retention: LOG_RETENTION,
         }
+    }
+
+    /// The configuration of a shown world: [`headless`](Self::headless) with
+    /// `physics.reserved_workers` set to [`RECORD_RESERVATION`](crate::RECORD_RESERVATION),
+    /// the workers a frame's record keeps while the physics step blocks (`README.md`, "The
+    /// shown frame").
+    #[must_use]
+    pub fn shown() -> Self {
+        let mut config = Self::headless();
+        config.physics.reserved_workers = RECORD_RESERVATION;
+        config
     }
 }
 

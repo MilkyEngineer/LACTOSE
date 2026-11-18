@@ -3,15 +3,19 @@
 //! is the timer root, the owner of the error policy, the place the `dyn` resources are
 //! wired, the client's loop around the prediction world, the server's store of saved
 //! regions, and the save path from the sync point to the slot. The thin binaries
-//! (`app-headless` at milestone 1, `app-client` and `app-server` at milestone 4) link it
-//! and add what one build needs: a platform, a renderer, a transport. Nothing that
-//! renders, presents, pumps a window or plays sound is named here, which is what keeps the
-//! server's denylist satisfiable (D83).
+//! (`app-headless` at milestone 1, `app-client` at milestone 2 with a local world,
+//! `app-server` at milestone 4) link it and add what one build needs: a platform, a
+//! renderer, a transport. No crate that renders, presents, pumps a window or plays sound is
+//! named here, which is what keeps the server's denylist satisfiable (D83): the shown frame
+//! of [`Shown`] drives the render side through `dyn` objects whose traits name
+//! `lactose-rhi-api` and `lactose-present-api` alone, and the binary builds them (D162).
 //!
 //! The README is the contract. `tests/proof/` and `tests/headless.rs` are the milestone 1
 //! proof, the latter with the headless binary's `main` and the SOUR test of the assembly;
 //! `tests/spike.rs` is a compile-only sketch of what the milestone 1 netcode spike writes
-//! against this surface.
+//! against this surface. The shown frame is a facade (`src/shown.rs`), and
+//! `tests/shown.rs` is the compile-only sketch of what `lactose-app-client` and
+//! `frame-impl`'s tests write against it.
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +27,7 @@ mod policy;
 mod runtime;
 mod save;
 mod server;
+mod shown;
 mod world;
 
 pub use client::{Client, ClientError, ClientFrame, ClientOutput, build_client};
@@ -35,6 +40,12 @@ pub use server::{
     FrameOutput, LifecycleFailures, Server, ServerError, ServerFrame, ServerSave, ServerStep,
     StepOutput, build_server,
 };
+pub use shown::{
+    Draw, Finished, FrameCounts, FrameTime, KindCounts, PresentLane, PresentReport, PresentSide,
+    RECORD_RESERVATION, Region, RenderSide, Rendered, Shown, ShownError, ShownFlush, ShownFrame,
+    ShownKept, ShownOutput, ShownStats, ShownStep, ShownStop, Stopped, Submitted, TARGETS,
+    TargetIndex, build_shown,
+};
 pub use world::{Start, WorldConfig};
 
 /// What the contract promises at the type level, pinned so the implementation cannot lose
@@ -43,7 +54,12 @@ pub use world::{Start, WorldConfig};
 /// task that starts the worlds; the server and the client are owned by the timer root's
 /// task, which runs on whichever frame-critical worker picks it up; every run future, every
 /// output and the save future are `Send` for the same reason; the cooked-content stand-in
-/// is shared with background tasks.
+/// is shared with background tasks. For the shown frame: the shown world, its run futures
+/// and what `stop` hands back are `Send` like the server's; the render side is `Send +
+/// Sync + 'static`, which is what a world's service must be; the present side is the
+/// `Send + 'static` state of the present thread, and its lane is `Send + Sync` so the
+/// frame's render task may hold it; every value that crosses to the job or to the present
+/// thread is plain data; and the frame has the two targets rhi-api's minimum names.
 const _: () = {
     const fn send<T: Send>() {}
     const fn send_sync<T: Send + Sync + ?Sized>() {}
@@ -69,4 +85,33 @@ const _: () = {
     send::<ClientOutput>();
     send_sync::<dyn Cooked>();
     copy::<ErrorPolicy>();
+
+    const fn service<T: Send + Sync + ?Sized + 'static>() {}
+    const fn present_state<T: Send + 'static>() {}
+    send::<Shown>();
+    send::<ShownStep<'_>>();
+    send::<ShownFrame<'_>>();
+    send::<ShownFlush>();
+    send::<ShownStop>();
+    send::<ShownOutput>();
+    send::<ShownError>();
+    send::<Stopped>();
+    service::<dyn RenderSide>();
+    service::<Box<dyn RenderSide>>();
+    present_state::<Box<dyn PresentSide>>();
+    send_sync::<PresentLane>();
+    copy::<TargetIndex>();
+    copy::<Region>();
+    copy::<Draw>();
+    copy::<Finished>();
+    copy::<Submitted>();
+    copy::<PresentReport>();
+    copy::<KindCounts>();
+    copy::<FrameCounts>();
+    copy::<Rendered>();
+    copy::<ShownStats>();
+    send_sync::<FrameTime>();
+    assert!(TARGETS >= 2);
+    assert!(TargetIndex::new(TARGETS - 1).is_some() && TargetIndex::new(TARGETS).is_none());
+    assert!(RECORD_RESERVATION >= 1);
 };
