@@ -11,9 +11,9 @@ use std::time::Instant;
 use ash::vk;
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::{
-    CacheIdentity, CacheStart, Capabilities, ComputePipelineDesc, GraphicsPipelineDesc, HEAP_SET,
-    HeapArrayKind, PUSH_BYTES_MAX, PipelineStats, Rule, ShaderStage, ShaderTarget, StageDesc,
-    WriteMask, open_cache, seal_cache,
+    CacheIdentity, CacheStart, Capabilities, ComputePipelineDesc, ConstantValue,
+    GraphicsPipelineDesc, HEAP_SET, HeapArrayKind, PUSH_BYTES_MAX, PipelineStats, Rule,
+    ShaderStage, ShaderTarget, StageDesc, WriteMask, open_cache, seal_cache,
 };
 
 use crate::convert;
@@ -156,26 +156,20 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
         let Some(slot) = shader.constants.iter().find(|slot| slot.id == constant.id) else {
             return Err(invalid(format!("a constant {} the shader does not declare", constant.id)));
         };
-        if constant.bytes.len() != slot.bytes as usize {
+        if constant.value.ty() != slot.ty {
             return Err(invalid(format!(
-                "a constant {} of {} bytes, declared {}",
-                constant.id,
-                constant.bytes.len(),
-                slot.bytes
+                "a constant {} given a value of {:?}, declared {:?}",
+                constant.id, constant.value, slot.ty
             )));
         }
         if desc.constants[..at].iter().any(|other| other.id == constant.id) {
             return Err(invalid(format!("a constant {} given twice", constant.id)));
         }
-        let value = match constant.bytes {
-            [byte] => u32::from(*byte != 0).to_le_bytes(),
-            [a, b, c, d] => [*a, *b, *c, *d],
-            _ => {
-                return Err(invalid(format!(
-                    "a constant {} of neither 1 nor 4 bytes",
-                    constant.id
-                )));
-            }
+        let value = match constant.value {
+            ConstantValue::Bool(value) => vk::Bool32::from(value).to_le_bytes(),
+            ConstantValue::Int(value) => value.to_le_bytes(),
+            ConstantValue::Uint(value) => value.to_le_bytes(),
+            ConstantValue::Float(value) => value.to_le_bytes(),
         };
         entries.push(vk::SpecializationMapEntry {
             constant_id: constant.id,

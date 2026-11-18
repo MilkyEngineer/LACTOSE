@@ -92,8 +92,8 @@ pub use encoder::{
 pub use message::{Message, MessageSink, MessageSource, Severity};
 pub use pipeline::{
     CacheIdentity, CacheStart, ColourTargetDesc, Compare, ComputePipelineDesc,
-    ComputePipelineHandle, Constant, Cull, DepthDesc, GraphicsPipelineDesc, GraphicsPipelineHandle,
-    PipelineStats, StageDesc, WriteMask, open_cache, seal_cache,
+    ComputePipelineHandle, Constant, ConstantValue, Cull, DepthDesc, GraphicsPipelineDesc,
+    GraphicsPipelineHandle, PipelineStats, StageDesc, WriteMask, open_cache, seal_cache,
 };
 pub use resource::{
     AddressMode, BufferDesc, BufferHandle, BufferUsage, Extent, Filter, Format, HeapSlot,
@@ -102,8 +102,9 @@ pub use resource::{
 };
 pub use rule::{Refusal, Rule};
 pub use shader::{
-    COOKED_SHADER_VERSION, ConstantSlot, CookedShader, HEAP_SET, HeapArray, HeapArrayKind,
-    HeapForm, HeapUse, PUSH_BYTES_MAX, ShaderStage, ShaderTarget,
+    COOKED_SHADER_VERSION, ComponentType, ConstantSlot, ConstantType, CookedShader, HEAP_SET,
+    HeapArray, HeapArrayKind, HeapForm, HeapUse, PUSH_BYTES_MAX, ShaderStage, ShaderTarget,
+    VARYING_LOCATIONS, Varying, WORKGROUP_INVOCATIONS_MAX, WORKGROUP_SIZE_MAX, check_varyings,
 };
 pub use state::{
     BufferReach, BufferState, BufferTransition, ImageState, ImageTransition, PassReach, StateOn,

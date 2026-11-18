@@ -11,11 +11,11 @@ use crate::{AddressMode, QueuePath};
 use crate::{
     BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferUsage,
     ColourAttachment, ColourTargetDesc, Compare, ComputePipelineDesc, ComputePipelineHandle,
-    Constant, Cull, DepthAttachment, DepthDesc, Device, Encoder, Extent, Filter, Format,
-    GraphicsPipelineDesc, GraphicsPipelineHandle, HeapSlot, ImageHandle, ImageMemory, ImageRange,
-    ImageState, ImageUsage, IndexedIndirectArgs, Load, MemoryBlockDesc, MemoryClass, PassReach,
-    QueueRole, Rect, RenderPass, SamplerDesc, ShaderStage, StageDesc, Store, Target, Viewport,
-    WriteMask,
+    Constant, ConstantValue, Cull, DepthAttachment, DepthDesc, Device, Encoder, Extent, Filter,
+    Format, GraphicsPipelineDesc, GraphicsPipelineHandle, HeapSlot, ImageHandle, ImageMemory,
+    ImageRange, ImageState, ImageUsage, IndexedIndirectArgs, Load, MemoryBlockDesc, MemoryClass,
+    PassReach, QueueRole, Rect, RenderPass, SamplerDesc, ShaderStage, StageDesc, Store, Target,
+    Viewport, WriteMask,
 };
 
 type Applies = Result<(), &'static str>;
@@ -35,6 +35,10 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     ("declared_reader_follows_a_lagging_writer", declared_reader_follows_a_lagging_writer),
     ("sampler_filters_as_described", sampler_filters_as_described),
     ("specialised_constant_changes_the_output", specialised_constant_changes_the_output),
+    (
+        "specialised_constant_of_each_type_is_read_back",
+        specialised_constant_of_each_type_is_read_back,
+    ),
     ("write_mask_keeps_a_channel", write_mask_keeps_a_channel),
     ("depth_state_orders_two_triangles", depth_state_orders_two_triangles),
     ("warm_cache_hits_every_stage", warm_cache_hits_every_stage),
@@ -52,6 +56,7 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         dispatches_of_one_pass_see_each_others_writes,
     ),
     ("dispatch_indirect_reads_its_counts", dispatch_indirect_reads_its_counts),
+    ("dispatch_runs_workgroups_of_the_shaders_size", dispatch_runs_workgroups_of_the_shaders_size),
     ("each_validator_reports_its_canary", each_validator_reports_its_canary),
 ];
 
@@ -222,7 +227,7 @@ fn pipeline(
     colour: &[(Format, WriteMask)],
     depth: Option<DepthDesc>,
     cull: Cull,
-    constants: &[Constant<'_>],
+    constants: &[Constant],
 ) -> GraphicsPipelineHandle {
     let vertex = ctx.shader(&format!("{source}.vs_main"), ShaderStage::Vertex);
     let fragment = ctx.shader(&format!("{source}.{fragment}"), ShaderStage::Fragment);
@@ -248,12 +253,72 @@ fn simple(ctx: &Ctx<'_>, device: &dyn Device, source: &str) -> GraphicsPipelineH
 
 /// The compute pipeline of `<source>.cs_main`.
 fn kernel(ctx: &Ctx<'_>, device: &dyn Device, source: &str) -> ComputePipelineHandle {
+    specialised_kernel(ctx, device, source, &[])
+}
+
+/// The compute pipeline of `<source>.cs_main`, specialised with `constants`.
+fn specialised_kernel(
+    ctx: &Ctx<'_>,
+    device: &dyn Device,
+    source: &str,
+    constants: &[Constant],
+) -> ComputePipelineHandle {
     let shader = ctx.shader(&format!("{source}.cs_main"), ShaderStage::Compute);
     let desc = ComputePipelineDesc {
         label: "conformance",
-        stage: StageDesc { shader: &shader, constants: &[] },
+        stage: StageDesc { shader: &shader, constants },
     };
     ctx.ok(device.create_compute_pipeline(&desc), "a compute pipeline")
+}
+
+/// Runs `<source>.cs_main`, specialised with `constants`, once over `groups` into a new
+/// device buffer of `words` words that it reaches through the address at push byte 0, the
+/// buffer first filled with `fill`; returns every word of the buffer after the run.
+fn dispatch_into(
+    ctx: &Ctx<'_>,
+    source: &str,
+    constants: &[Constant],
+    groups: [u32; 3],
+    words_of: u32,
+    fill: u32,
+) -> Vec<u32> {
+    let device = ctx.device();
+    let pipeline = specialised_kernel(ctx, &*device, source, constants);
+    let size = u64::from(words_of * 4);
+    let filled: Vec<u8> = (0..words_of).flat_map(|_| fill.to_le_bytes()).collect();
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &filled);
+    let written = ctx.buffer(
+        &*device,
+        size,
+        BufferUsage::DEVICE_ADDRESS
+            .union(BufferUsage::COPY_SOURCE)
+            .union(BufferUsage::COPY_DESTINATION),
+        MemoryClass::Device,
+    );
+    let mut encoder = ctx.encoder(&*device, G);
+    encoder.transition_buffers(&[
+        buffer_to(source, BufferState::Undefined, BufferState::CopySource, G),
+        buffer_to(written, BufferState::Undefined, BufferState::CopyDestination, G),
+    ]);
+    encoder.copy_buffer(
+        source,
+        written,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size }],
+    );
+    encoder.transition_buffers(&[buffer_to(
+        written,
+        BufferState::CopyDestination,
+        BufferState::ShaderWrite,
+        G,
+    )]);
+    let declared = [BufferReach { buffer: written, state: BufferState::ShaderWrite }];
+    compute_pass(&mut *encoder, pipeline, PassReach { slots: &[], buffers: &declared });
+    encoder.push_address(0, written, 0);
+    encoder.dispatch(groups);
+    encoder.end_pass();
+    let out = copy_out(ctx, &*device, &mut *encoder, written, BufferState::ShaderWrite, size);
+    run(ctx, &*device, G, &mut [encoder]);
+    words(&ctx.read(&*device, out, 0, size))
 }
 
 /// Begins a pass over `image`, in `Undefined` before it, cleared to `clear` and stored.
@@ -509,9 +574,10 @@ fn specialised_constant_changes_the_output(ctx: &Ctx<'_>) -> Applies {
     let mut encoder = ctx.encoder(&*device, G);
     let mut outs = Vec::new();
     for (&image, &(red, green)) in targets.iter().zip(&set) {
-        let red = red.to_le_bytes();
-        let green = [u8::from(green)];
-        let constants = [Constant { id: 0, bytes: &red }, Constant { id: 1, bytes: &green }];
+        let constants = [
+            Constant { id: 0, value: ConstantValue::Uint(red) },
+            Constant { id: 1, value: ConstantValue::Bool(green) },
+        ];
         let pipeline = pipeline(
             ctx,
             &*device,
@@ -535,6 +601,60 @@ fn specialised_constant_changes_the_output(ctx: &Ctx<'_>) -> Applies {
     compare(ctx, &pixels(ctx, &*device, outs[1]), "red 50, green false", |_, _| {
         Some([50, 0, 0, 255])
     });
+    Ok(())
+}
+
+fn specialised_constant_of_each_type_is_read_back(ctx: &Ctx<'_>) -> Applies {
+    // `specialised.slang`'s constants: two bools of defaults false and true, an int of 5, a
+    // uint of 2 and a float of 0.25, each given another value; a bool of default true and a
+    // uint of 9 given none.
+    let given = [
+        Constant { id: 0, value: ConstantValue::Bool(true) },
+        Constant { id: 1, value: ConstantValue::Bool(false) },
+        Constant { id: 2, value: ConstantValue::Int(-3) },
+        Constant { id: 3, value: ConstantValue::Uint(7) },
+        Constant { id: 4, value: ConstantValue::Float(1.5) },
+    ];
+    let got = dispatch_into(ctx, "specialised", &given, [1, 1, 1], 8, 0xdead_beef);
+    let expected = [1, 0, (-3i32).cast_unsigned(), 7, 1.5f32.to_bits(), 1, 9, 0xdead_beef];
+    for (at, (have, want)) in got.iter().zip(expected).enumerate() {
+        if *have != want {
+            ctx.fail(format_args!("word {at} is {have:#x}, {want:#x} expected"));
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_runs_workgroups_of_the_shaders_size(ctx: &Ctx<'_>) -> Applies {
+    // `workgroup.slang`: workgroups of (8, 4, 2) over (3, 2, 1) groups cover (24, 8, 2), and
+    // each invocation inside it writes a record of its local id, its global id and its local
+    // index at the record its global id flattens to.
+    const SIZE: [u32; 3] = [8, 4, 2];
+    const BOUNDS: [u32; 3] = [24, 8, 2];
+    const RECORD: u32 = 7;
+    const RECORDS: u32 = BOUNDS[0] * BOUNDS[1] * BOUNDS[2];
+    const TAIL: u32 = 256;
+    // No id or index the shader writes equals it.
+    const SENTINEL: u32 = 0xdead_beef;
+    let got = dispatch_into(ctx, "workgroup", &[], [3, 2, 1], RECORDS * RECORD + TAIL, SENTINEL);
+    for z in 0..BOUNDS[2] {
+        for y in 0..BOUNDS[1] {
+            for x in 0..BOUNDS[0] {
+                let local = [x % SIZE[0], y % SIZE[1], z % SIZE[2]];
+                let index = local[0] + SIZE[0] * (local[1] + SIZE[1] * local[2]);
+                let want = [local[0], local[1], local[2], x, y, z, index];
+                let at = ((x + BOUNDS[0] * (y + BOUNDS[1] * z)) * RECORD) as usize;
+                let have = &got[at..at + RECORD as usize];
+                if have != want {
+                    ctx.fail(format_args!(
+                        "the record of global id ({x}, {y}, {z}) is {have:?}, {want:?} expected"
+                    ));
+                }
+            }
+        }
+    }
+    let tail = &got[(RECORDS * RECORD) as usize..];
+    ctx.check(tail.iter().all(|&word| word == SENTINEL), "the words after the records unwritten");
     Ok(())
 }
 

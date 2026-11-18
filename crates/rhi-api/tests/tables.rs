@@ -1,11 +1,15 @@
 //! The bodies the facade does have: the rule names, the refusal's round trip, the queue
-//! layout, the indirect record and the conformance table's own consistency.
+//! layout, the indirect record, the varyings rule's message, a constant value's equality and
+//! the conformance table's own consistency.
 
 use std::collections::BTreeSet;
 
 use lactose_core::{Error, ErrorKind};
 use lactose_rhi_api::conformance::{CASES, CaseKind};
-use lactose_rhi_api::{IndexedIndirectArgs, QueueLayout, QueuePath, QueueRole, Rule};
+use lactose_rhi_api::{
+    ComponentType, ConstantType, ConstantValue, CookedShader, IndexedIndirectArgs, QueueLayout,
+    QueuePath, QueueRole, Rule, ShaderStage, ShaderTarget, Varying, check_varyings,
+};
 
 #[test]
 fn rule_names_are_distinct_and_kept() {
@@ -139,6 +143,61 @@ const EVERYWHERE: [&str; 64] = [
     "resize_with_a_present_pending_is_refused",
     "image_of_before_a_resize_is_refused",
 ];
+
+/// A stage of `stage` with `varyings`, each a location, a component type and a count.
+fn stage(stage: ShaderStage, varyings: &[(u32, ComponentType, u32)]) -> CookedShader {
+    CookedShader {
+        stage,
+        target: ShaderTarget::SpirV,
+        entry: "main".to_owned(),
+        code: Vec::new(),
+        heap: None,
+        constants: Vec::new(),
+        push_bytes: 0,
+        inputs: 0,
+        outputs: 0,
+        workgroup: None,
+        varyings: varyings
+            .iter()
+            .map(|&(location, component, count)| Varying { location, component, count })
+            .collect(),
+    }
+}
+
+#[test]
+fn varyings_rule_names_what_is_written_at_the_location_read() {
+    use ComponentType::{Float, Int, Uint};
+    let vertex = stage(ShaderStage::Vertex, &[(0, Float, 2), (1, Uint, 1)]);
+    let refused = [
+        (&[(0, Float, 4)], "location 0 as 4 Float, which the vertex stage writes as 2 Float"),
+        (&[(1, Int, 1)], "location 1 as 1 Int, which the vertex stage writes as 1 Uint"),
+        (&[(2, Float, 1)], "location 2 as 1 Float, which the vertex stage does not write"),
+    ];
+    for (read, message) in refused {
+        let error = check_varyings(&vertex, &stage(ShaderStage::Fragment, read)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(error.message().ends_with(message), "{}", error.message());
+    }
+    assert!(check_varyings(&vertex, &stage(ShaderStage::Fragment, &[(1, Uint, 1)])).is_ok());
+}
+
+#[test]
+fn constant_values_are_equal_by_type_and_bits() {
+    assert_eq!(ConstantValue::Float(f32::NAN), ConstantValue::Float(f32::NAN));
+    assert_ne!(ConstantValue::Float(0.0), ConstantValue::Float(-0.0));
+    assert_ne!(ConstantValue::Uint(1), ConstantValue::Int(1));
+    assert_ne!(ConstantValue::Uint(1), ConstantValue::Bool(true));
+    assert_ne!(ConstantValue::Uint(1.5f32.to_bits()), ConstantValue::Float(1.5));
+    let types = [
+        (ConstantValue::Bool(false), ConstantType::Bool),
+        (ConstantValue::Int(-1), ConstantType::Int),
+        (ConstantValue::Uint(1), ConstantType::Uint),
+        (ConstantValue::Float(1.0), ConstantType::Float),
+    ];
+    for (value, ty) in types {
+        assert_eq!(value.ty(), ty);
+    }
+}
 
 #[test]
 fn readme_names_every_case_and_every_device_refusal() {

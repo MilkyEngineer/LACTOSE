@@ -572,8 +572,12 @@ const SHADER: u32 = 1;
 pub(super) const INT64_ATOMICS: u32 = 12;
 
 /// A SPIR-V 1.0 module of one empty entry point `main` for `stage`, declaring `Shader` and
-/// `capabilities`.
-pub(super) fn spirv(stage: ShaderStage, capabilities: &[u32]) -> Vec<u8> {
+/// `capabilities`, whose `LocalSize` is `workgroup` where it is `Some`.
+pub(super) fn spirv(
+    stage: ShaderStage,
+    workgroup: Option<[u32; 3]>,
+    capabilities: &[u32],
+) -> Vec<u8> {
     fn op(words: &mut Vec<u32>, code: u32, operands: &[u32]) {
         words.push(((operands.len() as u32 + 1) << 16) | code);
         words.extend_from_slice(operands);
@@ -591,10 +595,11 @@ pub(super) fn spirv(stage: ShaderStage, capabilities: &[u32]) -> Vec<u8> {
     };
     let main = u32::from_le_bytes(*b"main");
     op(&mut words, 15, &[model, 3, main, 0]); // OpEntryPoint
-    match stage {
-        ShaderStage::Fragment => op(&mut words, 16, &[3, 7]), // OriginUpperLeft
-        ShaderStage::Compute => op(&mut words, 16, &[3, 17, 1, 1, 1]), // LocalSize
-        ShaderStage::Vertex => {}
+    if stage == ShaderStage::Fragment {
+        op(&mut words, 16, &[3, 7]); // OpExecutionMode OriginUpperLeft
+    }
+    if let Some([x, y, z]) = workgroup {
+        op(&mut words, 16, &[3, 17, x, y, z]); // OpExecutionMode LocalSize
     }
     op(&mut words, 19, &[1]); // OpTypeVoid
     op(&mut words, 33, &[2, 1]); // OpTypeFunction
@@ -605,18 +610,22 @@ pub(super) fn spirv(stage: ShaderStage, capabilities: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-/// A cooked SPIR-V stage with no heap and no constants.
+/// A cooked SPIR-V stage with no heap, no constants and no varyings; a compute stage's
+/// workgroup is one invocation, the module's `LocalSize`.
 pub(super) fn cooked(stage: ShaderStage, inputs: u32, outputs: u32) -> CookedShader {
+    let workgroup = (stage == ShaderStage::Compute).then_some([1, 1, 1]);
     CookedShader {
         stage,
         target: ShaderTarget::SpirV,
         entry: "main".to_owned(),
-        code: spirv(stage, &[]),
+        code: spirv(stage, workgroup, &[]),
         heap: None,
         constants: Vec::new(),
         push_bytes: 16,
         inputs,
         outputs,
+        workgroup,
+        varyings: Vec::new(),
     }
 }
 

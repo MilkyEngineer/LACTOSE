@@ -3,9 +3,8 @@
 //! shader interface", is the full statement; the numbers both sides must agree on are the
 //! constants here. [`Renderer::new`](crate::Renderer::new) holds each cooked shader's
 //! reflection to them as far as the cooked format carries it: the stage, the push block's
-//! bytes, the heap, the constants, the inputs and the outputs. The format does not carry
-//! the scatter's workgroup size yet, so [`SCATTER_GROUP`] is the cook's to hold until it
-//! does.
+//! bytes, the heap, the constants, the inputs and the outputs, and the scatter's workgroup,
+//! which the format carries as `CookedShader::workgroup`.
 //!
 //! Every buffer is read through a device address in the pass's push-constant block, and
 //! a shader reads `SV_VulkanVertexID` and `SV_VulkanInstanceID`
@@ -17,10 +16,9 @@ use lactose_rhi_api::{CookedShader, Format};
 /// of `n` entries runs `ceil(n / 64)` groups, and an invocation whose index is `n` or more
 /// does nothing.
 ///
-/// Unchecked: `CookedShader` carries no workgroup size, so `Renderer::new` cannot refuse a
-/// scatter cooked at another, and on native Metal, where the host passes the size with the
-/// dispatch, the backend has none to read. Once the format carries one, `new` refuses a
-/// scatter whose size is not `(SCATTER_GROUP, 1, 1)`.
+/// `CookedShader::workgroup` carries the size, and `Renderer::new` refuses a scatter whose
+/// workgroup is not `(SCATTER_GROUP, 1, 1)`; on native Metal the backend passes it with each
+/// dispatch.
 pub const SCATTER_GROUP: u32 = 64;
 
 /// The bytes of the scatter's push-constant block: the address of the region's first row

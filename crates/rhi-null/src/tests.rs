@@ -214,6 +214,8 @@ fn a_pass_that_begins_during_a_heap_write_is_refused() {
         push_bytes: 0,
         inputs: 0,
         outputs: 0,
+        workgroup: Some([1, 1, 1]),
+        varyings: Vec::new(),
     };
     let desc =
         ComputePipelineDesc { label: "unit", stage: StageDesc { shader: &shader, constants: &[] } };

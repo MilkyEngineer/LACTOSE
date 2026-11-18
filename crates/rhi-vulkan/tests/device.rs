@@ -11,8 +11,8 @@ use std::time::Duration;
 use lactose_rhi_api::{
     BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferReach, BufferState,
     BufferTransition, BufferUsage, CacheStart, ColourTargetDesc, ComputePass, ComputePipelineDesc,
-    ComputePipelineHandle, Constant, Cull, Device, DeviceRequest, Encoder, Extent, Format,
-    GraphicsPipelineDesc, ImageDesc, ImageMemory, ImageRange, ImageState, ImageTransition,
+    ComputePipelineHandle, Constant, ConstantValue, Cull, Device, DeviceRequest, Encoder, Extent,
+    Format, GraphicsPipelineDesc, ImageDesc, ImageMemory, ImageRange, ImageState, ImageTransition,
     ImageUsage, MemoryClass, PassReach, QueueRole, Rect, Sharing, StageDesc, StateOn, Submit,
     TimelinePoint, WriteMask,
 };
@@ -280,8 +280,7 @@ fn engine_shader_makes_its_pipelines() {
     let shader = |name: &str| engine_shader(name).expect("the engine's cooked shaders");
     let (vertex, surface, resolve) =
         (shader("surface.vs_main"), shader("surface.fs_main"), shader("surface.fs_resolve"));
-    let tint = 7u32.to_le_bytes();
-    let constants = [Constant { id: 0, bytes: &tint }];
+    let constants = [Constant { id: 0, value: ConstantValue::Uint(7) }];
     let target = ColourTargetDesc { format: Format::Rgba8Unorm, write_mask: WriteMask::ALL };
     // The resolve reads target 0 as its input, so it may not write it.
     let read = ColourTargetDesc { write_mask: WriteMask::NONE, ..target };
