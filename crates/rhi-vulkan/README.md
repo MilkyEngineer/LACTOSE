@@ -120,13 +120,15 @@ process of its own, under the pinned Khronos validation layer, by decision 5.10'
 
 ## Records
 
-The runs on the M1 (Vulkan SDK 1.4.363.1), each with every message counted:
+The runs on the M1 (macOS 27.2.1, Vulkan SDK 1.4.363.1), each by `cargo xtask gpu` with every
+message counted. Under `system` the loader's first device is MoltenVK's, and the run is
+MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choose between them.
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2 | 130 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363), a record (decision 5.7) | 125 | 49: 30 null alone, 8 no window, 4 no loss, 6 compute shared, every optional draw capability reported | 0 |
-| KosmicKrisp under GPU-assisted validation, a record | 123 | 49, as above | 0 |
+| MoltenVK 1.4.2 | 131 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363), a record (decision 5.7) | 126 | 49: 30 null alone, 8 no window, 4 no loss, 6 compute shared, every optional draw capability reported | 0 |
+| KosmicKrisp under GPU-assisted validation, a record | 124 | 49, as above | 0 |
 
 GPU-assisted validation does not run under MoltenVK 1.4.2: its instrumented shaders fail in
 SPIRV-Cross (a `uint` to `ulong` `reinterpret_cast`). On an Apple GPU the device reports

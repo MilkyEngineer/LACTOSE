@@ -375,7 +375,8 @@ pub struct Run {
 
 /// Variables a run removes from the environment it inherits: each would change which layers
 /// or drivers load, or the layer's settings.
-pub const CLEARED: [&str; 7] = [
+pub const CLEARED: [&str; 8] = [
+    "DYLD_LIBRARY_PATH",
     "VK_INSTANCE_LAYERS",
     "VK_LOADER_LAYERS_ENABLE",
     "VK_LOADER_LAYERS_DISABLE",
@@ -402,8 +403,14 @@ impl Run {
         let [layers, no_layers, shaders] = dirs;
         let path = |path: &Path| path.to_string_lossy().into_owned();
         let mut set: Vec<(String, String)> = Vec::new();
-        let library_path =
-            if cfg!(target_os = "macos") { "DYLD_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
+        // On macOS the fallback path: `DYLD_LIBRARY_PATH` would also redirect a driver the
+        // loader opens by its absolute path to the SDK's copy of the same name, which the
+        // loader reports as a message under `system`, where the drivers are the system's.
+        let library_path = if cfg!(target_os = "macos") {
+            "DYLD_FALLBACK_LIBRARY_PATH"
+        } else {
+            "LD_LIBRARY_PATH"
+        };
         set.push((library_path.to_owned(), path(&sdk.loader)));
         let icd = match driver {
             Driver::Lavapipe => Some(lavapipe_icd(&sdk.icds)?),

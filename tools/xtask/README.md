@@ -687,7 +687,9 @@ driver selects a Vulkan loader's environment and the Metal step uses none.
      `target/vulkan-sdk/`, refused unless its SHA-256 is the pin's (LunarG's published
      digest), and its loader, layer and manifest unpacked; on the Mac the SDK is the one the
      installer put at `VULKAN_SDK`, or at `~/VulkanSDK/<version>/macOS`. The loader is the
-     SDK's (`LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH`);
+     SDK's (`LD_LIBRARY_PATH`, or on macOS `DYLD_FALLBACK_LIBRARY_PATH`, since
+     `DYLD_LIBRARY_PATH` would also load the SDK's copy of a driver the loader opens by its
+     absolute path, and the loader reports the difference);
    - the layer is loaded as an implicit layer, from a copy of its manifest under
      `target/gpu/layers/` that names its library by its absolute path, with `VK_LAYER_PATH`
      set to an empty directory: a layer forced through `VK_INSTANCE_LAYERS` or
