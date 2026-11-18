@@ -1,7 +1,7 @@
 //! What the Vulkan device holds beyond the suite's cases: its creation on the driver the
-//! loader finds, a device-only buffer filled through a staging copy, the pipeline cache's
-//! start from bytes that fail each check and a cache directory that cannot be written, and
-//! each validator's canary. `cargo xtask gpu` runs every canary in a process of its own and
+//! loader finds, a device-only buffer filled through a staging copy, the pipelines of the
+//! engine's shader, the pipeline cache's start from bytes that fail each check and a cache
+//! directory that cannot be written, and each validator's canary. `cargo xtask gpu` runs every canary in a process of its own and
 //! checks that it said its known message and nothing else.
 
 use std::path::Path;
@@ -10,14 +10,15 @@ use std::time::Duration;
 
 use lactose_rhi_api::{
     BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferReach, BufferState,
-    BufferTransition, BufferUsage, CacheStart, ComputePass, ComputePipelineDesc,
-    ComputePipelineHandle, Device, DeviceRequest, Encoder, Extent, Format, ImageDesc, ImageMemory,
-    ImageRange, ImageState, ImageTransition, ImageUsage, MemoryClass, PassReach, QueueRole, Rect,
-    Sharing, StageDesc, StateOn, Submit, TimelinePoint,
+    BufferTransition, BufferUsage, CacheStart, ColourTargetDesc, ComputePass, ComputePipelineDesc,
+    ComputePipelineHandle, Constant, Cull, Device, DeviceRequest, Encoder, Extent, Format,
+    GraphicsPipelineDesc, ImageDesc, ImageMemory, ImageRange, ImageState, ImageTransition,
+    ImageUsage, MemoryClass, PassReach, QueueRole, Rect, Sharing, StageDesc, StateOn, Submit,
+    TimelinePoint, WriteMask,
 };
 use lactose_rhi_vulkan::VulkanDevice;
 
-use crate::{Counting, request, suite_shader};
+use crate::{Counting, engine_shader, request, suite_shader};
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -266,6 +267,38 @@ fn cache_that_fails_a_check_starts_empty() {
 fn identity(sealed: &[u8]) -> lactose_rhi_api::CacheIdentity<'_> {
     let len = u32::from_le_bytes([sealed[8], sealed[9], sealed[10], sealed[11]]) as usize;
     lactose_rhi_api::CacheIdentity(&sealed[12..12 + len])
+}
+
+/// The engine's shader, `shaders/surface.slang`, as the cook wrote it, makes its two
+/// pipelines on the device: its surface with its specialisation constant given, into one
+/// target, and its resolve, which reads target 0 through the local read and writes target 1.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn engine_shader_makes_its_pipelines() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    let shader = |name: &str| engine_shader(name).expect("the engine's cooked shaders");
+    let (vertex, surface, resolve) =
+        (shader("surface.vs_main"), shader("surface.fs_main"), shader("surface.fs_resolve"));
+    let tint = 7u32.to_le_bytes();
+    let constants = [Constant { id: 0, bytes: &tint }];
+    let target = ColourTargetDesc { format: Format::Rgba8Unorm, write_mask: WriteMask::ALL };
+    // The resolve reads target 0 as its input, so it may not write it.
+    let read = ColourTargetDesc { write_mask: WriteMask::NONE, ..target };
+    for (fragment, constants, colour) in
+        [(&surface, &constants[..], &[target][..]), (&resolve, &[][..], &[read, target][..])]
+    {
+        let desc = GraphicsPipelineDesc {
+            label: "engine",
+            vertex: StageDesc { shader: &vertex, constants: &[] },
+            fragment: Some(StageDesc { shader: fragment, constants }),
+            colour,
+            depth: None,
+            cull: Cull::None,
+        };
+        device.create_graphics_pipeline(&desc).expect("a pipeline of the engine's shader");
+    }
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
 }
 
 /// A compute pipeline of the suite's cooked `name`.

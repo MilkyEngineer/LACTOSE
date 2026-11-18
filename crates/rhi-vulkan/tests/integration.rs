@@ -61,13 +61,23 @@ fn request(messages: Arc<dyn MessageSink>) -> DeviceRequest {
 /// the directory `LACTOSE_GPU_SHADERS` names for `shaders/conformance/<source>.slang`'s entry
 /// point and the SPIR-V target.
 fn suite_shader(name: &str) -> Result<CookedShader> {
+    cooked(&format!("conformance/{name}"))
+}
+
+/// The engine's cooked shader `name`, `<source>.<entry>`, of `shaders/<source>.slang`, as
+/// `suite_shader` reads the suite's.
+fn engine_shader(name: &str) -> Result<CookedShader> {
+    cooked(name)
+}
+
+fn cooked(name: &str) -> Result<CookedShader> {
     let Some(dir) = std::env::var_os("LACTOSE_GPU_SHADERS").map(PathBuf::from) else {
         return Err(Error::new(
             ErrorKind::NotFound,
-            "LACTOSE_GPU_SHADERS is not set: the suite's shaders were not cooked",
+            "LACTOSE_GPU_SHADERS is not set: the shaders were not cooked",
         ));
     };
-    let path = dir.join("conformance").join(format!("{name}.spirv"));
+    let path = dir.join(format!("{name}.spirv"));
     let bytes = std::fs::read(&path)
         .map_err(|e| Error::new(ErrorKind::NotFound, format!("{}: {e}", path.display())))?;
     CookedShader::decode(&bytes)

@@ -107,7 +107,8 @@ process of its own, under the pinned Khronos validation layer, by decision 5.10'
   loss, a window or a capability the device does not report, is skipped and says why. The
   output cases read their shaders from `$LACTOSE_GPU_SHADERS`, which `cargo xtask gpu` cooks.
 - `tests/device.rs`: the device's facts, sent nothing when clean; a device-only buffer filled
-  through a staging copy and read back through a copy; each validator's canary, a misuse whose
+  through a staging copy and read back through a copy; the engine's shader,
+  `shaders/surface.slang` as cooked, making its two pipelines, not run; each validator's canary, a misuse whose
   message alone the run must hear (core: an image declared in a state it is not in;
   synchronisation: two copies into one range; GPU-assisted: a shader's read past a buffer, run
   by `--gpu-assisted` alone); a cache that fails a check (a corrupt payload, a truncated file,
