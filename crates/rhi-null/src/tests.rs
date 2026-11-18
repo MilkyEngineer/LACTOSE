@@ -1,10 +1,11 @@
 //! Fixed interleavings: a call made in full between another call's two holds of the
 //! records, at the points the hook of [`Shared`](crate::device::Shared) names; and the
 //! present's walk of the records, against queues that run nothing (`lag`) where a promise
-//! must decide a point the timeline has not reached.
+//! must decide a point the timeline has not reached; and the drops that wait, of the
+//! swapchain and of the device's last handle.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use lactose_core::Result;
@@ -442,4 +443,127 @@ fn a_timeline_destroyed_during_a_present_wait_refuses_the_present() {
             Presented::Shown
         );
     }
+}
+
+/// How long a drop that must wait is given before the test takes it as not waiting.
+const HELD: Duration = Duration::from_millis(300);
+
+/// How long a drop, once what it waits for has run, may take to return.
+const WOKEN: Duration = Duration::from_secs(10);
+
+/// Runs `release` on a thread of its own and reports, through the receiver, when it returns.
+/// Not scoped: a drop that never returns fails the test rather than hanging its join.
+fn dropped(release: impl FnOnce() + Send + 'static) -> mpsc::Receiver<()> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        release();
+        sender.send(()).ok();
+    });
+    receiver
+}
+
+/// A second write of the heap, started between a write's first hold and its slot's write,
+/// does not land before the first write ends ("two writes of the heap never interleave"):
+/// the heap's lock holds it. The write is started from inside the hook and given 200 ms.
+/// Without the lock, two writes of one slot can leave its entry on one image and its record
+/// on the other.
+#[test]
+fn a_heap_write_started_inside_another_waits_for_it() {
+    let device = device(QueueLayout::ONE, false);
+    let (first, second) = (sampled(&device), sampled(&device));
+    let (slot, other) = (HeapSlot(3), HeapSlot(4));
+    let (sender, receiver) = mpsc::channel();
+    let keep = Arc::new(Mutex::new(None));
+    let kept = Arc::clone(&keep);
+    let out = between(&device, Between::HeapWrite, move |twin| {
+        let racer = twin.twin();
+        let sender = sender.clone();
+        *lock(&kept) = Some(std::thread::spawn(move || {
+            let written = racer.write_heap_slot(other, second);
+            sender.send(()).ok();
+            written
+        }));
+        receiver.recv_timeout(Duration::from_millis(200)).is_ok()
+    });
+    device.write_heap_slot(slot, first).expect("the first write");
+    let landed = taken(&device, &out);
+    let racer = lock(&keep).take().expect("the second write was started");
+    racer.join().expect("the second writer").expect("the second write");
+    assert!(!landed, "a second heap write ran to its end inside the first's holds");
+}
+
+/// With the queues running nothing, a present is shown with its submit pending: the
+/// swapchain's drop waits until that submit runs, and returns once it has.
+#[test]
+fn a_swapchain_drop_with_its_present_pending_waits_for_its_submit() {
+    let device = device(QueueLayout::SEVERAL, true);
+    let (mut swapchain, image) = swapchain(&device);
+    lag(&device, true);
+    let mut encoders = [frame(&device, image)];
+    let shown = present(&mut *swapchain, &mut encoders, image, &[]);
+    assert_eq!(shown.expect("a present with its submit lagging"), Presented::Shown);
+    let returned = dropped(move || drop(swapchain));
+    assert!(
+        returned.recv_timeout(HELD).is_err(),
+        "the swapchain's drop returned with its present's submit pending"
+    );
+    lag(&device, false);
+    returned.recv_timeout(WOKEN).expect("the swapchain's drop once the submit ran");
+}
+
+/// The last drop of a device waits until every submit it took has run: with the queues
+/// running nothing, until they run again; with a submit held by a point no one signals,
+/// until the device is lost.
+#[test]
+fn the_last_drop_of_a_device_waits_for_its_pending_submits() {
+    let lagging = device(QueueLayout::ONE, false);
+    let shared = Arc::clone(lagging.shared());
+    lag(&lagging, true);
+    let done = at(lagging.create_timeline(0).expect("a timeline"), 1);
+    submit(&lagging, G, &[], &[done]).expect("a lagging submit");
+    let returned = dropped(move || drop(lagging));
+    assert!(returned.recv_timeout(HELD).is_err(), "the last drop returned with a submit lagging");
+    let mut records = shared.records();
+    records.lag = false;
+    records.run();
+    drop(records);
+    shared.progressed();
+    returned.recv_timeout(WOKEN).expect("the last drop once the submit ran");
+
+    let held = device(QueueLayout::ONE, false);
+    let control = held.control();
+    let gate = at(held.create_timeline(0).expect("a timeline"), 1);
+    submit(&held, G, &[gate], &[]).expect("a held submit");
+    let returned = dropped(move || drop(held));
+    assert!(returned.recv_timeout(HELD).is_err(), "the last drop returned with a submit held");
+    assert!(control.lose(), "the device is still there");
+    returned.recv_timeout(WOKEN).expect("the last drop once the device is lost");
+}
+
+/// Two host signals of one timeline, each landed between the other's two holds round after
+/// round: the one that lands is refused (`timeline`), the other is accepted, and the
+/// timeline ends at its value. The conformance case races the two on threads, where null's
+/// holds are too close for a landing inside them to happen; this fixes it in both orders.
+#[test]
+fn a_host_signal_landed_between_another_host_signals_holds_keeps_the_timeline_growing() {
+    const ROUNDS: u64 = 20;
+    let device = device(QueueLayout::ONE, false);
+    let mut landings = [0; 2];
+    for round in 0..ROUNDS {
+        for (order, landed) in landings.iter_mut().enumerate() {
+            let timeline = device.create_timeline(round).expect("a timeline");
+            let (low, high) = (at(timeline, round + 3), at(timeline, round + 5));
+            let (first, inside) = if order == 0 { (low, high) } else { (high, low) };
+            let out =
+                between(&device, Between::HostSignal, move |twin| twin.signal_timeline(inside));
+            device.signal_timeline(first).expect("the signal whose holds the other lands in");
+            let refused = taken(&device, &out);
+            assert_eq!(rule(&refused), Some(Rule::Timeline), "round {round}: {refused:?}");
+            *landed += 1;
+            let value = device.timeline_value(timeline).expect("a read");
+            assert_eq!(value, first.value, "round {round}: the timeline ends at the accepted");
+            device.destroy_timeline(timeline).expect("a destroy");
+        }
+    }
+    assert_eq!(landings, [ROUNDS; 2], "a landing in every round of each order");
 }

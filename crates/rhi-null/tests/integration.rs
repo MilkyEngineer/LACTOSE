@@ -5,6 +5,7 @@
 
 mod conformance;
 mod null;
+mod wakes;
 
 use std::sync::Arc;
 

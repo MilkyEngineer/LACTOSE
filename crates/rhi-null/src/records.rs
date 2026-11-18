@@ -209,6 +209,9 @@ pub(crate) struct ImageRec {
     /// For a placed image: begun, by an alias call or by a first use where no image that
     /// overlaps it was used, and not ended since by another's alias call.
     pub(crate) active: bool,
+    /// For a placed image: ended by another's alias call, and not begun by one of its own
+    /// since. Kept when the image that ended it is destroyed.
+    pub(crate) ended: bool,
     /// For a placed image: the queue of its last use, `None` before its first.
     pub(crate) used_on: Option<usize>,
     /// For a swapchain image: whether it is the acquired one.
@@ -231,6 +234,7 @@ impl ImageRec {
             slots: 0,
             placed,
             active: false,
+            ended: false,
             used_on: None,
             acquired: swapchain.then_some(false),
         }

@@ -46,7 +46,7 @@ impl NullSwapchain {
         let images = make_images(shared, records, extent)?;
         records.next_swapchain += 1;
         records.swapchain = Some(number);
-        Ok(Self { shared: Arc::clone(shared), number, extent, images, next: 0, acquired: None })
+        Ok(Self { shared: shared.hold(), number, extent, images, next: 0, acquired: None })
     }
 
     /// The queue the present role is served by.
@@ -252,5 +252,7 @@ impl Drop for NullSwapchain {
         if records.swapchain == Some(self.number) {
             records.swapchain = None;
         }
+        drop(records);
+        self.shared.let_go();
     }
 }

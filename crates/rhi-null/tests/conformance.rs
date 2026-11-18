@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::conformance::{self, CASES, Case, CaseKind, Harness, Outcome};
 use lactose_rhi_api::{
-    Capabilities, CookedShader, Device, MessageSink, QueueLayout, QueuePath, ShaderStage,
+    Capabilities, CookedShader, Device, DeviceRequest, MessageSink, QueueLayout, QueuePath,
+    ShaderStage,
 };
 use lactose_rhi_null::{Control, NullDevice};
 
@@ -23,8 +24,10 @@ struct Null {
 
 /// The capability sets the contract needs, between them: one queue and several, each role
 /// on a queue of its own and on the graphics queue, coherent memory and not, memoryless
-/// contents kept across a local read and lost, and each optional capability on and off.
-pub(crate) const SETS: [Capabilities; 4] = [
+/// contents kept across a local read and lost, each optional capability on and off, and
+/// MoltenVK 1.4.2's shape on the M1 (the RHI spike): multi-draw indirect with no count draw,
+/// and memoryless depth alone, lost across a local read.
+pub(crate) const SETS: [Capabilities; 5] = [
     Capabilities::LEAST,
     Capabilities {
         multi_draw_indirect: true,
@@ -44,12 +47,12 @@ pub(crate) const SETS: [Capabilities; 4] = [
     },
     Capabilities {
         multi_draw_indirect: true,
-        indirect_count: true,
         buffer_atomics_64: true,
         coherent_host_memory: false,
         queues: QueueLayout { compute: QueuePath::Shared, present: QueuePath::Own },
         ..Capabilities::LEAST
     },
+    Capabilities { multi_draw_indirect: true, memoryless_depth: true, ..Capabilities::LEAST },
 ];
 
 /// The address a device is known by while it lives.
@@ -85,6 +88,16 @@ impl Harness for Null {
         controls.retain(|(known, _)| *known != at);
         controls.push((at, control));
         Ok(device)
+    }
+
+    fn device_with_cache(
+        &self,
+        set: &Capabilities,
+        messages: Arc<dyn MessageSink>,
+        cache: Vec<u8>,
+    ) -> Result<Box<dyn Device>> {
+        let request = DeviceRequest { pipeline_cache: cache, ..request(set, false, messages) };
+        Ok(Box::new(NullDevice::new(request, *set)?))
     }
 
     fn renders(&self) -> bool {
@@ -165,6 +178,12 @@ cases! {
     CONTRACT, contract:
     capabilities_are_fixed
     unreported_capability_is_refused
+    buffer_declared_in_two_states_is_refused
+    read_of_contents_left_undefined_is_refused
+    waits_are_woken_by_the_submit_that_reaches_them
+    wait_is_woken_by_a_host_signal
+    wait_is_woken_by_a_loss
+    pending_encoder_drop_waits_for_its_submit
     roles_resolve_as_the_layout_reports
     submit_to_the_present_role_is_refused
     buffer_write_then_copy_then_read_returns_the_bytes

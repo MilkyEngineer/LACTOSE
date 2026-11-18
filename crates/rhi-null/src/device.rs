@@ -2,7 +2,7 @@
 //! `Device`.
 
 use core::time::Duration;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
@@ -121,6 +121,8 @@ pub(crate) struct ComputeObj;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Between {
     HostSignal,
+    /// Between a heap write's first hold and its slot's write. The closure runs under the
+    /// heap's lock: it may submit, but may not write the heap, which would wait on itself.
     HeapWrite,
     HostLend,
     /// A present's wait for an undecided point, with no lock held.
@@ -134,6 +136,10 @@ pub(crate) enum Between {
 /// table or a heap slot's (`slots`); then a buffer's bytes. Recording takes an entry's lock
 /// alone. No lock is held across a wait or the caller's closure: a wait on `progress`
 /// gives the records' lock up while it waits.
+///
+/// One test-only exception: a unit test's [`Between::HeapWrite`] closure submits under the
+/// heap's lock, so holds the heap's and then a queue's. No cycle can form: nothing takes
+/// the heap's lock while it holds a queue's, since a submit and a present write no slot.
 pub(crate) struct Shared {
     pub(crate) caps: Capabilities,
     info: DeviceInfo,
@@ -147,6 +153,10 @@ pub(crate) struct Shared {
     /// device is lost.
     pub(crate) progress: Condvar,
     lost: AtomicBool,
+    /// The device objects, encoders and swapchains that hold the device. Counted apart from
+    /// the `Arc`'s count, which a call's own clone raises too, so that exactly one drop finds
+    /// itself the last.
+    holders: AtomicUsize,
     pub(crate) buffers: Table<BufferObj>,
     pub(crate) images: Table<ImageObj>,
     pub(crate) graphics: Table<GraphicsObj>,
@@ -166,6 +176,27 @@ pub(crate) struct Shared {
 impl Shared {
     pub(crate) fn records(&self) -> MutexGuard<'_, Records> {
         lock(&self.records)
+    }
+
+    /// A new holder of the device: an encoder, the swapchain, or a second device object.
+    pub(crate) fn hold(self: &Arc<Self>) -> Arc<Self> {
+        // Relaxed: the count decides only which drop is the last, which its RMW alone
+        // settles; what that drop waits for is read under the records' lock.
+        self.holders.fetch_add(1, Ordering::Relaxed);
+        Arc::clone(self)
+    }
+
+    /// A holder's drop. The last waits, as the contract's last drop does, until every
+    /// submit the device has taken has run or the device is lost; not while the thread
+    /// unwinds a panic.
+    pub(crate) fn let_go(&self) {
+        if self.holders.fetch_sub(1, Ordering::Relaxed) != 1 || std::thread::panicking() {
+            return;
+        }
+        let mut records = self.records();
+        while !records.lost && records.queues.iter().any(|queue| queue.ran + 1 < queue.next) {
+            records = self.wait(records, None);
+        }
     }
 
     /// Wakes every call that waits on the records.
@@ -288,6 +319,7 @@ impl NullDevice {
             records: Mutex::new(Records::new(caps.heap_slots, caps.samplers, cache, stages)),
             progress: Condvar::new(),
             lost: AtomicBool::new(false),
+            holders: AtomicUsize::new(1),
             buffers: Table::new(),
             images: Table::new(),
             graphics: Table::new(),
@@ -317,7 +349,7 @@ impl NullDevice {
     /// A second handle to the same device, for a unit test's hook to call it with.
     #[cfg(test)]
     pub(crate) fn twin(&self) -> Self {
-        Self { shared: Arc::clone(&self.shared) }
+        Self { shared: self.shared.hold() }
     }
 
     fn records(&self) -> MutexGuard<'_, Records> {
@@ -384,6 +416,7 @@ impl Drop for NullDevice {
         // The stall is the device's: a device dropped while stalled is unstalled first, so
         // the swapchain and the encoders it leaves never wait on a hold no one will lift.
         let _unstalled = Control { shared: Arc::downgrade(&self.shared) }.stall(false);
+        self.shared.let_go();
     }
 }
 
@@ -402,6 +435,8 @@ impl Control {
         let Some(shared) = self.shared.upgrade() else { return false };
         let mut records = shared.records();
         records.lost = true;
+        // The flag is read by `is_lost` alone, which promises nothing about what else it
+        // sees: Relaxed would do, and every call that acts on a loss reads the records'.
         shared.lost.store(true, Ordering::Release);
         drop(records);
         shared.progressed();
@@ -517,6 +552,7 @@ impl Device for NullDevice {
     }
 
     fn is_lost(&self) -> bool {
+        // Pairs with `lose`'s store, though nothing is read through it (see there).
         self.shared.lost.load(Ordering::Acquire)
     }
 
@@ -679,8 +715,13 @@ impl Device for NullDevice {
     fn invalidate_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()> {
         let mut records = self.records();
         alive(&records)?;
-        let rec = records.buffers.live_mut(buffer, "a buffer")?;
+        let rec = records.buffers.live(buffer, "a buffer")?;
         let end = range(offset, len, rec.size, "an invalidate")?;
+        // An invalidate made before the writer runs makes nothing it writes visible.
+        if records.pending(&rec.writers) {
+            return Err(Rule::Pending.refuse("an invalidate of a buffer a pending submit writes"));
+        }
+        let rec = records.buffers.live_mut(buffer, "a buffer")?;
         rec.uninvalidated.subtract(offset, end);
         Ok(())
     }
@@ -874,7 +915,7 @@ impl Device for NullDevice {
     fn pipeline_cache(&self) -> Result<Vec<u8>> {
         let records = self.records();
         alive(&records)?;
-        Ok(pipeline::seal(&records.pipelines.stages))
+        pipeline::seal(&records.pipelines.stages)
     }
 
     fn pipeline_stats(&self) -> PipelineStats {
@@ -950,7 +991,7 @@ impl Device for NullDevice {
 
     fn create_encoder(&self, queue: QueueRole, _label: &str) -> Result<Box<dyn Encoder>> {
         alive(&self.records())?;
-        Ok(Box::new(NullEncoder::new(Arc::clone(&self.shared), queue)))
+        Ok(Box::new(NullEncoder::new(self.shared.hold(), queue)))
     }
 
     fn submit(&self, queue: QueueRole, submit: Submit<'_>) -> Result<()> {

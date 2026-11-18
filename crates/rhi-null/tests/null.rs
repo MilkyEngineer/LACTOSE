@@ -126,6 +126,47 @@ fn a_read_of_a_written_range_needs_an_invalidate_where_memory_is_not_coherent() 
             part.expect("a read of the invalidated part");
             let rest = device.read_buffer(readback, 0, 16, &mut |_| {});
             assert_eq!(rule(&rest), Some(Rule::Unflushed), "{rest:?}");
+            // An invalidate made while the copy is pending is refused, and so is not taken
+            // for the invalidate after it: the read once the copy has run still needs one.
+            device.invalidate_buffer(readback, 0, SIZE).expect("an invalidate of the rest");
+            let mut encoder =
+                device.create_encoder(QueueRole::Graphics, "null").expect("an encoder");
+            encoder.transition_buffers(&[on_graphics(
+                readback,
+                BufferState::HostRead,
+                BufferState::CopyDestination,
+            )]);
+            encoder.copy_buffer(
+                source,
+                readback,
+                &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+            );
+            encoder.transition_buffers(&[on_graphics(
+                readback,
+                BufferState::CopyDestination,
+                BufferState::HostRead,
+            )]);
+            let (gate, done) = (point(&device, 1), point(&device, 1));
+            // Kept past the gate: the drop of a pending encoder waits for its submit.
+            let mut encoders = [encoder];
+            device
+                .submit(
+                    QueueRole::Graphics,
+                    Submit { encoders: &mut encoders, waits: &[gate], signals: &[done] },
+                )
+                .expect("a held copy");
+            let early = device.invalidate_buffer(readback, 0, SIZE);
+            assert_eq!(
+                rule(&early),
+                Some(Rule::Pending),
+                "an invalidate under the copy: {early:?}"
+            );
+            device.signal_timeline(gate).expect("the gate");
+            reached(&device, done);
+            let read = device.read_buffer(readback, 0, SIZE, &mut |_| {});
+            assert_eq!(rule(&read), Some(Rule::Unflushed), "the read after the copy: {read:?}");
+            device.invalidate_buffer(readback, 0, SIZE).expect("the invalidate after the copy");
+            device.read_buffer(readback, 0, SIZE, &mut |_| {}).expect("the read after it");
         }
     }
 }
@@ -268,6 +309,7 @@ fn submits_on_two_queues_race_a_present() {
                 start.wait();
                 let waits = [TimelinePoint { timeline: frames, value: round }];
                 let signals = [TimelinePoint { timeline: presented, value: round }];
+                let mut refused = 0;
                 loop {
                     let submit =
                         Submit { encoders: &mut encoders, waits: &waits, signals: &signals };
@@ -277,8 +319,17 @@ fn submits_on_two_queues_race_a_present() {
                             break;
                         }
                         // A loaded machine may keep the graphics thread past the bound:
-                        // the caller retries.
-                        Err(error) if Rule::of(&error) == Some(Rule::Pending) => refusals += 1,
+                        // the caller retries. Three bounds in a row are no load: the frame
+                        // submit is kept out, as by a present that waits under the lock.
+                        Err(error) if Rule::of(&error) == Some(Rule::Pending) => {
+                            refusals += 1;
+                            refused += 1;
+                            assert!(
+                                refused < 3,
+                                "round {round} under {queues:?}: the present was refused past \
+                                 its bound {refused} times: {error}"
+                            );
+                        }
                         Err(error) => panic!("round {round} under {queues:?}: {error}"),
                     }
                 }

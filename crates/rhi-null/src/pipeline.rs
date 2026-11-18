@@ -56,7 +56,7 @@ pub(crate) fn open(bytes: &[u8]) -> (CacheStart, HashSet<u64>) {
 }
 
 /// The cache's bytes: its stage keys, in order, sealed.
-pub(crate) fn seal(stages: &HashSet<u64>) -> Vec<u8> {
+pub(crate) fn seal(stages: &HashSet<u64>) -> Result<Vec<u8>> {
     let mut keys: Vec<u64> = stages.iter().copied().collect();
     keys.sort_unstable();
     let payload: Vec<u8> = keys.iter().flat_map(|key| key.to_le_bytes()).collect();
@@ -129,7 +129,7 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
     if shader.push_bytes > PUSH_BYTES_MAX {
         return Err(invalid(format!("a push-constant block of {} bytes", shader.push_bytes)));
     }
-    let mut bytes = shader.encode();
+    let mut bytes = shader.encode()?;
     for constant in desc.constants {
         bytes.extend_from_slice(&constant.id.to_le_bytes());
         bytes.extend_from_slice(constant.bytes);
@@ -199,6 +199,13 @@ pub(crate) fn graphics(
     }
     let (inputs, outputs) =
         desc.fragment.map_or((0, 0), |fragment| (fragment.shader.inputs, fragment.shader.outputs));
+    if desc.colour.len() > caps.colour_attachments as usize {
+        return Err(Rule::Usage.refuse(format!(
+            "a pipeline of {} colour targets, past the {} the device reports",
+            desc.colour.len(),
+            caps.colour_attachments
+        )));
+    }
     let mut writes = 0;
     for (at, target) in desc.colour.iter().enumerate() {
         if target.format.is_depth() {

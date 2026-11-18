@@ -24,6 +24,8 @@ static GENERATION: AtomicU32 = AtomicU32::new(1);
 /// A generation no handle of any null device has had yet, wrapping past zero.
 pub(crate) fn generation() -> NonZeroU32 {
     loop {
+        // Relaxed: a generation needs only to be unique, which the RMW gives; no other
+        // memory is published through it.
         if let Some(generation) = NonZeroU32::new(GENERATION.fetch_add(1, Ordering::Relaxed)) {
             return generation;
         }

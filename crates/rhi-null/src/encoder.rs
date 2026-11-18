@@ -259,6 +259,13 @@ impl NullEncoder {
         let declared = self.declare_buffers(reach.buffers)?;
         let mut buffers = reach.buffers.to_vec();
         buffers.sort_unstable_by_key(|reach| (reach.buffer.index(), reach.buffer.generation()));
+        if buffers
+            .windows(2)
+            .any(|two| two[0].buffer == two[1].buffer && two[0].state != two[1].state)
+        {
+            self.fail(Rule::State, "a pass that declares one buffer in two states");
+            return None;
+        }
         buffers.dedup_by_key(|reach| reach.buffer);
         Some((slots, buffers, declared))
     }
@@ -348,14 +355,15 @@ impl NullEncoder {
 
 impl Drop for NullEncoder {
     fn drop(&mut self) {
-        let Some((queue, seq)) = self.submitted else { return };
-        if std::thread::panicking() {
-            return;
+        if let Some((queue, seq)) = self.submitted
+            && !std::thread::panicking()
+        {
+            let mut records = self.shared.records();
+            while !records.lost && records.queues[queue].ran < seq {
+                records = self.shared.wait(records, None);
+            }
         }
-        let mut records = self.shared.records();
-        while !records.lost && records.queues[queue].ran < seq {
-            records = self.shared.wait(records, None);
-        }
+        self.shared.let_go();
     }
 }
 
@@ -397,6 +405,17 @@ impl Encoder for NullEncoder {
                 && range.layer.checked_add(range.layers).is_some_and(|end| end <= object.layers);
             if !inside {
                 self.fail(Rule::Bounds, "a transition of mips or layers the image does not have");
+                return;
+            }
+            let needs = state_usage(transition.to.state);
+            if !object.usage.contains(needs) {
+                self.fail(
+                    Rule::Usage,
+                    format!(
+                        "a transition to {:?} of an image without {needs:?}",
+                        transition.to.state
+                    ),
+                );
                 return;
             }
         }
@@ -964,6 +983,12 @@ impl NullEncoder {
             let len = u64::from(rect.extent.width)
                 * u64::from(rect.extent.height)
                 * u64::from(image.format.texel_bytes());
+            // Vulkan's VUIDs 07975 and 07978: a multiple of the texel, which is 4 bytes of a
+            // depth format too.
+            if !region.buffer_offset.is_multiple_of(u64::from(image.format.texel_bytes())) {
+                self.fail(Rule::Bounds, "a copy's buffer offset not a multiple of its texel");
+                return None;
+            }
             let Ok(end) = range(region.buffer_offset, len, buffer.size, "a copy's buffer side")
             else {
                 self.fail(Rule::Bounds, "a copy's rows outside its buffer");
@@ -973,6 +998,20 @@ impl NullEncoder {
             ranges.push((region.buffer_offset, end));
         }
         Some((subresources, ranges))
+    }
+}
+
+/// The usage an image needs for a transition to `state`: Vulkan's layout of each is valid
+/// only for an image with it.
+const fn state_usage(state: ImageState) -> ImageUsage {
+    match state {
+        ImageState::Undefined | ImageState::Present => ImageUsage::EMPTY,
+        ImageState::ColourAttachment => ImageUsage::COLOUR,
+        ImageState::LocalRead => ImageUsage::COLOUR.union(ImageUsage::INPUT),
+        ImageState::DepthAttachment => ImageUsage::DEPTH,
+        ImageState::SampledRead => ImageUsage::SAMPLED,
+        ImageState::CopySource => ImageUsage::COPY_SOURCE,
+        ImageState::CopyDestination => ImageUsage::COPY_DESTINATION,
     }
 }
 

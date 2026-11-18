@@ -349,10 +349,9 @@ impl Replay<'_> {
     /// A draw's or dispatch's read of every declared slot's image.
     fn read_slots(&mut self) -> Result<()> {
         let slots = self.pass.as_ref().map(|pass| pass.slots.clone()).unwrap_or_default();
-        for (slot, image) in slots {
-            let Some(image) = image else {
-                return Err(Rule::HeapLayout.refuse(format!("slot {} declared and empty", slot.0)));
-            };
+        for (_, image) in slots {
+            // An empty slot is the encoder's breach: its draw or dispatch recorded nothing.
+            let Some(image) = image else { continue };
             let rec = self.image(image)?;
             let (mips, layers) =
                 (rec.mips, u32::try_from(rec.subs.len()).unwrap_or(u32::MAX) / rec.mips);
@@ -430,6 +429,12 @@ impl Replay<'_> {
         let queue = self.queue;
         let rec = self.image(handle)?;
         let Some(placed) = rec.placed else { return Ok(()) };
+        if rec.ended {
+            return Err(Rule::Alias.refuse(
+                "a placed image used after another image's alias call ended it, with no alias call \
+                 of its own since",
+            ));
+        }
         if !rec.active {
             let held = self
                 .overlapping(handle, placed)
@@ -469,21 +474,28 @@ impl Replay<'_> {
             return Err(Rule::Usage.refuse("an alias call of an image not placed in a block"));
         };
         let others = self.overlapping(handle, placed);
-        for &other in &others {
-            if self.peek(other).and_then(|rec| rec.used_on).is_some_and(|used| used != queue) {
+        // The image itself too: an alias call moves it onto this queue, which a use pending
+        // on another must not see.
+        for &image in others.iter().chain([&handle]) {
+            if self.peek(image).and_then(|rec| rec.used_on).is_some_and(|used| used != queue) {
                 return Err(Rule::Queue.refuse(
-                    "an alias call on another queue than the one the images it ends were used on",
+                    "an alias call on another queue than the one its images were used on",
                 ));
             }
         }
+        // An image ended before stays ended, and one never begun stays unbegun: neither is
+        // taken into the plan.
         for other in others {
             if self.peek(other).is_some_and(|rec| rec.active) {
-                self.image(other)?.active = false;
+                let rec = self.image(other)?;
+                rec.active = false;
+                rec.ended = true;
             }
         }
         let owner = exclusive(self.image(handle)?.sharing).then_some(queue);
         let rec = self.image(handle)?;
         rec.active = true;
+        rec.ended = false;
         rec.used_on = Some(queue);
         for sub in &mut rec.subs {
             *sub = Sub { owner, ..Sub::new(ImageState::Undefined) };
@@ -574,6 +586,11 @@ impl Replay<'_> {
             BufferState::Undefined,
             false,
         )?;
+        // The host reads only once the barrier into `HostRead` has run: a host call counts it
+        // a write.
+        if transition.to.state == BufferState::HostRead {
+            self.plan.written.insert(transition.buffer);
+        }
         Ok(())
     }
 
