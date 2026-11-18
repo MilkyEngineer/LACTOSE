@@ -173,17 +173,26 @@ Step 1 for the next frame may come any time after step 3.
   remote batch, applied after them, gives those that still exist new slots.
 - **One remote batch a frame.** A region holds several frames' batches where a frame did
   not prepare, or its `prepare` was refused. `prepare` applies the last batch the region
-  holds, and that one only where it is whole (its end note is in the region), no `Client`
-  pass began after it, and the `Client` kind is not lost in the frame. Every other batch of
-  the region is left out, its rows counted in `FrameStats::remote_rows` and nowhere else:
-  the batch applied writes every remote instance again. So a batch is never applied over
-  the removals of a `Client` pass that began after it, which would bring back an instance
-  despawned since and count nothing. A lost `Client` kind applies no batch, since a loss
-  has no place in the region to order it by: a pass lost for want of room may have left no
-  note, and one lost with no region open is in no region. The remote instances are then
-  missing until the next frame's batch, as after a batch with no room ("Writers"). Which
-  batch is applied follows from the order the region holds the `Client` passes and the
-  batches in, which is the program's, and from which kinds are lost.
+  holds, and that one only where it is whole (its end note is in the region), no note of a
+  `Client` pass (its `begin`, its `end` or a removed key) lies after the batch's opening,
+  and the `Client` kind is not lost in the frame. Every other batch of the region is left
+  out: the batch applied writes every remote instance again. So a batch is never applied
+  over the removals of a `Client` pass that began after it, which would bring back an
+  instance despawned since and count nothing, nor over those of a `Client` pass it
+  overlapped, which a frame that breaks its ordering ("At once") makes: in either order
+  of their beginnings that batch is left out. A lost `Client` kind applies no batch, since
+  a loss has no place in the region to order it by: a pass lost for want of room may have
+  left no note, and one lost with no region open is in no region. The remote instances
+  are then missing until the next frame's batch, as after a batch with no room
+  ("Writers"). Which batch is applied follows from the order the region holds the
+  `Client` passes and the batches in, which is the program's, and from which kinds are
+  lost.
+- **What a batch that is not applied counts.** A remote batch that is not applied,
+  whichever the reason (another batch is the region's last, a `Client` note lies after its
+  opening, the kind is lost, or its end note is missing), counts its written rows in
+  `FrameStats::remote_rows` alone. `FrameStats::dropped` counts only the rows a writer
+  could not write: those that found no room, those written with no region open and those
+  the device refused, never a written row. "Writers" and `RemoteWriter` follow this rule.
 - `SlotTable::extent` is one more than the highest held slot. The lowest-free rule keeps it
   near `live`.
 - The same passes of each kind, each as a set of keys, give the same table on every run,
@@ -261,9 +270,10 @@ Step 1 for the next frame may come any time after step 3.
 - **The remote batch takes no count** of the open word: the writer borrows the renderer
   mutably, which keeps `prepare` out already. So a `RemoteWriter` passed to `mem::forget`
   cannot keep the renderer from preparing: its batch has no end note, and a remote batch
-  with no end note is left out whole, its rows counted as dropped.
+  with no end note is left out whole, counted as "Slots" says.
 - **A remote batch with no room.** A remote batch whose notes had no room, or that was
-  opened while no region was open, is left out whole and its rows are counted as dropped.
+  opened while no region was open, is left out whole, counted as "Slots" says: its written
+  rows in `remote_rows`, and those that found no room or no region in `dropped`.
   It frees nothing, and the remote instances that hold slots keep the placements they had.
   After a full or a lost `Client` pass in the same frame, which freed them, the remote
   instances are missing until the next frame's batch.
@@ -285,7 +295,8 @@ Step 1 for the next frame may come any time after step 3.
   apart by what is left beside each row, and the order in which they began changes nothing
   of the table ("Slots"). Two things are the frame's to order: the `Client` world's pass of
   a frame ends before that frame's remote batch begins, and no pass is open during
-  `prepare` ("Concurrency").
+  `prepare` ("Concurrency"). A frame that overlaps the two has that batch left out
+  ("Slots"), and its remote instances wait for the next frame's batch.
 - Neither writer has a method that returns a row, a key or a byte, and no call of this crate
   reads the ring on the host.
 
@@ -563,7 +574,10 @@ table, which already holds each instance's mesh; it adds no field to the row.
 - **The open word** is one `AtomicU64`: the open generation in the high 32 bits, the open
   region's index in the next 16, all ones while no region is open, so `Renderer::new`
   refuses more than 65,535 regions, and the count of open passes in the low 16. A `begin`
-  that would take the count past 65,535 is lost. The generation is never zero, and the
+  that would take the count past 65,535 is lost and takes no count, so no give-back would
+  carry a lost mark of the region's to the sealing: its lost mark goes in the
+  renderer-wide record, as a pass's that began with no region open does, which the sealing
+  cannot miss and `open` cannot reset. The generation is never zero, and the
   entries beside the rows start at zero, so no entry a use did not write matches it
   ("Writers"). Only a pass whose `begin` took a count gives one back, by its `end` or by
   its sink's drop, so a give-back never borrows from the index or the generation.
@@ -846,6 +860,7 @@ description and report type to plain data, and each format to its size.
 | (the same) The table does not depend on which kind's pass began first | Two frames, one with the `Prediction` pass begun before the `Server` pass: equal tables | One that applies in begin order across kinds |
 | (the same) A region that holds two frames applies its last remote batch alone | A region left by a frame that did not prepare, and one left by a refused `prepare`: frame 1's batch holds `gone` and `kept`, frame 2's `Client` pass removes `gone` and its batch holds `kept`. `gone` holds no slot | One that applies every batch after every `Client` pass: `gone` comes back, and no count shows it |
 | (the same) A `Client` pass lost after a batch stops it | The same region, with frame 2's `Client` pass lost for want of room: `lost(Client)`, and no slot of the kind held | One that applies the region's batches whatever kind is lost: frame 1's batch brings `gone` back |
+| (the same) A batch that overlaps a `Client` pass is left out | One frame that breaks its ordering, from an empty table: a `Client` pass begins, the batch writes `gone` and `kept`, and the pass removes `gone` and ends; and the batch first, then the pass. In both orders neither holds a slot, `remote_rows` is 2 and nothing is lost | One that compares the batch's opening with the `Client` begins alone: the pass-first order applies the batch over the removal, and `gone` is drawn with no count |
 | A batch names each slot once, resolved in batch order and asserted | On null: duplicate rows through `RemoteWriter::write`, then `ScatterBatch` and `FrameStats::duplicates`. Null's assertion is what proves the resolution | One without the resolution: the assertion fires |
 | Many duplicates in different workgroups of a large batch | On a device: slots made `LIVE` at a known placement `c0` by an earlier frame, then duplicates from a world pass at a new tick, entries `TAKE_BASE \| HAS_BASE`, each instance's two rows at least 2^15 entries apart (row `i` and row `n + i`); the instance buffer copied out, each record's `base` and `previous` equal to `c0` and `current` to the kept row. It shows that a resolved batch scatters right; an entry with neither flag reads nothing of its record, so remote rows on fresh slots cannot show it | Without the resolution and with the assertion off, the second entry of a slot lacks `TAKE_BASE`, and run in order its records match: the host's check of the flags fails that build. The records fail one that marks both entries `TAKE_BASE \| HAS_BASE`, at that spacing. Null's assertion is the proof of the resolution |
 | With the GPU made to lag, the ring never overwrites a region a frame in flight reads | Frames held behind an import's `ready` point; `Opened::Wait`; the readback of a held frame after later writes | One whose `open` ignores the point |

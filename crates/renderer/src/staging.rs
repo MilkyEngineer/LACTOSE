@@ -38,8 +38,10 @@ pub(crate) struct Staging {
     /// one word, so that a pass's beginning and the renderer's sealing cannot both
     /// succeed: the generation in the high 32 bits, the region's index in the next 16,
     /// all ones while no region is open, and the count in the low 16. The generation is
-    /// never zero, which the shadow entries start at; a `begin` that would take the count
-    /// past its width is lost. The remote batch takes no count.
+    /// never zero, which the shadow entries start at. A `begin` that would take the count
+    /// past its width is lost and takes no count, so its lost mark goes in the
+    /// renderer-wide record, not the region's: the sealing cannot miss it and `open`
+    /// cannot reset it. The remote batch takes no count.
     open: AtomicU64,
 }
 
@@ -120,9 +122,10 @@ impl Drop for ExtractSink {
 /// `Client` pass has ended. It borrows the renderer for as long as it lives, so no
 /// [`prepare`](crate::Renderer::prepare) runs beside it, and the batch takes no count of
 /// the open word; dropping it closes the batch with its end note. A batch whose end note
-/// is missing, as after `mem::forget`, is left out whole and its rows are counted as
-/// dropped. Of the batches a region holds, `prepare` applies the last alone, and only where
-/// no `Client` pass began after it and the `Client` kind is not lost (`README.md`,
+/// is missing, as after `mem::forget`, is left out whole. Of the batches a region holds,
+/// `prepare` applies the last alone, and only where no note of a `Client` pass lies after
+/// its opening and the `Client` kind is not lost. A batch that is not applied, whichever
+/// the reason, counts its written rows in `FrameStats::remote_rows` alone (`README.md`,
 /// "Slots").
 pub struct RemoteWriter<'r> {
     /// What the writer shares with the sinks.

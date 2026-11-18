@@ -277,6 +277,42 @@ fn renderer_impl_lost_client_pass_applies_no_batch(
     Ok(())
 }
 
+/// A frame that breaks its ordering and overlaps its `Client` pass and its remote batch,
+/// from an empty table: the pass removes `gone` after the batch, which holds `gone` and
+/// `kept` as sampled, has opened, or the batch is written whole before the pass begins. A
+/// `Client` note lies after the batch's opening in both orders, so the batch is left out,
+/// counted in `remote_rows` alone, and `gone` is never drawn stale.
+fn renderer_impl_overlapping_client_pass_leaves_the_batch_out(
+    device: Arc<dyn Device>,
+    tick: Tick,
+    gone: InstanceRow,
+    kept: InstanceRow,
+    batch_first: bool,
+) -> Result<()> {
+    let desc = RendererDesc { instances: 16, rows: 64, regions: 2, shaders: None };
+    let mut renderer = Renderer::new(device, &desc)?;
+    // The sink is owned, not a borrow of the renderer, so its pass may stay open while the
+    // remote writer borrows the renderer mutably.
+    let mut sink: ExtractSink = renderer.sink();
+    let pass = ExtractPass { kind: WorldKind::Client, tick, full: false };
+    if batch_first {
+        renderer.remote().write(&[gone, kept]);
+        sink.begin(pass);
+    } else {
+        sink.begin(pass);
+        renderer.remote().write(&[gone, kept]);
+    }
+    sink.removed(&[gone.key]);
+    sink.end();
+    let stats = renderer.prepare()?;
+    assert!(!stats.lost(WorldKind::Client));
+    assert_eq!((stats.remote_rows, stats.dropped, stats.live), (2, 0, 0));
+    let slots = renderer.slots();
+    assert_eq!(slots.get(WorldKind::Client, gone.key), None);
+    assert_eq!(slots.get(WorldKind::Client, kept.key), None);
+    Ok(())
+}
+
 /// A batch names each slot once: the builder resolves a duplicate on the host. The test's
 /// rows name `twice` two times, the second time in the batch's last row.
 fn renderer_impl_resolves_duplicates_on_null(
@@ -854,9 +890,9 @@ fn as_resource(render: ClientRender) -> Box<dyn Any + Send + Sync> {
 /// Runs `step` in one job of the frame's and returns once it has run, so that the frame's
 /// own thread blocks and no worker does. It stands for a system of the world whose
 /// resource the render side is (`as_resource`), which reaches the side through that
-/// resource: lactose-task runs nothing a caller lends that is not `'static`, so a closure
-/// that borrows the frame's locals never runs on a worker, and the frame needs no
-/// `unsafe`. How the frame makes the job is `frame-design`'s.
+/// resource: from outside a job, lactose-task runs nothing a caller lends that is not
+/// `'static`, so a closure that borrows the frame's locals never runs on a worker, and the
+/// frame needs no `unsafe`. How the frame makes the job is `frame-design`'s.
 type InJob<'a> = &'a mut dyn FnMut(&mut (dyn FnMut(&mut JobContext<'_>) + Send));
 
 /// The frame drives the render side through the `dyn` object from its own thread, in the

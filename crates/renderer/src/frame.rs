@@ -64,14 +64,15 @@ pub enum Opened {
 pub struct FrameStats {
     /// The rows extract's passes wrote into the region.
     pub pass_rows: u32,
-    /// The rows the remote batches wrote into the region, those of a batch left out
-    /// included: a region that holds several frames' batches applies the last one alone
+    /// The rows the remote batches wrote into the region, those of every batch that was
+    /// not applied included: such a batch, whichever the reason, is counted here alone
     /// (`README.md`, "Slots").
     pub remote_rows: u32,
     /// The rows a writer could not write: the region was full, no region was open, or
-    /// the device refused the write. Those of each kind's extract passes are also
-    /// counted by [`dropped_in`](Self::dropped_in); the remote batch's are counted here
-    /// alone, since the next frame's batch writes every remote instance again.
+    /// the device refused the write; never a written row. Those of each kind's extract
+    /// passes are also counted by [`dropped_in`](Self::dropped_in); the remote batch's are
+    /// counted here alone, since the next frame's batch writes every remote instance
+    /// again.
     pub dropped: u32,
     /// The rows left out of the batch because a later row of their pass or batch named
     /// the same instance. Zero unless a writer broke its contract.
@@ -275,8 +276,8 @@ impl Renderer {
     /// it after the frame's `Client` pass has ended and drops it before
     /// [`prepare`](Self::prepare), which the borrow holds it to. The batch takes no count
     /// of the open word, so a writer passed to `mem::forget` leaves the renderer
-    /// preparable: its batch has no end note and is left out whole (`README.md`,
-    /// "Writers").
+    /// preparable: its batch has no end note and is left out whole, its rows counted in
+    /// [`FrameStats::remote_rows`] alone (`README.md`, "Slots").
     pub fn remote(&mut self) -> RemoteWriter<'_> {
         todo!()
     }
@@ -309,11 +310,11 @@ impl Renderer {
     /// Seals the open region and builds the frame's batch from what the writers left in
     /// it: applies each pass's frees and rows to the slot table, kind by kind in the order
     /// of `WorldKind`'s variants and in the order they began within a kind, and then the
-    /// region's last remote batch, where it is whole, no `Client` pass began after it and
-    /// the `Client` kind is not lost; writes the batch's entries and the draw's arguments
-    /// to the region's buffers, and flushes what the frame's submit will read. After it no
-    /// region is open until the next [`open`](Self::open), and the frame is not declared
-    /// (`README.md`, "Slots").
+    /// region's last remote batch, where it is whole, no note of a `Client` pass lies after
+    /// its opening and the `Client` kind is not lost; writes the batch's entries and the
+    /// draw's arguments to the region's buffers, and flushes what the frame's submit will
+    /// read. After it no region is open until the next [`open`](Self::open), and the frame
+    /// is not declared (`README.md`, "Slots").
     ///
     /// # Errors
     ///
