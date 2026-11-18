@@ -288,3 +288,68 @@ jobs:
               name = errno.errorcode.get(code, str(code))
               print(f"- `io_uring_setup`: failed with {name}, io_uring is not usable here")
           PROBE
+
+  # docs/plans/milestone-2.md section 3, `gpu-probe`: what lavapipe on the Linux runner offers,
+  # for lane `vulkan` (docs/verification.md, the row on lavapipe). It records and never fails.
+  # The macOS runners' facts, the oldest image's included, are the `shaders` jobs' own
+  # (tools/xtask/runner-facts.sh).
+  gpu-probe:
+    name: gpu probe (lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Install lavapipe, vulkaninfo and the validation layer
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            mesa-vulkan-drivers vulkan-tools vulkan-validationlayers
+      - name: Record what lavapipe offers
+        run: |
+          # A fact that is not found is recorded, never a failure.
+          set +e -u
+          version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null || echo "not installed"; }
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
+          export VK_DRIVER_FILES="$icd"
+          vulkaninfo > vulkaninfo.txt 2>&1 || echo "vulkaninfo exited $?" >> vulkaninfo.txt
+          {
+            echo "### lavapipe on this runner"
+            echo
+            echo "- system: \`$(uname -srm)\`, $(. /etc/os-release && printf %s "$PRETTY_NAME")"
+            echo "- mesa-vulkan-drivers: \`$(version mesa-vulkan-drivers)\`"
+            echo "- vulkan-tools: \`$(version vulkan-tools)\`"
+            echo "- vulkan-validationlayers: \`$(version vulkan-validationlayers)\`"
+            echo "- ICD: \`${icd:-none found}\`"
+            echo
+            echo "#### Device, extensions and features"
+            echo '```'
+            grep -E '^\s*(apiVersion|driverVersion|driverName|driverInfo|deviceName|deviceType) *[=:]' vulkaninfo.txt | sort -u
+            for name in VK_KHR_dynamic_rendering_local_read VK_EXT_headless_surface \
+                VK_KHR_draw_indirect_count VK_EXT_swapchain_maintenance1 VK_KHR_present_wait \
+                VK_KHR_present_id VK_EXT_memory_budget VK_KHR_pipeline_binary; do
+              if grep -q "$name" vulkaninfo.txt; then echo "$name: offered"; else echo "$name: absent"; fi
+            done
+            grep -E '^\s*(dynamicRendering|dynamicRenderingLocalRead|synchronization2|timelineSemaphore|bufferDeviceAddress|drawIndirectCount|drawIndirectFirstInstance|multiDrawIndirect|shaderInt64|shaderStorageImageReadWithoutFormat|independentBlend|runtimeDescriptorArray|shaderSampledImageArrayNonUniformIndexing|descriptorBindingPartiallyBound|maintenance4|maintenance5|maintenance6) *=' vulkaninfo.txt | sed 's/^ *//' | sort -u
+            echo '```'
+            echo
+            echo "#### Queue families and memory types"
+            echo '```'
+            grep -E '^\s*(queueFlags|queueCount|propertyFlags|heapIndex|size) *[=:]' vulkaninfo.txt | sed 's/^ *//'
+            echo '```'
+            echo
+            echo "#### The validation layer"
+            echo '```'
+            VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation vulkaninfo --summary > layer.txt 2>&1 \
+              && echo "loads under VK_INSTANCE_LAYERS: yes" || echo "loads under VK_INSTANCE_LAYERS: no (exit $?)"
+            grep -E 'VK_LAYER_KHRONOS_validation' layer.txt | sort -u | head -3
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Keep vulkaninfo's output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-probe-lavapipe
+          path: |
+            vulkaninfo.txt
+            layer.txt
+          if-no-files-found: warn
