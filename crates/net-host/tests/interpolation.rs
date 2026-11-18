@@ -336,7 +336,8 @@ fn every_sample_is_a_pushed_state(pushes: u64, reallocate_every: u64) {
     assert!(samples > 0);
 }
 
-/// The stress on hardware, where a reordering is caught only by chance (no loom model).
+/// The stress on hardware, where a reordering is caught only by chance (the loom models in
+/// `src/models.rs` check the protocol).
 #[test]
 #[cfg_attr(miri, ignore = "the hardware variant; Miri runs the small one")]
 fn every_sample_under_contention_is_a_pushed_state() {

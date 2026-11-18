@@ -76,10 +76,14 @@ kind.
    that carries nothing between jobs and folds order-independently. Inside the boundary every
    ordering key is a `StableKey`.
 7. **Formal models.** Synchronisation that decides when a borrow ends or a sleeper wakes belongs in
-   `lactose-task`, on its `sync` shim, with a loom model; `input-host`'s `Memory` trait
-   (`src/seqlock.rs`) is the other sanctioned shape. No other crate may name loom (ci.yml, "Nothing
-   enables the loom feature"), so new atomics elsewhere must be covered by Miri and stress, or they
-   are a finding. Models call the shipped functions and state their preemption bound. Run Miri as
+   `lactose-task`, on its `sync` shim, with a loom model; a sequence lock generic over a `Memory`
+   trait, modelled behind its crate's own optional `loom` feature, is the other sanctioned shape
+   (`src/seqlock.rs` of `input-host` and `net-host`). No other crate may name loom (`cargo xtask
+   features`, its `LOOM_MODELS` list), so new atomics elsewhere must be covered by Miri and stress,
+   or they are a finding. Models call the shipped functions and state their preemption bound.
+   Under loom 0.7.2 a model whose reader is the main thread, with its writer spawned, may
+   explore a single execution, so a model's pass counts only through weakened variants that
+   fail it. Run Miri as
    `.github/workflows/nightly.yml` runs it for each changed crate, including task's run over the
    real deque. Run the new parallel tests both over the stand-in deque and with
    `LACTOSE_MIRI_REAL_DEQUE=1 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks"` (the real

@@ -64,7 +64,9 @@ jobs:
             key: input-host
             args: -p lactose-input-host
           # The interpolation buffer's sequence lock (crates/net-host): Miri's weak-memory
-          # emulation catches the reader-side orderings the hardware stress test misses.
+          # emulation checks the shipped `Native` orderings, which the loom models (over their
+          # own atomics) do not, and catches what the hardware stress test misses: with any one
+          # of the four orderings weakened, its 150-push test reads torn samples.
           - name: net-host
             key: net-host
             args: '-p lactose-net-host --test integration -- interpolation::'
@@ -83,10 +85,12 @@ jobs:
           MIRIFLAGS: ${{ matrix.miriflags }}
 
   # Architecture section 5.1: the scope latch and the sleep-and-wake protocol are modelled
-  # under loom, as is input-host's latest-sample sequence lock (architecture section 5.3),
-  # each switched on by a Cargo feature of its crate and never by a `--cfg` flag in the
-  # environment, which would replace the x86-64 pin. Release, because the models explore
-  # every interleaving.
+  # under loom, as are input-host's latest-sample sequence lock and net-host's interpolation
+  # slot sequence lock (architecture section 5.3), each switched on by a Cargo feature of its
+  # crate and never by a `--cfg` flag in the environment, which would replace the x86-64 pin.
+  # Release, because the models' searches are long: every interleaving, or those loom reaches
+  # within a preemption bound where a model names one (three of task's, and input-host's and
+  # net-host's).
   loom:
     name: loom
     runs-on: ubuntu-latest
@@ -97,6 +101,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p lactose-task --features loom --release --locked
       - run: cargo test -p lactose-input-host --features loom --release --locked
+      - run: cargo test -p lactose-net-host --features loom --release --locked
 
   # SOUR, the determinism harness (architecture section 8.3): every mode, on every platform
   # of architecture mode. Each platform also emits its baseline hashes, which the next job

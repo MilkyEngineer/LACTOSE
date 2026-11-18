@@ -474,30 +474,33 @@ pub fn unlisted_binaries(ws: &Workspace, roots: &[String]) -> Vec<Finding> {
 /// The crate whose `loom` feature swaps the executor's primitives for loom's.
 const LOOM_OWNER: &str = "lactose-task";
 
-/// The one other package that may name loom: as an optional dependency that only its own
-/// feature `loom = ["dep:loom"]` turns on. The feature builds the package's loom models and
-/// changes nothing it ships.
-const LOOM_MODELS: &str = "lactose-input-host";
+/// The other packages that may name loom, each as an optional dependency that only its own
+/// feature `loom = ["dep:loom"]` turns on. The feature builds the package's loom models of a
+/// lock it ships and changes nothing it ships.
+const LOOM_MODELS: &[&str] = &["lactose-input-host", "lactose-net-host"];
 
 /// Features unify across a build, so one package turning on `lactose-task/loom` would switch
 /// every executor in that build to loom's primitives, which panic outside a model. No
 /// workspace package but `lactose-task` names loom: no dependency on it, under any rename,
 /// no dependency declaration or feature that turns on a feature named `loom`, and no feature
-/// of that name, except `lactose-input-host`'s optional dependency and its feature
-/// `loom = ["dep:loom"]`. Read from `cargo metadata`, so a comment is not a use.
+/// of that name, except that each package of [`LOOM_MODELS`] may have an optional dependency
+/// on loom under its own name and the feature `loom = ["dep:loom"]`, and nothing more. Read
+/// from `cargo metadata`, so a comment is not a use.
 #[must_use]
 pub fn loom_users(ws: &Workspace) -> Vec<Finding> {
     let mut findings = Vec::new();
     for package in ws.packages.iter().filter(|p| p.name != LOOM_OWNER) {
-        let models = package.name == LOOM_MODELS;
+        let models = LOOM_MODELS.contains(&package.name.as_str());
         let mut report = |what: String| {
             findings.push(Finding::new(
                 package.manifest(),
                 format!(
                     "`{}` {what}; only {LOOM_OWNER} names loom, since a feature turned on in one \
-                     build turns its executor into loom's model everywhere ({LOOM_MODELS}'s \
-                     optional dependency and `loom = [\"dep:loom\"]` excepted)",
-                    package.name
+                     build turns its executor into loom's model everywhere (except the optional \
+                     dependency and `loom = [\"dep:loom\"]` of a package that builds its own \
+                     loom models: {})",
+                    package.name,
+                    LOOM_MODELS.join(", "),
                 ),
             ));
         };
@@ -983,8 +986,9 @@ root v0.0.0 (/ws)|
         assert_eq!(loom_users(&ws), []);
 
         let tail = "only lactose-task names loom, since a feature turned on in one build turns \
-                    its executor into loom's model everywhere (lactose-input-host's optional \
-                    dependency and `loom = [\"dep:loom\"]` excepted)";
+                    its executor into loom's model everywhere (except the optional dependency \
+                    and `loom = [\"dep:loom\"]` of a package that builds its own loom models: \
+                    lactose-input-host, lactose-net-host)";
         let mut ecs = package("lactose-ecs", &[("lactose-task", Normal), ("loom", Dev)]);
         ecs.deps[0].features.push("loom".to_owned());
         ecs.deps[1].rename = Some("model_checker".to_owned());
@@ -1016,6 +1020,62 @@ root v0.0.0 (/ws)|
         assert!(found[1].contains("has a feature named `loom`"), "{found:#?}");
         assert!(found[2].contains("turn on `dep:loom`"), "{found:#?}");
         assert!(found[3].contains("turn on `lactose-task/loom`"), "{found:#?}");
+    }
+
+    #[test]
+    fn each_package_of_the_models_list_and_no_other_builds_loom_models() {
+        use crate::workspace::DepKind::Normal;
+        // The excepted shape: loom optional under its own name, and `loom = ["dep:loom"]`.
+        let models = |name: &str| {
+            let mut package = package(name, &[("loom", Normal)]);
+            package.deps[0].optional = true;
+            package.features.insert("loom".to_owned(), vec!["dep:loom".to_owned()]);
+            package
+        };
+        let input = models("lactose-input-host");
+        let net = models("lactose-net-host");
+        // Each entry of the list passes, the last as much as the first.
+        assert_eq!(loom_users(&workspace(vec![input.clone(), net.clone()])), []);
+        assert_eq!(loom_users(&workspace(vec![net.clone()])), []);
+
+        // The same shape in a package off the list fails.
+        let found: Vec<String> = loom_users(&workspace(vec![input, models("lactose-net")]))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(found.len(), 3, "{found:#?}");
+        assert!(found[0].starts_with("crates/net/Cargo.toml: `lactose-net` depends on loom"));
+        assert!(found[1].contains("`lactose-net` has a feature named `loom`"), "{found:#?}");
+        assert!(found[2].contains("has the feature `loom` turn on `dep:loom`"), "{found:#?}");
+
+        // In net-host, loom as a dependency that is not optional fails.
+        let mut required = net;
+        required.deps[0].optional = false;
+        let found: Vec<String> =
+            loom_users(&workspace(vec![required])).iter().map(ToString::to_string).collect();
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with(
+                "crates/net-host/Cargo.toml: `lactose-net-host` depends on loom (as `loom`)"
+            ),
+            "{found:#?}"
+        );
+
+        // Inside the list the exception is loom under its own name and the one feature: loom
+        // renamed, or a second feature turning it on, still fails.
+        let mut renamed = models("lactose-net-host");
+        renamed.deps[0].rename = Some("model_checker".to_owned());
+        renamed.features.insert("loom".to_owned(), vec!["dep:model_checker".to_owned()]);
+        let found: Vec<String> =
+            loom_users(&workspace(vec![renamed])).iter().map(ToString::to_string).collect();
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(found[0].contains("depends on loom (as `model_checker`)"), "{found:#?}");
+        let mut second = models("lactose-net-host");
+        second.features.insert("check".to_owned(), vec!["dep:loom".to_owned()]);
+        let found: Vec<String> =
+            loom_users(&workspace(vec![second])).iter().map(ToString::to_string).collect();
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("has the feature `check` turn on `dep:loom`"), "{found:#?}");
     }
 
     #[test]

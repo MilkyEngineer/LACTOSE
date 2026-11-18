@@ -6,12 +6,13 @@
 //!
 //! Host-only: the sampler runs on the render side and the writer on the network thread.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::Arc;
 
 use lactose_core::{Error, ErrorKind, Result, Tick};
 use lactose_math::{Quat, Scalar, ScalarBits, Vec3};
 use lactose_net_api::InterpolationSlot;
+
+use crate::seqlock::{self, Native};
 
 /// How many received states one slot keeps: the newest eight by tick, about 270
 /// milliseconds at a 30 Hz send rate, so the sampling point two send intervals back has
@@ -83,32 +84,11 @@ impl RemoteSample {
         Self { status: SampleStatus::Missing, position: Vec3::ZERO, rotation: Quat::IDENTITY };
 }
 
-/// One slot: a sequence lock over a ring of states, every word an atomic so the lock
-/// needs no `unsafe`. The writer stores the odd sequence (`Relaxed`), issues
-/// `fence(Release)`, stores the words (`Relaxed`), and stores the even sequence with
-/// `Release`; a reader loads the sequence with `Acquire`, loads the words with `Relaxed`,
-/// issues `fence(Acquire)`, and reloads the sequence, retrying when the first load was
-/// odd or the two differ. A first load left `Relaxed` admits torn reads on aarch64 (the
-/// review measured them); `Acquire` admits none. `generation` and `count` are words read
-/// inside that window; `generation` is the slot's current allocation, zero when free, and
-/// `allocate` and `release` bump the sequence as `push` does.
-struct Slot {
-    sequence: AtomicU32,
-    generation: AtomicU32,
-    /// How many states the ring holds, up to [`STATES_PER_SLOT`]: `states[..count]`,
-    /// ascending by tick, so the newest is the last.
-    count: AtomicU32,
-    states: [[AtomicU64; STATE_WORDS]; STATES_PER_SLOT],
-}
-
-/// A slot's contents as one consistent read: the generation, then the states held,
-/// ascending by tick, in `states[..count]`.
-#[derive(Clone, Copy)]
-struct Snapshot {
-    generation: u32,
-    count: usize,
-    states: [ReceivedState; STATES_PER_SLOT],
-}
+/// One slot: a sequence lock over the ring of the [`STATES_PER_SLOT`] newest states, every
+/// word an atomic so the lock needs no `unsafe` (`seqlock` states the orderings). Its
+/// `generation` is the slot's current allocation, zero when free, and `allocate` and
+/// `release` bump the sequence as `push` does.
+type Slot = seqlock::Slot<Native, STATES_PER_SLOT, STATE_WORDS>;
 
 const EMPTY_STATE: ReceivedState = ReceivedState {
     tick: Tick(0),
@@ -117,70 +97,7 @@ const EMPTY_STATE: ReceivedState = ReceivedState {
     rotation: Quat::IDENTITY,
 };
 
-impl Slot {
-    const fn new() -> Self {
-        Self {
-            sequence: AtomicU32::new(0),
-            generation: AtomicU32::new(0),
-            count: AtomicU32::new(0),
-            states: [const { [const { AtomicU64::new(0) }; STATE_WORDS] }; STATES_PER_SLOT],
-        }
-    }
-
-    /// The writer's side of the lock: `write` stores words with `Relaxed` between the odd
-    /// and the even sequence. Only the one writer calls it, so its own loads of the
-    /// sequence need no ordering.
-    fn write(&self, write: impl FnOnce(&Self)) {
-        let sequence = self.sequence.load(Ordering::Relaxed);
-        self.sequence.store(sequence.wrapping_add(1), Ordering::Relaxed);
-        fence(Ordering::Release);
-        write(self);
-        self.sequence.store(sequence.wrapping_add(2), Ordering::Release);
-    }
-
-    /// One consistent read, retried until no write overlapped it. The writer reads its
-    /// own words through this too; it never retries there, since nothing else writes.
-    fn read(&self) -> Snapshot {
-        loop {
-            let before = self.sequence.load(Ordering::Acquire);
-            if before & 1 == 1 {
-                core::hint::spin_loop();
-                continue;
-            }
-            let generation = self.generation.load(Ordering::Relaxed);
-            // A torn count is caught by the sequence check below; the bound keeps the
-            // indexing in range meanwhile.
-            let count = (self.count.load(Ordering::Relaxed) as usize).min(STATES_PER_SLOT);
-            let mut words = [[0; STATE_WORDS]; STATES_PER_SLOT];
-            for (held, words) in self.states[..count].iter().zip(&mut words) {
-                for (word, value) in held.iter().zip(words) {
-                    *value = word.load(Ordering::Relaxed);
-                }
-            }
-            fence(Ordering::Acquire);
-            if self.sequence.load(Ordering::Relaxed) == before {
-                let mut states = [EMPTY_STATE; STATES_PER_SLOT];
-                for (state, words) in states.iter_mut().zip(&words).take(count) {
-                    *state = decode(words);
-                }
-                return Snapshot { generation, count, states };
-            }
-            core::hint::spin_loop();
-        }
-    }
-
-    /// Stores `states` as the ring, inside a write.
-    fn store_states(&self, states: &[ReceivedState]) {
-        for (held, state) in self.states.iter().zip(states) {
-            for (word, value) in held.iter().zip(encode(state)) {
-                word.store(value, Ordering::Relaxed);
-            }
-        }
-        let count = u32::try_from(states.len()).expect("at most STATES_PER_SLOT");
-        self.count.store(count, Ordering::Relaxed);
-    }
-}
-
+/// A state as the slot's words: word 0's upper half is the tick, which orders the ring.
 fn encode(state: &ReceivedState) -> [u64; STATE_WORDS] {
     let p = state.position;
     let r = state.rotation;
@@ -199,7 +116,7 @@ fn encode(state: &ReceivedState) -> [u64; STATE_WORDS] {
 fn decode(words: &[u64; STATE_WORDS]) -> ReceivedState {
     let scalar = |word: u64| Scalar::from_canonical_bits(narrow(word));
     ReceivedState {
-        tick: Tick((words[0] >> 32) as u32),
+        tick: Tick(seqlock::tick(words)),
         teleported: Tick(words[0] as u32),
         position: Vec3::new(scalar(words[1]), scalar(words[2]), scalar(words[3])),
         rotation: Quat::new(scalar(words[4]), scalar(words[5]), scalar(words[6]), scalar(words[7])),
@@ -224,8 +141,7 @@ fn narrow(word: u64) -> ScalarBits {
 
 /// Whether `tick` is after `than` under the wrapping comparison the frames use.
 const fn tick_after(tick: Tick, than: Tick) -> bool {
-    let distance = tick.0.wrapping_sub(than.0);
-    distance != 0 && distance < 1 << 31
+    seqlock::tick_after(tick.0, than.0)
 }
 
 /// The generation after `generation`, skipping zero, which marks a free slot.
@@ -300,10 +216,7 @@ impl InterpolationWriter {
         };
         let generation = next_generation(self.generations[index as usize]);
         self.generations[index as usize] = generation;
-        self.buffer.slots[index as usize].write(|slot| {
-            slot.generation.store(generation, Ordering::Relaxed);
-            slot.count.store(0, Ordering::Relaxed);
-        });
+        self.buffer.slots[index as usize].reset(generation);
         Ok(InterpolationSlot { index, generation })
     }
 
@@ -312,25 +225,7 @@ impl InterpolationWriter {
     /// a kept state replaces it, so arrival order does not matter. Readers never observe
     /// a half-written ring. Fails with `NotFound` if `slot` is stale or unallocated.
     pub fn push(&mut self, slot: InterpolationSlot, state: ReceivedState) -> Result<()> {
-        let held = self.allocated(slot)?;
-        let snapshot = held.read();
-        let mut states = [EMPTY_STATE; STATES_PER_SLOT + 1];
-        let kept = &snapshot.states[..snapshot.count];
-        // Ascending by tick: the states before `state`, `state` (replacing an equal tick),
-        // the states after it; then the oldest dropped if there are too many.
-        let at = kept.iter().take_while(|kept| tick_after(state.tick, kept.tick)).count();
-        let replaces = kept.get(at).is_some_and(|kept| kept.tick == state.tick);
-        if !replaces && at == 0 && kept.len() == STATES_PER_SLOT {
-            return Ok(());
-        }
-        let after = if replaces { at + 1 } else { at };
-        let mut count = 0;
-        for next in kept[..at].iter().chain([&state]).chain(&kept[after..]) {
-            states[count] = *next;
-            count += 1;
-        }
-        let first = count.saturating_sub(STATES_PER_SLOT);
-        held.write(|slot| slot.store_states(&states[first..count]));
+        self.allocated(slot)?.push(encode(&state));
         Ok(())
     }
 
@@ -338,19 +233,18 @@ impl InterpolationWriter {
     /// next, until reallocated. Fails with `NotFound` if `slot` is stale or unallocated.
     pub fn release(&mut self, slot: InterpolationSlot) -> Result<()> {
         let held = self.allocated(slot)?;
-        held.write(|held| {
-            held.generation.store(0, Ordering::Relaxed);
-            held.count.store(0, Ordering::Relaxed);
-        });
+        held.reset(0);
         self.free.push(slot.index);
         Ok(())
     }
 
     /// The slot `slot` names, if it is allocated at `slot`'s generation.
     fn allocated(&self, slot: InterpolationSlot) -> Result<&Slot> {
-        let held = self.buffer.slots.get(slot.index as usize).filter(|held| {
-            slot.generation != 0 && held.generation.load(Ordering::Relaxed) == slot.generation
-        });
+        let held = self
+            .buffer
+            .slots
+            .get(slot.index as usize)
+            .filter(|held| slot.generation != 0 && held.generation() == slot.generation);
         held.ok_or_else(|| Error::new(ErrorKind::NotFound, "a stale or unallocated slot"))
     }
 
@@ -397,7 +291,11 @@ impl InterpolationReader {
         if slot.generation == 0 || snapshot.generation != slot.generation || snapshot.count == 0 {
             return RemoteSample::MISSING;
         }
-        let kept = &snapshot.states[..snapshot.count];
+        let mut states = [EMPTY_STATE; STATES_PER_SLOT];
+        for (state, words) in states.iter_mut().zip(&snapshot.states[..snapshot.count]) {
+            *state = decode(words);
+        }
+        let kept = &states[..snapshot.count];
         // `at` is `at.tick + fraction`, the fraction below one, so against an integer tick
         // the comparisons are those of `at.tick`.
         let later_at = kept.iter().position(|state| tick_after(state.tick, at.tick));

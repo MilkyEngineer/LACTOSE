@@ -49,7 +49,7 @@ of `[check_groups]` that the table's rule names, all in `ci-policy.toml`, in the
 adds them. Nothing in the code names a crate of the workspace except where a rule itself does:
 `lactose-app-server` (the server denylist, which binds the `[assembly]` crates too, whether
 or not the server exists), the `lactose-app-` prefix and `lactose-sim` (the two guards below),
-and `lactose-task` and `lactose-input-host` (the loom rule).
+and `lactose-task`, `lactose-input-host` and `lactose-net-host` (the loom rule).
 
 ## `tiers`
 
@@ -314,8 +314,9 @@ No workspace package but `lactose-task` names loom, read from `cargo metadata`: 
 dependency on it under any rename, no dependency declaration or `[features]` value that turns
 on loom or a feature named `loom`, and no feature named `loom`. Features unify across a
 build, so one package turning on `lactose-task/loom` would make every executor in that build
-loom's model. `lactose-input-host`'s optional dependency on loom and its feature
-`loom = ["dep:loom"]`, which builds its own models, are the one exception.
+loom's model. The one exception is the packages that build loom models of a lock they ship,
+`lactose-input-host` and `lactose-net-host`: each may have an optional dependency on loom
+and the feature `loom = ["dep:loom"]`, and nothing more.
 
 ## `vendor`
 

@@ -63,7 +63,11 @@ pub mod interpolation;
 pub mod message;
 pub mod packet;
 pub mod quant;
+mod seqlock;
 pub mod transport;
+
+#[cfg(all(test, feature = "loom"))]
+mod models;
 
 pub use clock::ClockEstimate;
 pub use handshake::Handshake;

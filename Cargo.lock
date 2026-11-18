@@ -589,6 +589,7 @@ dependencies = [
  "lactose-reflect",
  "lactose-sim",
  "lactose-task",
+ "loom",
 ]
 
 [[package]]
