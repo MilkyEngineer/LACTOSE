@@ -12,6 +12,8 @@
 //! queue's own timeline semaphore as its last operation, and the device reads that value
 //! before each check (`lactose-rhi-api`'s README, "Queues by role").
 
+#[cfg(test)]
+mod canary;
 mod convert;
 mod device;
 mod encoder;

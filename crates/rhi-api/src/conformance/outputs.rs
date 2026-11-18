@@ -345,14 +345,16 @@ fn fill(encoder: &mut dyn Encoder, pipeline: GraphicsPipelineHandle, rgba: [u8; 
 /// edge's line, `None` where it is closer and the rasteriser's rule decides.
 fn covers(corners: [[f32; 2]; 3], x: u32, y: u32) -> Option<bool> {
     let point = [(x as f32 + 0.5) / W as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / H as f32 * 2.0];
-    let pixel = 2.0 / W as f32;
+    // Half a pixel in clip space, whose pixel is 2 / W wide: a vertex half a pixel off
+    // moves an edge across some pixel's centre that is compared.
+    let half = 1.0 / W as f32;
     let mut inside = true;
     for at in 0..3 {
         let (a, b) = (corners[at], corners[(at + 1) % 3]);
         let edge = [b[0] - a[0], b[1] - a[1]];
         let cross = edge[0] * (point[1] - a[1]) - edge[1] * (point[0] - a[0]);
         let distance = cross / (edge[0] * edge[0] + edge[1] * edge[1]).sqrt();
-        if distance.abs() < pixel {
+        if distance.abs() < half {
             return None;
         }
         // Anticlockwise corners: the inside is to the left of every edge.
@@ -626,17 +628,18 @@ fn specialised_constant_of_each_type_is_read_back(ctx: &Ctx<'_>) -> Applies {
 }
 
 fn dispatch_runs_workgroups_of_the_shaders_size(ctx: &Ctx<'_>) -> Applies {
-    // `workgroup.slang`: workgroups of (8, 4, 2) over (3, 2, 1) groups cover (24, 8, 2), and
+    // `workgroup.slang`: workgroups of (8, 4, 2) over (3, 2, 2) groups cover (24, 8, 4), and
     // each invocation inside it writes a record of its local id, its global id and its local
-    // index at the record its global id flattens to.
+    // index at the record its global id flattens to. Two groups in each of y and z tell a
+    // size larger than the module's in any dimension from it.
     const SIZE: [u32; 3] = [8, 4, 2];
-    const BOUNDS: [u32; 3] = [24, 8, 2];
+    const BOUNDS: [u32; 3] = [24, 8, 4];
     const RECORD: u32 = 7;
     const RECORDS: u32 = BOUNDS[0] * BOUNDS[1] * BOUNDS[2];
     const TAIL: u32 = 256;
     // No id or index the shader writes equals it.
     const SENTINEL: u32 = 0xdead_beef;
-    let got = dispatch_into(ctx, "workgroup", &[], [3, 2, 1], RECORDS * RECORD + TAIL, SENTINEL);
+    let got = dispatch_into(ctx, "workgroup", &[], [3, 2, 2], RECORDS * RECORD + TAIL, SENTINEL);
     for z in 0..BOUNDS[2] {
         for y in 0..BOUNDS[1] {
             for x in 0..BOUNDS[0] {
@@ -973,6 +976,9 @@ fn heap_is_sampled_past_slot_zero(ctx: &Ctx<'_>) -> Applies {
     Ok(())
 }
 
+/// The least `subTexelPrecisionBits` Vulkan allows a device.
+const SUB_TEXEL_BITS: u32 = 4;
+
 fn sampler_filters_as_described(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     // Four texels in a row, red rising by 80 from zero; the rest of each texel fixed.
@@ -999,9 +1005,13 @@ fn sampler_filters_as_described(ctx: &Ctx<'_>) -> Applies {
             let (low, frac) = (t.floor() as usize, t.fract());
             let high = (low + 1).min(3);
             let value = f32::from(reds[low]) * (1.0 - frac) + f32::from(reds[high]) * frac;
-            // Linear filtering is exact to the format's precision: one step either way.
+            // A filter weight is exact to 2^-bits of `subTexelPrecisionBits`, so a step of
+            // 80 lands up to 80 / 2^(bits + 1) off, and one more for the format's rounding.
+            // No capability reports the bits: the tolerance is of the least a device may
+            // have, 4, which every device meets.
+            let tolerance = 80.0 / f32::from(1u16 << (SUB_TEXEL_BITS + 1)) + 1.0;
             let have = f32::from(texel[0]);
-            if (have - value).abs() > 1.5 {
+            if (have - value).abs() > tolerance {
                 ctx.fail(format_args!("pixel {x} filtered to {have}, {value} expected"));
             }
             texel[0]

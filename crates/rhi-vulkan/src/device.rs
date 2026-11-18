@@ -618,6 +618,12 @@ impl VulkanDevice {
         Ok(Self { shared: Arc::new(shared) })
     }
 
+    /// What the device holds, for the thread-safety canary's call below the contract.
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> &Shared {
+        &self.shared
+    }
+
     fn records(&self) -> MutexGuard<'_, Records> {
         self.shared.records()
     }

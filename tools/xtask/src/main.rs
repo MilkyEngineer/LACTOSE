@@ -285,9 +285,11 @@ fn install_slang() -> Result<PathBuf, String> {
 const SHADERS: &str = "shaders";
 /// The Swift script of the Metal step.
 const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
-/// The device tests the Vulkan step runs: each package and its integration test target, whose
-/// ignored tests are the ones that need a device.
-const DEVICE_TESTS: [(&str, &str); 1] = [("lactose-rhi-vulkan", "integration")];
+/// The device tests the Vulkan step runs: each package and its test target, `None` for its
+/// library's unit tests, whose ignored tests are the ones that need a device. The library's
+/// is the thread-safety canary, whose unlocked driver call no safe call can make.
+const DEVICE_TESTS: [(&str, Option<&str>); 2] =
+    [("lactose-rhi-vulkan", None), ("lactose-rhi-vulkan", Some("integration"))];
 
 /// What `gpu` was asked to run.
 struct GpuArgs<'a> {
@@ -575,11 +577,15 @@ fn run_vulkan(
     Ok(())
 }
 
-/// Builds the test target `target` of `package` and returns its binary.
-fn test_binary(context: &Context, package: &str, target: &str) -> Result<PathBuf, String> {
+/// Builds the test target `target` of `package`, or its library's unit tests for `None`, and
+/// returns its binary.
+fn test_binary(context: &Context, package: &str, target: Option<&str>) -> Result<PathBuf, String> {
+    let selected = target.map_or(vec!["--lib"], |target| vec!["--test", target]);
+    let target = target.map_or_else(|| package.replace('-', "_"), str::to_owned);
     let output = Command::new(&context.cargo)
         .args(["test", "--locked", "--no-run", "--message-format", "json-render-diagnostics"])
-        .args(["--package", package, "--test", target])
+        .args(["--package", package])
+        .args(selected)
         .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("cannot run cargo: {e}"))?;
@@ -592,7 +598,7 @@ fn test_binary(context: &Context, package: &str, target: &str) -> Result<PathBuf
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|message| message["target"]["name"] == target)
+        .filter(|message| message["target"]["name"] == target.as_str())
         .find_map(|message| message["executable"].as_str().map(PathBuf::from))
         .ok_or_else(|| format!("cargo built no binary of {package}'s {target} tests"))
 }

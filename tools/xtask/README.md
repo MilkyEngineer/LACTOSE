@@ -681,9 +681,9 @@ driver selects a Vulkan loader's environment and the Metal step uses none.
    device's facts, the system's version, one line per pipeline state, and the messages
    counted.
 4. The Vulkan step runs every device test: each ignored test of the test targets
-   `DEVICE_TESTS` in `src/main.rs` lists, which is `lactose-rhi-vulkan`'s `integration` for
-   now, each in a process of its own, built with `cargo test --no-run` and run by its exact
-   name. Under each driver it sets the loader's environment for its children:
+   `DEVICE_TESTS` in `src/main.rs` lists, which are `lactose-rhi-vulkan`'s library's unit
+   tests and its `integration` binary, each in a process of its own, built with `cargo test
+   --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
    - the layer is the Khronos validation layer of the Vulkan SDK that
      `tools/xtask/vulkan-layer.toml` pins, refused unless its library's SHA-256 and its
      manifest's version are the pin's. On Linux the SDK's archive is fetched into
@@ -697,8 +697,14 @@ driver selects a Vulkan loader's environment and the Metal step uses none.
      `target/gpu/layers/` that names its library by its absolute path, with `VK_LAYER_PATH`
      set to an empty directory: a layer forced through `VK_INSTANCE_LAYERS` or
      `VK_LOADER_LAYERS_ENABLE`, or found twice, makes the loader warn, and the warning reaches
-     the debug messenger, which counts it. The variables that would change which layers or
-     drivers load are removed (`CLEARED` in `src/vulkan.rs`);
+     the debug messenger, which counts it. Before the run sets its own, it removes every
+     inherited variable the loader, the layer or the tests read (`CLEARED` and
+     `CLEARED_PREFIXES` in `src/vulkan.rs`): `VK_KHRONOS_VALIDATION_*`, `VK_LOADER_*`,
+     `VK_INSTANCE_LAYERS`, `VK_ICD_FILENAMES`, `VK_DRIVER_FILES`, `VK_ADD_DRIVER_FILES`,
+     `VK_LAYER_PATH`, `VK_ADD_LAYER_PATH`, `VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_SETTINGS_PATH`,
+     `DYLD_LIBRARY_PATH`, `LACTOSE_VALIDATION_OFF`, `LACTOSE_GPU_ADAPTER` and
+     `LACTOSE_GPU_SHADERS`, and names each it removed in its file; what a run needs of them it
+     takes as an argument;
    - the driver is `VK_DRIVER_FILES`: lavapipe's manifest in `/usr/share/vulkan/icd.d/`,
      MoltenVK's or KosmicKrisp's in the SDK's `share/vulkan/icd.d/`; under `system` the
      loader's own search, and `--adapter <name>` selects the device by a part of its name
@@ -711,24 +717,31 @@ driver selects a Vulkan loader's environment and the Metal step uses none.
    - MoltenVK writes its warnings and errors (`MVK_CONFIG_LOG_LEVEL=2`), and Mesa's banner for
      a driver that is not conformant is off (`MESA_VK_IGNORE_CONFORMANCE_WARNING=1`): it is
      no message about a call.
-5. The run's canaries go first, each in its own process: core validation's (an image
-   declared in a state it is not in, `VUID-vkCmdDraw-None-09600`), synchronisation
-   validation's (two copies into one range, `SYNC-HAZARD-WRITE-AFTER-WRITE`), its check of a
-   load after a store (a target stored by one render pass and kept by the next with no
-   transition, `SYNC-HAZARD-READ-AFTER-WRITE`, which the layer sends only with
-   `syncval_load_op_after_store_op_validation` on) and the suite's
-   `each_validator_reports_its_canary`, which provokes the first two; with `--gpu-assisted`, GPU-assisted
-   validation's alone (a shader's read past a buffer through its address,
-   `VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819`). A canary passes when its test passes
-   and every message it sent is one of its identifiers, each heard. Every other test passes
-   when it passes, its sinks printed no message and the driver wrote no line of its errors or
-   warnings: MoltenVK's `[mvk-error]` and `[mvk-warn]`, Mesa's `MESA: error`, `MESA: warning`
-   and any `WARNING: ` line. Thread-safety validation has no canary: an encoder is recorded
-   through `&mut` and a queue is submitted to under its lock, so no safe call can race one,
-   and a race made below the contract would be heard only when the two calls overlap in time,
-   which no test can make certain.
+5. Each binary's canaries go first. The canaries (`Validators::canaries` in `src/vulkan.rs`) are
+   thread-safety validation's (the graphics queue waited idle through `ash` with no lock under
+   a lagging dispatch while another thread submits to it,
+   `UNASSIGNED-Threading-MultipleThreads-Write`; a unit test in `src/canary.rs`, since no
+   safe call can race a queue), core validation's (an image declared in a state it is not in,
+   `VUID-vkCmdDraw-None-09600`), synchronisation validation's (two copies into one range,
+   `SYNC-HAZARD-WRITE-AFTER-WRITE`), its check of a load after a store (a target stored by
+   one render pass and kept by the next with no transition, `SYNC-HAZARD-READ-AFTER-WRITE`,
+   which the layer sends only with `syncval_load_op_after_store_op_validation` on), its
+   hazard across queues (a target a lagging graphics submit stores and a compute submit takes
+   from `Undefined` with no semaphore, `SYNC-HAZARD-WRITE-RACING-WRITE`, which says `skipped,
+   compute shares the graphics queue` on a device with one queue) and the suite's
+   `each_validator_reports_its_canary`, which provokes core's and synchronisation's; with
+   `--gpu-assisted`, GPU-assisted validation's alone (a shader's read past a buffer through
+   its address, `VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819`, and a draw that samples
+   slot `heap_slots`, one past the heap, by an index in push bytes,
+   `VUID-vkCmdDraw-None-10068`). A canary passes when its test passes and every message it
+   sent is one of its identifiers, each heard, or when it says why it is skipped. After every
+   test, a listed canary that no binary holds fails the run. Every other test passes when it
+   passes, its sinks printed no message and the driver wrote no line of its errors or
+   warnings: MoltenVK's `[mvk-error]` and `[mvk-warn]`, Mesa's `MESA: error`, `MESA:
+   warning` and any `WARNING: ` line.
 6. It writes `target/gpu/<driver>-vulkan.txt`, or `<driver>-vulkan-gpu-assisted.txt`: the
-   driver, the shaders' Slang, the layer, every variable it set, the canaries heard, the
+   driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
+   cleared:`, or `none`), every variable it set, the canaries heard or skipped, the
    device's `DeviceInfo` and `Capabilities`, and each test with `passed`, the suite's
    `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed. A failed
    test fails the run, except under `kosmickrisp`, whose file is that driver's record

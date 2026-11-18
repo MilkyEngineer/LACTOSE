@@ -3,7 +3,9 @@
 Every `unsafe` block carries a `// SAFETY:` comment. This file states the invariants those
 comments rely on. Architecture section 21 lists the reason for unsafe here: FFI to the Vulkan
 driver, through `ash`, whose every driver call is an `unsafe fn`. No `unsafe` of this crate
-is anything else: it has no `unsafe` data structure, and its tests forbid `unsafe`.
+is anything else: it has no `unsafe` data structure, and its integration tests forbid `unsafe`.
+The one `unsafe` block of its unit tests is the thread-safety canary's (below), a driver call
+that breaks the queue's external synchronisation on purpose.
 
 The methods of `VulkanDevice` and its encoders are safe, and their callers forbid `unsafe`, so
 no call they make may reach undefined behaviour through this crate's code. Each driver call is
@@ -29,7 +31,8 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
    cook's and is trusted. An address, a slot or sampler index in push bytes or a buffer, an
    indirect record's contents or a dispatch's counts may fault the GPU or race a host access.
    GPU-assisted validation reports such an access in tests (`cargo xtask gpu
-   --gpu-assisted`, whose canary is a read past a buffer through its address).
+   --gpu-assisted`, whose canaries are a read past a buffer through its address and a sample
+   of slot `heap_slots`, one past the heap, by an index in push bytes).
 
 ## The sites, by kind
 
@@ -148,10 +151,13 @@ holders' count, `leaking` and `lost`, and the encoders. Those run on devices in 
 gpu`, the unwinding drops included, where a data race between two of this crate's threads is
 seen only if a validator or a test's assertion meets it.
 
-## What no test here shows
+## The thread-safety canary
 
-The thread-safety validator of the Khronos layer has no canary: a safe call cannot race a
-command buffer or a queue, so no test provokes the misuse that would show the validator live.
-A race made below the contract, through `ash`, would be heard only when the two calls are
-inside the layer at the same instant, which no test can make certain. Its setting is recorded
-in each run's report with the others.
+A safe call cannot race a command buffer or a queue, so the thread-safety validator's canary
+makes its race below the contract: `src/canary.rs`, a unit test that only `cargo xtask gpu`
+runs, waits the graphics queue idle through `ash` with no queue lock on one thread, under a
+dispatch that runs for about two seconds, and submits to the queue through the safe API from
+another 300 ms later. The wait lasts until the dispatch ends, so both calls are inside the
+layer at once, and the layer reports `UNASSIGNED-Threading-MultipleThreads-Write` at the
+submit, under MoltenVK and KosmicKrisp. It is compiled into the unit tests alone, and ignored
+there: only `cargo xtask gpu` runs it, in a process of its own.

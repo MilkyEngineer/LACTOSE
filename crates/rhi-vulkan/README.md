@@ -63,7 +63,10 @@ contract leaves to the backend.
   reports the attachment's kind memoryless, and ordinary memory otherwise. An allocation
   larger than its type's heap or `maxMemoryAllocationSize`, and a buffer larger than
   `maxBufferSize`, is refused `ResourceExhausted` before any driver call, as null refuses a
-  buffer past its bound.
+  buffer past its bound. An image placed in a block is bound at its offset; its alias call
+  records a global memory barrier from every command's writes to every later access, which
+  the aliasing rule needs between the ending image's writes and the new one's, and which the
+  image's own barrier from `Undefined`, scoped to its range, does not give.
 - **The heap and the sampler table** are one descriptor set (set 1), partially bound and
   updated after bind, with a placeholder image in each empty slot and a placeholder sampler in
   each free entry, so a slot is never unbound. A slot write and a sampler's free are the
@@ -136,9 +139,9 @@ anything under the GPU's use; with nothing pending it tears down as any last hol
 ## Tests
 
 Every test that makes a device is ignored by a plain run, which may have no driver;
-`cargo xtask gpu --driver <name>` runs each ignored test of the `integration` binary in a
-process of its own, under the pinned Khronos validation layer, by decision 5.10's rule
-(`tools/xtask/README.md`, "GPU runs").
+`cargo xtask gpu --driver <name>` runs each ignored test of the library's unit tests and of
+the `integration` binary in a process of its own, under the pinned Khronos validation layer,
+by decision 5.10's rule (`tools/xtask/README.md`, "GPU runs").
 
 - `tests/conformance.rs`: every case of `lactose-rhi-api`'s suite, one test each, on the
   driver the loader finds. A case of a check null alone makes, a case that needs a device
@@ -147,18 +150,42 @@ process of its own, under the pinned Khronos validation layer, by decision 5.10'
 - `tests/device.rs`: the device's facts, sent nothing when clean; a device-only buffer filled
   through a staging copy and read back through a copy; the engine's shader,
   `shaders/surface.slang` as cooked, making its two pipelines, not run; a compute stage whose
-  workgroup is not its module's, refused; each validator's canary, a misuse whose message
-  alone the run must hear (core: an image declared in a state it is not in; synchronisation:
-  two copies into one range; synchronisation's load-after-store check: a target stored by one
-  render pass and kept by the next with no transition; GPU-assisted: a shader's read past a
-  buffer, run by `--gpu-assisted` alone); a cache that fails a check (a corrupt payload, a truncated file,
-  a wrong checksum, a stale header) starting empty; and a cache whose directory cannot be
-  written, which the run reports and goes past.
-- Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, a
-  `Bool` widened to four bytes and `Int64Atomics` refused unless enabled. In
-  `src/convert.rs`: the re-take from `Undefined`, the transfer within a family
-  as one layout change, the transfer between families as a release and an acquire of equal
-  values, a family without `GRAPHICS`, and two writes in one writing state.
+  workgroup is not its module's, refused; an entry point the module lacks, or declares for the
+  other stage, refused; a heap and sampler table past the driver's support refused
+  `Unsupported`, and one within it made; a buffer and a block past the device's size refused
+  `ResourceExhausted`; a cache that fails a check (a corrupt payload, a truncated file, a
+  wrong checksum, a stale header) starting empty; a cache whose directory cannot be written,
+  which the run reports and goes past; and the drops while a thread unwinds: a last holder
+  with a submit pending leaks the device and keeps its messengers' sink, one with nothing
+  pending destroys everything, and an encoder dropped with its submit pending hands its pools
+  to the last holder.
+- Each validator's canary, a misuse whose message alone the run must hear. In
+  `tests/device.rs`: core, an image declared in a state it is not in; synchronisation, two
+  copies into one range; its load-after-store check, a target stored by one render pass and
+  kept by the next with no transition; synchronisation across queues, a target a lagging
+  graphics submit stores and a compute submit takes from `Undefined` with no semaphore, skipped
+  where compute shares the graphics queue; GPU-assisted, a shader's read past a buffer, and a
+  draw that samples slot `heap_slots` through push bytes, both run by `--gpu-assisted` alone.
+  In `src/canary.rs`, a unit test since its misuse is a driver call no safe call makes: thread
+  safety, the graphics queue waited idle with no lock on one thread under a lagging dispatch
+  while another submits to it.
+- Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, no size,
+  two sizes or the built-in state no workgroup, an entry declared by its name and its stage's
+  execution model, a `Bool` widened to four bytes and `Int64Atomics` refused unless enabled.
+  In `src/convert.rs`: the re-take from `Undefined`, the transfer within a family as one
+  layout change, the transfer between families as a release and an acquire of equal values,
+  a family without `GRAPHICS`, and two writes in one writing state. In `src/raw.rs`: compute
+  takes a family that does not draw first, and viewport bounds rounded inward to what an Apple
+  GPU honours. In `src/records.rs`: a reached point completing its submit and the earlier ones
+  of its queue, a failed submit's promise dropped and its point retried, another queue's
+  pending signal needing a wait, a host signal below a promise; the interleavings of a driver
+  read and its hold, each fixed in order against a model driver (a host signal or a dropped
+  promise between a read and its hold, a pass begun during a slot write, a destroy at once
+  after a wait with the queue behind, a failed submit's point signalled from the host, a
+  wait-only submit 2^31 below a marked host signal), and host signals racing on threads over
+  one timeline, which stays behind the driver. In `src/table.rs`: a replaced or removed value
+  dropped after its entry's lock, and a handle resolving to its own value or none across
+  threads. Nightly runs these under Miri ("What Miri covers" in `SAFETY.md`).
 
 ## Records
 
@@ -168,11 +195,11 @@ MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choos
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2 | 139 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363), a record (decision 5.7) | 134 | 49: 30 null alone, 8 no window, 4 no loss, 6 compute shared, every optional draw capability reported | 0 |
-| KosmicKrisp under GPU-assisted validation, a record | 131 | 49, as above | 0 |
+| MoltenVK 1.4.2 | 148 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363), a record (decision 5.7) | 142 | 50: 30 null alone, 8 no window, 4 no loss, 5 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
+| KosmicKrisp under GPU-assisted validation, a record | 138 | 50: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
 
-The counts are of the device tests: the suite's 174 cases, 146 contract and 28 output, and the
+The counts are of the device tests: the suite's 175 cases, 147 contract and 28 output, and the
 device's own. Each driver passes 27 of the 28 output cases: MoltenVK skips the count draw, and
 KosmicKrisp the ownership transfer, since compute shares its one queue.
 

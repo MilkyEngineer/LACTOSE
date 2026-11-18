@@ -1,7 +1,10 @@
 //! What the Vulkan device holds beyond the suite's cases: its creation on the driver the
 //! loader finds, a device-only buffer filled through a staging copy, the pipelines of the
-//! engine's shader, the pipeline cache's start from bytes that fail each check and a cache
-//! directory that cannot be written, and each validator's canary. `cargo xtask gpu` runs every canary in a process of its own and
+//! engine's shader, a workgroup or an entry point the module does not declare, a heap past
+//! the driver's support and a resource past the device's size, the pipeline cache's start
+//! from bytes that fail each check and a cache directory that cannot be written, the drops
+//! while a thread unwinds, and each validator's canary but thread safety's, which is a unit
+//! test (`src/canary.rs`). `cargo xtask gpu` runs every canary in a process of its own and
 //! checks that it said its known message and nothing else.
 
 use std::panic::AssertUnwindSafe;
@@ -684,6 +687,79 @@ fn canary_gpu_assisted_validation_reports_a_read_past_a_buffer() {
 
 /// What GPU-assisted validation's canary must say.
 const GPU_ASSISTED_CANARY: &str = "VUID-RuntimeSpirv-PhysicalStorageBuffer64";
+
+/// GPU-assisted validation's canary of the heap: a draw that samples slot `heap_slots`, one
+/// past the heap's end, by an index in push bytes, which no check before the driver can see.
+/// Run by `cargo xtask gpu --gpu-assisted` alone, as the canary of a read past a buffer is.
+#[test]
+#[ignore = "needs GPU-assisted validation: cargo xtask gpu --gpu-assisted"]
+fn canary_gpu_assisted_validation_reports_a_slot_past_the_heap() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    let shader = |name: &str| suite_shader(name).expect("the suite's cooked shaders");
+    let (vertex, fragment) = (shader("sample.vs_main"), shader("sample.fs_main"));
+    let colour = [ColourTargetDesc { format: Format::Rgba8Unorm, write_mask: WriteMask::ALL }];
+    let pipeline = device
+        .create_graphics_pipeline(&GraphicsPipelineDesc {
+            label: "canary",
+            vertex: StageDesc { shader: &vertex, constants: &[] },
+            fragment: Some(StageDesc { shader: &fragment, constants: &[] }),
+            colour: &colour,
+            depth: None,
+            cull: Cull::None,
+        })
+        .expect("a pipeline");
+    let sampler = device
+        .create_sampler(&SamplerDesc {
+            magnify: Filter::Nearest,
+            minify: Filter::Nearest,
+            mip: Filter::Nearest,
+            address_u: AddressMode::ClampToEdge,
+            address_v: AddressMode::ClampToEdge,
+        })
+        .expect("a sampler");
+    let image = device
+        .create_image(&ImageDesc {
+            label: "canary",
+            format: Format::Rgba8Unorm,
+            extent: Extent { width: 4, height: 4 },
+            mips: 1,
+            layers: 1,
+            usage: ImageUsage::COLOUR,
+            memory: ImageMemory::Own,
+            sharing: Sharing::Exclusive,
+        })
+        .expect("an image");
+    let mut encoder = device.create_encoder(QueueRole::Graphics, "canary").expect("an encoder");
+    encoder.transition_images(&[ImageTransition {
+        image,
+        range: ImageRange::FIRST,
+        from: StateOn { state: ImageState::Undefined, queue: QueueRole::Graphics },
+        to: StateOn { state: ImageState::ColourAttachment, queue: QueueRole::Graphics },
+    }]);
+    let target = Target { image, mip: 0, layer: 0 };
+    let load = Load::Clear([0.0; 4]);
+    encoder.begin_render_pass(&RenderPass {
+        label: "canary",
+        colour: &[ColourAttachment { target, load, store: Store::Store, local_read: false }],
+        depth: None,
+        reach: PassReach::NOTHING,
+    });
+    encoder.bind_graphics_pipeline(pipeline);
+    // `sample.slang`'s block: the slot, then the left and the right half's sampler.
+    let past = device.capabilities().heap_slots;
+    encoder.push_bytes(0, &past.to_le_bytes());
+    encoder.push_bytes(4, &sampler.0.to_le_bytes());
+    encoder.push_bytes(8, &sampler.0.to_le_bytes());
+    encoder.draw(0..3, 0..1);
+    encoder.end_pass();
+    run(&device, encoder);
+    drop(device);
+    heard_alone(&sink, GPU_ASSISTED_HEAP_CANARY);
+}
+
+/// What GPU-assisted validation's heap canary must say.
+const GPU_ASSISTED_HEAP_CANARY: &str = "VUID-vkCmdDraw-None-10068";
 
 /// Whether the run turns GPU-assisted validation on, whose teardown at the process's exit
 /// aborts over a device leaked on purpose.

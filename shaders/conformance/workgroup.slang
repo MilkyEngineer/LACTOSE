@@ -1,10 +1,10 @@
 // The conformance suite's workgroup: workgroups of (8, 4, 2), each invocation whose global id
-// lies inside (24, 8, 2) writing seven words through the device address in the push block, at
+// lies inside (24, 8, 4) writing seven words through the device address in the push block, at
 // the record its global id flattens to, x fastest: its local id, its global id and its local
 // index. One outside writes nothing, so a dispatch of another size cannot write past the
 // records.
 
-static const uint3 BOUNDS = uint3(24, 8, 2);
+static const uint3 BOUNDS = uint3(24, 8, 4);
 static const uint RECORD = 7;
 
 struct Push

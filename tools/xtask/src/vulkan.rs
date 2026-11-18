@@ -189,12 +189,22 @@ impl Validators {
                     "device::canary_synchronisation_validation_reports_a_race_across_queues",
                     &["SYNC-HAZARD-WRITE-RACING-WRITE"],
                 ),
+                (
+                    "canary::canary_thread_safety_validation_reports_a_queue_used_on_two_threads",
+                    &["UNASSIGNED-Threading-MultipleThreads-Write"],
+                ),
                 ("conformance::each_validator_reports_its_canary", &[CORE, SYNC]),
             ],
-            Self::GpuAssisted => &[(
-                "device::canary_gpu_assisted_validation_reports_a_read_past_a_buffer",
-                &["VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819"],
-            )],
+            Self::GpuAssisted => &[
+                (
+                    "device::canary_gpu_assisted_validation_reports_a_read_past_a_buffer",
+                    &["VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819"],
+                ),
+                (
+                    "device::canary_gpu_assisted_validation_reports_a_slot_past_the_heap",
+                    &["VUID-vkCmdDraw-None-10068"],
+                ),
+            ],
         }
     }
 }
@@ -745,22 +755,25 @@ mod tests {
     /// send nothing, and fail every run.
     #[test]
     fn every_canary_the_device_tests_name_is_listed() {
-        let tests =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/rhi-vulkan/tests/device.rs");
-        let source = fs::read_to_string(&tests).expect("rhi-vulkan's device tests");
-        let named: Vec<&str> = source
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("fn canary_"))
-            .filter_map(|rest| rest.split('(').next())
-            .collect();
-        for name in &named {
-            assert!(is_canary(&format!("device::canary_{name}")), "canary_{name} is in no list");
+        // Each file of device tests, and the module path its tests are named under.
+        for (file, module) in [("tests/device.rs", "device::"), ("src/canary.rs", "canary::")] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/rhi-vulkan");
+            let source = fs::read_to_string(path.join(file)).expect("rhi-vulkan's device tests");
+            let named: Vec<&str> = source
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("fn canary_"))
+                .filter_map(|rest| rest.split('(').next())
+                .collect();
+            for name in &named {
+                let test = format!("{module}canary_{name}");
+                assert!(is_canary(&test), "{test} is in no list");
+            }
+            let listed = [Validators::Plain, Validators::GpuAssisted]
+                .iter()
+                .flat_map(|validators| validators.canaries())
+                .filter(|(name, _)| name.starts_with(module))
+                .count();
+            assert_eq!(named.len(), listed, "a listed canary is not in {file}: {named:?}");
         }
-        let listed = [Validators::Plain, Validators::GpuAssisted]
-            .iter()
-            .flat_map(|validators| validators.canaries())
-            .filter(|(name, _)| name.starts_with("device::"))
-            .count();
-        assert_eq!(named.len(), listed, "a listed device canary is not in device.rs: {named:?}");
     }
 }

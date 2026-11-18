@@ -1108,7 +1108,7 @@ and `conformance::run` runs one against a `Harness`. The contract cases' bodies 
 with `rhi-null` and the output cases' with `vulkan`; the output cases' Slang sources are the
 repository's `shaders/conformance/`, cooked before a run by `ricotta --shaders` and read
 through `Harness::shader` by the name `<source>.<entry>`. A backend's tests carry one test for
-each case, named after it. There are 174: 146 contract cases and 28 output cases.
+each case, named after it. There are 175: 147 contract cases and 28 output cases.
 
 - A **contract** case asserts what the contract says of calls and results. It needs no
   shader to run and no pixel, so null passes it as a device does. A case that names a rule
@@ -1304,7 +1304,9 @@ Some output cases count as evidence only in the shape, or on the device, named h
   submit before the next is made, silences it.
 - `sampler_filters_as_described` picks among two or more samplers by a non-uniform index
   past zero, in the draw that indexes the image array past slot zero, and compares exactly
-  where filtering is exact, with ±1 at a linear midpoint.
+  where filtering is exact; a linear sample is within 80 / 2^(4 + 1) + 1 of the reference,
+  the weight's error at Vulkan's least `subTexelPrecisionBits` over a step of 80, and one
+  more for rounding.
 - `dispatch_indirect_reads_its_counts` has a dispatch write the counts, at an offset that
   is not zero and all three different, through a `ShaderWrite` to `Indirect` transition,
   with a lagging writer; a mutation that drops the transition shows on a discrete GPU
@@ -1322,11 +1324,12 @@ Some output cases count as evidence only in the shape, or on the device, named h
 - `draw_parameters_reach_the_shader` draws indexed with a `base_vertex` and a first
   instance that are not zero, and writes the ids the shader reads.
 - `dispatch_runs_workgroups_of_the_shaders_size` dispatches a stage of workgroup (8, 4, 2)
-  over (3, 2, 1) groups into a buffer filled first with a sentinel word no id equals. Each
-  invocation whose global id lies inside (24, 8, 2) writes, at the record its global id
+  over (3, 2, 2) groups into a buffer filled first with a sentinel word no id equals. Each
+  invocation whose global id lies inside (24, 8, 4) writes, at the record its global id
   flattens to, its local id, its global id and its flattened local index; one outside it
-  writes nothing, so a wrong size cannot write past the buffer. The case compares all 384
-  records exactly with the reference, and checks that the words after them still hold the
+  writes nothing, so a wrong size cannot write past the buffer. Two groups in y and in z
+  tell a larger size in either from the module's. The case compares all 768 records
+  exactly with the reference, and checks that the words after them still hold the
   sentinel: on Metal it fails where the backend passes another size than the cooked
   `workgroup` as `threadsPerThreadgroup`, a smaller one leaving records at the sentinel.
 - `specialised_constant_of_each_type_is_read_back` specialises a compute stage with a `Bool`

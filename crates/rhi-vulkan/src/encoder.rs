@@ -801,9 +801,21 @@ impl Encoder for VulkanEncoder {
         let Some(object) = self.image(image) else { return };
         if !object.placed {
             self.fail(Rule::Usage, "an alias call of an image not placed in a block");
+            return;
         }
-        // Nothing is recorded: the image's first transition is from `Undefined`, whose
-        // barrier waits for every earlier command's writes of any memory.
+        // A global memory dependency: every earlier command's writes, a store that discards
+        // included, are made available and visible to every later access. The image's
+        // first transition, from `Undefined`, would not do: an image barrier's access scopes
+        // are its own range, which leaves the ending alias's writes unordered against the
+        // new one's, where the aliasing rule wants a memory dependency.
+        let barrier = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)];
+        let info = vk::DependencyInfo::default().memory_barriers(&barrier);
+        // SAFETY: recording outside a pass.
+        unsafe { self.device().cmd_pipeline_barrier2(self.command_buffer, &info) };
     }
 
     fn copy_buffer(
