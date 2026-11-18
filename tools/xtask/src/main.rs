@@ -312,14 +312,23 @@ fn run_gpu(args: &[&str]) -> Checked {
     eprintln!("gpu: the Metal step, under driver {driver}, with Metal's validation on");
     // The canaries first, each in a process of its own: a layer that did not load reports
     // nothing. API validation's aborts the process; shader validation's lets it complete.
-    for (canary, says, aborts) in CANARIES {
+    // What each said, as it wrote it, is recorded: the wording differs between Xcodes.
+    let mut heard = Vec::with_capacity(CANARIES.len());
+    for (canary, phrasings, aborts) in CANARIES {
         let run = metal_step(&["--canary", canary])?;
-        if run.status.success() == aborts || !run.stderr.contains(says) {
-            return Err(format!(
-                "Metal {canary} validation's canary did not yield `{says}`, so the layer is \
-                 not listening: it ended with {}:\n{}",
-                run.status, run.stderr
-            ));
+        match said(phrasings, &run.stderr) {
+            Some(says) if run.status.success() != aborts => {
+                heard.push(format!("{canary} `{says}`"));
+            }
+            _ => {
+                return Err(format!(
+                    "Metal {canary} validation's canary yielded none of `{}`, so the layer is \
+                     not listening: it ended with {}:\n{}",
+                    phrasings.join("`, `"),
+                    run.status,
+                    run.stderr
+                ));
+            }
         }
     }
     let step = metal_step(&[&code.to_string_lossy()])?;
@@ -334,7 +343,7 @@ fn run_gpu(args: &[&str]) -> Checked {
     let written = format!(
         "driver: {driver}\ncode: {cooked_by}\nvalidation: api and shader, canaries {}\n{}messages: \
          {}\n{}",
-        CANARIES.map(|(canary, says, _)| format!("{canary} `{says}`")).join(", "),
+        heard.join(", "),
         step.stdout,
         counted.len(),
         counted.iter().map(|line| format!("{line}\n")).collect::<String>()
@@ -382,12 +391,36 @@ fn cook_engine_shaders(context: &Context, pin: &slang::Pin, out: &Path) -> Resul
     Ok(code)
 }
 
-/// Each validator's canary in the Metal script, what the validator says of it, and whether
-/// that aborts the process.
-const CANARIES: [(&str, &str, bool); 2] = [
-    ("api", "missing Buffer binding at index 0", true),
-    ("shader", "Invalid store in 'device' or 'constant' address space", false),
+/// Each validator's canary in the Metal script, every phrasing seen so far of what the
+/// validator says of it, and whether that aborts the process. Each phrasing names the
+/// canary's own misuse: no buffer bound at index 0, and the `canary` kernel's store at
+/// offset 4194304, the script's index `1 << 20` into a buffer of one `uint`.
+const CANARIES: [(&str, &[&str], bool); 2] = [
+    // Xcode 16.4 writes `buffer`, Xcode 26.6 and 27.2 `Buffer`: `said` ignores ASCII case.
+    ("api", &["missing Buffer binding at index 0"], true),
+    (
+        "shader",
+        &[
+            // Xcode 27.2.
+            "Invalid store in 'device' or 'constant' address space at offset 4194304, executing \
+             compute function: \"canary\"",
+            // Xcode 26.6.
+            "Invalid device store at offset 4194304, executing kernel function: \"canary\"",
+        ],
+        false,
+    ),
 ];
+
+/// The text of `stderr` that is one of `phrasings`, compared without regard to ASCII case,
+/// as the validator wrote it.
+fn said<'a>(phrasings: &[&str], stderr: &'a str) -> Option<&'a str> {
+    // ASCII lowercase keeps every byte where it was, so a match's offsets hold in `stderr`.
+    let lower = stderr.to_ascii_lowercase();
+    phrasings.iter().find_map(|phrasing| {
+        let at = lower.find(&phrasing.to_ascii_lowercase())?;
+        Some(&stderr[at..at + phrasing.len()])
+    })
+}
 /// The lines the two layers write when they load.
 const VALIDATION_ON: [&str; 2] = ["Metal API Validation Enabled", "Metal GPU Validation Enabled"];
 
@@ -700,4 +733,75 @@ fn heavy(args: &[&str]) -> Result<i32, String> {
     let code = run(command.env(heavy::HELD_VAR, slot.held_value()));
     drop(slot);
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CANARIES, said};
+
+    #[test]
+    fn a_canary_is_heard_in_each_phrasing_seen_and_no_other_misuse_is() {
+        let [(_, api, _), (_, shader, _)] = CANARIES;
+        for (phrasings, text, heard) in [
+            // Xcode 27.2 on the M1; Xcode 26.6 on the hosted runner wrote the same phrase.
+            (
+                api,
+                "validateComputeFunctionArguments:1043: failed assertion `Compute \
+                 Function(canary): missing Buffer binding at index 0 for o[0].'",
+                Some("missing Buffer binding at index 0"),
+            ),
+            // Xcode 16.4 on the oldest runner.
+            (
+                api,
+                "validateComputeFunctionArguments:1056: failed assertion `Compute \
+                 Function(canary): missing buffer binding at index 0 for o[0].'",
+                Some("missing buffer binding at index 0"),
+            ),
+            // Xcode 27.2 on the M1.
+            (
+                shader,
+                "Invalid Metal usage: Invalid store in 'device' or 'constant' address space at \
+                 offset 4194304, executing compute function: \"canary\" \nMTLBuffer: <no label>",
+                Some(
+                    "Invalid store in 'device' or 'constant' address space at offset 4194304, \
+                     executing compute function: \"canary\"",
+                ),
+            ),
+            // Xcode 26.6 on the hosted runner.
+            (
+                shader,
+                "Invalid device store at offset 4194304, executing kernel function: \"canary\" \
+                 encoder: \"0\", dispatch: 0",
+                Some(
+                    "Invalid device store at offset 4194304, executing kernel function: \"canary\"",
+                ),
+            ),
+            // Another binding index, another kernel's store, another offset, a load.
+            (
+                api,
+                "failed assertion `Compute Function(canary): missing buffer binding at index 1 \
+                 for at[0].'",
+                None,
+            ),
+            (
+                shader,
+                "Invalid device store at offset 4194304, executing kernel function: \"cull\" \
+                 encoder: \"0\", dispatch: 0",
+                None,
+            ),
+            (
+                shader,
+                "Invalid store in 'device' or 'constant' address space at offset 64, executing \
+                 compute function: \"canary\"",
+                None,
+            ),
+            (
+                shader,
+                "Invalid device load at offset 4194304, executing kernel function: \"canary\"",
+                None,
+            ),
+        ] {
+            assert_eq!(said(phrasings, text), heard, "{text}");
+        }
+    }
 }

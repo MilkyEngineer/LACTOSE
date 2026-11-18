@@ -649,9 +649,14 @@ loader's environment and the Metal step uses none; on another host it exits 2.
    Metal API validation (`MTL_DEBUG_LAYER=1`, warnings to the log) and Metal shader validation
    (`MTL_SHADER_VALIDATION=1`, reports to standard error), as the Metal spike set them:
    - first each validator's canary, in a process of its own: an unbound buffer, which API
-     validation must abort on with `missing Buffer binding at index 0`, and a store past a
-     buffer's end, which shader validation must report with `Invalid store in 'device' or
-     'constant' address space`. A canary that is silent fails the run;
+     validation must abort on with `missing Buffer binding at index 0`, and the `canary`
+     kernel's store past a buffer's end, at offset 4194304, which shader validation must
+     report and let the process complete. The wording differs between Xcodes, so `CANARIES`
+     in `src/main.rs` lists each phrasing seen, compared without regard to ASCII case (Xcode
+     16.4 writes `buffer`): for the store, `Invalid store in 'device' or 'constant' address
+     space at offset 4194304, executing compute function: "canary"` (Xcode 27.2) and `Invalid
+     device store at offset 4194304, executing kernel function: "canary"` (Xcode 26.6). A
+     canary that is silent, or says only something else, fails the run;
    - then the step: the device is the first of `MTLCopyAllDevices`, and the run fails with
      none. It prints the device's facts: its name, its argument buffers tier, its highest
      Apple GPU family and whether it is of the Metal 3 family. Code that takes the heap
@@ -665,7 +670,8 @@ loader's environment and the Metal step uses none; on another host it exits 2.
      validation is loaded, as its canary shows, and sees no execution of the engine's code.
 3. Every line the step writes on standard error counts, except the two validators' banners,
    and one fails the run. It writes `target/gpu/<driver>-metal.txt`: the driver, the Slang
-   version or the directory the code was taken from, the validators and their canaries, the
+   version or the directory the code was taken from, the validators and what each canary
+   was heard to say, as the validator wrote it, so a run shows a runner's wording, the
    device's facts, the system's version, one line per pipeline state, and the messages
    counted.
 
