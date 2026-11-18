@@ -41,10 +41,10 @@ pub use server::{
     StepOutput, build_server,
 };
 pub use shown::{
-    Draw, Finished, FrameCounts, FrameTime, KindCounts, PresentLane, PresentReport, PresentSide,
-    RECORD_RESERVATION, Region, RenderSide, Rendered, Shown, ShownError, ShownFlush, ShownFrame,
-    ShownKept, ShownOutput, ShownStats, ShownStep, ShownStop, Stopped, Submitted, TARGETS,
-    TargetIndex, build_shown,
+    Draw, Finished, FrameCounts, FrameTime, JOIN_MARGIN, KindCounts, PresentLane, PresentReport,
+    PresentSide, RECORD_RESERVATION, Region, RenderSide, Rendered, SHED_DEPTH, Shown, ShownError,
+    ShownFlush, ShownFrame, ShownKept, ShownOutput, ShownStats, ShownStep, ShownStop, Stopped,
+    Submitted, TARGETS, TargetIndex, build_shown,
 };
 pub use world::{Start, WorldConfig};
 
@@ -60,8 +60,9 @@ pub use world::{Start, WorldConfig};
 /// asked of it (`tests/shown.rs`, section 6, implements the trait for a type that is not);
 /// the present side is the `Send + 'static` state of the present thread; a shown run's
 /// failure does not convert into `lactose_core::Error`, since `?` would then drop what it
-/// kept; every value that crosses to the job or to the present thread is plain data; and
-/// the frame has the two targets rhi-api's minimum names.
+/// kept; every value that crosses to the job or to the present thread is plain data; the
+/// frame has the two targets rhi-api's minimum names; the margin of a frame's wait is
+/// inside a tick period; and no frame is shed at a count of one.
 const _: () = {
     const fn send<T: Send>() {}
     const fn send_sync<T: Send + Sync + ?Sized>() {}
@@ -113,6 +114,11 @@ const _: () = {
     assert!(TARGETS >= 2);
     assert!(TargetIndex::new(TARGETS - 1).is_some() && TargetIndex::new(TARGETS).is_none());
     assert!(RECORD_RESERVATION >= 1);
+    // A frame's limit falls inside its own period: after its start, so a frame on time
+    // waits at all, and before the next deadline, so the wait delays no tick.
+    assert!(!JOIN_MARGIN.is_zero() && JOIN_MARGIN.as_nanos() < TICK_PERIOD.as_nanos());
+    // The picture presented a frame ago is on its way at any swapchain's floor.
+    assert!(SHED_DEPTH >= 2);
 
     // `ShownError: !Into<lactose_core::Error>`. Both impls below apply to a type that
     // converts, and the marker then cannot be inferred, which fails the build.

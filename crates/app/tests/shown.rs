@@ -22,9 +22,9 @@ use std::any::Any;
 use std::cell::Cell;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use lactose_app::{
@@ -47,9 +47,7 @@ use lactose_rhi_api::{
     TimelineHandle, TimelinePoint,
 };
 use lactose_sim::TickInput;
-use lactose_task::{
-    ChaosConfig, Executor, GraphBuilder, GraphNode, JobContext, Sleep, WorkerClass,
-};
+use lactose_task::{ChaosConfig, Executor, GraphBuilder, GraphNode, JobContext, WorkerClass};
 
 const GRAPHICS: QueueRole = QueueRole::Graphics;
 
@@ -383,7 +381,7 @@ struct ClientPresent {
 /// The bound the present side gives its own waits, on the present thread alone.
 const PRESENT_WAIT: Duration = Duration::from_millis(100);
 
-const NOTHING: PresentReport = PresentReport { read: None, shown: false };
+const NOTHING: PresentReport = PresentReport { read: None, shown: false, waiting: None };
 
 /// The pass that samples the target into the swapchain image, with a pipeline made for
 /// `Swapchain::format` (rhi-api, "The present thread").
@@ -460,7 +458,13 @@ impl PresentSide for ClientPresent {
                 self.next += 1;
                 self.last = Some(read);
                 self.stale = presented == Presented::Stale;
-                Ok(PresentReport { read: Some(read), shown: presented == Presented::Shown })
+                // No swapchain reports a display time yet, so nothing is counted as
+                // waiting and no frame is shed.
+                Ok(PresentReport {
+                    read: Some(read),
+                    shown: presented == Presented::Shown,
+                    waiting: None,
+                })
             }
             // Nothing was submitted and the image is still the acquired one: the frame's
             // release of the target stays unmet, and the frame takes the target back from
@@ -545,9 +549,10 @@ async fn ended(failure: ShownError) -> Result<Ended> {
 }
 
 /// The timer root paces the frame and nothing else does (architecture section 5.1): one
-/// sleep to the next tick's deadline, one frame. The root waits for nothing of the render
-/// side: a frame that finds the frame before it still there runs its ticks, defers its
-/// passes and says `Rendered::Busy`. Where the present role has a queue of its own the
+/// sleep to the next tick's deadline, one frame. No tick waits for the render side: a
+/// frame waits for the frame before it only until `JOIN_MARGIN` before the next tick's
+/// deadline, and one that finds it still there then has run its ticks, defers its passes
+/// and says `Rendered::Busy`. Where the present role has a queue of its own the
 /// present thread holds no frame; where it shares the graphics queue a present call still
 /// in flight holds one frame's submit, and that frame is dropped after it.
 async fn root(
@@ -566,10 +571,10 @@ async fn root(
             Ok((next, output)) => {
                 shown = next;
                 deadline = output.world.next_deadline;
-                if let Some(Rendered::Drew { counts, queued, held, .. }) = output.joined {
+                if let Some(Rendered::Drew { counts, queued, held, shed, .. }) = output.joined {
                     // A result file's: what was drawn, what was queued to be shown, and
                     // what was held and so dropped.
-                    let _ = (counts.server.stale(), queued, held);
+                    let _ = (counts.server.stale(), queued, held, shed);
                 }
                 // A result file's as well: a frame that ran its ticks alone because the
                 // frame before it was still on the render side.
@@ -743,7 +748,7 @@ struct CountingPresent {
 impl PresentSide for CountingPresent {
     fn present(&mut self, finished: Finished) -> Result<PresentReport> {
         self.presents += 1;
-        Ok(PresentReport { read: Some(point(1 << 32 | self.presents)), shown: true })
+        Ok(PresentReport { read: Some(point(1 << 32 | self.presents)), shown: true, waiting: None })
     }
 
     fn close(&mut self) {
@@ -873,10 +878,22 @@ const UNITS: usize = 4096;
 /// is the bound of a failure: no assertion reads a duration.
 const WAIT_BOUND: Duration = Duration::from_secs(10);
 
-/// A wait raced against the executor's timer: `None` once the timer resolved first.
+/// What a bounded wait shares with the thread that keeps its bound.
+struct Expiry {
+    /// Raised once the bound has passed.
+    passed: AtomicBool,
+    /// The waker the wait's last poll left, which the keeping thread wakes after it has
+    /// raised the flag.
+    waker: Mutex<Option<Waker>>,
+}
+
+/// A wait raced against a clock that is no worker's: `None` once the bound passed first.
+/// The executor's own timers are fired by a frame-critical worker that looks for work, so
+/// a bound kept by one of them would not fire while every such worker is stuck in a job,
+/// which is the failure the bound is for.
 struct Bounded<W> {
     wait: Pin<Box<W>>,
-    bound: Pin<Box<Sleep>>,
+    expiry: Arc<Expiry>,
 }
 
 impl<W: Future> Future for Bounded<W> {
@@ -886,15 +903,39 @@ impl<W: Future> Future for Bounded<W> {
         if let Poll::Ready(value) = self.wait.as_mut().poll(cx) {
             return Poll::Ready(Some(value));
         }
-        self.bound.as_mut().poll(cx).map(|_| None)
+        // The waker is left before the flag is read, and the keeping thread raises the
+        // flag before it takes the waker: a bound that passes between the two is seen
+        // here or woken there.
+        *self.expiry.waker.lock().expect("no poll panicked") = Some(cx.waker().clone());
+        if self.expiry.passed.load(Ordering::Acquire) { Poll::Ready(None) } else { Poll::Pending }
     }
 }
 
-/// `wait`, from the thread that drives the test, within `WAIT_BOUND`.
+/// `wait`, from the thread that drives the test, within `WAIT_BOUND`. The bound is kept
+/// by a thread of the test's own, which sleeps on a channel and is ended by its sender's
+/// drop when the wait resolves first.
 fn bounded<W: Future>(executor: &Executor, wait: W, what: &str) -> W::Output {
-    let bound = Box::pin(executor.sleep_until(Instant::now() + WAIT_BOUND));
-    let raced = Bounded { wait: Box::pin(wait), bound };
-    executor.block_on(raced).unwrap_or_else(|| panic!("{what} did not resolve within its bound"))
+    let expiry = Arc::new(Expiry { passed: AtomicBool::new(false), waker: Mutex::new(None) });
+    let (resolved, ended) = mpsc::channel::<()>();
+    let keeper = {
+        let expiry = Arc::clone(&expiry);
+        std::thread::Builder::new()
+            .name("wait-bound".to_owned())
+            .spawn(move || {
+                if ended.recv_timeout(WAIT_BOUND) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    expiry.passed.store(true, Ordering::Release);
+                    let waker = expiry.waker.lock().expect("no poll panicked").take();
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                }
+            })
+            .expect("the thread that keeps the bound")
+    };
+    let value = executor.block_on(Bounded { wait: Box::pin(wait), expiry });
+    drop(resolved);
+    keeper.join().expect("the thread that keeps the bound");
+    value.unwrap_or_else(|| panic!("{what} did not resolve within its bound"))
 }
 
 /// A render side that is `Send` and not `Sync`, and that uses the context its job lends:
