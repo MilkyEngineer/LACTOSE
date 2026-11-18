@@ -6,9 +6,9 @@ use super::kit::{
 };
 use crate::{
     BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferTransition,
-    BufferUsage, Device, Encoder, Extent, Format, ImageDesc, ImageHandle, ImageMemory, ImageRange,
-    ImageState, ImageUsage, Load, MemoryBlockDesc, MemoryClass, PassReach, QueuePath, QueueRole,
-    Rect, Rule, Sharing, Store, Submit,
+    BufferUsage, Device, Encoder, Extent, Format, HeapSlot, ImageDesc, ImageHandle, ImageMemory,
+    ImageRange, ImageState, ImageUsage, Load, MemoryBlockDesc, MemoryClass, PassReach, QueuePath,
+    QueueRole, Rect, Rule, Sharing, Store, Submit,
 };
 
 type Applies = Result<(), &'static str>;
@@ -48,6 +48,10 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     (
         "use_under_another_queues_pending_transition_is_refused",
         use_under_another_queues_pending_transition_is_refused,
+    ),
+    (
+        "sampled_read_under_another_queues_pending_write_is_refused",
+        sampled_read_under_another_queues_pending_write_is_refused,
     ),
     (
         "use_in_a_later_submit_than_the_waiting_change_is_refused",
@@ -807,6 +811,50 @@ fn use_under_another_queues_pending_write_is_refused(ctx: &Ctx<'_>) -> Applies {
         (shared, image),
         "another queue's pending submit writes",
     );
+    Ok(())
+}
+
+/// Compute fills a `Concurrent` image and moves it to `SampledRead` in a submit held pending.
+/// A graphics dispatch whose pass declares a heap slot that holds the image, with no wait for
+/// that submit, is refused; with the wait it passes.
+fn sampled_read_under_another_queues_pending_write_is_refused(ctx: &Ctx<'_>) -> Applies {
+    several_queues(ctx)?;
+    let device = ctx.device();
+    let usage = ImageUsage::SAMPLED.union(ImageUsage::COPY_DESTINATION);
+    let image = ctx.image(
+        &*device,
+        &ImageDesc {
+            sharing: Sharing::Concurrent,
+            ..image_desc(Format::Rgba8Unorm, EXTENT, usage)
+        },
+    );
+    let mut writer = ctx.encoder(&*device, C);
+    fill(&mut *writer, texels(ctx, &*device), image);
+    writer.transition_images(&[image_to(
+        image,
+        ImageState::CopyDestination,
+        ImageState::SampledRead,
+        C,
+    )]);
+    let mut writers = [writer];
+    let gate = ctx.held(&*device, C, &mut writers);
+    let slot = HeapSlot(3);
+    ctx.ok(device.write_heap_slot(slot, image), "a write of the slot");
+    let pipeline = ctx.compute(&*device);
+    let mut reader = ctx.encoder(&*device, G);
+    compute_pass(&mut *reader, pipeline, PassReach { slots: &[slot], buffers: &[] });
+    reader.push_slot(0, slot);
+    reader.dispatch([1, 1, 1]);
+    reader.end_pass();
+    let mut readers = [reader];
+    ctx.refused(
+        submit(&*device, G, &mut readers),
+        "a sampled read of an image another queue's pending submit writes, with no wait for it",
+    );
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, G, &mut readers, &[gate.done], &[done]);
+    gate.open(ctx, &*device);
+    ctx.reached(&*device, done);
     Ok(())
 }
 
