@@ -118,9 +118,13 @@ fn walk(node: &Value, base: u32, semantics: &mut Semantics) -> Result<()> {
     if index != u64::from(location) {
         return Err(invalid(format!(
             "{} is `{semantic}{index}` at location {location}, where each is at its semantic's \
-             index: declare it in a struct with `[[vk::location({index})]]`{}",
+             index: declare it with `[[vk::location({index})]]`{}",
             described(what),
-            if target { ", since a returned value is at location 0" } else { "" }
+            if name.is_none() {
+                ", since Slang places a returned value after any `out` outputs"
+            } else {
+                ""
+            }
         )));
     }
     let bits = if target { &mut semantics.outputs } else { &mut semantics.varyings };
@@ -228,6 +232,23 @@ mod tests {
             let error = read(&reflection(&parameter, &result), "fs").unwrap_err();
             assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
             assert!(error.message().contains(says), "{says}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_hint_on_a_returned_value_alone_says_where_slang_places_it() {
+        let none = r#"{"type": {"kind": "struct", "fields": []}}"#;
+        let clause = "since Slang places a returned value after any `out` outputs";
+        let returned = leaf("", "varyingOutput", 1, "SV_TARGET", None);
+        let error = read(&reflection(none, &returned), "fs").unwrap_err();
+        assert!(error.message().contains("declare it with `[[vk::location(0)]]`, "), "{error}");
+        assert!(error.message().contains(clause), "{error}");
+        // An `out` parameter, and a field of a returned struct.
+        let out = leaf("b", "varyingOutput", 0, "SV_TARGET", Some(1));
+        let field = fields("", "varyingOutput", 0, &[out.clone()]);
+        for (parameter, result) in [(out.as_str(), none), (none, field.as_str())] {
+            let error = read(&reflection(parameter, result), "fs").unwrap_err();
+            assert!(error.message().ends_with("`[[vk::location(1)]]`"), "{error}");
         }
     }
 

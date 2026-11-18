@@ -84,10 +84,11 @@ const DIM_SUBPASS_DATA: u32 = 6;
 
 /// The capabilities `rhi-api`'s README lists, each of which the required set enables, by
 /// number and name.
-const ALLOWED: [(u32, &str); 7] = [
+const ALLOWED: [(u32, &str); 8] = [
     (1, "Shader"),
     (11, "Int64"),
     (40, "InputAttachment"),
+    (50, "ImageQuery"),
     (55, "StorageImageReadWithoutFormat"),
     (5301, "ShaderNonUniform"),
     (5307, "SampledImageArrayNonUniformIndexing"),
@@ -725,18 +726,17 @@ impl Module {
 
     /// The bytes a value of type `ty` takes in a block; `member` is the struct member it is,
     /// or the member that holds the array it is an element of, for a matrix's stride and
-    /// order. A 3-component vector, and a matrix of 3 rows or columns, are refused at any
-    /// depth: SPIR-V's layout gives the vector 12 bytes and the MSL's struct 16, so a member
-    /// after one is at another offset on each target.
+    /// order. A 3-component vector is refused at any depth: SPIR-V's layout gives it 12 bytes
+    /// and the MSL's struct 16, so a member after one is at another offset on each target. A
+    /// matrix's columns or rows of 3 are not: its `MatrixStride` is theirs on both targets.
     fn size(&self, ty: u32, member: Option<(u32, u32)>) -> Result<u32> {
         let unsized_ = || {
             invalid(format!("the push-constant block holds type %{ty}, which the cook cannot size"))
         };
         let three = || {
             invalid(
-                "the push-constant block holds a 3-component vector or a matrix of 3 rows or \
-                 columns, which the SPIR-V lays out in 12 bytes a vector and the MSL in 16: use \
-                 4 components",
+                "the push-constant block holds a 3-component vector, which the SPIR-V lays out in \
+                 12 bytes and the MSL in 16: use 4 components",
             )
         };
         let size = match self.types.get(&ty).ok_or_else(unsized_)? {
@@ -747,9 +747,6 @@ impl Module {
                 let Some(Type::Vector { count: rows, .. }) = self.types.get(column) else {
                     return Err(unsized_());
                 };
-                if *rows == 3 || *count == 3 {
-                    return Err(three());
-                }
                 let stride = member.and_then(|m| self.member_decoration(m, MATRIX_STRIDE));
                 let stride = stride.ok_or_else(unsized_)?;
                 // A row-major matrix is a stride per row, a column-major one per column.
@@ -861,6 +858,17 @@ mod tests {
         let extension = literal("SPV_EXT_descriptor_indexing");
         let error = reflect(&module(&[shader, (OP_EXTENSION, &extension)])).unwrap_err();
         assert!(error.message().contains("extension SPV_EXT_descriptor_indexing"), "{error}");
+    }
+
+    #[test]
+    fn each_capability_on_the_list_is_read() {
+        for (capability, name) in ALLOWED {
+            let declared = [(OP_CAPABILITY, vec![capability])];
+            let read = reflect(&assemble(FRAGMENT, &[], &declared, &[]));
+            assert!(read.is_ok(), "{name}: {:?}", read.err());
+        }
+        // `ImageQuery`, which a size query of a heap image declares.
+        reflect(&assemble(FRAGMENT, &[], &[(OP_CAPABILITY, vec![50])], &[])).unwrap();
     }
 
     #[test]
@@ -1341,14 +1349,28 @@ mod tests {
         let stride = (OP_MEMBER_DECORATE, vec![FREE + 10, 0, MATRIX_STRIDE, 16]);
         assert_eq!(bytes(&push_block(&[FREE], &[0], &[matrix.clone(), stride.clone()])), 32);
         let row_major = (OP_MEMBER_DECORATE, vec![FREE + 10, 0, ROW_MAJOR]);
-        assert_eq!(bytes(&push_block(&[FREE], &[0], &[matrix, stride, row_major])), 64);
+        assert_eq!(
+            bytes(&push_block(&[FREE], &[0], &[matrix, stride.clone(), row_major.clone()])),
+            64
+        );
+        // A matrix of 3 rows or columns is its stride, 16 on both targets, a row or column:
+        // its 3-component vectors are not refused.
+        for (column, count, row_major_bytes, column_major_bytes) in
+            [(VEC3, 4, 48, 64), (VEC4, 3, 64, 48), (VEC3, 3, 48, 48)]
+        {
+            let matrix = (OP_TYPE_MATRIX, vec![FREE, column, count]);
+            let column_major = [matrix.clone(), stride.clone()];
+            assert_eq!(bytes(&push_block(&[FREE], &[0], &column_major)), column_major_bytes);
+            let row = [matrix, stride.clone(), row_major.clone()];
+            assert_eq!(bytes(&push_block(&[FREE], &[0], &row)), row_major_bytes);
+        }
         assert_eq!(bytes(&assemble(FRAGMENT, &[], &[], &[])), 0);
     }
 
     #[test]
     fn a_push_block_the_targets_lay_out_apart_or_out_of_bounds_is_refused() {
-        let three = "the push-constant block holds a 3-component vector or a matrix of 3 rows \
-                     or columns";
+        let three = "the push-constant block holds a 3-component vector, which the SPIR-V lays \
+                     out in 12 bytes and the MSL in 16";
         refused(&push_block(&[FLOAT, VEC3], &[0, 16], &[]), three);
         // In a struct, an array or a matrix.
         let inner = [
@@ -1360,10 +1382,6 @@ mod tests {
         let array =
             [(OP_TYPE_ARRAY, vec![FREE, VEC3, N1024]), (OP_DECORATE, vec![FREE, ARRAY_STRIDE, 16])];
         refused(&push_block(&[FREE], &[0], &array), three);
-        let stride = (OP_MEMBER_DECORATE, vec![FREE + 10, 0, MATRIX_STRIDE, 16]);
-        for matrix in [vec![FREE, VEC3, 4], vec![FREE, VEC4, 3]] {
-            refused(&push_block(&[FREE], &[0], &[(OP_TYPE_MATRIX, matrix), stride.clone()]), three);
-        }
         // A device address to one is not in the block.
         let pointer = (OP_TYPE_POINTER, vec![FREE, PHYSICAL_STORAGE_BUFFER, VEC3]);
         reflect(&push_block(&[FREE], &[0], &[pointer])).unwrap();

@@ -20,9 +20,9 @@ public ParameterBlock<Heap> heap : register(b1);
 // The non-uniform marker: every index into the heap goes through it. SPIR-V carries the
 // decoration only where the marker is inlined into the access, and the cook refuses an access
 // that does not carry it. The pinned Slang's Metal target refuses `NonUniformResourceIndex`
-// written in the entry module, though not inlined from this one, and later releases compile
-// it: the marker is the index alone on Metal, which needs no decoration, so what Metal is
-// given rests on neither.
+// unless a generic over an interface reaches it, wherever it is written, and later releases
+// compile it: the marker is the index alone on Metal, which needs no decoration, so what
+// Metal is given rests on neither.
 [ForceInline]
 public uint nonuniform_slot(uint slot)
 {

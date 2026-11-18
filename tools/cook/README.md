@@ -120,8 +120,10 @@ and names the source, the entry and, where one alone is read, the target; nothin
 
 - **Capabilities.** The SPIR-V declares only `rhi-api`'s list: `Shader`,
   `PhysicalStorageBufferAddresses`, `Int64`, `ShaderNonUniform`,
-  `SampledImageArrayNonUniformIndexing`, `InputAttachment` and
+  `SampledImageArrayNonUniformIndexing`, `InputAttachment`, `ImageQuery` and
   `StorageImageReadWithoutFormat`, and no extension but `SPV_KHR_physical_storage_buffer`.
+  `ImageQuery`, which a size query of an image declares, is enabled by Vulkan 1.0 as
+  `InputAttachment` is, and Metal's `get_width` and `get_height` need no feature.
   The refusal of `DrawParameters` says it comes from `SV_VertexID` or `SV_InstanceID`, and
   that `SV_VulkanVertexID` and `SV_VulkanInstanceID` are the engine's; that of
   `RuntimeDescriptorArray`, that a runtime descriptor array declares it, such as the one
@@ -158,9 +160,10 @@ and names the source, the entry and, where one alone is read, the target; nothin
   `[[color(i)]]` are the same set: Metal writes an output to the colour of its semantic and
   Vulkan to its location, so an output at another location than its index would be written
   to another attachment on each. Slang gives an output without `[[vk::location(i)]]` its
-  place in its struct, and a returned value location 0, whatever its `SV_Target<i>`: a
-  returned `SV_Target1`, or a struct whose outputs are out of their indices' order, is
-  refused, and the message names the `[[vk::location(i)]]` to write in a struct.
+  place among the outputs, whatever its `SV_Target<i>`, and places a returned value after
+  any `out` outputs, so at location 0 when it is the only output: a returned `SV_Target1`
+  alone, or outputs out of their indices' order, are refused, and the message names the
+  `[[vk::location(i)]]` to write, on a struct's field or an `out` parameter.
 - **Varyings.** A vertex entry's outputs and a fragment entry's inputs, the built-ins aside,
   are each `TEXCOORD<i>` at location `i`, in Slang's reflection, of one location each:
   Metal links the stages by semantic and Vulkan by location, so a varying at another
@@ -174,10 +177,11 @@ and names the source, the entry and, where one alone is read, the target; nothin
   `[[color(i)]]` parameters, and its `SpecId`s, each of one byte for a `bool` or four for a
   32-bit scalar, are the MSL's `[[function_constant(i)]]`s.
 - **Push bytes.** At most one push-constant block, whose size, a device address counting
-  eight bytes, is at most `PUSH_BYTES_MAX`. It holds no 3-component vector, and no matrix of
-  3 rows or columns, at any depth: the SPIR-V lays a `float3` out in 12 bytes and the MSL in
-  16, so a member after one is at another offset on each target. A `float3` reached through
-  a device address is not in the block, and is read.
+  eight bytes, is at most `PUSH_BYTES_MAX`. It holds no 3-component vector at any depth: the
+  SPIR-V lays a `float3` out in 12 bytes and the MSL in 16, so a member after one is at
+  another offset on each target. A matrix of 3 rows or columns is not refused: its
+  `MatrixStride` is 16 on both targets, so a `float3x4` or a `float3x3` takes the same bytes
+  on each. A `float3` reached through a device address is not in the block, and is read.
 
 ## The glTF reader
 
@@ -366,6 +370,8 @@ The tests that run Slang are ignored, and run once `cargo xtask slang` has insta
 | Each refusal decision 5.8 names, on the engine shader mutated: the marker removed; the marker in a helper that is not inlined; `NonUniformResourceIndex` on a `DescriptorHandle`, which Slang only warns of, and the handle with Slang's own marker; a lone `SV_Target1`; `SV_VertexID`; a warning | `tests/shader.rs`, `the_marker_removed_is_refused`, `the_marker_in_a_helper_not_inlined_is_refused`, `non_uniform_resource_index_on_a_descriptor_handle_is_refused_and_so_is_the_handle`, `a_lone_sv_target1_is_refused`, `sv_vertex_id_is_refused`, `a_warning_is_an_error` |
 | What Slang emits that the two targets would read apart, each refused on a probe beside the engine's modules: outputs off their `SV_Target` index (in reverse order, at swapped locations, a returned `SV_Target1`); varyings off their `TEXCOORD` index and one of another semantic; a vertex input that is not a built-in; a push block's `float3`; a heap image arrayed, of `uint` texels or multisampled, by the SPIR-V's reader; the heap without its register, at `[[buffer(0)]]`, and as globals | `tests/shader.rs`, `outputs_off_their_target_index_are_refused`, `varyings_off_their_texcoord_index_are_refused`, `a_vertex_input_that_is_not_a_built_in_is_refused`, `a_push_block_float3_is_refused`, `a_heap_image_of_another_form_is_refused`, `the_heap_off_its_metal_buffer_or_bound_alone_is_refused` |
 | The heap at `[[buffer(1)]]` with no push block and with one declared and unread, and a `float3` reached through a device address, cook | `tests/shader.rs`, `the_heap_is_at_buffer_1_with_or_without_a_push_block_and_a_pointee_float3_is_read` |
+| What the pin emits alike for both targets cooks: a push block's `float3x4`, `float4x3` and `float3x3`, row-major and column-major; a size query of a heap image, which declares `ImageQuery` | `tests/shader.rs`, `a_push_block_matrix_of_3_rows_or_columns_cooks`, `a_size_query_of_a_heap_image_cooks` |
+| Why the marker is the index alone on Metal: with `NonUniformResourceIndex` on every target, the pin refuses it for Metal, inlined from the marker or not, unless a generic over an interface reaches it | `tests/shader.rs`, `non_uniform_resource_index_for_metal_cooks_on_the_pin_only_through_a_generic` |
 | A `slangc` of another version, the SDK's among them, and a missing one, are refused; a shader source with no `slangc`, a link module alone and `--code` without `--slangc` are refused | `tests/shader.rs`, `a_slangc_of_another_version_is_refused`, `a_shader_without_slangc_and_a_lone_link_module_are_refused`, `the_binary_refuses_code_without_slangc` |
 | Two checkouts at different paths cook the same SPIR-V and MSL, no cooked file names a path of either checkout or of the temporary directory, and the metallibs' equality is printed | `tests/shader.rs`, `two_checkouts_at_different_paths_cook_the_same_spirv_and_msl_and_name_no_path` |
 | The link-time constant folds into both targets: `discard_fragment` and `OpKill` with it true, neither with it false, and no specialisation constant for it | `tests/shader.rs`, `the_link_time_constant_folds_into_both_targets` |

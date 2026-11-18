@@ -80,13 +80,34 @@ fn probe(env: &Env, name: &str, edits: &[(&str, &str, &str)], shaders: &[(&str, 
 }
 
 /// Asserts that `probe.slang`, of `source` and beside the modules `edits` changed, is refused
-/// as invalid with a message that contains `says`.
-fn assert_probe_refused(name: &str, edits: &[(&str, &str, &str)], source: &str, says: &str) {
+/// as invalid with a message that contains `says`, and returns the message.
+fn assert_probe_refused(
+    name: &str,
+    edits: &[(&str, &str, &str)],
+    source: &str,
+    says: &str,
+) -> String {
     let env = Env::new(name);
     let sources = probe(&env, "sources", edits, &[("probe.slang", source)]);
     let error = cook_shaders(&env, &sources, None).expect_err("the probe is refused");
     assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
     assert!(error.message().contains(says), "{error}");
+    error.message().to_owned()
+}
+
+/// Cooks `probe.slang`, of `source` and beside the modules `edits` changed, and returns the
+/// MSL of its entry `entry`.
+fn assert_probe_cooks(
+    name: &str,
+    edits: &[(&str, &str, &str)],
+    source: &str,
+    entry: &str,
+) -> String {
+    let env = Env::new(name);
+    let sources = probe(&env, "sources", edits, &[("probe.slang", source)]);
+    let code = env.dir.join("code");
+    cook_shaders(&env, &sources, Some(&code)).unwrap_or_else(|error| panic!("{name}: {error}"));
+    std::fs::read_to_string(code.join(format!("probe.{entry}.msl"))).unwrap()
 }
 
 fn copy(from: &Path, to: &Path) {
@@ -214,11 +235,21 @@ fn outputs_off_their_target_index_are_refused() {
         (
             "value-target1",
             "[shader(\"fragment\")] float4 fs_main() : SV_Target1 { return 1; }\n",
-            "probe.slang: fs_main: the returned fragment output is `SV_Target1` at location 0",
+            "probe.slang: fs_main: the returned fragment output is `SV_Target1` at location 0, \
+             where each is at its semantic's index: declare it with `[[vk::location(1)]]`, since \
+             Slang places a returned value after any `out` outputs",
         ),
     ] {
         assert_probe_refused(name, &[], source, says);
     }
+    // An `out` output, which Slang places before the returned value: its hint is the location
+    // alone.
+    let source = "[shader(\"fragment\")] float4 fs_main(float4 p : SV_Position, \
+                  out float4 b : SV_Target1) : SV_Target0 { b = 0; return 1; }\n";
+    let says = "probe.slang: fs_main: the fragment output `b` is `SV_Target1` at location 0, \
+                where each is at its semantic's index: declare it with `[[vk::location(1)]]`";
+    let message = assert_probe_refused("return-and-out", &[], source, says);
+    assert!(message.ends_with("`[[vk::location(1)]]`"), "{message}");
 }
 
 #[test]
@@ -280,6 +311,24 @@ fn a_push_block_float3_is_refused() {
                   { return float4(push.a, push.b) + float(push.c) + float(push.address); }\n";
     let says = "probe.slang: fs_p (SPIR-V): the push-constant block holds a 3-component vector";
     assert_probe_refused("push-float3", &[], source, says);
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_push_block_matrix_of_3_rows_or_columns_cooks() {
+    // Its stride is 16 on both targets, so the member after it is at one offset on each.
+    for matrix in ["float3x4", "float4x3", "float3x3"] {
+        for layout in ["row_major", "column_major"] {
+            let source = format!(
+                "struct Push {{ {layout} {matrix} m; float4 after; }};\n\
+                 [[vk::push_constant]] ConstantBuffer<Push> push;\n\
+                 [shader(\"fragment\")] float4 fs_p() : SV_Target0 \
+                 {{ return float4(push.m[0][0] + push.after.x); }}\n"
+            );
+            let name = format!("push-{layout}-{matrix}");
+            assert_probe_cooks(&name, &[], &source, "fs_p");
+        }
+    }
 }
 
 const HEAP: &str = "lactose/heap.slang";
@@ -386,6 +435,45 @@ fn the_heap_is_at_buffer_1_with_or_without_a_push_block_and_a_pointee_float3_is_
         let parameter = msl[at..].split_once("]]").unwrap().0;
         assert!(parameter.ends_with("[[buffer(1)"), "{shader}: {parameter}");
     }
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_size_query_of_a_heap_image_cooks() {
+    // `GetDimensions` declares `ImageQuery` on SPIR-V and is `get_width` on Metal.
+    let source = "import lactose.heap;\n\
+                  struct Push { uint slot; };\n\
+                  [[vk::push_constant]] ConstantBuffer<Push> push;\n\
+                  [shader(\"fragment\")] float4 fs_p() : SV_Target0\n\
+                  {\n    uint w, h;\n    \
+                  heap.images[nonuniform_slot(push.slot)].GetDimensions(w, h);\n    \
+                  return float4(w, h, 0, 1);\n}\n";
+    let msl = assert_probe_cooks("size-query", &[], source, "fs_p");
+    assert!(msl.contains("get_width"), "{msl}");
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn non_uniform_resource_index_for_metal_cooks_on_the_pin_only_through_a_generic() {
+    // Why the marker is the index alone on Metal: with `NonUniformResourceIndex` on every
+    // target, the pin refuses it for Metal, inlined from `lactose.heap` or not, unless a
+    // generic over an interface reaches it, as the engine shader's surface does.
+    let switch = "    __target_switch\n    {\n    case spirv:\n        \
+                  return NonUniformResourceIndex(slot);\n    default:\n        return slot;\n    }";
+    let edit = (HEAP, switch, "    return NonUniformResourceIndex(slot);");
+    let says = "uses features that are not available in 'fragment' stage for 'metal'";
+    assert_probe_refused("nuri-direct", &[edit], HEAP_WITHOUT_PUSH, says);
+    let generic = "import lactose.heap;\n\
+                   interface ISurface { float4 shade(float2 uv); }\n\
+                   struct Textured : ISurface\n{\n    uint slot;\n    \
+                   float4 shade(float2 uv) { return heap.images[nonuniform_slot(slot)]\
+                   .Sample(heap.samplers[nonuniform_slot(slot)], uv); }\n}\n\
+                   float4 evaluate<S : ISurface>(S surface, float2 uv) \
+                   { return surface.shade(uv); }\n\
+                   [shader(\"fragment\")] float4 fs_p(float2 uv : TEXCOORD0, \
+                   nointerpolation uint slot : TEXCOORD1) : SV_Target0\n\
+                   { Textured surface; surface.slot = slot; return evaluate(surface, uv); }\n";
+    assert_probe_cooks("nuri-generic", &[edit], generic, "fs_p");
 }
 
 #[test]
