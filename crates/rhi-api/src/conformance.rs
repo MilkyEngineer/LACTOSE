@@ -236,6 +236,7 @@ pub const CASES: &[Case] = cases! {
     contract "host_access_outside_the_memory_class_is_refused" => Usage everywhere;
     contract "address_of_a_buffer_without_the_usage_is_refused" => Usage everywhere;
     contract "read_under_a_pending_writer_is_refused" => Pending everywhere;
+    contract "read_under_a_pending_transition_to_host_read_is_refused" => Pending everywhere;
     contract "write_under_a_pending_writer_is_refused" => Pending everywhere;
     contract "submit_writing_under_a_host_access_is_refused" => HostOverlap everywhere;
     contract "submit_racing_a_host_access_refuses_one";
@@ -271,6 +272,11 @@ pub const CASES: &[Case] = cases! {
     contract "roles_on_one_queue_need_no_transfer";
     contract "image_taken_while_another_queue_reads_it_is_refused" => Queue;
     contract "read_of_contents_left_undefined_is_refused" => UndefinedRead;
+    contract "use_under_another_queues_pending_write_is_refused" => Queue;
+    contract "use_in_a_later_submit_than_the_waiting_change_is_refused" => Queue;
+    contract "use_waiting_through_another_submit_passes";
+    contract "acquire_of_a_release_a_retake_ended_is_refused" => Queue;
+    contract "read_after_a_retake_of_an_unmet_release_is_refused" => UndefinedRead;
     output "ownership_transfer_keeps_the_contents";
     // The heap, the sampler table and what a pass declares.
     contract "heap_slot_outside_the_heap_is_refused" => Bounds everywhere;
@@ -319,6 +325,7 @@ pub const CASES: &[Case] = cases! {
     contract "pass_left_open_is_refused" => Encoding everywhere;
     contract "push_outside_the_block_is_refused" => Bounds everywhere;
     contract "copy_region_outside_its_resource_is_refused" => Bounds everywhere;
+    contract "copy_regions_overlapping_in_the_destination_are_refused" => Bounds everywhere;
     contract "refused_submit_changes_nothing";
     contract "submit_of_no_encoders_waits_and_signals";
     contract "submit_is_pending_until_its_wait_is_reached";

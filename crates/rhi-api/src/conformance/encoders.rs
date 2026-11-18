@@ -28,6 +28,10 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     ("pass_left_open_is_refused", pass_left_open_is_refused),
     ("push_outside_the_block_is_refused", push_outside_the_block_is_refused),
     ("copy_region_outside_its_resource_is_refused", copy_region_outside_its_resource_is_refused),
+    (
+        "copy_regions_overlapping_in_the_destination_are_refused",
+        copy_regions_overlapping_in_the_destination_are_refused,
+    ),
     ("refused_submit_changes_nothing", refused_submit_changes_nothing),
     ("submit_of_no_encoders_waits_and_signals", submit_of_no_encoders_waits_and_signals),
     ("submit_is_pending_until_its_wait_is_reached", submit_is_pending_until_its_wait_is_reached),
@@ -501,6 +505,95 @@ fn copy_region_outside_its_resource_is_refused(ctx: &Ctx<'_>) -> Applies {
         submit(&*device, G, &mut [encoder]),
         "a copy to a buffer offset that is not a multiple of the texel",
     );
+    Ok(())
+}
+
+/// Two regions of one copy call that write one byte of the destination buffer, or one
+/// texel of the destination image, are refused, in either order; regions that read one
+/// source byte twice, or meet in the destination without sharing a byte, are accepted.
+fn copy_regions_overlapping_in_the_destination_are_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let (source, destination) = pair(ctx, &*device);
+    let region = |source_offset, destination_offset| BufferCopy {
+        source_offset,
+        destination_offset,
+        size: 16,
+    };
+    let buffer_copies = [
+        ("two regions that share a destination byte", [region(0, 0), region(32, 15)], false),
+        ("two regions, the later first, that share one", [region(32, 40), region(0, 32)], false),
+        ("two regions that read one source byte twice", [region(0, 0), region(0, 16)], true),
+    ];
+    for (what, regions, accepted) in buffer_copies {
+        let mut encoder = ctx.encoder(&*device, G);
+        encoder.transition_buffers(&[
+            buffer_to(source, BufferState::Undefined, BufferState::CopySource, G),
+            buffer_to(destination, BufferState::Undefined, BufferState::CopyDestination, G),
+        ]);
+        encoder.copy_buffer(source, destination, &regions);
+        if accepted {
+            run(ctx, &*device, &mut [encoder]);
+        } else {
+            ctx.refused(submit(&*device, G, &mut [encoder]), what);
+        }
+    }
+    let usage = ImageUsage::COPY_DESTINATION.union(ImageUsage::COPY_SOURCE);
+    let image = ctx.image(&*device, &image_desc(Format::Rgba8Unorm, EXTENT, usage));
+    let half = u64::from(EXTENT.width / 2 * EXTENT.height * 4);
+    let texels = ctx.upload(&*device, BufferUsage::EMPTY, &vec![3; half as usize]);
+    let rect = |x| Rect {
+        x,
+        y: 0,
+        extent: crate::Extent { width: EXTENT.width / 2, height: EXTENT.height },
+    };
+    let at = |buffer_offset, x| BufferImageCopy { buffer_offset, rect: rect(x), ..whole_image() };
+    let write = |encoder: &mut dyn Encoder, regions: &[BufferImageCopy]| {
+        encoder.transition_buffers(&[buffer_to(
+            texels,
+            BufferState::Undefined,
+            BufferState::CopySource,
+            G,
+        )]);
+        encoder.transition_images(&[image_to(
+            image,
+            ImageState::Undefined,
+            ImageState::CopyDestination,
+            G,
+        )]);
+        encoder.copy_buffer_to_image(texels, image, regions);
+    };
+    let mut encoder = ctx.encoder(&*device, G);
+    write(&mut *encoder, &[at(0, 0), at(0, EXTENT.width / 4)]);
+    ctx.refused(submit(&*device, G, &mut [encoder]), "two regions that share a texel");
+    let mut encoder = ctx.encoder(&*device, G);
+    write(&mut *encoder, &[at(0, 0), at(0, EXTENT.width / 2)]);
+    run(ctx, &*device, &mut [encoder]);
+    let readback =
+        ctx.buffer(&*device, 2 * half, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    for (what, regions, accepted) in [
+        ("two regions that share a buffer byte", [at(0, 0), at(4, EXTENT.width / 2)], false),
+        ("two regions that meet in the buffer", [at(0, 0), at(half, EXTENT.width / 2)], true),
+    ] {
+        let mut encoder = ctx.encoder(&*device, G);
+        encoder.transition_images(&[image_to(
+            image,
+            ImageState::CopyDestination,
+            ImageState::CopySource,
+            G,
+        )]);
+        encoder.transition_buffers(&[buffer_to(
+            readback,
+            BufferState::Undefined,
+            BufferState::CopyDestination,
+            G,
+        )]);
+        encoder.copy_image_to_buffer(image, readback, &regions);
+        if accepted {
+            run(ctx, &*device, &mut [encoder]);
+        } else {
+            ctx.refused(submit(&*device, G, &mut [encoder]), what);
+        }
+    }
     Ok(())
 }
 

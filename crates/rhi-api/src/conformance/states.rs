@@ -5,9 +5,10 @@ use super::kit::{
     image_across, image_desc, image_to, whole_image,
 };
 use crate::{
-    BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferUsage, Device,
-    Encoder, Extent, Format, ImageHandle, ImageRange, ImageState, ImageUsage, Load, MemoryClass,
-    PassReach, QueuePath, QueueRole, Rect, Rule, Sharing, Store, Submit,
+    BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferTransition,
+    BufferUsage, Device, Encoder, Extent, Format, ImageDesc, ImageHandle, ImageRange, ImageState,
+    ImageUsage, Load, MemoryClass, PassReach, QueuePath, QueueRole, Rect, Rule, Sharing, Store,
+    Submit,
 };
 
 type Applies = Result<(), &'static str>;
@@ -40,6 +41,23 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         image_taken_while_another_queue_reads_it_is_refused,
     ),
     ("read_of_contents_left_undefined_is_refused", read_of_contents_left_undefined_is_refused),
+    (
+        "use_under_another_queues_pending_write_is_refused",
+        use_under_another_queues_pending_write_is_refused,
+    ),
+    (
+        "use_in_a_later_submit_than_the_waiting_change_is_refused",
+        use_in_a_later_submit_than_the_waiting_change_is_refused,
+    ),
+    ("use_waiting_through_another_submit_passes", use_waiting_through_another_submit_passes),
+    (
+        "acquire_of_a_release_a_retake_ended_is_refused",
+        acquire_of_a_release_a_retake_ended_is_refused,
+    ),
+    (
+        "read_after_a_retake_of_an_unmet_release_is_refused",
+        read_after_a_retake_of_an_unmet_release_is_refused,
+    ),
 ];
 
 const G: QueueRole = QueueRole::Graphics;
@@ -655,5 +673,299 @@ fn read_of_contents_left_undefined_is_refused(ctx: &Ctx<'_>) -> Applies {
         submit(&*device, C, &mut [encoder]),
         "a copy from a buffer taken from Undefined onto another queue",
     );
+    Ok(())
+}
+
+/// A buffer of `SIZE` bytes that copies read and write, in device memory.
+fn copied(ctx: &Ctx<'_>, device: &dyn Device, sharing: Sharing) -> BufferHandle {
+    let usage = BufferUsage::COPY_SOURCE.union(BufferUsage::COPY_DESTINATION);
+    ctx.buffer_shared(device, SIZE, usage, MemoryClass::Device, sharing)
+}
+
+/// Records a copy of the whole of `source` into `destination`, each transitioned from
+/// `Undefined` on the encoder's queue first.
+fn copy_fresh(encoder: &mut dyn Encoder, source: BufferHandle, destination: BufferHandle) {
+    let queue = encoder.queue();
+    encoder.transition_buffers(&[
+        buffer_to(source, BufferState::Undefined, BufferState::CopySource, queue),
+        buffer_to(destination, BufferState::Undefined, BufferState::CopyDestination, queue),
+    ]);
+    encoder.copy_buffer(
+        source,
+        destination,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+}
+
+/// Compute writes a `Concurrent` buffer and a `Concurrent` image in a submit held pending.
+/// A graphics submit that copies from either with no wait for that submit is refused; with
+/// the wait it passes.
+fn use_under_another_queues_pending_write_is_refused(ctx: &Ctx<'_>) -> Applies {
+    several_queues(ctx)?;
+    let device = ctx.device();
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &[7; SIZE as usize]);
+    let shared = copied(ctx, &*device, Sharing::Concurrent);
+    let usage = ImageUsage::COPY_DESTINATION.union(ImageUsage::COPY_SOURCE);
+    let desc =
+        ImageDesc { sharing: Sharing::Concurrent, ..image_desc(Format::Rgba8Unorm, EXTENT, usage) };
+    let image = ctx.image(&*device, &desc);
+    let mut writer = ctx.encoder(&*device, C);
+    copy_fresh(&mut *writer, source, shared);
+    fill(&mut *writer, texels(ctx, &*device), image);
+    writer.transition_buffers(&[buffer_to(
+        shared,
+        BufferState::CopyDestination,
+        BufferState::CopySource,
+        C,
+    )]);
+    writer.transition_images(&[image_to(
+        image,
+        ImageState::CopyDestination,
+        ImageState::CopySource,
+        C,
+    )]);
+    let mut writers = [writer];
+    let gate = ctx.held(&*device, C, &mut writers);
+    let local = copied(ctx, &*device, Sharing::Exclusive);
+    let mut buffer_reader = ctx.encoder(&*device, G);
+    buffer_reader.transition_buffers(&[buffer_to(
+        local,
+        BufferState::Undefined,
+        BufferState::CopyDestination,
+        G,
+    )]);
+    buffer_reader.copy_buffer(
+        shared,
+        local,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+    let mut buffer_readers = [buffer_reader];
+    ctx.refused(
+        submit(&*device, G, &mut buffer_readers),
+        "a copy from a buffer another queue's pending submit writes, with no wait for it",
+    );
+    let readback =
+        ctx.buffer(&*device, SIZE * 64, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let mut image_reader = ctx.encoder(&*device, G);
+    image_reader.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::Undefined,
+        BufferState::CopyDestination,
+        G,
+    )]);
+    image_reader.copy_image_to_buffer(image, readback, &[whole_image()]);
+    let mut image_readers = [image_reader];
+    ctx.refused(
+        submit(&*device, G, &mut image_readers),
+        "a copy from an image another queue's pending submit writes, with no wait for it",
+    );
+    ctx.submit(&*device, G, &mut buffer_readers, &[gate.done], &[]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, G, &mut image_readers, &[gate.done], &[done]);
+    gate.open(ctx, &*device);
+    ctx.reached(&*device, done);
+    Ok(())
+}
+
+/// Compute writes an `Exclusive` buffer and a `Concurrent` one in a submit held pending.
+/// A graphics submit that waits for it takes the first from `Undefined`; a later graphics
+/// submit with no wait of its own that copies into it, or transitions the second, is
+/// refused, and passes with the wait. An acquire, unlike a take from `Undefined`, orders
+/// the later submits of its queue: a use in one with no wait passes.
+fn use_in_a_later_submit_than_the_waiting_change_is_refused(ctx: &Ctx<'_>) -> Applies {
+    several_queues(ctx)?;
+    let device = ctx.device();
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &[4; SIZE as usize]);
+    let taken = copied(ctx, &*device, Sharing::Exclusive);
+    let shared = copied(ctx, &*device, Sharing::Concurrent);
+    let mut writer = ctx.encoder(&*device, C);
+    copy_fresh(&mut *writer, source, taken);
+    writer.transition_buffers(&[buffer_to(
+        shared,
+        BufferState::Undefined,
+        BufferState::CopyDestination,
+        C,
+    )]);
+    writer.copy_buffer(
+        source,
+        shared,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+    let mut writers = [writer];
+    let gate = ctx.held(&*device, C, &mut writers);
+    let mut take = ctx.encoder(&*device, G);
+    take.transition_buffers(&[buffer_to(
+        taken,
+        BufferState::Undefined,
+        BufferState::CopyDestination,
+        G,
+    )]);
+    let mut takes = [take];
+    ctx.submit(&*device, G, &mut takes, &[gate.done], &[]);
+    let other = ctx.upload(&*device, BufferUsage::EMPTY, &[5; SIZE as usize]);
+    let mut user = ctx.encoder(&*device, G);
+    user.transition_buffers(&[buffer_to(
+        other,
+        BufferState::Undefined,
+        BufferState::CopySource,
+        G,
+    )]);
+    user.copy_buffer(
+        other,
+        taken,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+    let mut users = [user];
+    ctx.refused(
+        submit(&*device, G, &mut users),
+        "a copy into a buffer taken in an earlier submit that waited, with no wait of its own",
+    );
+    let mut changer = ctx.encoder(&*device, G);
+    changer.transition_buffers(&[buffer_to(
+        shared,
+        BufferState::CopyDestination,
+        BufferState::CopySource,
+        G,
+    )]);
+    let mut changers = [changer];
+    ctx.refused(
+        submit(&*device, G, &mut changers),
+        "a transition of a `Concurrent` buffer after an earlier submit that waited, with no wait \
+         of its own",
+    );
+    ctx.submit(&*device, G, &mut users, &[gate.done], &[]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, G, &mut changers, &[gate.done], &[done]);
+    gate.open(ctx, &*device);
+    ctx.reached(&*device, done);
+    // The acquire's submit waits for the release; the later one waits for nothing.
+    let crossed = copied(ctx, &*device, Sharing::Exclusive);
+    let mut release = ctx.encoder(&*device, C);
+    copy_fresh(&mut *release, source, crossed);
+    let crossing =
+        buffer_across(crossed, (BufferState::CopyDestination, C), (BufferState::CopySource, G));
+    release.transition_buffers(&[crossing]);
+    let mut releases = [release];
+    let gate = ctx.held(&*device, C, &mut releases);
+    let mut acquire = ctx.encoder(&*device, G);
+    acquire.transition_buffers(&[crossing]);
+    let mut acquires = [acquire];
+    ctx.submit(&*device, G, &mut acquires, &[gate.done], &[]);
+    let local = copied(ctx, &*device, Sharing::Exclusive);
+    let mut reader = ctx.encoder(&*device, G);
+    reader.transition_buffers(&[buffer_to(
+        local,
+        BufferState::Undefined,
+        BufferState::CopyDestination,
+        G,
+    )]);
+    reader.copy_buffer(
+        crossed,
+        local,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+    let done = ctx.point(&*device, 1);
+    let mut readers = [reader];
+    ctx.submit(&*device, G, &mut readers, &[], &[done]);
+    gate.open(ctx, &*device);
+    ctx.reached(&*device, done);
+    Ok(())
+}
+
+/// Compute writes a `Concurrent` buffer in a submit held pending. A graphics submit waits
+/// for it and signals a point; a later graphics submit that waits only for that point
+/// copies from the buffer, ordered after the write through the submit it waits for.
+fn use_waiting_through_another_submit_passes(ctx: &Ctx<'_>) -> Applies {
+    several_queues(ctx)?;
+    let device = ctx.device();
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &[8; SIZE as usize]);
+    let shared = copied(ctx, &*device, Sharing::Concurrent);
+    let mut writer = ctx.encoder(&*device, C);
+    copy_fresh(&mut *writer, source, shared);
+    writer.transition_buffers(&[buffer_to(
+        shared,
+        BufferState::CopyDestination,
+        BufferState::CopySource,
+        C,
+    )]);
+    let mut writers = [writer];
+    let gate = ctx.held(&*device, C, &mut writers);
+    let relay = ctx.point(&*device, 1);
+    ctx.submit(&*device, G, &mut [], &[gate.done], &[relay]);
+    let local = copied(ctx, &*device, Sharing::Exclusive);
+    let mut reader = ctx.encoder(&*device, G);
+    reader.transition_buffers(&[buffer_to(
+        local,
+        BufferState::Undefined,
+        BufferState::CopyDestination,
+        G,
+    )]);
+    reader.copy_buffer(
+        shared,
+        local,
+        &[BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }],
+    );
+    let done = ctx.point(&*device, 1);
+    let mut readers = [reader];
+    ctx.submit(&*device, G, &mut readers, &[relay], &[done]);
+    gate.open(ctx, &*device);
+    ctx.reached(&*device, done);
+    Ok(())
+}
+
+/// A buffer graphics wrote, released to compute and seen complete.
+fn released(ctx: &Ctx<'_>, device: &dyn Device) -> (BufferHandle, BufferTransition) {
+    let source = ctx.upload(device, BufferUsage::EMPTY, &[6; SIZE as usize]);
+    let local = copied(ctx, device, Sharing::Exclusive);
+    let crossing =
+        buffer_across(local, (BufferState::CopyDestination, G), (BufferState::CopySource, C));
+    let mut release = ctx.encoder(device, G);
+    copy_fresh(&mut *release, source, local);
+    release.transition_buffers(&[crossing]);
+    run(ctx, device, G, &mut [release]);
+    (local, crossing)
+}
+
+/// Graphics takes back from `Undefined` a buffer it released, before compute acquires it:
+/// the take is accepted and ends the release, so the acquire is refused.
+fn acquire_of_a_release_a_retake_ended_is_refused(ctx: &Ctx<'_>) -> Applies {
+    several_queues(ctx)?;
+    let device = ctx.device();
+    let (local, crossing) = released(ctx, &*device);
+    let mut take = ctx.encoder(&*device, G);
+    take.transition_buffers(&[buffer_to(
+        local,
+        BufferState::Undefined,
+        BufferState::CopyDestination,
+        G,
+    )]);
+    run(ctx, &*device, G, &mut [take]);
+    let mut acquire = ctx.encoder(&*device, C);
+    acquire.transition_buffers(&[crossing]);
+    ctx.refused(submit(&*device, C, &mut [acquire]), "an acquire of a release a take ended");
+    Ok(())
+}
+
+/// A buffer taken back from `Undefined` by the queue that released it, with no acquire,
+/// holds undefined contents: a copy from it is refused. One taken so with no release
+/// pending keeps its bytes.
+fn read_after_a_retake_of_an_unmet_release_is_refused(ctx: &Ctx<'_>) -> Applies {
+    several_queues(ctx)?;
+    let device = ctx.device();
+    let (local, _) = released(ctx, &*device);
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let mut reader = ctx.encoder(&*device, G);
+    copy_fresh(&mut *reader, local, readback);
+    ctx.refused(
+        submit(&*device, G, &mut [reader]),
+        "a copy from a buffer taken back from `Undefined` with its release unmet",
+    );
+    let kept = copied(ctx, &*device, Sharing::Exclusive);
+    let mut writer = ctx.encoder(&*device, G);
+    copy_fresh(&mut *writer, ctx.upload(&*device, BufferUsage::EMPTY, &[3; SIZE as usize]), kept);
+    run(ctx, &*device, G, &mut [writer]);
+    let mut reader = ctx.encoder(&*device, G);
+    copy_fresh(&mut *reader, kept, readback);
+    run(ctx, &*device, G, &mut [reader]);
     Ok(())
 }

@@ -496,9 +496,11 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
 - A transition between two roles that one queue serves is an ordinary change of state. One
   between two queues is an ownership transfer, recorded twice with equal values: on an
   encoder of `from.queue`'s role, which releases, and on one of `to.queue`'s, which
-  acquires. Between the two the resource is used by nothing. Null refuses an acquire with no
-  equal release already submitted, and any use on a queue that does not own the resource
-  (`no-qfot`).
+  acquires. Between the two the resource is used by nothing, but for a transition from
+  `Undefined`, which ends a release no acquire met and takes the resource with no transfer,
+  its contents undefined, a buffer's as an image's; an acquire of that release is then
+  refused. Null refuses an acquire with no equal release already submitted, and any use on
+  a queue that does not own the resource (`no-qfot`).
 - A resource made `Sharing::Concurrent` has no owner: its transitions are recorded once, the
   queue of a transition's `from` is not compared, and two queues may use it at once in one
   state.
@@ -508,7 +510,16 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   That covers an acquire, a transition from `Undefined` and every transition of a
   `Concurrent` resource. A submit uses what its commands name: a transition's resource, an
   attachment, a declared buffer, a declared slot's image, a copy's two sides, an index or
-  indirect buffer.
+  indirect buffer. A submit that uses a resource while a pending submit of another queue
+  wrote it or changed its state or owner waits, directly or through the submits it waits
+  for, for a point that submit, or a later submit to its queue, signals; null refuses it
+  otherwise (`no-qfot`). It binds `Concurrent` resources, which no acquire orders, and an
+  `Exclusive` one moved to another queue by a transition from `Undefined`, which has no
+  acquire: an image taken back from the present thread, and a resource imported again after
+  a failed submit. It binds every submit that uses the resource, not the first of its queue
+  alone: an acquire or a transition in an earlier submit of the queue does not discharge a
+  later submit's use. A wait for a point already reached costs no GPU wait, so a caller that
+  waits in each such submit is never refused by it.
 - A transition is recorded on an encoder of the role that uses the resource next; a release
   on one of the role that used it last.
 - A buffer has one state at a time. A pass cannot both bind a buffer as indices or indirect
@@ -918,12 +929,12 @@ stale number into a wrong image ("The heap and the sampler table").
 | Rule | Name | Every backend | Null alone |
 |---|---|---|---|
 | `State` | `state` | a buffer a pass declares in two states | a transition's `from`, a use's state, by subresource; a use after a write in a writing state with no transition since |
-| `Queue` | `no-qfot` | | a use off the owning queue; an acquire with no release; a change of state or owner under another queue's pending submit with no wait for it; an alias call across queues |
+| `Queue` | `no-qfot` | | a use off the owning queue; an acquire with no release, or of a release a transition from `Undefined` ended; a change of state or owner under another queue's pending submit, or a use under another queue's pending write or change of state or owner, with no wait for it, direct or through the submits it waits for; an alias call across queues |
 | `Destroyed` | `destroyed` | a stale handle, at the `Device` call it is given to, or at the submit of the encoder it was recorded into, a resource destroyed since the recording included | a handle another device issued that resolves to a live resource |
 | `Pending` | `pending` | `Encoder::reset` while pending; `resize` with a present pending past its wait; `present` behind a wait that no signal made or submitted meets, past `acquire`'s bound; a destroy under a pending submit of any queue; of an image a slot holds; of a block an image is placed in; of a sampler while any submit made before it is pending; `write_buffer` of a buffer a pending submit writes; `read_buffer` and `invalidate_buffer` of one a pending submit writes or changes the state of | a submit counted pending until the caller has seen its point ("Queues by role") |
 | `Capability` | `capability` | every call that needs an unreported capability; a SPIR-V module whose `OpCapability` or `OpExtension` instructions name one the device did not enable | |
 | `Usage` | `usage` | host access outside the memory class; `buffer_address` without `DEVICE_ADDRESS`; a descriptor no device could honour; every other use outside a usage, a transition into a state the image's usage does not allow included; a pass's attachments; a pipeline's formats, and colour targets past `colour_attachments` | |
-| `Bounds` | `bounds` | host ranges; heap slots; placements; push-constant offsets; copy regions, a buffer offset of a buffer-image copy that is not a multiple of the texel included; the scissor; the viewport, against `viewport_extent` and `viewport_bounds`; the index buffer's offset and the indices a direct draw reads; indirect offsets and strides, their alignment and the records they span; a dispatch's counts against `compute_groups`; a swapchain extent with a zero dimension | |
+| `Bounds` | `bounds` | host ranges; heap slots; placements; push-constant offsets; copy regions, outside their resources or two of one call that write one byte of a buffer or one texel of an image, a buffer offset of a buffer-image copy that is not a multiple of the texel included; the scissor; the viewport, against `viewport_extent` and `viewport_bounds`; the index buffer's offset and the indices a direct draw reads; indirect offsets and strides, their alignment and the records they span; a dispatch's counts against `compute_groups`; a swapchain extent with a zero dimension | |
 | `Undeclared` | `undeclared` | `push_slot`, `push_address` | |
 | `Unflushed` | `unflushed` | | a written range at a submit; a read with no invalidate |
 | `HostOverlap` | `host-overlap` | overlapping host access; a destroy of a buffer under a host access; a submit that writes a buffer under one | |
@@ -1000,7 +1011,7 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 `conformance::CASES` lists every case by name, each a *contract* case or an *output* case,
 and `conformance::run` runs one against a `Harness`. The bodies arrive with the backends:
 the contract cases' with `rhi-null`, the output cases' and their Slang sources with
-`vulkan`. A backend's tests carry one test for each case, named after it. There are 148: 123
+`vulkan`. A backend's tests carry one test for each case, named after it. There are 161: 136
 contract cases and 25 output cases.
 
 - A **contract** case asserts what the contract says of calls and results. It needs no
@@ -1014,12 +1025,14 @@ contract cases and 25 output cases.
   and its refusal there depends on timing.
 
 The refusal cases a device backend also runs are those of the rules table's "Every backend"
-column, one or more for each of its clauses, 62 in all: `unreported_capability_is_refused`,
+column, one or more for each of its clauses, 64 in all: `unreported_capability_is_refused`,
 `submit_to_the_present_role_is_refused`, `overlapping_host_access_is_refused`,
 `destroy_during_host_access_is_refused`, `host_range_outside_the_buffer_is_refused`,
 `host_access_outside_the_memory_class_is_refused`,
 `address_of_a_buffer_without_the_usage_is_refused`,
-`read_under_a_pending_writer_is_refused`, `write_under_a_pending_writer_is_refused`,
+`read_under_a_pending_writer_is_refused`,
+`read_under_a_pending_transition_to_host_read_is_refused`,
+`write_under_a_pending_writer_is_refused`,
 `submit_writing_under_a_host_access_is_refused`, `buffer_use_outside_its_usage_is_refused`,
 `image_use_outside_its_usage_is_refused`, `memoryless_request_without_transient_is_refused`,
 `memoryless_attachment_stored_is_refused`, `memoryless_attachment_kept_is_refused`,
@@ -1039,6 +1052,7 @@ column, one or more for each of its clauses, 62 in all: `unreported_capability_i
 `encoder_of_another_role_or_device_is_refused`, `command_outside_its_scope_is_refused`,
 `draw_with_nothing_bound_is_refused`, `pass_left_open_is_refused`,
 `push_outside_the_block_is_refused`, `copy_region_outside_its_resource_is_refused`,
+`copy_regions_overlapping_in_the_destination_are_refused`,
 `dispatch_beyond_the_group_limit_is_refused`,
 `timeline_value_that_does_not_grow_is_refused`,
 `host_signal_above_a_pending_signal_is_refused`,
@@ -1170,12 +1184,12 @@ Some output cases count as evidence only in the shape, or on the device, named h
 | Area | Contract cases | Output cases |
 |---|---|---|
 | Capabilities and queues | `capabilities_are_fixed`, `unreported_capability_is_refused`, `roles_resolve_as_the_layout_reports`, `submit_to_the_present_role_is_refused` | |
-| Buffers and host access | `buffer_write_then_copy_then_read_returns_the_bytes`, `buffer_address_is_stable_and_distinct`, `host_ranges_that_do_not_overlap_are_written_at_once`, `overlapping_host_access_is_refused`, `destroy_during_host_access_is_refused`, `host_range_outside_the_buffer_is_refused`, `host_access_outside_the_memory_class_is_refused`, `address_of_a_buffer_without_the_usage_is_refused`, `read_under_a_pending_writer_is_refused`, `write_under_a_pending_writer_is_refused`, `submit_writing_under_a_host_access_is_refused`, `submit_racing_a_host_access_refuses_one`, `unflushed_range_at_a_submit_is_refused`, `flush_and_invalidate_are_accepted_where_memory_is_coherent`, `buffer_use_outside_its_usage_is_refused` | `device_memory_is_filled_through_a_staging_copy` |
+| Buffers and host access | `buffer_write_then_copy_then_read_returns_the_bytes`, `buffer_address_is_stable_and_distinct`, `host_ranges_that_do_not_overlap_are_written_at_once`, `overlapping_host_access_is_refused`, `destroy_during_host_access_is_refused`, `host_range_outside_the_buffer_is_refused`, `host_access_outside_the_memory_class_is_refused`, `address_of_a_buffer_without_the_usage_is_refused`, `read_under_a_pending_writer_is_refused`, `read_under_a_pending_transition_to_host_read_is_refused`, `write_under_a_pending_writer_is_refused`, `submit_writing_under_a_host_access_is_refused`, `submit_racing_a_host_access_refuses_one`, `unflushed_range_at_a_submit_is_refused`, `flush_and_invalidate_are_accepted_where_memory_is_coherent`, `buffer_use_outside_its_usage_is_refused` | `device_memory_is_filled_through_a_staging_copy` |
 | Images, memoryless, aliases | `image_use_outside_its_usage_is_refused`, `memoryless_outcome_is_queryable_and_as_reported`, `memoryless_request_without_transient_is_refused`, `memoryless_attachment_stored_is_refused`, `memoryless_attachment_kept_is_refused`, `memoryless_attachment_after_a_local_read_is_refused_where_lost`, `placement_outside_the_block_is_refused`, `destroy_of_a_block_an_image_is_placed_in_is_refused`, `aliased_image_used_without_the_alias_call_is_refused`, `alias_read_before_its_first_write_is_refused`, `aliases_used_in_turn_with_the_alias_call_pass` | `memoryless_g_buffer_is_lit_in_its_pass`, `aliased_transients_render_in_turn`, `image_round_trips_through_copies` |
-| States and queues | `transition_from_another_state_is_refused`, `use_in_another_state_is_refused`, `use_after_a_write_without_a_transition_is_refused`, `state_is_kept_for_each_mip_and_layer`, `state_follows_submission_order_not_recording_order`, `cross_queue_use_without_a_transfer_is_refused`, `acquire_without_a_release_is_refused`, `release_and_acquire_cross_a_resource`, `shared_and_discarded_resources_cross_without_a_transfer`, `roles_on_one_queue_need_no_transfer`, `image_taken_while_another_queue_reads_it_is_refused`, `read_of_contents_left_undefined_is_refused` | `ownership_transfer_keeps_the_contents` |
+| States and queues | `transition_from_another_state_is_refused`, `use_in_another_state_is_refused`, `use_after_a_write_without_a_transition_is_refused`, `state_is_kept_for_each_mip_and_layer`, `state_follows_submission_order_not_recording_order`, `cross_queue_use_without_a_transfer_is_refused`, `acquire_without_a_release_is_refused`, `release_and_acquire_cross_a_resource`, `shared_and_discarded_resources_cross_without_a_transfer`, `roles_on_one_queue_need_no_transfer`, `image_taken_while_another_queue_reads_it_is_refused`, `read_of_contents_left_undefined_is_refused`, `use_under_another_queues_pending_write_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused`, `use_waiting_through_another_submit_passes`, `acquire_of_a_release_a_retake_ended_is_refused`, `read_after_a_retake_of_an_unmet_release_is_refused` | `ownership_transfer_keeps_the_contents` |
 | The heap, samplers, declarations | `heap_slot_outside_the_heap_is_refused`, `declared_slot_empty_is_refused`, `slot_written_after_its_pass_began_is_refused`, `declared_slot_not_in_sampled_read_is_refused`, `heap_write_under_a_pending_reader_is_refused`, `heap_write_after_its_reader_completes_passes`, `heap_write_racing_a_submit_refuses_one`, `destroy_of_an_image_a_slot_holds_is_refused`, `sampler_destroyed_under_a_pending_submit_is_refused`, `undeclared_slot_argument_is_refused`, `undeclared_address_argument_is_refused`, `declared_buffer_in_another_state_is_refused`, `buffer_declared_in_two_states_is_refused`, `sampler_table_is_bounded` | `heap_is_sampled_past_slot_zero`, `address_is_read_in_a_shader`, `declared_reader_follows_a_lagging_writer`, `sampler_filters_as_described` |
 | Cooked shaders, pipelines, the cache | `cooked_shader_round_trips`, `cooked_shader_of_another_version_is_refused`, `cooked_shader_corrupt_or_truncated_is_refused`, `shader_for_another_heap_is_refused`, `shader_target_the_backend_does_not_run_is_unsupported`, `constant_of_another_length_is_refused`, `shader_needing_an_unenabled_capability_is_refused`, `pipeline_of_other_formats_than_its_pass_is_refused`, `sealed_cache_round_trips`, `cache_corrupt_truncated_or_foreign_starts_empty` | `specialised_constant_changes_the_output`, `write_mask_keeps_a_channel`, `depth_state_orders_two_triangles`, `warm_cache_hits_every_stage` |
-| Encoders and submits | `encoder_recorded_on_another_thread_submits`, `encoder_reset_while_pending_is_refused`, `pending_encoder_drop_waits_for_its_submit`, `encoder_in_two_submits_is_refused`, `encoder_resubmitted_without_reset_is_refused`, `recording_while_pending_records_nothing`, `encoder_of_another_role_or_device_is_refused`, `command_outside_its_scope_is_refused`, `draw_with_nothing_bound_is_refused`, `pass_left_open_is_refused`, `push_outside_the_block_is_refused`, `copy_region_outside_its_resource_is_refused`, `refused_submit_changes_nothing`, `submit_of_no_encoders_waits_and_signals`, `submit_is_pending_until_its_wait_is_reached`, `empty_draws_and_dispatches_record_nothing` | `two_threads_record_at_once` |
+| Encoders and submits | `encoder_recorded_on_another_thread_submits`, `encoder_reset_while_pending_is_refused`, `pending_encoder_drop_waits_for_its_submit`, `encoder_in_two_submits_is_refused`, `encoder_resubmitted_without_reset_is_refused`, `recording_while_pending_records_nothing`, `encoder_of_another_role_or_device_is_refused`, `command_outside_its_scope_is_refused`, `draw_with_nothing_bound_is_refused`, `pass_left_open_is_refused`, `push_outside_the_block_is_refused`, `copy_region_outside_its_resource_is_refused`, `copy_regions_overlapping_in_the_destination_are_refused`, `refused_submit_changes_nothing`, `submit_of_no_encoders_waits_and_signals`, `submit_is_pending_until_its_wait_is_reached`, `empty_draws_and_dispatches_record_nothing` | `two_threads_record_at_once` |
 | Timelines, destroys and races | `timeline_is_signalled_waited_and_read_by_the_host`, `timeline_wait_times_out`, `waits_are_woken_by_the_submit_that_reaches_them`, `wait_is_woken_by_a_host_signal`, `timeline_value_that_does_not_grow_is_refused`, `host_signal_above_a_pending_signal_is_refused`, `host_signal_below_a_promise_that_does_not_wait_for_it_is_refused`, `host_signal_below_a_pending_signal_releases_its_waiter`, `host_signal_below_a_promise_whose_wait_is_met_is_refused`, `submit_signalling_no_more_than_it_waits_for_is_refused`, `timeline_value_beyond_the_difference_limit_is_refused`, `timeline_signalled_from_two_queues_without_a_wait_is_refused`, `destroy_under_a_pending_submit_is_refused`, `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`, `destroy_after_an_unobserved_submit_is_refused`, `destroy_at_once_after_the_wait_is_accepted`, `destroy_racing_a_submit_refuses_one`, `submits_racing_on_one_queue_keep_their_order`, `host_signals_racing_on_one_timeline_keep_it_growing`, `use_after_destruction_is_refused`, `destroyed_after_recording_is_refused_at_submit`, `handle_of_another_device_is_refused` | |
 | Render passes and the local read | `input_read_without_a_local_read_is_refused`, `input_read_of_another_attachment_is_refused`, `attachments_of_unequal_extent_are_refused`, `scissor_outside_the_attachments_is_refused`, `viewport_outside_its_rules_is_refused` | `triangle_matches_the_reference`, `local_read_sees_what_the_pass_wrote`, `clear_and_keep_load_as_described`, `viewport_and_scissor_place_the_triangles`, `draw_parameters_reach_the_shader` |
 | Indirect draws and dispatches | `index_buffer_offset_outside_or_unaligned_is_refused`, `indexed_draw_past_its_index_buffer_is_refused`, `indirect_arguments_outside_or_unaligned_are_refused`, `dispatch_beyond_the_group_limit_is_refused` | `indexed_indirect_draw_matches_the_reference`, `indirect_count_draws_where_reported`, `dispatch_writes_through_an_address`, `dispatches_of_one_pass_see_each_others_writes`, `dispatch_indirect_reads_its_counts` |

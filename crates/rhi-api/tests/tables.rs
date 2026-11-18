@@ -73,7 +73,7 @@ fn indirect_record_is_five_little_endian_words() {
 
 /// The refusal cases a device backend runs: one or more for each clause of the rules
 /// table's "Every backend" column.
-const EVERYWHERE: [&str; 62] = [
+const EVERYWHERE: [&str; 64] = [
     "unreported_capability_is_refused",
     "submit_to_the_present_role_is_refused",
     "overlapping_host_access_is_refused",
@@ -82,6 +82,7 @@ const EVERYWHERE: [&str; 62] = [
     "host_access_outside_the_memory_class_is_refused",
     "address_of_a_buffer_without_the_usage_is_refused",
     "read_under_a_pending_writer_is_refused",
+    "read_under_a_pending_transition_to_host_read_is_refused",
     "write_under_a_pending_writer_is_refused",
     "submit_writing_under_a_host_access_is_refused",
     "buffer_use_outside_its_usage_is_refused",
@@ -111,6 +112,7 @@ const EVERYWHERE: [&str; 62] = [
     "pass_left_open_is_refused",
     "push_outside_the_block_is_refused",
     "copy_region_outside_its_resource_is_refused",
+    "copy_regions_overlapping_in_the_destination_are_refused",
     "dispatch_beyond_the_group_limit_is_refused",
     "timeline_value_that_does_not_grow_is_refused",
     "host_signal_above_a_pending_signal_is_refused",

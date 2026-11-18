@@ -444,11 +444,25 @@ fn concurrent_resource_destroyed_while_another_queue_uses_it_is_refused(ctx: &Ct
     ctx.write(&*device, shared, 0, &[9; SIZE as usize]);
     let region = [BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }];
     let first = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Device);
+    // The change of state is seen complete first: a use on the other queue under a pending
+    // one would be refused `no-qfot`.
+    let mut setup = ctx.encoder(&*device, G);
+    setup.transition_buffers(&[buffer_to(
+        shared,
+        BufferState::Undefined,
+        BufferState::CopySource,
+        G,
+    )]);
+    let set = ctx.point(&*device, 1);
+    ctx.submit(&*device, G, &mut [setup], &[], &[set]);
+    ctx.reached(&*device, set);
     let mut graphics = ctx.encoder(&*device, G);
-    graphics.transition_buffers(&[
-        buffer_to(shared, BufferState::Undefined, BufferState::CopySource, G),
-        buffer_to(first, BufferState::Undefined, BufferState::CopyDestination, G),
-    ]);
+    graphics.transition_buffers(&[buffer_to(
+        first,
+        BufferState::Undefined,
+        BufferState::CopyDestination,
+        G,
+    )]);
     graphics.copy_buffer(shared, first, &region);
     let mut graphics = [graphics];
     let gate = ctx.held(&*device, G, &mut graphics);

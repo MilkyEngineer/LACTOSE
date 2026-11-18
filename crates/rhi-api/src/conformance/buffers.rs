@@ -32,6 +32,10 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         address_of_a_buffer_without_the_usage_is_refused,
     ),
     ("read_under_a_pending_writer_is_refused", read_under_a_pending_writer_is_refused),
+    (
+        "read_under_a_pending_transition_to_host_read_is_refused",
+        read_under_a_pending_transition_to_host_read_is_refused,
+    ),
     ("write_under_a_pending_writer_is_refused", write_under_a_pending_writer_is_refused),
     (
         "submit_writing_under_a_host_access_is_refused",
@@ -318,8 +322,28 @@ fn read_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
         ctx.read(&*device, readback, 0, SIZE) == pattern(2),
         "the read once the writer is seen complete",
     );
-    // A submit that only changes the buffer's state, here into `HostRead`, holds a host read
-    // back too: its barrier makes the device's writes visible.
+    Ok(())
+}
+
+/// A submit that only changes a buffer's state, here into `HostRead`, holds a host read
+/// and an invalidate back as a writer does: its barrier makes the device's writes visible
+/// to the host.
+fn read_under_a_pending_transition_to_host_read_is_refused(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let queue = QueueRole::Graphics;
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &pattern(2));
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let mut encoder = ctx.encoder(&*device, queue);
+    copy(&mut *encoder, source, readback);
+    encoder.transition_buffers(&[buffer_to(
+        readback,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        queue,
+    )]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, queue, &mut [encoder], &[], &[done]);
+    ctx.reached(&*device, done);
     let mut encoder = ctx.encoder(&*device, queue);
     encoder.transition_buffers(&[buffer_to(
         readback,
@@ -337,6 +361,7 @@ fn read_under_a_pending_writer_is_refused(ctx: &Ctx<'_>) -> Applies {
     )]);
     let mut movers = [mover];
     let gate = ctx.held(&*device, queue, &mut movers);
+    let mut called = false;
     ctx.refused(
         device.read_buffer(readback, 0, SIZE, &mut |_| called = true),
         "a read while its move into HostRead is pending",
