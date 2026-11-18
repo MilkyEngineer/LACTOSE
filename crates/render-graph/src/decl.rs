@@ -1,10 +1,10 @@
 //! One frame's declaration: its imports, its transients and its passes, in order.
 
-use crate::exclusive::Exclusive;
 use crate::id::{BufferId, ImageId, PassId};
 use crate::pass::{ComputePassDecl, CopyPassDecl, RenderPassDecl};
 use crate::recorder::{ComputeRecorder, CopyRecorder, RenderRecorder};
 use crate::resource::{BufferImport, ImageImport, TransientImage};
+use crate::sync_view::SyncView;
 
 /// A pass's recorder, boxed by the call that declared the pass. It is called at most once,
 /// by the one recording job that owns it, so it is `FnOnce` and `Send` and need be neither
@@ -41,7 +41,7 @@ pub struct FrameDecl<'f> {
     views: u32,
     /// The recorders, by pass, reached through `&mut` or by value alone. The
     /// implementation keeps the copied declarations beside them.
-    recorders: Exclusive<Vec<Recorder<'f>>>,
+    recorders: SyncView<Vec<Recorder<'f>>>,
 }
 
 impl<'f> FrameDecl<'f> {

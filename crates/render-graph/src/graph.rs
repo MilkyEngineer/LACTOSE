@@ -8,8 +8,8 @@ use lactose_rhi_api::{Device, Encoder, TimelinePoint};
 use lactose_task::JobContext;
 
 use crate::decl::FrameDecl;
-use crate::exclusive::Exclusive;
 use crate::plan::{CompiledFrame, CompiledPlan};
+use crate::sync_view::SyncView;
 
 /// The target of the graph's spans and events. Every kept pass is recorded inside one
 /// span of this target named `pass`, at trace level, with the pass's label as its `label`
@@ -61,13 +61,14 @@ pub struct GraphStats {
 /// Its drop waits, with no bound, until every submit it made has completed, then
 /// destroys the transients, the memory blocks, the timelines and the encoders it made. It
 /// is dropped off the frame-critical workers, as a device's objects are, and after the
-/// host has signalled every point a pending frame waits for (`README.md`, "Errors and
-/// drops").
+/// host has signalled every point a pending frame waits for. A drop made while the thread
+/// unwinds a panic does not wait: it destroys what no pending submit uses and leaks the
+/// rest, as the device's own drops do (`README.md`, "Errors and drops").
 pub struct RenderGraph {
     /// The device every call reaches.
     device: Arc<dyn Device>,
     /// The encoders no frame holds.
-    encoders: Exclusive<Vec<Box<dyn Encoder>>>,
+    encoders: SyncView<Vec<Box<dyn Encoder>>>,
 }
 
 impl RenderGraph {
@@ -115,8 +116,9 @@ impl RenderGraph {
     /// plan derived, the pass's beginning, its recorder, and its end. The jobs run on the
     /// frame-critical workers, the calling worker among them, and share nothing they
     /// write: each owns its encoder and the recorders of its passes (`README.md`,
-    /// "Concurrency"). A panic in a recorder aborts the process, as any scope child's
-    /// does.
+    /// "Concurrency"). A recorder does not block or wait: not for another recorder, which
+    /// on one worker runs after it, not for a lock and not for a timeline point. A panic
+    /// in a recorder aborts the process, as any scope child's does.
     ///
     /// An encoder is taken from the graph's free ones, or made. A pending encoder becomes
     /// free, and is reset, once the point of the frame it was submitted in is seen
@@ -125,9 +127,10 @@ impl RenderGraph {
     ///
     /// # Errors
     ///
-    /// `ErrorKind::InvalidData` for a frame another graph compiled, and for a recorder
-    /// that named an id its pass did not declare for that use, naming the pass and the
-    /// call, the first such pass in graph order where there are several; what
+    /// `ErrorKind::InvalidData` for a frame another graph compiled, for a recorder that
+    /// named an id its pass did not declare for that use, and for a copy pass's recorder
+    /// that wrote one destination in two calls, naming the pass and the call, the first
+    /// such pass in graph order where there are several; what
     /// `Device::create_encoder` returns. After an error nothing of the frame is
     /// submitted or can be, and its encoders are free again.
     pub fn record(
@@ -152,8 +155,12 @@ impl RenderGraph {
     /// broke. An error from the frame's first submit leaves every import as the
     /// declaration found it. An error from a later one leaves the frame torn: the
     /// submits before it were made, the frame's point is never signalled for it, and the
-    /// states of the frame's imports are no longer the graph's word (`README.md`,
-    /// "Submission").
+    /// states of the frame's imports are no longer the graph's word. The error does not
+    /// say which submit failed, so the caller takes every error as a torn frame: it
+    /// imports the frame's imports next from `Undefined`, relies on no buffer's bytes, and
+    /// calls [`History::reset`](crate::History::reset) on every history the frame
+    /// imported. The next frame submitted whole waits for what the torn frame submitted,
+    /// and its point covers it (`README.md`, "Submission").
     pub fn submit(&mut self, frame: RecordedFrame) -> Result<TimelinePoint> {
         todo!()
     }
@@ -175,7 +182,9 @@ impl RenderGraph {
 impl Drop for RenderGraph {
     /// Waits until every submit the graph made has completed, then destroys what the
     /// graph made. An error from a destroy is logged under [`LOG_TARGET`] and dropped. On
-    /// a lost device the wait returns at once.
+    /// a lost device the wait returns at once. While the thread unwinds a panic it waits
+    /// for nothing: it makes no destroy a pending submit would refuse, and its encoders'
+    /// drops leak what is pending.
     fn drop(&mut self) {
         todo!()
     }
@@ -192,5 +201,5 @@ pub struct RecordedFrame {
     /// The plan the frame was recorded from.
     plan: Arc<CompiledPlan>,
     /// The frame's encoders, in the order its submits take them.
-    encoders: Exclusive<Vec<Box<dyn Encoder>>>,
+    encoders: SyncView<Vec<Box<dyn Encoder>>>,
 }

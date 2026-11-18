@@ -18,7 +18,9 @@ use lactose_rhi_api::{
 ///
 /// One handle is imported at most once in a declaration. Nothing here can see a second
 /// import of it, and the two ids would each be given transitions of their own; null
-/// refuses the submit (`state`).
+/// refuses the submit (`state`). An import is never an image made with a memoryless
+/// request: the graph stores every import's attachments, which is refused for such an
+/// image (`memoryless-store`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ImageImport<'a> {
     /// A name for an error that names the import. Part of the key.
@@ -36,7 +38,10 @@ pub struct ImageImport<'a> {
     /// The state and queue every subresource is in before the frame's first submit: the
     /// caller's word, which the graph does not check and null does (`state`). `Undefined`
     /// discards the contents and takes the image from whichever queue it was on, with no
-    /// transfer, for the queue that uses it first; its `queue` is then ignored.
+    /// transfer, for the queue that uses it first; its `queue` is then ignored. A state
+    /// that writes, where the frame's first use is in it, gets the same-state transition
+    /// that orders this frame's write after the last frame's (`README.md`, "Transitions
+    /// and store actions").
     pub initial: StateOn<ImageState>,
     /// The state and queue every subresource is in once the frame's submits have
     /// completed, whether or not a kept pass used the image, and before any release
@@ -78,7 +83,8 @@ pub struct BufferImport<'a> {
     /// first, which keeps its bytes, and moves it by a transfer where the frame first
     /// uses it on another queue. So a buffer may be imported from `Undefined` in every
     /// frame. Where the word is wrong the bytes are discarded, and null refuses the next
-    /// read (`undefined-read`).
+    /// read (`undefined-read`). A state that writes is ordered as an image's is
+    /// ([`ImageImport::initial`]).
     pub initial: StateOn<BufferState>,
     /// The state and queue the buffer is in once the frame's submits have completed,
     /// whether or not a kept pass used it. Never `Undefined`. `HostRead` for a readback,

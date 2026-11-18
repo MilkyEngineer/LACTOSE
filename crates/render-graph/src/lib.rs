@@ -106,7 +106,6 @@
 )]
 
 mod decl;
-mod exclusive;
 mod graph;
 mod history;
 mod id;
@@ -114,6 +113,7 @@ mod pass;
 mod plan;
 mod recorder;
 mod resource;
+mod sync_view;
 
 pub use decl::FrameDecl;
 pub use graph::{GraphDesc, GraphStats, LOG_TARGET, RecordedFrame, RenderGraph};

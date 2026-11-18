@@ -13,8 +13,10 @@
 /// (`README.md`, "History").
 ///
 /// The owner calls [`advance`](Self::advance) once `RenderGraph::submit` has returned the
-/// frame's point, and not after a submit that failed: the half that frame was to write
-/// holds nothing.
+/// frame's point. After a submit that failed it calls [`reset`](Self::reset) instead:
+/// every error from `submit` is taken as a torn frame, so the half that frame read is
+/// imported next from `Undefined`, which discards it, and the half it was to write holds
+/// nothing (`README.md`, "Submission").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct History<H> {
     /// The two halves.

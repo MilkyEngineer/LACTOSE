@@ -47,7 +47,7 @@ consumer writes: a change that breaks one is a signature change to list.
 | `LOG_TARGET` | `gouda`, the target of the graph's spans |
 
 The crate exports no trait and no `#[doc(hidden)]` item. Its one piece of private plumbing
-is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurrency").
+is `sync_view::SyncView`, a `Sync` cell reached through `&mut` alone ("Concurrency").
 
 ## What each consumer needs, and where this surface gives it
 
@@ -58,6 +58,28 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
 | `lactose-terrain` and `lactose-debug-ui`, which `crate-tiers.toml` gives the renderer alone; later `lactose-ui`, which it gives this crate too | To add passes through the renderer's pass-provider trait, the first two without naming this crate | Nothing here for the first two: the renderer's facade re-exports what its pass-provider trait names, and `FrameDecl` and the pass types are plain enough to re-export. `lactose-ui` may name them here or there |
 | The client's frame (`frame-design`, `frame-impl`): `lactose-app-client`, and `lactose-app` through a `dyn` object | Compile, record, latch and submit as steps of the frame; objects that wait between steps in a world's resource or a `dyn` object's fields; record from a job, under the physics reservation; the frame's point, for the present thread and for pacing; a target handed to the present role and taken back | `RenderGraph` and `RecordedFrame` are `Send + Sync + 'static` and borrow nothing; `record` takes `&mut JobContext` and forks in its scope; `submit` returns a `TimelinePoint`; `ImageImport::handoff` and `ready`. No trait here is one `lactose-app` must name |
 | The present thread (`swapchain`, `present-impl`) | A finished target in a known state, released toward the present role where that is a transfer, and a point to wait for | `ImageImport::last` and `handoff`; the frame's point |
+
+Three things these consumers must know that no signature shows:
+
+- **`frame-design` and the present thread: the present thread never acquires a release it
+  skipped.** A target released toward the present role and taken back from `Undefined` by
+  a later frame is accepted whether or not the present thread acquired it (rhi-api,
+  "States"). A present thread that then acquires a release older than the frame's re-take
+  is refused on null (`no-qfot`: an acquire with no equal release submitted), and on Vulkan
+  races the graphics queue's writes.
+- **`frame-design` and `frame-impl`: the lock-free way to call `record`** is a once-per-tick
+  system that holds the graph, or the object that owns it, as a `ResMut` beside a `Job`
+  parameter, whose `context()` is the `&mut JobContext` that `record` takes;
+  `World::insert_service` holds any `Send + Sync + 'static` type. A `GraphNode`'s `run`
+  has `&self` and would need a lock to reach `&mut RenderGraph`, which section 3 does not
+  permit on the per-frame path; a scope child holds a `ChildContext`, not a `JobContext`;
+  and the main thread holds neither.
+- **`graph-impl`: a frame of another graph.** `record` and `submit` refuse a frame another
+  graph made (`InvalidData`, "Errors and drops"). Two `compile`s may precede a `record`,
+  since a `CompiledFrame` borrows no graph, so the second may evict the first frame's plan:
+  comparing a frame's plan with the cache's cannot tell an evicted plan from a foreign one.
+  The graph tells them apart by a token of its own that every plan it compiles carries,
+  such as an `Arc` compared with `Arc::ptr_eq`, and not by comparing cache pointers.
 
 ## A frame, by step
 
@@ -199,12 +221,21 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   and on Apple a submit whose host wait is unmet for about five seconds loses the device.
   A test gives one, briefly, to hold a frame pending.
 - The graph orders its own frames, with no word from the caller, who cannot give one: the
-  graph chooses each pass's queue. A submit of a frame that changes the state or owner of
-  an import which a submit of an earlier frame of this graph used on another queue waits
-  for a point that submit signals. The graph may make a frame's submit wait for an earlier
+  graph chooses each pass's queue. A submit that uses an import which another queue's
+  submit, of this frame or an earlier frame of this graph, wrote or changed the state or
+  owner of waits for a point that submit signals; so does a submit that changes the state
+  or owner of an import which another queue's submit of an earlier frame used. A submit
+  uses what rhi-api counts ("States"): a transition's resource, an attachment, a declared
+  buffer, a copy's side, an index or an indirect buffer. For an `Exclusive` import a
+  transfer's wait already orders such a use; for a `Concurrent` one this wait is the only
+  order, and rhi-api has no rule yet that refuses a graph that leaves it out ("What
+  `graph-impl` proves on null"). The graph may make a frame's submit wait for an earlier
   frame's submits to another queue where it need not; which such waits it makes is not
   promised.
 - One handle is imported once in a declaration. The graph cannot see a second import of it.
+- An import is never an image made with a memoryless request: the graph stores every
+  import's attachments ("Transitions and store actions"), and storing such an image is
+  refused on every backend (rhi-api, `memoryless-store`).
 
 ### Transients
 
@@ -256,9 +287,13 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   records one transition for every resource the pass uses that is not already in the state
   and on the queue the use needs, from where the frame so far left it.
 - Where the resource is already there and the state is one that writes (`ColourAttachment`,
-  `LocalRead`, `DepthAttachment`, `CopyDestination`, `ShaderWrite`) and an earlier pass of
-  the frame used it in that state, the graph records the same-state transition rhi-api
-  requires between the two ("States").
+  `LocalRead`, `DepthAttachment`, `CopyDestination`, `ShaderWrite`), and an earlier pass of
+  the frame used it in that state or the use is the import's first in the frame and its
+  `initial` is that state, the graph records the same-state transition rhi-api requires
+  between the two ("States"). The second case is the frame's edge: null keeps a write
+  across submits, and without it an attachment kept with `Load::Keep` every frame, or a
+  buffer a compute pass writes every frame, is written after the last frame's write with
+  nothing between them.
 - A change between two queues of an `Exclusive` resource is recorded twice with equal
   values: the release on an encoder of the queue that used it last, after that use, in a
   submit made before the acquiring one; the acquire before the pass. The acquiring submit
@@ -297,9 +332,11 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
 - On a device whose compute role has a queue of its own, a compute pass is the compute
   role's when it has no graphics-queue dependency, and the graphics role's otherwise. A
   compute pass depends on a graphics-role pass of the frame when both use one resource,
-  unless the resource is `Concurrent`, neither writes it and both need it in one state. The
-  rule is applied until nothing changes: a compute pass made graphics-role by it is a
-  graphics-role pass for the others.
+  unless the resource is an import made `Concurrent`, neither pass writes it, both need it
+  in one state, and its `initial` is that state. No transition of it then falls inside the
+  frame before both uses, and a closing transition after both waits for the other queue's
+  use ("Transitions and store actions"). The rule is applied until nothing changes: a
+  compute pass made graphics-role by it is a graphics-role pass for the others.
 - The window of architecture section 12.3 is the frame. A dependency that crosses frames is
   an import's `initial` or `last`: a transfer at the frame's edge, which the graph records
   and which does not keep a pass off the compute queue. So what a compute-role pass writes
@@ -313,8 +350,9 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   image in declaration order (import or transient; its label; an import's `mips`, `layers`,
   `sharing`, `initial`, `last` and `handoff`; a transient's format, extent, mips and
   layers); each buffer in declaration order (its label, `sharing`, `initial`, `last`); each
-  pass in declaration order (its kind, its label, and each use: the id, an attachment's
-  mip, layer, `local_read` and the variant of its load, a buffer's access).
+  pass in declaration order (its kind, its label, and each use: the list it is declared in,
+  which is `colour`, `depth`, `sampled`, `buffers` or one of a copy pass's four, the id, an
+  attachment's mip, layer, `local_read` and the variant of its load, a buffer's access).
 - Against architecture section 12.3's list: the pass list is the passes' kinds and labels;
   the edges are a function of the uses, which are hashed; the resource descriptors are the
   transients' and what an import declares; the imported initial states are `initial`, and
@@ -324,9 +362,10 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   key so that one declaration has different keys on a one-queue and a several-queue device.
 - Not in the key, and free to change every frame under one plan: every handle, every
   `ready` point, every clear value, every `slots` list and every recorder.
-- A hit is an equal declaration, not an equal hash: the cache compares what it hashed, so a
-  collision compiles again. `CompiledFrame::fresh` is `true` exactly when this call compiled
-  the plan.
+- A hit is an equal declaration, not an equal hash: the cache compares what it hashed, the
+  list of each use included, so a collision compiles again and two declarations that differ
+  only in which list a use is in never share a plan. `CompiledFrame::fresh` is `true`
+  exactly when this call compiled the plan.
 - On a hit `compile` makes nothing. On a miss it calls `image_placement`,
   `create_memory_block` and `create_image` for the plan's transients, and after an error
   destroys what it made and caches nothing. Either way it may read a timeline's value and
@@ -344,8 +383,9 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   frame-critical workers, the calling worker among them, so `record` is called from a job.
   While another job's `JobContext::block_in_place` holds the executor's gate, the
   recording jobs run on the workers its reservation leaves (`crates/task/README.md`,
-  "Workers"): the physics phase slows recording and does not stop it, by as much as
-  verification's `record-stall` row measures.
+  "Workers"): the physics phase slows recording, by as much as verification's
+  `record-stall` row measures, and stops it for the step where the reservation is zero, as
+  it is where there is one frame-critical worker.
 - The passes of one submit are split into the smaller of `GraphDesc::jobs` and their number
   of jobs, each a run of consecutive passes in graph order. Where the plan cuts the runs is
   its choice, part of the plan and the same in every run. A submit that carries transitions
@@ -366,7 +406,9 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   that owns it, which is why it is `FnOnce + Send` and need be neither `Fn` nor `Sync`: it
   may consume what it captured and may hold a `&mut` for the frame. Recorders of one job
   are called in graph order; no order is promised between two recorders of different
-  jobs, which may run at once. Called or not, every recorder is dropped before `record`
+  jobs, which may run at once. A recorder does not block or wait (architecture section
+  5.1): not for another recorder, which on one worker runs after it, not for a lock, and
+  not for a timeline point. Called or not, every recorder is dropped before `record`
   returns, on a worker that is not promised. A recorder reaches the encoder through its
   recorder type alone: it cannot transition, alias, begin or end a pass, or reset.
 - A recorder call forwards to the `Encoder` call of its name with the handle imported under
@@ -377,6 +419,12 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   call, the first such pass in graph order where there are several, and no frame is
   recorded. Heap slots are passed on unchecked, and the device refuses one the pass did not
   declare (`undeclared`, every backend).
+- A copy pass's recorder writes each destination in one call, which takes as many regions
+  as it needs, every mip and layer of an image among them. A second call that writes a
+  destination the pass already wrote is a breach like the others, reported as above:
+  rhi-api requires a transition between two copies into one resource ("States"), and a
+  recorder cannot record one. Copies into one destination from two sources are two copy
+  passes, and the graph records the transition between them.
 - A panic in a recorder aborts the process, as any scope child's does.
 - After an error from `record` nothing of the frame is submitted, and its encoders are
   reset and free.
@@ -392,24 +440,43 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   that order, each with its jobs' encoders in graph order. Passes of one queue therefore
   run in graph order. Under "Queues" no pass uses what a pass of the same frame on another
   queue uses in another state or writes, so the frame's queues are ordered against each
-  other only where an import crosses at the frame's edge, by the wait of its transfer, and
-  by the frame's point.
+  other by three waits alone: a transfer's, where an `Exclusive` import crosses at the
+  frame's edge; that of a submit that uses an import under another queue's write or
+  change, or changes a `Concurrent` one under another queue's use ("Imports",
+  "Transitions and store actions"); and the frame's last submit's, for the frame's point.
 - A frame all of whose commands are for one queue is one `Device::submit`. That is every
   frame on a device with one queue.
 - The frame's point is a value of one timeline of the graph's. It is signalled when every
-  submit of the frame has completed: the frame's last submit signals it and waits for a
-  point of each of the frame's submits to another queue, and for the point of the frame
-  before where that frame's was signalled from another queue (rhi-api, "Timelines"). Values
-  grow with each frame submitted, so a point reached means that frame's submits, and every
-  earlier frame's, have completed.
+  submit of the frame has completed: the frame's last submit signals it, and waits for a
+  point of each submit the graph made to another queue after the last submit it made that
+  signals a frame point, which after a whole frame are the frame's own, and for that frame
+  point where it is signalled from another queue (rhi-api, "Timelines"). Values grow with
+  each frame submitted, so a point reached means that frame's submits, and every earlier
+  frame's, have completed: those on the last submit's queue by submission order, and those
+  on another queue by these waits.
+- One point a frame serialises the frame's end. The last submit waits for the frame's
+  compute-queue work before any of its own passes run, so compute work overlaps only the
+  graphics submits made before the last one, and no compute work overlaps graphics across
+  the frame's end at milestone 2. A trailing submit with no encoder that signals the point
+  is for a later milestone ("Not in this crate yet").
 - `submit` waits for nothing and returns an error from `Device::submit` unchanged. A
   refusal of the frame's first submit changes nothing (rhi-api, "Timelines"): every import
   is as the declaration found it, and the frame's encoders are reset and free. An error
   from a later submit leaves the frame torn. The submits before it were made and stay
   made, the frame's point is not signalled for it, and its imports are in no state the
-  graph vouches for: the caller imports them next from `Undefined`, and relies on no
-  buffer's bytes. The graph still takes later frames, and a later frame's point covers the
-  torn frame's submits.
+  graph vouches for. The error does not say which submit failed, so the caller treats
+  every error from `submit` as a torn frame: it imports the frame's imports next from
+  `Undefined`, relies on no buffer's bytes, and calls `History::reset` on every history
+  whose halves the frame imported.
+- After a torn frame the graph still takes later frames, with these waits. No frame waits
+  for the torn frame's point, which nothing signals, and the next frame's point is above
+  it. The last submit of the next frame the graph submits whole waits, by the rule above,
+  for a point of each submit the torn frame made to another queue, and for the point of
+  the last whole frame before it where that is signalled from another queue, so its point
+  covers the torn frame's submits, those on its own queue by submission order. The torn
+  frame's submitted encoders and its plan are held, as a pending frame's are, until that
+  point is seen reached, so nothing is reset or destroyed under a submit the torn frame
+  made; the encoders of the submits it never made are reset and free at once.
 - A `RecordedFrame` dropped unsubmitted drops its encoders, none of which is pending.
 
 ### History
@@ -420,8 +487,9 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
 - A handle is not in the key, so the swap changes no plan. A frame with no previous half
   declares one import fewer and has a key of its own: a history costs one plan for its
   first frame, or the first after `reset`, and one for every frame after.
-- The owner calls `advance` after `submit` returned the frame's point and not after a
-  failed submit.
+- The owner calls `advance` after `submit` returned the frame's point. After a `submit`
+  that failed it calls `reset` instead: the frame is taken as torn ("Submission"), so the
+  half it read is imported next from `Undefined`, which discards it.
 
 ### Concurrency
 
@@ -433,16 +501,14 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   breach is written, each lent to it as `&mut` from a slice split by job: a job's passes
   are consecutive in the declaration, so the split is by index. Nothing else exists while
   the jobs run, and nothing a job writes is reachable from another.
-- **This crate takes no lock and has no `unsafe`, and its only atomics are the counts of
-  the `Arc`s that hold a plan and the device, so section 3 needs no amendment for it.**
-  The locks a frame takes are those of the layers below, each permitted by section 3 where
-  its README names it: a device backend's (D158), under the device and encoder calls, and
-  the executor's, under the scope.
-- `exclusive::Exclusive` holds the graph's and a recorded frame's encoders and a
+- **This crate takes no lock and has no `unsafe`, so section 3 needs no amendment for
+  it.** The locks a frame takes are a device backend's (D158), under the device and
+  encoder calls, which section 3 permits; the scope `record` opens takes none.
+- `sync_view::SyncView` holds the graph's and a recorded frame's encoders and a
   declaration's recorders. It wraps a `std::sync::Mutex` for its `Sync` impl alone and
   calls only `get_mut` and `into_inner`, which take `&mut` or the value, block nothing and
-  take no lock. `std::sync::Exclusive` is the same type and is not stable on the pinned
-  toolchain.
+  take no lock. `std::sync::SyncView` (unstable `exclusive_wrapper`) is the same type and
+  is not stable on the pinned toolchain.
 - `RenderGraph`, `RecordedFrame` and `CompiledPlan` are `Send + Sync + 'static`.
   `FrameDecl<'f>` and `CompiledFrame<'f>` are `Send + Sync` whatever their recorders are,
   and `'static` where the recorders are. A recorder type is lent to one call on one worker.
@@ -472,6 +538,10 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
   It is dropped off the frame-critical workers (rhi-api, "Handles and lifetimes"), and
   after the host has signalled every `ready` point a pending frame waits for that the host
   owes: the drop cannot release such a frame. On a lost device the wait ends at once.
+- A drop made while the thread unwinds a panic does not wait. It reads the timelines,
+  destroys what no pending submit uses, makes no destroy a pending submit would refuse,
+  and drops its encoders, which leak what is pending, as rhi-api's drops do ("Handles and
+  lifetimes"). So a test that fails holding a pending frame fails instead of hanging.
 - A `FrameDecl` and a `CompiledFrame` drop as plain values and leave the graph as it was.
 
 ## What `graph-impl` proves on null, and the rule each proof rests on
@@ -483,8 +553,10 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
 |---|---|
 | Record every derived transition, with the `from` the frame left | `state` |
 | Record the same-state transition between two writers | `state` |
+| Record the same-state transition before an import's first use in the frame where its `initial` is that writing state: one declaration, an import written in that state every frame, submitted for two frames | `state` |
 | Record both halves of a transfer, the release submitted first, and wait for it | `no-qfot` |
 | Wait before a change of state while another queue's pending submit uses the resource | `no-qfot` |
+| Wait before a use of an import that another queue's pending submit wrote or changed the state of | none yet: `no-qfot`, once rhi-api amends it |
 | Record the alias call before the first use of a transient whose bytes another used | `no-fence` |
 | Keep aliasing transients on one queue | `no-qfot` |
 | Begin every transient undefined; store an attachment a later pass uses | `undefined-read` |
@@ -498,10 +570,19 @@ is `exclusive::Exclusive`, a `Sync` cell reached through `&mut` alone ("Concurre
 | Give a submit only encoders of its role, each recorded once since its reset, with no pass left open | `encoding` |
 | Never submit to the present role | `present-queue` |
 
+The row with no rule yet is the `Concurrent` path across queues. rhi-api's `no-qfot`
+refuses a change of state or owner under another queue's pending use, not a use under
+another queue's pending write or change, so null accepts a graph that leaves that wait
+out. The facade stands without the amendment that names it (D160), and `graph-impl`
+builds the wait all the same; until the amendment merges, no CI test proves the
+`Concurrent` path.
+
 Some proofs rest on this surface and not on a rule. An unreachable pass is culled and a
 pass whose only output is a readback or an import is kept (`is_culled`, and a culled pass's
 recorder never runs). Each input of the key, changed alone, forces a recompile (`fresh`,
-`GraphKey`; the queue layout by one declaration on two devices). Two transients alias
+`GraphKey`; the queue layout by one declaration on two devices; a use moved from one of a
+pass's lists to another, such as a copy's image from its sources to its destinations).
+A copy pass's second call into one destination fails `record`. Two transients alias
 (`transient`), after which a read of the second before its first write is refused by
 `undefined-read` above. Memoryless is asked for only where the device reports it honoured
 (`transient` under a capability set with it and one without: a request the device does not
@@ -554,6 +635,11 @@ kind section 20 allows, a new field, variant or call, and changes what no call a
 - **A point for each import.** The frame's one point waits for every queue, so a reader of
   the target waits for the frame's compute-queue work too. No pass of milestone 2 runs on
   the compute queue outside `graph-impl`'s tests.
+- **A trailing submit for the frame's point.** A submit with no encoder, after the frame's
+  last, that waits for the other queues' last submits and signals the point, so that the
+  frame's last graphics passes need not wait for its compute work ("Submission").
+  `CompiledPlan::submits` then counts one more for a frame with work on two queues, as it
+  counts every submit; a later milestone that runs compute beside graphics adds it.
 - **A reordering compile.** Graph order is declaration order. A compile that moves
   independent passes, to shorten a transient's life or to merge submits, changes
   `CompiledPlan::passes` and nothing a recorder sees.
@@ -568,10 +654,12 @@ kind section 20 allows, a new field, variant or call, and changes what no call a
 
 There is nothing to run against a facade but `History`. `tests/consumers.rs` compiles what
 each consumer writes: `graph-impl`'s proofs on null (aliasing, culling and null's refusal;
-the key's inputs and the cap; both queue paths; encoders under a lagging device), the
-minimal renderer's scatter and triangle passes through a pass-provider trait and its
-readback, the client's frame through a `dyn` object with the latch between record and
-submit and the target's hand-off to the present thread, and a history's frame.
+the key's inputs and the cap, and a use moved between lists; a write in one state across
+the frame's edge; a copy's second call into one destination; both queue paths; encoders
+under a lagging device), the minimal renderer's scatter and triangle passes through a
+pass-provider trait and its readback, the client's frame through a `dyn` object with the
+latch between record and submit and the target's hand-off to the present thread, and a
+history's frame.
 `tests/values.rs` runs the ping-pong and holds this file's surface table to the crate's
 exports. The static assertions in `src/lib.rs` hold `RenderGraph`, `RecordedFrame` and
 `CompiledPlan` to `Send + Sync + 'static`, `FrameDecl` and `CompiledFrame` to `Send + Sync`
@@ -582,6 +670,30 @@ fails it. On devices, by class of hazard (decision 5.17), it owes the dropped ba
 tracked attachment or buffer, which synchronisation validation reports; a host write under
 a pending reader, which yields a wrong readback with the GPU made to lag; a host access
 under a pending writer, refused on every backend (`pending`); and the encoder reset held
-back with the GPU made to lag (`VUID-vkResetCommandPool-commandPool-00040`). It owes a test
-that counts the spans of a frame against its kept passes. `reviewer-concurrency` reads the
-recording jobs' sharing against "Concurrency".
+back with the GPU made to lag (`VUID-vkResetCommandPool-commandPool-00040`). Every device
+run, the `gpu (lavapipe)` job's included, sets the Khronos layer's
+`VK_KHRONOS_VALIDATION_SYNCVAL_LOAD_OP_AFTER_STORE_OP_VALIDATION=true` beside
+`VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`: without it the layer does not report a load
+after a store between two render pass instances, which is the write across the frame's
+edge of "Transitions and store actions" (verification, the row of D160 on the layer).
+
+It owes three tests of recording itself, because none of the above fails a `graph-impl`
+that records its jobs one at a time:
+- **Recording runs in parallel.** On at least two frame-critical workers, a recorder of one
+  job and a recorder of another each wait, with a bound, for the other, so the test fails
+  rather than hangs where the jobs do not run at once, and each job's commands are still
+  in graph order. The bounded wait is the test's own breach of "Recording"'s rule that a
+  recorder does not wait, made to detect serial recording.
+- **Chaos.** The same frame records the same commands under `ExecutorBuilder::chaos`
+  (`ChaosConfig::shuffle_steals` and `inject_yields`, several seeds), at one and at four
+  frame-critical workers.
+- **Spans.** A test counts the spans of a frame against its kept passes, with its
+  subscriber installed process-wide (`tracing::subscriber::set_global_default`, as
+  `crates/task/tests/spans.rs` does): the jobs' spans open on other workers, so a
+  subscriber set for the test thread alone sees the opener's only, and the count passes
+  only where recording is serial.
+
+The graph facade's concurrency review (round 1) built the first two over a model of
+`record` on the shipped executor, with a switch that makes recording serial: under it every
+check of order, breach and encoder reuse passed, and only the rendezvous failed, at its
+bound. `reviewer-concurrency` reads the recording jobs' sharing against "Concurrency".

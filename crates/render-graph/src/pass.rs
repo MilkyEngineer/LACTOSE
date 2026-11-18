@@ -115,7 +115,8 @@ pub struct ComputePassDecl<'a> {
 /// makes. The slices are copied by the call that takes it.
 ///
 /// No image and no buffer is named twice in one pass, so none is both a source and a
-/// destination.
+/// destination. The recorder writes each destination in one call
+/// ([`CopyRecorder`](crate::CopyRecorder)).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CopyPassDecl<'a> {
     /// The pass's name: its span's `label` and the name of an error that names it. Part

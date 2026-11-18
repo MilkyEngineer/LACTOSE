@@ -11,7 +11,8 @@ use crate::resource::TransientMemory;
 /// The hash a plan is cached under (architecture section 12.3): of the view count, the
 /// device's queue layout, every resource's declaration but its handle and its `ready`
 /// point, and every pass's declaration but its clear values, its heap slots and its
-/// recorder, each in declaration order (`README.md`, "Compile and its cache").
+/// recorder, each in declaration order, with each use under the list it is declared in
+/// (`README.md`, "Compile and its cache").
 ///
 /// Equal declarations under equal layouts have equal keys, in every process of one build.
 /// Two declarations with equal keys may differ: the cache compares what it hashed before

@@ -16,9 +16,10 @@ use lactose_render_graph::{
     RecordedFrame, RenderGraph, RenderPassDecl, TransientImage, TransientMemory,
 };
 use lactose_rhi_api::{
-    BufferHandle, BufferImageCopy, BufferState, ComputePipelineHandle, Device, Encoder, Extent,
-    Format, GraphicsPipelineHandle, HeapSlot, ImageHandle, ImageRange, ImageState, ImageTransition,
-    IndexedIndirectArgs, Load, QueuePath, QueueRole, Rect, Rule, Sharing, StateOn, TimelinePoint,
+    BufferCopy, BufferHandle, BufferImageCopy, BufferState, ComputePipelineHandle, Device, Encoder,
+    Extent, Format, GraphicsPipelineHandle, HeapSlot, ImageHandle, ImageRange, ImageState,
+    ImageTransition, IndexedIndirectArgs, Load, QueuePath, QueueRole, Rect, Rule, Sharing, StateOn,
+    TimelinePoint,
 };
 use lactose_task::JobContext;
 
@@ -177,6 +178,134 @@ fn graph_impl_key_inputs(device: Arc<dyn Device>, targets: [ImageHandle; 2]) -> 
     Ok(())
 }
 
+/// A use moved from one of a pass's lists to another is a key input: a copy pass that only
+/// reads `b` writes nothing and is culled, and the same ids with `b` a destination make a
+/// pass that writes an import and is kept. A hit would replay the culled plan.
+fn graph_impl_key_tells_the_lists_apart(
+    device: Arc<dyn Device>,
+    images: [ImageHandle; 2],
+) -> Result<()> {
+    let mut graph = RenderGraph::new(device, &GraphDesc { jobs: 1, plans: 2 })?;
+    let declare = |b_is_written: bool| {
+        let mut decl = FrameDecl::new(1);
+        let import = |label, image| ImageImport {
+            label,
+            image,
+            mips: 1,
+            layers: 1,
+            sharing: Sharing::Exclusive,
+            initial: on(ImageState::CopySource, GRAPHICS),
+            last: on(ImageState::CopySource, GRAPHICS),
+            handoff: None,
+            ready: None,
+        };
+        let a = decl.import_image(&import("a", images[0]));
+        let b = decl.import_image(&import("b", images[1]));
+        let (sources, destinations): (&[ImageId], &[ImageId]) =
+            if b_is_written { (&[a], &[b]) } else { (&[a, b], &[]) };
+        let pass = decl.copy_pass(
+            &CopyPassDecl {
+                label: "p",
+                image_sources: sources,
+                image_destinations: destinations,
+                buffer_sources: &[],
+                buffer_destinations: &[],
+            },
+            |_| {},
+        );
+        (decl, pass)
+    };
+
+    let (reads, pass) = declare(false);
+    let culled = graph.compile(reads)?;
+    assert!(culled.plan().is_culled(pass));
+    let (writes, pass) = declare(true);
+    let kept = graph.compile(writes)?;
+    assert!(kept.fresh());
+    assert!(!kept.plan().is_culled(pass));
+    assert_ne!(kept.plan().key(), culled.plan().key());
+    Ok(())
+}
+
+/// The same-state transition across a frame's edge: a buffer a compute pass writes every
+/// frame, imported in `ShaderWrite` and left there, is written by the second frame after
+/// the first frame's write. Without the transition before the second frame's first use,
+/// null refuses that frame's submit (`state`). The buffer lives on the queue the pass runs
+/// on, so no transfer stands in for the transition under either layout.
+fn graph_impl_writes_across_the_frame_edge(
+    device: Arc<dyn Device>,
+    ctx: &mut JobContext<'_>,
+    pipeline: ComputePipelineHandle,
+    written: BufferHandle,
+) -> Result<()> {
+    let several = device.capabilities().queues.compute == QueuePath::Own;
+    let queue = if several { QueueRole::Compute } else { GRAPHICS };
+    let mut graph = RenderGraph::new(device, &GraphDesc { jobs: 1, plans: 1 })?;
+    let mut points = Vec::new();
+    for _ in 0..2 {
+        let mut decl = FrameDecl::new(1);
+        let buffer = decl.import_buffer(&BufferImport {
+            label: "written every frame",
+            buffer: written,
+            sharing: Sharing::Exclusive,
+            initial: on(BufferState::ShaderWrite, queue),
+            last: on(BufferState::ShaderWrite, queue),
+            ready: None,
+        });
+        decl.compute_pass(
+            &ComputePassDecl {
+                label: "write",
+                sampled: &[],
+                buffers: &[BufferUse { buffer, access: BufferAccess::Write }],
+                slots: &[],
+            },
+            move |pass| {
+                pass.bind_pipeline(pipeline);
+                pass.push_address(0, buffer, 0);
+                pass.dispatch([1, 1, 1]);
+            },
+        );
+        let compiled = graph.compile(decl)?;
+        let recorded = graph.record(compiled, ctx)?;
+        points.push(graph.submit(recorded)?);
+    }
+    assert!(graph.device().wait_timeline(points[1], Duration::from_secs(5))?);
+    Ok(())
+}
+
+/// A copy pass's recorder writes each destination in one call: a second call into one
+/// destination fails `record`, naming the pass, and nothing of the frame is recorded.
+fn graph_impl_copy_writes_each_destination_once(
+    device: Arc<dyn Device>,
+    ctx: &mut JobContext<'_>,
+    buffers: [BufferHandle; 3],
+) -> Result<()> {
+    let mut graph = RenderGraph::new(device, &GraphDesc { jobs: 1, plans: 1 })?;
+    let mut decl = FrameDecl::new(1);
+    let [first, second, out] = buffers;
+    let first = decl.import_buffer(&on_graphics("first", first, BufferState::CopySource));
+    let second = decl.import_buffer(&on_graphics("second", second, BufferState::CopySource));
+    let out = decl.import_buffer(&on_graphics("out", out, BufferState::HostRead));
+    let region = BufferCopy { source_offset: 0, destination_offset: 0, size: 16 };
+    decl.copy_pass(
+        &CopyPassDecl {
+            label: "twice into out",
+            image_sources: &[],
+            image_destinations: &[],
+            buffer_sources: &[first, second],
+            buffer_destinations: &[out],
+        },
+        move |copy| {
+            copy.copy_buffer(first, out, &[region]);
+            copy.copy_buffer(second, out, &[region]);
+        },
+    );
+    let compiled = graph.compile(decl)?;
+    let breach = graph.record(compiled, ctx).err().expect("the second write is a breach");
+    assert_eq!(breach.kind(), ErrorKind::InvalidData);
+    Ok(())
+}
+
 /// The two queue paths: under a capability set whose compute role has a queue of its own, a
 /// compute pass with no graphics-queue dependency runs there and the frame takes a second
 /// submit; under one queue every pass is the graphics role's and the frame is one submit.
@@ -245,10 +374,12 @@ fn graph_impl_queue_paths(
 
 /// An encoder is reset only after its frame's point: with the device made to lag, a second
 /// frame takes encoders of its own, and once the first frame's point is reached a third
-/// reuses them.
+/// reuses them. `frame` declares an import whose `ready` is `held`, a point of a timeline
+/// of the test's that the host owes, so both frames stay pending until the test signals it.
 fn graph_impl_pools_under_lag(
     graph: &mut RenderGraph,
     ctx: &mut JobContext<'_>,
+    held: TimelinePoint,
     mut frame: impl FnMut(&mut RenderGraph, &mut JobContext<'_>) -> Result<TimelinePoint>,
 ) -> Result<()> {
     let first = frame(graph, ctx)?;
@@ -259,7 +390,9 @@ fn graph_impl_pools_under_lag(
     assert!(first.value < second.value);
     assert_eq!(graph.last_frame(), Some(second));
 
-    // The test lets the device go, and a point reached covers every earlier frame.
+    // The test lets the device go: the host signals the point it owes before any wait, and
+    // a point reached covers every earlier frame.
+    graph.device().signal_timeline(held)?;
     assert!(graph.device().wait_timeline(second, Duration::from_secs(5))?);
     frame(graph, ctx)?;
     assert_eq!(graph.stats().encoders, 2 * after_one);

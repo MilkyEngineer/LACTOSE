@@ -171,6 +171,11 @@ impl ComputeRecorder<'_> {
 }
 
 /// The commands of a copy pass, lent to its recorder with no pass open on the encoder.
+///
+/// Each destination is written by one call, which takes as many regions as it needs. A
+/// second call that writes a destination the pass already wrote is a breach, as a call
+/// that names an undeclared id is: two copies into one resource need a transition between
+/// them, which a recorder cannot record (`README.md`, "Recording").
 pub struct CopyRecorder<'r> {
     /// The recording job's encoder, outside any pass.
     encoder: &'r mut dyn Encoder,
