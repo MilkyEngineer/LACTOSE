@@ -441,8 +441,8 @@ impl Replay<'_> {
 
     /// Refuses a use of a resource that a pending submit of another queue wrote or changed
     /// the state or owner of, unless the submit waits for that one, directly or through
-    /// the submits it waits for. The earlier submits of the queue, their waits and their
-    /// acquires order no use of this one.
+    /// the submits it waits for. An acquire is such a use. The earlier submits of the queue
+    /// and their waits order no use of this one.
     fn waited_for(&self, changed: &Stamps) -> Result<()> {
         for other in (0..QUEUES).filter(|&other| other != self.queue) {
             if changed[other] > self.waited[other] {
@@ -573,12 +573,6 @@ impl Replay<'_> {
         self.waited_for(&changed)
     }
 
-    /// Whether a transition of an `Exclusive` resource is an acquire on this queue, which
-    /// the change rule orders and the use rule does not bind.
-    fn acquires(&self, owned: bool, transition: (usize, usize), undefined: bool) -> bool {
-        owned && !undefined && transition.0 != transition.1 && transition.1 == self.queue
-    }
-
     fn image_transition(&mut self, transition: &ImageTransition) -> Result<()> {
         let layout = self.layout_queues(transition.from.queue, transition.to.queue);
         self.touch_placed(transition.image)?;
@@ -592,9 +586,7 @@ impl Replay<'_> {
         }
         let owned = exclusive(rec.sharing);
         let changed = rec.changed;
-        if !self.acquires(owned, layout, transition.from.state == ImageState::Undefined) {
-            self.waited_for(&changed)?;
-        }
+        self.waited_for(&changed)?;
         self.plan.images_changed.insert(transition.image);
         let rec = self.image(transition.image)?;
         let range = transition.range;
@@ -625,9 +617,7 @@ impl Replay<'_> {
         let rec = self.buffer(transition.buffer)?;
         let owned = exclusive(rec.sharing);
         let changed = rec.changed;
-        if !self.acquires(owned, layout, transition.from.state == BufferState::Undefined) {
-            self.waited_for(&changed)?;
-        }
+        self.waited_for(&changed)?;
         let rec = self.buffer(transition.buffer)?;
         rec.sub = change(
             rec.sub,

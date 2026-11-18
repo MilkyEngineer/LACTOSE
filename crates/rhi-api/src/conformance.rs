@@ -277,6 +277,7 @@ pub const CASES: &[Case] = cases! {
     contract "use_under_another_queues_pending_transition_is_refused" => Queue;
     contract "sampled_read_under_another_queues_pending_write_is_refused" => Queue;
     contract "use_in_a_later_submit_than_the_waiting_change_is_refused" => Queue;
+    contract "acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused" => Queue;
     contract "take_of_a_mip_after_an_acquire_of_another_is_refused" => Queue;
     contract "use_waiting_through_another_submit_passes";
     contract "acquire_of_a_release_a_retake_ended_is_refused" => Queue;
@@ -320,6 +321,7 @@ pub const CASES: &[Case] = cases! {
     contract "encoder_recorded_on_another_thread_submits";
     contract "encoder_reset_while_pending_is_refused" => Pending everywhere;
     contract "pending_encoder_drop_waits_for_its_submit";
+    contract "drop_that_is_not_the_last_returns_at_once";
     contract "encoder_in_two_submits_is_refused" => Encoding everywhere;
     contract "encoder_resubmitted_without_reset_is_refused" => Encoding everywhere;
     contract "recording_while_pending_records_nothing";

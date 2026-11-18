@@ -163,7 +163,10 @@ fn waits_return_at_once_after_a_loss(ctx: &Ctx<'_>) -> Applies {
     let reached = ctx.point(&*device, 1);
     ctx.ok(device.signal_timeline(reached), "a host signal");
     let gate = ctx.held(&*device, QueueRole::Graphics, &mut []);
-    ctx.lose(&*device)?;
+    if let Err(skip) = ctx.lose(&*device) {
+        gate.open(ctx, &*device);
+        return Err(skip);
+    }
     let start = Instant::now();
     let was = device.wait_timeline(reached, Duration::from_secs(60));
     ctx.check(matches!(was, Ok(true)), "a wait for a point reached before the loss returns true");
@@ -223,8 +226,11 @@ fn teardown_succeeds_after_a_loss(ctx: &Ctx<'_>) -> Applies {
     let mut encoder = ctx.encoder(&*device, QueueRole::Graphics);
     clear(&mut *encoder, image, Some(graphics));
     let mut encoders: [Box<dyn Encoder>; 1] = [encoder];
-    let _gate = ctx.held(&*device, QueueRole::Graphics, &mut encoders);
-    ctx.lose(&*device)?;
+    let gate = ctx.held(&*device, QueueRole::Graphics, &mut encoders);
+    if let Err(skip) = ctx.lose(&*device) {
+        gate.open(ctx, &*device);
+        return Err(skip);
+    }
     ctx.ok(device.destroy_buffer(buffer), "a buffer's destroy after the loss");
     ctx.ok(device.destroy_image(image), "a used image's destroy after the loss");
     ctx.ok(device.destroy_sampler(sampler), "a sampler's destroy after the loss");

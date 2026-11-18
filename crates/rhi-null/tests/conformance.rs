@@ -184,6 +184,7 @@ cases! {
     wait_is_woken_by_a_host_signal
     wait_is_woken_by_a_loss
     pending_encoder_drop_waits_for_its_submit
+    drop_that_is_not_the_last_returns_at_once
     roles_resolve_as_the_layout_reports
     submit_to_the_present_role_is_refused
     buffer_write_then_copy_then_read_returns_the_bytes
@@ -229,6 +230,7 @@ cases! {
     use_under_another_queues_pending_transition_is_refused
     sampled_read_under_another_queues_pending_write_is_refused
     use_in_a_later_submit_than_the_waiting_change_is_refused
+    acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused
     take_of_a_mip_after_an_acquire_of_another_is_refused
     use_waiting_through_another_submit_passes
     acquire_of_a_release_a_retake_ended_is_refused
@@ -345,4 +347,70 @@ cases! {
     dispatches_of_one_pass_see_each_others_writes
     dispatch_indirect_reads_its_counts
     each_validator_reports_its_canary
+}
+
+/// Null's harness with no loss: what a device backend's harness is unless it has a hook of
+/// its own.
+struct Unlosing(Null);
+
+impl Harness for Unlosing {
+    fn sets(&self) -> Vec<Capabilities> {
+        self.0.sets()
+    }
+
+    fn device(
+        &self,
+        set: &Capabilities,
+        messages: Arc<dyn MessageSink>,
+        presents: bool,
+    ) -> Result<Box<dyn Device>> {
+        self.0.device(set, messages, presents)
+    }
+
+    fn device_with_cache(
+        &self,
+        set: &Capabilities,
+        messages: Arc<dyn MessageSink>,
+        cache: Vec<u8>,
+    ) -> Result<Box<dyn Device>> {
+        self.0.device_with_cache(set, messages, cache)
+    }
+
+    fn renders(&self) -> bool {
+        self.0.renders()
+    }
+
+    fn shader(&self, name: &str, stage: ShaderStage) -> Result<CookedShader> {
+        self.0.shader(name, stage)
+    }
+
+    fn lose(&self, _: &dyn Device) -> bool {
+        false
+    }
+
+    fn stall(&self, device: &dyn Device, on: bool) -> bool {
+        self.0.stall(device, on)
+    }
+}
+
+/// A case that needs a loss is skipped, and returns, where the harness cannot lose a device:
+/// it lets go of every submit it held before it says so. Each case runs on a thread of its
+/// own, so that one that never returns fails here rather than at the runner's kill.
+#[test]
+fn loss_cases_are_skipped_where_the_harness_cannot_lose() {
+    for name in [
+        "loss_is_returned_and_stays",
+        "wait_is_woken_by_a_loss",
+        "waits_return_at_once_after_a_loss",
+        "teardown_succeeds_after_a_loss",
+    ] {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(conformance::run(&Unlosing(Null::default()), case(name))).ok();
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{name} did not return where the harness cannot lose"));
+        assert_eq!(outcome, Outcome::Skipped("the harness cannot lose a device"), "{name}");
+    }
 }

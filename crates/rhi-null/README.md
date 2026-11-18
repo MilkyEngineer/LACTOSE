@@ -45,10 +45,12 @@ undecided point are bounded at one second.
   it. A host read and an invalidate wait for the second, a host write for the third. The
   `no-qfot` use rule compares the second with what the using submit's own waits order it
   after, through the submits they name and those submits' waits, and not through the
-  earlier submits of its queue, their waits or their acquires: an acquire is held to the
-  change rule alone, and every later use waits for itself. The stamps are of the whole
-  resource, not of each subresource: a `Concurrent` image changed at one mip on one queue
-  holds back a use of another mip on another.
+  earlier submits of its queue or their waits. It binds `Concurrent` resources, an
+  `Exclusive` resource moved by a transfer, and an `Exclusive` one moved by a transition
+  from `Undefined`. An acquire is such a use: its own submit waits for the release, directly
+  or through the submits it waits for, and so does every later use. The stamps are of the
+  whole resource, not of each subresource: a `Concurrent` image changed at one mip on one
+  queue holds back a use of another mip on another.
 - `read_buffer` reads `Readback` memory, of a buffer in a host-read state, whose written range
   has been invalidated where `coherent_host_memory` is `false` (`unflushed`).
 - A SPIR-V module is checked by its header and its `OpCapability` and `OpExtension`

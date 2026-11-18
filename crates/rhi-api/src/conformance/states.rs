@@ -58,6 +58,10 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         use_in_a_later_submit_than_the_waiting_change_is_refused,
     ),
     (
+        "acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused",
+        acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused,
+    ),
+    (
         "take_of_a_mip_after_an_acquire_of_another_is_refused",
         take_of_a_mip_after_an_acquire_of_another_is_refused,
     ),
@@ -858,18 +862,30 @@ fn sampled_read_under_another_queues_pending_write_is_refused(ctx: &Ctx<'_>) -> 
     Ok(())
 }
 
-/// A `Concurrent` buffer and a `Concurrent` image, each filled and seen. Compute only
-/// transitions them, with no write, in a submit held pending. A graphics submit that copies
-/// from either with no wait for that submit is refused, as under a write; with the wait it
-/// passes.
+/// `Concurrent` buffers and images, each filled and seen where it is read. Compute only
+/// transitions them, with no write, in a submit held pending. A graphics submit with no wait
+/// for that submit is refused, as under a write, when it copies from a buffer or an image,
+/// draws to an image as an attachment, declares a buffer in a pass, or draws with a buffer
+/// of indices; with the wait it passes.
 fn use_under_another_queues_pending_transition_is_refused(ctx: &Ctx<'_>) -> Applies {
     several_queues(ctx)?;
     let device = ctx.device();
     let source = ctx.upload(&*device, BufferUsage::EMPTY, &[2; SIZE as usize]);
+    let zeros = ctx.upload(&*device, BufferUsage::EMPTY, &[0; SIZE as usize]);
     let shared = copied(ctx, &*device, Sharing::Concurrent);
     let image = shared_image(ctx, &*device);
+    let declared = shared_buffer(ctx, &*device, BufferUsage::DEVICE_ADDRESS);
+    let indices = shared_buffer(ctx, &*device, BufferUsage::INDEX);
+    let whole = [BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }];
     let mut setup = ctx.encoder(&*device, C);
     copy_fresh(&mut *setup, source, shared);
+    setup.transition_buffers(&[
+        buffer_to(zeros, BufferState::Undefined, BufferState::CopySource, C),
+        buffer_to(declared, BufferState::Undefined, BufferState::CopyDestination, C),
+        buffer_to(indices, BufferState::Undefined, BufferState::CopyDestination, C),
+    ]);
+    setup.copy_buffer(source, declared, &whole);
+    setup.copy_buffer(zeros, indices, &whole);
     fill(&mut *setup, texels(ctx, &*device), image);
     run(ctx, &*device, C, &mut [setup]);
     let mut changer = ctx.encoder(&*device, C);
@@ -894,7 +910,106 @@ fn use_under_another_queues_pending_transition_is_refused(ctx: &Ctx<'_>) -> Appl
         (shared, image),
         "another queue's pending submit only transitions",
     );
+    let usage = ImageUsage::COLOUR.union(ImageUsage::COPY_SOURCE);
+    let desc =
+        ImageDesc { sharing: Sharing::Concurrent, ..image_desc(Format::Rgba8Unorm, EXTENT, usage) };
+    let target = ctx.image(&*device, &desc);
+    let mut changer = ctx.encoder(&*device, C);
+    changer.transition_images(&[image_to(
+        target,
+        ImageState::Undefined,
+        ImageState::ColourAttachment,
+        C,
+    )]);
+    let mut user = ctx.encoder(&*device, G);
+    begin(
+        &mut *user,
+        &[attachment(target, Load::Clear([0.0; 4]), Store::Store, false)],
+        PassReach::NOTHING,
+    );
+    user.end_pass();
+    pending_refused(
+        ctx,
+        &*device,
+        changer,
+        user,
+        "an attachment another queue's pending submit only transitions",
+    );
+    let mut changer = ctx.encoder(&*device, C);
+    changer.transition_buffers(&[buffer_to(
+        declared,
+        BufferState::CopyDestination,
+        BufferState::ShaderRead,
+        C,
+    )]);
+    let mut user = ctx.encoder(&*device, G);
+    let read = [BufferReach { buffer: declared, state: BufferState::ShaderRead }];
+    compute_pass(&mut *user, ctx.compute(&*device), PassReach { slots: &[], buffers: &read });
+    user.end_pass();
+    pending_refused(
+        ctx,
+        &*device,
+        changer,
+        user,
+        "a pass that declares a buffer another queue's pending submit only transitions",
+    );
+    let mut changer = ctx.encoder(&*device, C);
+    changer.transition_buffers(&[buffer_to(
+        indices,
+        BufferState::CopyDestination,
+        BufferState::Index,
+        C,
+    )]);
+    let target = ctx.target(&*device);
+    let mut user = ctx.encoder(&*device, G);
+    user.transition_images(&[image_to(
+        target,
+        ImageState::Undefined,
+        ImageState::ColourAttachment,
+        G,
+    )]);
+    begin(
+        &mut *user,
+        &[attachment(target, Load::Clear([0.0; 4]), Store::Store, false)],
+        PassReach::NOTHING,
+    );
+    user.bind_graphics_pipeline(ctx.plain(&*device));
+    user.bind_index_buffer(indices, 0);
+    user.draw_indexed(0..3, 0, 0..1);
+    user.end_pass();
+    pending_refused(
+        ctx,
+        &*device,
+        changer,
+        user,
+        "a draw with indices another queue's pending submit only transitions",
+    );
     Ok(())
+}
+
+/// A `Concurrent` buffer of [`SIZE`] bytes that a copy fills, with `usage` besides.
+fn shared_buffer(ctx: &Ctx<'_>, device: &dyn Device, usage: BufferUsage) -> BufferHandle {
+    let usage = usage.union(BufferUsage::COPY_DESTINATION);
+    ctx.buffer_shared(device, SIZE, usage, MemoryClass::Device, Sharing::Concurrent)
+}
+
+/// Holds `changer` pending on compute. `user`, submitted to graphics with no wait for it, is
+/// refused, and passes with the wait.
+fn pending_refused(
+    ctx: &Ctx<'_>,
+    device: &dyn Device,
+    changer: Box<dyn Encoder>,
+    user: Box<dyn Encoder>,
+    what: &str,
+) {
+    let mut changers = [changer];
+    let gate = ctx.held(device, C, &mut changers);
+    let mut users = [user];
+    ctx.refused(submit(device, G, &mut users), &format!("{what}, with no wait for it"));
+    let done = ctx.point(device, 1);
+    ctx.submit(device, G, &mut users, &[gate.done], &[done]);
+    gate.open(ctx, device);
+    ctx.reached(device, done);
 }
 
 /// Compute, in a submit held pending, writes an `Exclusive` buffer and a `Concurrent` one,
@@ -1160,6 +1275,55 @@ fn use_in_a_later_submit_than_the_waiting_change_is_refused(ctx: &Ctx<'_>) -> Ap
         (C, release),
         (G, &mut [acquire], reader),
         "a copy from an image acquired in an earlier submit that waited",
+    );
+    Ok(())
+}
+
+/// Compute takes an `Exclusive` image and an `Exclusive` buffer and releases each to
+/// graphics, in a submit held pending. A graphics submit waits for it and records nothing; a
+/// later graphics submit that acquires either with no wait of its own is refused, and passes
+/// with the wait. An acquire is a use: the wait of an earlier submit of its queue does not
+/// cover it.
+fn acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused(ctx: &Ctx<'_>) -> Applies {
+    several_queues(ctx)?;
+    let device = ctx.device();
+    let image = copyable(ctx, &*device);
+    let crossing = image_across(
+        image,
+        ImageRange::FIRST,
+        (ImageState::CopyDestination, C),
+        (ImageState::CopySource, G),
+    );
+    let mut release = ctx.encoder(&*device, C);
+    release.transition_images(&[
+        image_to(image, ImageState::Undefined, ImageState::CopyDestination, C),
+        crossing,
+    ]);
+    let mut acquire = ctx.encoder(&*device, G);
+    acquire.transition_images(&[crossing]);
+    later_refused(
+        ctx,
+        &*device,
+        (C, release),
+        (G, &mut [], acquire),
+        "an acquire of an image after an earlier submit that waited for its release",
+    );
+    let buffer = copied(ctx, &*device, Sharing::Exclusive);
+    let crossing =
+        buffer_across(buffer, (BufferState::CopyDestination, C), (BufferState::CopySource, G));
+    let mut release = ctx.encoder(&*device, C);
+    release.transition_buffers(&[
+        buffer_to(buffer, BufferState::Undefined, BufferState::CopyDestination, C),
+        crossing,
+    ]);
+    let mut acquire = ctx.encoder(&*device, G);
+    acquire.transition_buffers(&[crossing]);
+    later_refused(
+        ctx,
+        &*device,
+        (C, release),
+        (G, &mut [], acquire),
+        "an acquire of a buffer after an earlier submit that waited for its release",
     );
     Ok(())
 }

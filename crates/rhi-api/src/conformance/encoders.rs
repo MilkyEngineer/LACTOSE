@@ -10,7 +10,7 @@ use super::kit::{
 use crate::{
     BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferUsage, Device,
     Encoder, Format, ImageDesc, ImageRange, ImageState, ImageUsage, Load, MemoryClass,
-    PUSH_BYTES_MAX, PassReach, QueueRole, Rect, Rule, Store, Submit,
+    PUSH_BYTES_MAX, PassReach, QueueRole, Rect, Rule, Store, Submit, SwapchainDesc,
 };
 
 type Applies = Result<(), &'static str>;
@@ -19,6 +19,7 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     ("encoder_recorded_on_another_thread_submits", encoder_recorded_on_another_thread_submits),
     ("encoder_reset_while_pending_is_refused", encoder_reset_while_pending_is_refused),
     ("pending_encoder_drop_waits_for_its_submit", pending_encoder_drop_waits_for_its_submit),
+    ("drop_that_is_not_the_last_returns_at_once", drop_that_is_not_the_last_returns_at_once),
     ("encoder_in_two_submits_is_refused", encoder_in_two_submits_is_refused),
     ("encoder_resubmitted_without_reset_is_refused", encoder_resubmitted_without_reset_is_refused),
     ("recording_while_pending_records_nothing", recording_while_pending_records_nothing),
@@ -112,6 +113,38 @@ fn pending_encoder_drop_waits_for_its_submit(ctx: &Ctx<'_>) -> Applies {
         "the drop of an encoder returns once its submit completes",
     );
     Ok(())
+}
+
+/// The drop of an encoder never submitted, and of a swapchain with nothing presented,
+/// returns at once while a submit of the device is held: neither is the device's last
+/// holder, and only the last waits for its submits. The swapchain's half runs where the run
+/// has a window.
+fn drop_that_is_not_the_last_returns_at_once(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.device();
+    let encoder = ctx.encoder(&*device, G);
+    let_go(ctx, &*device, Box::new(encoder), "an encoder never submitted");
+    if let Ok(device) = ctx.presenting() {
+        let desc = SwapchainDesc { extent: EXTENT };
+        let swapchain = ctx.ok(device.create_swapchain(&desc), "a swapchain");
+        let_go(ctx, &*device, Box::new(swapchain), "a swapchain with nothing presented");
+    }
+    Ok(())
+}
+
+/// Drops `held` on a thread while a submit of `device` is held, and checks that the drop
+/// returned before the gate opened.
+fn let_go(ctx: &Ctx<'_>, device: &dyn Device, held: Box<dyn Send>, what: &str) {
+    let gate = ctx.held(device, G, &mut []);
+    let (sender, receiver) = mpsc::channel();
+    // Not scoped: a drop that is never let go fails the case rather than hanging its join.
+    std::thread::spawn(move || {
+        drop(held);
+        sender.send(()).ok();
+    });
+    let at_once = receiver.recv_timeout(WOKEN).is_ok();
+    // Opened before the check, so that a failed check does not unwind with the submit held.
+    gate.open(ctx, device);
+    ctx.check(at_once, &format!("the drop of {what} returns while a submit is held"));
 }
 
 fn encoder_recorded_on_another_thread_submits(ctx: &Ctx<'_>) -> Applies {

@@ -275,7 +275,10 @@ fn address_of_a_buffer_without_the_usage_is_refused(ctx: &Ctx<'_>) -> Applies {
 /// A `Device` buffer written through its address by a compute pass that declares it
 /// `ShaderWrite` is then read through its address by a draw whose pass declares it
 /// `ShaderRead`, and copied out and read by the host: a pass fills device memory as a copy
-/// does.
+/// does. On null the case holds that the sequence is accepted, which it is not with the
+/// pass's write dropped: the `ShaderRead` then reads contents left undefined. It compares no
+/// bytes: device evidence that a pass writes through an address is the output case
+/// `dispatch_writes_through_an_address`.
 fn device_buffer_written_by_a_pass_is_read_after_it(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let queue = QueueRole::Graphics;
@@ -336,7 +339,7 @@ fn device_buffer_written_by_a_pass_is_read_after_it(ctx: &Ctx<'_>) -> Applies {
     let done = ctx.point(&*device, 1);
     ctx.submit(&*device, queue, &mut [encoder], &[], &[done]);
     ctx.reached(&*device, done);
-    ctx.check(ctx.read(&*device, readback, 0, SIZE).len() == SIZE as usize, "the read");
+    ctx.read(&*device, readback, 0, SIZE);
     Ok(())
 }
 
