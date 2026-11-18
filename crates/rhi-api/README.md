@@ -484,8 +484,9 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
 - A transition whose `from.state` is `Undefined` matches any state and takes the resource
   for `to.queue` with no transfer; `from.queue` is ignored. It discards an image's
   contents. A buffer's bytes it keeps, unless it moves the buffer to another queue, which
-  discards them. Vulkan gives such a transition a source scope that covers every earlier
-  use on the queue.
+  discards them. Vulkan gives such a transition a source scope of every stage and every
+  write access (`ALL_COMMANDS`, `MEMORY_WRITE`): the earlier use on its own queue may be a
+  write, an attachment a dropped or torn frame stored, and not only a read.
 - Discarded contents, an image's after `Store::DontCare`, and a buffer nothing has written
   are undefined, and a read of them before the next write is refused (`undefined-read`,
   null): `Load::Keep`, a declared slot's image, a copy's source, an input read, a buffer
