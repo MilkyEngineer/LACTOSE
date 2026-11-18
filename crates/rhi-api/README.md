@@ -737,12 +737,13 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   `FrontFacing` for less. The format cannot count them, since it does not carry the
   built-ins; the cook counts each stage's interface, four components a location up to its
   highest and each built-in's own, and refuses a stage above 64 (`tools/cook/README.md`).
-  The location bound stays 16, the most that 64 components allow with no built-in, since the
-  cook's count is the guard every device needs and a lower bound would refuse no stage the
-  count passes. On SPIR-V a varying is the `Output` or `Input` variable decorated with its
-  `Location`; on Metal it is the field of the vertex function's output or of the fragment
-  function's `[[stage_in]]` with the attribute `[[user(locn)]]`, which Slang writes
-  `[[user(TEXCOORD_n)]]` for location n and `[[user(TEXCOORD)]]` for 0.
+  The location bound stays 16, the most that 64 components allow with no built-in: a lower
+  bound would refuse stages every device runs, such as one with a varying at location 15 and
+  no built-in, and the cook's count already refuses those some device cannot run. On SPIR-V
+  a varying is the `Output` or `Input` variable decorated with its `Location`; on Metal it
+  is the field of the vertex function's output or of the fragment function's `[[stage_in]]`
+  with the attribute `[[user(locn)]]`, which Slang writes `[[user(TEXCOORD_n)]]` for
+  location n and `[[user(TEXCOORD)]]` for 0.
 - The varyings rule, at `create_graphics_pipeline`: each varying the fragment stage reads is
   one the vertex stage writes, at the same location, of the same component type and the same
   count, or the pipeline is `InvalidData`, naming the location and what is written there, if
@@ -1301,11 +1302,13 @@ Some output cases count as evidence only in the shape, or on the device, named h
   sentinel: on Metal it fails where the backend passes another size than the cooked
   `workgroup` as `threadsPerThreadgroup`, a smaller one leaving records at the sentinel.
 - `specialised_constant_of_each_type_is_read_back` specialises a compute stage with a `Bool`
-  true and another false, an `Int` of -3, a `Uint` of 7 and a `Float` of 1.5, and with no
-  value for a `Bool` and a `Uint` it declares defaults for; the stage writes each as it
-  reads it, and the case compares every word exactly. It is the proof of Vulkan's widening
-  of a `Bool` to a `VkBool32`, run under the validation layer, and of each `MTLDataType` on
-  Metal.
+  true whose default is false, a `Bool` false whose default is true, an `Int` of -3, a
+  `Uint` of 7 and a `Float` of 1.5, each given value other than its constant's default, and
+  with no value for a `Bool` whose default is true and a `Uint` whose default is not 0; the
+  stage writes each as it reads it, and the case compares every word exactly. A backend that
+  drops a value, or fills an unset constant with zeros, reads back another word. It is the
+  proof of Vulkan's widening of a `Bool` to a `VkBool32`, run under the validation layer,
+  and of each `MTLDataType` on Metal.
 
 | Area | Contract cases | Output cases |
 |---|---|---|
