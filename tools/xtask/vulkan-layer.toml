@@ -1,0 +1,18 @@
+# The Khronos validation layer every Vulkan run of `cargo xtask gpu` loads (decision 5.10 of
+# docs/plans/milestone-2.md): one Vulkan SDK's, by its version, the version its manifest
+# reports and the SHA-256 of the layer's library on each host (tools/xtask/README.md, "GPU
+# runs"). Ubuntu's own package is 1.3.275, older than the swapchain's semaphore checks.
+version = "1.4.363.1"
+api_version = "1.4.363"
+
+# LunarG's SDK archive, fetched into target/vulkan-sdk/ and refused unless its SHA-256 is the
+# one below (the digest LunarG publishes beside it); its loader and layer are unpacked from it.
+[host.linux-x86_64]
+url = "https://sdk.lunarg.com/sdk/download/1.4.363.1/linux/vulkansdk-linux-x86_64-1.4.363.1.tar.xz"
+sha256 = "b7867d8ca658563813af666f34b93db87f1b1c7d9d69d97e924c210c7ba33eb8"
+library_sha256 = "eed43e28b9360aba05d34ff2f6c2b2c16834fa6097f73982182b50e2957ccdfe"
+
+# The SDK's installer, which an owner runs: the SDK at `VULKAN_SDK`, or at
+# `~/VulkanSDK/<version>/macOS` where the installer puts it. Nothing is fetched.
+[host.macos-aarch64]
+library_sha256 = "c4d93ad34b5e164fb6d5c6b7fbcf19aefbcbc73ea25fee0582937ddc36b086fe"

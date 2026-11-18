@@ -1,19 +1,23 @@
 //! What the Vulkan device holds beyond the suite's cases: its creation on the driver the
-//! loader finds, a device-only buffer filled through a staging copy, and the pipeline
-//! cache's start from bytes that fail each check.
+//! loader finds, a device-only buffer filled through a staging copy, the pipeline cache's
+//! start from bytes that fail each check and a cache directory that cannot be written, and
+//! each validator's canary. `cargo xtask gpu` runs every canary in a process of its own and
+//! checks that it said its known message and nothing else.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lactose_rhi_api::{
-    BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferState, BufferTransition,
-    BufferUsage, CacheStart, Device, DeviceRequest, Encoder, Extent, Format, ImageDesc,
-    ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage, MemoryClass, QueueRole, Rect,
-    Sharing, StateOn, Submit, TimelinePoint,
+    BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferReach, BufferState,
+    BufferTransition, BufferUsage, CacheStart, ComputePass, ComputePipelineDesc,
+    ComputePipelineHandle, Device, DeviceRequest, Encoder, Extent, Format, ImageDesc, ImageMemory,
+    ImageRange, ImageState, ImageTransition, ImageUsage, MemoryClass, PassReach, QueueRole, Rect,
+    Sharing, StageDesc, StateOn, Submit, TimelinePoint,
 };
 use lactose_rhi_vulkan::VulkanDevice;
 
-use crate::{Counting, request};
+use crate::{Counting, request, suite_shader};
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -234,6 +238,11 @@ fn cache_that_fails_a_check_starts_empty() {
     let mut checksum = sealed.clone();
     *checksum.last_mut().expect("bytes") ^= 1;
     assert_eq!(start(checksum), CacheStart::Rejected, "a wrong checksum");
+    // A byte of the driver's payload changed after the seal: the checksum no longer holds.
+    let mut corrupt = sealed.clone();
+    let inside = sealed.len() - 8 - 16;
+    corrupt[inside] ^= 0x5a;
+    assert_eq!(start(corrupt), CacheStart::Rejected, "a corrupt payload");
     // The payload's own header is the 32 bytes before the trailing checksum's payload: a
     // sealed cache of a payload whose header names another device is stale.
     let payload = lactose_rhi_api::open_cache(&sealed, identity(&sealed)).expect("the payload");
@@ -241,13 +250,15 @@ fn cache_that_fails_a_check_starts_empty() {
     stale[8] ^= 0xff;
     let resealed = lactose_rhi_api::seal_cache(identity(&sealed), &stale).expect("a seal");
     assert_eq!(start(resealed), CacheStart::Rejected, "a stale header");
-    let mut corrupt = payload.to_vec();
-    corrupt.truncate(32);
-    corrupt.extend_from_slice(&[0xa5; 64]);
-    let resealed = lactose_rhi_api::seal_cache(identity(&sealed), &corrupt).expect("a seal");
-    let corrupt_start = start(resealed);
-    eprintln!("a corrupt payload under a good header starts the cache {corrupt_start:?}");
-    assert_ne!(corrupt_start, CacheStart::Empty);
+    // Garbage after the driver's own header, sealed as a good cache: what the driver makes of
+    // it is the driver's, and recorded. The device is made and sends nothing either way.
+    let mut garbage = payload.to_vec();
+    garbage.truncate(32);
+    garbage.extend_from_slice(&[0xa5; 64]);
+    let resealed = lactose_rhi_api::seal_cache(identity(&sealed), &garbage).expect("a seal");
+    let garbage_start = start(resealed);
+    eprintln!("garbage sealed under the driver's header starts the cache {garbage_start:?}");
+    assert_ne!(garbage_start, CacheStart::Empty);
     assert_eq!(sink.count(), 0, "{:?}", sink.texts());
 }
 
@@ -256,3 +267,118 @@ fn identity(sealed: &[u8]) -> lactose_rhi_api::CacheIdentity<'_> {
     let len = u32::from_le_bytes([sealed[8], sealed[9], sealed[10], sealed[11]]) as usize;
     lactose_rhi_api::CacheIdentity(&sealed[12..12 + len])
 }
+
+/// A compute pipeline of the suite's cooked `name`.
+fn kernel(device: &VulkanDevice, name: &str) -> ComputePipelineHandle {
+    let shader = suite_shader(name).expect("the suite's cooked shaders");
+    let stage = StageDesc { shader: &shader, constants: &[] };
+    device
+        .create_compute_pipeline(&ComputePipelineDesc { label: "device", stage })
+        .expect("a compute pipeline")
+}
+
+/// Writes a device's cache bytes into `dir` as a caller does at shutdown.
+fn save_cache(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("pipeline.cache"), bytes)
+}
+
+/// A cache directory that cannot be written is reported, and costs the cache alone: the
+/// device still makes a pipeline and runs work, and still gives its cache's bytes.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn unwritable_cache_directory_is_reported_and_the_run_goes_on() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    // A directory below a regular file cannot be made on any host, whoever runs the test.
+    let file = std::env::temp_dir().join(format!("lactose-cache-{}", std::process::id()));
+    std::fs::write(&file, b"not a directory").expect("a file in the temporary directory");
+    let dir = file.join("cache");
+    let bytes = device.pipeline_cache().expect("the cache's bytes");
+    let saved = save_cache(&dir, &bytes);
+    std::fs::remove_file(&file).expect("the file removed");
+    let Err(error) = saved else { panic!("{} was written", dir.display()) };
+    eprintln!("the pipeline cache was not saved to {}: {error}; the run goes on", dir.display());
+    let pipeline = kernel(&device, "store.cs_main");
+    let target = buffer(&device, BufferUsage::DEVICE_ADDRESS, MemoryClass::Device);
+    let on = |state| StateOn { state, queue: QueueRole::Graphics };
+    let mut encoder = device.create_encoder(QueueRole::Graphics, "after").expect("an encoder");
+    encoder.transition_buffers(&[BufferTransition {
+        buffer: target,
+        from: on(BufferState::Undefined),
+        to: on(BufferState::ShaderWrite),
+    }]);
+    let declared = [BufferReach { buffer: target, state: BufferState::ShaderWrite }];
+    encoder.begin_compute_pass(&ComputePass {
+        label: "after",
+        reach: PassReach { slots: &[], buffers: &declared },
+    });
+    encoder.bind_compute_pipeline(pipeline);
+    // `store.slang`'s block: 16 words of 7 upward, with no lag.
+    encoder.push_address(0, target, 0);
+    encoder.push_bytes(8, &[16, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0]);
+    encoder.dispatch([1, 1, 1]);
+    encoder.end_pass();
+    run(&device, encoder);
+    assert!(!device.pipeline_cache().expect("the cache's bytes").is_empty());
+    drop(device);
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+/// GPU-assisted validation's canary: a shader's read one word past the end of a buffer it
+/// reaches through its address, which no check before the driver can see. Run by
+/// `cargo xtask gpu --gpu-assisted` alone: without that validator the read is the driver's
+/// to make, of bytes past the buffer.
+#[test]
+#[ignore = "needs GPU-assisted validation: cargo xtask gpu --gpu-assisted"]
+fn canary_gpu_assisted_validation_reports_a_read_past_a_buffer() {
+    const WORDS: u32 = 64;
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    let pipeline = kernel(&device, "copy.cs_main");
+    let desc = |size| BufferDesc {
+        label: "canary",
+        size,
+        usage: BufferUsage::DEVICE_ADDRESS,
+        memory: MemoryClass::Device,
+        sharing: Sharing::Exclusive,
+    };
+    let from = device.create_buffer(&desc(u64::from(WORDS * 4))).expect("a buffer");
+    let to = device.create_buffer(&desc(u64::from(WORDS * 8))).expect("a buffer");
+    let on = |state| StateOn { state, queue: QueueRole::Graphics };
+    let mut encoder = device.create_encoder(QueueRole::Graphics, "canary").expect("an encoder");
+    encoder.transition_buffers(&[
+        BufferTransition {
+            buffer: from,
+            from: on(BufferState::Undefined),
+            to: on(BufferState::ShaderRead),
+        },
+        BufferTransition {
+            buffer: to,
+            from: on(BufferState::Undefined),
+            to: on(BufferState::ShaderWrite),
+        },
+    ]);
+    let declared = [
+        BufferReach { buffer: from, state: BufferState::ShaderRead },
+        BufferReach { buffer: to, state: BufferState::ShaderWrite },
+    ];
+    encoder.begin_compute_pass(&ComputePass {
+        label: "canary",
+        reach: PassReach { slots: &[], buffers: &declared },
+    });
+    encoder.bind_compute_pipeline(pipeline);
+    // `copy.slang`'s block: one word more than `from` holds, each copied with nothing added.
+    encoder.push_address(0, from, 0);
+    encoder.push_address(8, to, 0);
+    encoder.push_bytes(16, &(WORDS + 1).to_le_bytes());
+    encoder.push_bytes(20, &0u32.to_le_bytes());
+    encoder.dispatch([2, 1, 1]);
+    encoder.end_pass();
+    run(&device, encoder);
+    drop(device);
+    heard_alone(&sink, GPU_ASSISTED_CANARY);
+}
+
+/// What GPU-assisted validation's canary must say.
+const GPU_ASSISTED_CANARY: &str = "VUID-RuntimeSpirv-PhysicalStorageBuffer64";

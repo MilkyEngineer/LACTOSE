@@ -5,7 +5,6 @@
 //! Khronos validation layer on and the suite's shaders cooked into the directory
 //! `LACTOSE_GPU_SHADERS` names.
 
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use lactose_core::{Error, ErrorKind, Result};
@@ -15,7 +14,7 @@ use lactose_rhi_api::{
 };
 use lactose_rhi_vulkan::VulkanDevice;
 
-use crate::{Counting, request};
+use crate::{Counting, request, suite_shader};
 
 /// The harness: the driver's one capability set.
 struct Vulkan;
@@ -39,19 +38,6 @@ fn reported() -> Capabilities {
             .expect("a Vulkan device on the driver the loader finds");
         *device.capabilities()
     })
-}
-
-/// The file the suite's cooked shader `name`, `<source>.<entry>`, is read from: what
-/// `ricotta --shaders` wrote for `shaders/conformance/<source>.slang`'s entry point and the
-/// SPIR-V target. The stage is the cooked shader's own, which the suite checks.
-fn shader_path(name: &str) -> Result<PathBuf> {
-    let Some(dir) = std::env::var_os("LACTOSE_GPU_SHADERS").map(PathBuf::from) else {
-        return Err(Error::new(
-            ErrorKind::NotFound,
-            "LACTOSE_GPU_SHADERS is not set: the suite's shaders were not cooked",
-        ));
-    };
-    Ok(dir.join("conformance").join(format!("{name}.spirv")))
 }
 
 impl Harness for Vulkan {
@@ -89,10 +75,7 @@ impl Harness for Vulkan {
     }
 
     fn shader(&self, name: &str, _: ShaderStage) -> Result<CookedShader> {
-        let path = shader_path(name)?;
-        let bytes = std::fs::read(&path)
-            .map_err(|e| Error::new(ErrorKind::NotFound, format!("{}: {e}", path.display())))?;
-        CookedShader::decode(&bytes)
+        suite_shader(name)
     }
 
     fn lose(&self, _: &dyn Device) -> bool {
