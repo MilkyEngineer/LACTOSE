@@ -102,7 +102,7 @@ tests = [
 # module and no `cfg` naming `miri` compiles it out. It reports an empty list, and a package
 # that two or more entries name by target or filter that the list leaves out.
 [miri_split]
-packages = ["lactose-ecs"]
+packages = ["lactose-ecs", "lactose-rhi-null"]
 
 # D150: a package with more than one integration test file builds them as one test binary,
 # the target `integration`, whose root `tests/integration.rs` declares every other file of
@@ -174,9 +174,10 @@ base = [
   "lactose-ecs-macros", "lactose-ecs", "lactose-bundle", "lactose-asset-api", "lactose-io",
   "lactose-asset", "lactose-input", "lactose-input-host", "lactose-sim", "lactose-net-api",
   "lactose-net-host", "lactose-persist", "lactose-xtask", "game-sim", "lactose-rhi-api",
-  "lactose-platform",
+  "lactose-platform", "lactose-render-graph", "lactose-rhi-null",
 ]
 physics = [
   "lactose-physics-api", "lactose-physics-rapier", "lactose-anim", "lactose-predict",
   "lactose-app", "lactose-app-headless", "lactose-cook", "lactose-present-api",
+  "lactose-renderer",
 ]

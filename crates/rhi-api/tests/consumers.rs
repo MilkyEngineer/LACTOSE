@@ -332,7 +332,7 @@ fn present_once(
 /// `tools/cook` and a backend: the cooker writes the format, and a pipeline is made from
 /// what `decode` reads back.
 fn cook_then_load(device: &dyn Device, shader: &CookedShader) -> Result<GraphicsPipelineHandle> {
-    let bytes: Vec<u8> = shader.encode();
+    let bytes: Vec<u8> = shader.encode()?;
     let vertex = CookedShader::decode(&bytes)?;
     device.create_graphics_pipeline(&GraphicsPipelineDesc {
         label: "triangle",

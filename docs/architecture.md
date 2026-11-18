@@ -171,7 +171,7 @@ crates/
   persist/        B            [SKIM] world overlay, save container [CARTON], migrations
   rhi-vulkan/     B            ash-based backend
   rhi-metal/      B            native Metal backend, milestone 3
-  rhi-null/       B            no-op backend for tests only
+  rhi-null/       B            the null backend for tests only: draws nothing, refuses each breach the RHI contract assigns it, by its rule
   rhi-dx12/       B            later
   render-graph/   B            [GOUDA] pass declaration, compile, barriers, aliasing, parallel record
   renderer/       B            GPU scene [CHEDDAR], bindless heap [BRIE], culling [CREAM], late-latch [LATTE], skinning, GPU VFX simulation [FROTH], deferred lighting, render slot table, RenderFeature pass-provider trait
@@ -1063,11 +1063,12 @@ lacks them.
 
 ### 12.3 Render graph
 
-- Passes declare reads and writes with usage. The graph derives order, culls unreachable
-  passes, computes transient lifetimes, aliases memory, inserts transitions and assigns queues.
-- Compile is cached by a hash of pass list, edges, resource descriptors, imported initial
-  states, view count and queue configuration. History resources use a ping-pong primitive. The
-  cache is capped.
+- Passes declare reads and writes with usage, in graph order. The graph derives the edges
+  between them from those uses and keeps that order, culls unreachable passes, computes
+  transient lifetimes, aliases memory, inserts transitions and assigns queues.
+- Compile is cached by a hash of pass list, edges, resource descriptors, the states imports
+  arrive and leave in, view count and queue configuration. History resources use a ping-pong
+  primitive. The cache is capped.
 - Each pass records on a frame-critical worker. Submission order is graph order.
 - Async compute is chosen by the graph when a pass has no graphics-queue dependency inside
   its lifetime window.
@@ -1082,8 +1083,10 @@ lacks them.
   scalars. Swept culling bounds, the light grid, decals, probes, VFX emitters, cascades, the clipmap
   centre, sky and atmosphere, markers, the audio listener and emitters, GPU picking, debug
   draw and the camera itself all convert through it.
-- Render slots are a renderer-owned side table keyed by `StableKey`, freed from the structural
-  change log, reconciled after any restore or load, never a column in simulation chunks.
+- Render slots are a renderer-owned side table keyed by `StableKey` within each kind of world a
+  client shows, freed from the structural change log's despawns as extract hands them to the
+  render side's sink, reconciled after any restore or load by the full pass that follows it,
+  never a column in simulation chunks.
 - Draw submission: the cull pass bins surviving clusters per pipeline and compacts their
   triangles into one 32-bit index buffer per pipeline over a global vertex pool; each pipeline
   then issues one indexed indirect draw. Post-transform vertex reuse is preserved, no backend
@@ -1406,8 +1409,8 @@ The policy is in section 3.
   and the verification list; a long command that needs no interpretation runs in the
   background, never in a foreground agent turn.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on
-  `core`, `task` over each deque, `ecs`, `input-host` and `net-host`, `cargo-deny`, the tier,
-  boundary, feature and vendor checks, and the line-ending check.
+  `core`, `task` over each deque, `ecs`, `input-host`, `net-host` and `rhi-null`, `cargo-deny`,
+  the tier, boundary, feature and vendor checks, and the line-ending check.
 - A package with more than one integration test file builds them as one test binary,
   `integration`, whose root `tests/integration.rs` declares every other file of `tests/` as a
   module (`autotests = false`); a package of one test file keeps its own target name. A file

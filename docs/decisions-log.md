@@ -7362,6 +7362,66 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   buffers" as something `rhi-api` would hold; the RHI result's point 1 where it puts runtime
   descriptor arrays in the required set; the plan's decision 5.17 and `graph-impl` row where a
   readback's hazard is shown by a wrong readback, which every backend now refuses.
+- Addendum (lane `rhi-null`, 2026-11-18; review rounds 1 to 4): amended at `rhi-null`'s fix rounds 1
+  to 4, from the reviews of `rhi-null` and the package `graph`'s round named for it. The rules the
+  contract gains or tightens:
+  - `pending`, every backend: `write_buffer` of a buffer a pending submit writes, and
+    `read_buffer` and `invalidate_buffer` of one a pending submit writes or changes the state
+    of, are refused. A transition into `HostRead` is the barrier that makes the device's
+    writes visible to the host, and an invalidate made before it lands would be taken for the
+    one after. A barrier touches no bytes, so a submit that only transitions a buffer holds no
+    host write back. A device keeps, for each buffer and queue, the last submit that writes it
+    and the last that writes it or changes its state.
+  - `no-qfot` binds a use, not only a change: a submit that uses a resource while a pending
+    submit of another queue wrote it or changed its state or owner waits for a point that
+    submit, or a later one of its queue, signals, directly or through the submits it waits
+    for. A write with no transition, a transition with no write, and an alias call each
+    count as a change. It binds `Concurrent` resources, an `Exclusive` resource moved to
+    another queue by a transfer, and an `Exclusive` one moved by a transition from
+    `Undefined`, in every submit that uses the resource. An acquire is such a use: its own
+    submit waits for the release, directly or through the submits it waits for. An acquire,
+    a take from `Undefined` or a wait in an earlier submit of its queue orders no later
+    submit. Null alone refuses it.
+  - A transition from `Undefined` ends a release no acquire met and takes the resource with no
+    transfer: its contents are undefined, a buffer's as an image's, and an acquire of that
+    release is refused (`no-qfot`, null).
+  - rhi-api's "States" gives Vulkan's transition from `Undefined` a source scope of every
+    stage and every write access (`ALL_COMMANDS`, `MEMORY_WRITE`), where it said only that the
+    scope covers every earlier use on the queue. A re-take from `Undefined` may follow a write
+    on its own queue: the attachment store of a frame no present read, or of a torn frame
+    whose submit wrote the target before it failed, which this scope covers and an execution
+    dependency alone does not (`reviewer-gpu` on `frame-design`, G2: under syncval on one
+    queue, source access 0 gave one write-after-write error for each dropped frame, and
+    `MEMORY_WRITE` none). Null tracks states, not availability, so no null case is owed; the
+    evidence is the output case `retake_after_a_store_on_one_queue_is_clean`, whose body
+    arrives with `rhi-vulkan`: a pass stores a colour attachment, a later submit on the same
+    queue takes the image from `Undefined` and clears it, the readback equals the clear
+    colour exactly, and the run raises no validation message.
+  - `state`, every backend: a pass that declares one buffer in two states is refused, not
+    merged.
+  - `usage`, every backend: a transition of an image into a state its usage does not allow,
+    and a graphics pipeline of more colour targets than `colour_attachments`
+    (VUID-VkPipelineRenderingCreateInfo-colorAttachmentCount-09533).
+  - `bounds`, every backend: a buffer-image copy whose buffer offset is not a multiple of the
+    texel (VUID-vkCmdCopyBufferToImage-dstImage-07975 and -07978, and their image-to-buffer
+    counterparts), and two regions of one copy call that write one byte of the destination
+    buffer or one texel of the destination image (VUID-vkCmdCopyBuffer-pRegions-12482,
+    VUID-vkCmdCopyBufferToImage-pRegions-12483, VUID-vkCmdCopyImageToBuffer-pRegions-12485,
+    and their `VkCopy*Info2` forms), checked from the regions and the format.
+  rhi-api's "Buffers and host access" says that `MemoryClass::Device` is filled by a copy or
+  by a pass that declares it `ShaderWrite`, as `renderer`'s facade asked (D161, ask (b)); the
+  contract case `device_buffer_written_by_a_pass_is_read_after_it` holds that null accepts
+  such a pass and a later `ShaderRead` and copy of the buffer.
+  The signatures changed: `CookedShader::encode` and `seal_cache` return `Result<Vec<u8>>` and
+  no longer panic; `encode` refuses, naming the broken precondition, every shader `decode`
+  would refuse, and `seal_cache` refuses, `InvalidData`, an identity of 4 GiB or more, which its
+  four-byte length cannot hold. Nothing outside `lactose-rhi-api` and `lactose-rhi-null` calls
+  either. The conformance `Harness` gains `device_with_cache`, which starts a device from cache
+  bytes, so the cache cases check `pipeline_stats().cache` for bytes loaded, rejected and
+  absent. A case that needs a loss returns `Skipped` where the harness cannot lose a device, as
+  `Harness::lose` says, and `drop_that_is_not_the_last_returns_at_once` holds on every backend
+  that a drop that is not the device's last returns while a submit is held. The suite has 168
+  cases, 142 of them contract cases, and a device backend runs 64 of its refusal cases.
 
 **D159. `lactose-platform`: one window whose `Arc` is its lifetime, the two pumps over `lactose-task`'s lanes, a close and a resize as states, and a present thread over the caller's state** (§3, §4, §5.1, §21, `lactose-platform`, `crates/app/README.md`, `crates/task/README.md`)
 - Why: section 4 gives the crate four nouns and section 5.1 two threads, and the milestone 2
@@ -7510,6 +7570,411 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   paragraph on locks, which gains two sentences; D90's "the present thread's surface need not
   be `Send`", since the state a present thread owns is `Send` and is moved onto it;
   `crates/app/README.md`'s "`app-client` passes the platform crate's instance at milestone 4".
+
+**D160. `lactose-render-graph`'s facade: a frame is declared afresh in graph order, a plan names no handle, an import states both its ends, a recording job owns its encoder and its recorders, and the crate takes no lock** (§3, §5.3, §12.3, `lactose-render-graph`, `crates/rhi-api/README.md`, `crates/task/README.md`)
+- Why: section 12.3 fixes what the graph derives and what its cache hashes, and the milestone 2
+  plan's row `graph` fixes its scope. They leave open how a pass is declared, what an import
+  says, whose the transients are, what a recorder may touch, what recording jobs share, and what
+  "inside its lifetime window" means. The facade settles each for the lanes written against it:
+  `graph-impl`, `renderer` and `frame-design`.
+  - *A frame is a value declared afresh, and the graph is three calls.* `FrameDecl` borrows no
+    graph and reaches no device. `compile`, `record` and `submit` each consume what the one
+    before returned, and the latch is the caller's write through the device between `record` and
+    `submit`. `RenderGraph` and `RecordedFrame` are `Send + Sync + 'static`, so they wait in a
+    world's resource or behind the `dyn` object `lactose-app` drives (decision 5.11). Rules out
+    a retained graph edited in place, a builder that borrows the graph, a latch call or a camera
+    type in this crate, and one call that records and submits.
+  - *A declaration and a plan name ids, and handles stay in the declaration.* An id is a number
+    in declaration order. The key hashes no handle, no `ready` point, no clear value, no slot
+    list and no recorder, so a frame that draws into another target, and a history's swap,
+    compile to the plan the last frame used, and a hit makes nothing on the device. The key
+    hashes each use under the list it is declared in, and a hit compares what was hashed, so a
+    collision compiles again and two declarations that differ only in a use's list never share a
+    plan. The cache holds `GraphDesc::plans` plans and evicts the one least recently returned.
+    The view count is hashed by itself and instances nothing: the caller declares each view's
+    passes. Rules out a plan for each handle, a hit decided by the hash alone, and a cache
+    without a cap.
+  - *Declaration order is graph order.* A pass sees each resource as the passes declared before
+    it left it, and every write is taken as partial. The edges the graph derives therefore all
+    point forward, their stable topological order is declaration order, and the graph leaves out
+    the culled passes and moves none. Section 3's "Declare access, never order" binds systems,
+    whose registration order is accidental and whose order the scheduler derives; a frame's
+    declaration is one caller's deliberate sequence, the order a pass is declared in is the
+    order its uses are read in, and the edges are still derived from access alone, with a
+    renderer that declares from a map declaring in key order. Rules out resource versions,
+    ordering constraints between passes, a declaration in which a reader comes before its
+    writer, and, at milestone 2, a compile that reorders independent passes.
+  - *A use is a state.* A pass declares attachments, sampled imports, buffers by access and copy
+    sides. The graph tracks one state for a whole image and one access of a buffer in a pass,
+    and derives every transition, the same-state one between two writers across a frame's edge
+    included, where an import's first use in the frame is in the writing state its `initial`
+    names, both halves of a transfer, each attachment's store action, and the `PassReach` of
+    D158: the declaration's slots as given, and each buffer declared read or written with its
+    exact state. An index or an indirect buffer is brought to its state and is not in the reach.
+    The heap is the caller's. Rules out a pass that names a state, a transition or a
+    `PassReach`, a state for each subresource at milestone 2, and a graph that writes heap
+    slots.
+  - *A pass is kept when it writes an import, or a transient a kept pass later uses.* A readback
+    is a buffer import that ends in `HostRead`. Rules out a flag that exempts a pass from
+    culling, and culling by whether anything reads an import.
+  - *An import states both its ends.* `initial` is the caller's word, which null checks. `last`
+    is reached whether or not a pass used the import. `handoff` says where a user that is not
+    the graph takes the image next, and the graph records the release half where that is a
+    transfer. `ready` is a point for a use the graph did not make, which every submit of the
+    frame that names the import waits for, not the first alone; a wait for a point already
+    reached costs no GPU wait. A buffer imported from `Undefined` keeps its bytes on the queue
+    `initial` names. An import is never an image made with a memoryless request, since every
+    import's attachments are stored. The graph orders its own frames, since it alone knows which
+    queue a pass ran on: each submit that uses an import another queue's submit, of the frame or
+    an earlier one, wrote or changed the state or owner of waits for a point that submit, or a
+    later submit to its queue, signals, a `sampled` import counted as a use, and so does a
+    submit that changes an import another queue's submit of an earlier frame used. That wait
+    orders an `Exclusive` image imported from `Undefined`, which moves to another queue with no
+    transfer, as it orders a `Concurrent` import. A heap slot holding an image the frame does
+    not declare has no pending write or change by another queue, or the image is declared in
+    `sampled`. A target released toward the present role and taken back from `Undefined` by a
+    later frame is accepted whether or not the present thread acquired it, since a transition
+    from `Undefined` ends a release no acquire met and leaves the contents undefined, a buffer's
+    as an image's; null ends the release already, and rhi-api's "States" gains the sentence
+    through the `rhi-null` lane under decision 5.13. Rules out a graph that tracks an import's
+    state from frame to frame by handle, a graph that records on another thread's encoder, a
+    `ready` point waited for by one submit of the frame alone, and an import the frame leaves
+    wherever its last pass put it.
+  - *A transient is an image of its plan.* It is made on the miss that compiles the plan,
+    destroyed after the plan is evicted and its last frame has completed, and undefined when
+    each frame begins. Its memory is the plan's choice: memoryless only where the device reports
+    the request honoured and the image is one pass's attachment; else placed by first fit in the
+    plan's blocks, with the alias call recorded every frame; else memory of its own. A transient
+    is never sampled and never leaves the graphics queue. The graph does not judge a read before
+    the first write: null refuses it (`undefined-read`), and a graph that takes every write as
+    partial cannot tell. Rules out a pool of transients shared between plans, transient buffers,
+    a transient in a heap slot before the bindless heap exists (milestone 3), and a second
+    undefined-read rule beside null's.
+  - *The window of section 12.3 is the frame.* On a device whose compute role has a queue of its
+    own, a compute pass runs there when it shares no resource with a graphics-role pass of the
+    frame, a `Concurrent` import excepted that neither pass writes and both need in the state
+    its `initial` names, so that no transition of it falls inside the frame before both uses.
+    What crosses frames is an import's `initial` and `last`, a transfer at the frame's edge.
+    Render and copy passes are the graphics role's, and the graph never submits to the present
+    role. The wait under another queue's write or change binds `graph-impl` with no rule of
+    null's behind it until `rhi-api` amends `no-qfot` to refuse a use under another queue's
+    pending write or change of state or owner, an amendment the `rhi-null` lane makes under
+    decision 5.13, and the facade stands without that amendment. Rules out a pass that chooses
+    its queue, compute-queue work whose output a graphics pass reads in the same frame, and a
+    `Concurrent` resource changed on one queue and then used on another with no wait between.
+  - *A frame's submits are the runs of graph order by queue, and it has one point.* A frame
+    whose commands are all for one queue is one `Device::submit`, so a refusal there changes
+    nothing. The point is a value of one timeline of the graph's, signalled by the frame's last
+    submit, which waits for each submit the graph made to another queue since its last
+    frame-point submit, and for that submit's point where it is on another queue, and a point
+    reached covers every earlier frame. One point a frame makes the last submit wait for the
+    frame's compute work, so at milestone 2 no compute work overlaps graphics across the frame's
+    end; a trailing submit with no encoder that signals the point is a later milestone's.
+    `submit` waits for nothing and returns a device's error unchanged, so `Rule::of` names the
+    rule. An error after the frame's first submit leaves the frame torn, and the error does not
+    say which submit failed, so the caller takes every error as torn: it imports the frame's
+    imports next from `Undefined` and resets each `History` the frame imported. A torn frame's
+    planned last submit is never made, so the graph's next `submit` first makes it in the torn
+    frame's place with no encoders, to the queue it was planned for: it waits as that submit
+    would have, for each submit the torn frame made to another queue and for the last frame
+    point where another queue signalled it, and signals the torn frame's point, which is then
+    reached like any other and waited for by the ordinary rules; the torn frame's encoders and
+    plan are held until it is seen reached. Where that submit is refused, the new frame is not
+    submitted, the graph is as before, still owing it, and the caller has the error. A drop
+    after a torn frame with no `submit` since makes it, then waits as a drop does, but not while
+    the thread unwinds. `submit` still waits for nothing: that submit waits on the device's
+    queue. Rules out a point for each import or each queue at milestone 2, a retry of a failed
+    submit inside the graph, a wait in `submit`, an error type that tells a torn frame from a
+    refused one, a point that is never signalled, and a wait for a point that nothing signals.
+  - *A recording job owns its encoder and the recorders of its passes.* `record` forks the jobs
+    in one scope of the caller's `JobContext`; each is a run of consecutive passes, at most
+    `GraphDesc::jobs` a submit. A recorder is `FnOnce + Send`, called once by the job that owns
+    it, through a type that offers the commands of its kind of pass over ids and cannot
+    transition, alias, begin, end or reset. A recorder does not wait, for another recorder, a
+    lock or a point. A recorder that names an id its pass did not declare for that use fails
+    `record`, and so does a copy pass's recorder that writes one destination in two calls:
+    rhi-api needs a transition between two copies into one resource, a recorder cannot record
+    one, and one call takes every region it needs. No two regions of one call write one byte or
+    texel, which Vulkan forbids (`VUID-vkCmdCopyBuffer-pRegions-12482`,
+    `VUID-vkCmdCopyBufferToImage-pRegions-12483`, `VUID-vkCmdCopyImageToBuffer-pRegions-12485`);
+    `bounds` refuses it once the `rhi-null` lane amends rhi-api under decision 5.13. Each kept
+    pass has one span, target `gouda`. An encoder is reused only after its frame's point is seen
+    reached, read and never waited for. The jobs share, read only, what the declaration copied,
+    the plan and the device. The crate takes no lock and has no `unsafe`: its `Sync` cell for
+    encoders and recorders is a `Mutex` that is never locked, `Sync` because every value it
+    holds is `Send`, and reached through `get_mut` and `into_inner` alone. `std::sync::SyncView`
+    (unstable `exclusive_wrapper`) does this job, `Sync` for any value, and replaces the cell
+    once it is stable. The locks a frame takes are a device backend's (D158); the scope takes
+    none. Section 3 is not amended. Rules out a recorder lent the encoder, recorders shared
+    between jobs, a lock of the graph's on the per-frame path, a recorder that waits, a copy
+    recorder that records its own transition, recording off the frame-critical workers, and a
+    wait for the device in `record`.
+  - *`History` is a value over two imports of the caller's.* Its owner swaps the halves after a
+    submit, resets it after a failed one, and a frame with no previous half has a key of its
+    own. Rules out resources that a graph or a plan keeps from frame to frame.
+  - *The drop waits, but while the thread unwinds.* `RenderGraph`'s drop waits, with no bound,
+    until every submit it made has completed, off the frame-critical workers. A drop made while
+    the thread unwinds a panic does not wait: it makes no destroy a pending submit would refuse,
+    and leaks what is pending, as `rhi-api`'s drops do, so a test that fails holding a pending
+    frame fails instead of hanging. After a torn frame with no `submit` since, the drop first
+    makes the submit in the torn frame's place; where that is refused, it waits for every point
+    it can see signalled, drops its encoders, which waits for their submits unless the device is
+    lost, and destroys what no pending submit uses, and on null, which counts a submit pending
+    until its point is seen, it leaks what the torn frame's submits that signal no point used.
+    Rules out a drop that leaks what a pending submit uses outside an unwind, but for a torn
+    frame's where the submit in its place was refused, a drop that waits while the thread
+    unwinds, and one that gives up.
+  - *The crate is outside the determinism boundary.* It has no `StableKey` and no entity,
+    nothing it reports is fed back into a world, and its one ordering rule is the caller's
+    declaration order. A plan is a function of the declaration and the device, so two runs
+    submit the same commands. Rules out a system inside the boundary that names the crate, and a
+    result that depends on a thread or on the order a hash map iterates in.
+- Driven by: architecture sections 3, 5.1, 5.3, 12.1, 12.3 and 20; the milestone 2 plan's rows
+  `graph`, `graph-impl`, `renderer`, `renderer-impl` and `frame-design` and decisions 5.1, 5.4,
+  5.6, 5.10, 5.11, 5.13, 5.15, 5.17 (D153) and 5.18; `crates/rhi-api/README.md` (D158), "Handles
+  and lifetimes", "Queues by role", "The present thread", "Buffers and host access", "Images and
+  memoryless requests", "Aliased transients", "States", "What a pass declares", "Recording and
+  submitting" and "Timelines"; `crates/task/README.md`, "Scopes" and "Workers"; the two spike
+  results of milestone 2; the facade's three reviews of rounds 1 and 2 (`reviewer`,
+  `reviewer-gpu`, `reviewer-concurrency`); D43, D45, D150 and D159.
+- Replaced: section 12.3's "The graph derives order", where it is read as a graph that reorders
+  passes, and its "imported initial states" as all that an import adds to the key; this merge
+  amends both sentences. Nothing of D158 is replaced: the amendment named above, the `no-qfot`
+  use rule, `bounds` over overlapping copy regions, the re-take from `Undefined` that ends a
+  release no acquire met, and `read_buffer`'s wait for a pending change of state, adds to its
+  rules, is made by the `rhi-null` lane under decision 5.13, and is not made by this merge.
+
+**D161. `lactose-renderer`'s facade: the writers append and the renderer resolves, kind by kind, a region of the ring is held until its frame's point, the scatter's rule is a function of the host, and the crate takes no lock** (§3, §5.3, §12.4, §12.5, `lactose-renderer`, `crates/render-graph/README.md`, `crates/rhi-api/README.md`, `crates/present-api/README.md`)
+- Why: sections 5.3, 12.4 and 12.5 fix what the render side keeps, and the milestone 2 plan's
+  decision 5.4 fixes the minimal renderer's scope. They leave open where the slot table changes
+  and on which thread, what the writers share with the renderer, how the ring is kept from a
+  frame in flight and what it does when it is full, what the scatter is told and where D157's
+  base lives, how a failed frame is recovered from, and how a provider's passes reach the frame.
+  The facade settles each for the lanes written against it: `renderer-impl`, `presentation`,
+  `frame-design`, `frame-impl` and `slang`.
+  - *The renderer is one value beside the graph, and a frame is six calls of it.* `Renderer`
+    owns the ring, the instance buffer, the pipelines and the slot table. A frame is `open`, the
+    writers, `prepare`, `declare`, `latch`, and `submitted` or `torn`; a frame that failed is
+    followed by `open` as any other is. The caller owns the `RenderGraph` and the `FrameDecl`,
+    imports its target, and compiles, records and submits; `declare` adds the scatter, the
+    triangle pass and each provider's passes to the caller's declaration, and its borrow of the
+    renderer ends with `RenderGraph::record`. `Renderer` is `Send + Sync + 'static`, and every
+    call that changes it takes `&mut self` but `declare(&'f self)`, whose one change is one
+    atomic word: the frame's extent, which is also the mark that the prepared frame is
+    declared, stored with one compare-exchange from zero once the arguments are checked, so
+    that of two `declare` calls exactly one succeeds. `latch` takes the extent from it. So the
+    renderer waits in a world's resource or behind the `dyn` object `lactose-app` drives
+    (decision 5.11). Rules out a renderer that owns
+    the graph or submits, a trait in this crate that `lactose-app` must name, a system declared
+    by this crate, and a frame the renderer drives.
+  - *A slot is keyed by the kind of its instance's world and the instance's `StableKey`, and the
+    table changes in `prepare` and `torn` alone.* A renderer shows at most one world of each
+    kind: two of one kind would share its slots, and each one's full pass would free the other's
+    instances. `prepare` applies the region's passes kind by kind, in the order of `WorldKind`'s
+    variants (`Server`, `Client`, `Prediction`), and in begin order within a kind, which the
+    program fixes: one sink per world begins and ends its passes in turn. At most one remote
+    batch follows the `Client` passes, as a `Client` pass that is not full: the region's last,
+    and only where it is whole, no note of a `Client` pass (a `begin`, an `end` or a removed
+    key) lies after its opening, and the `Client` kind is not lost. A region left by a frame
+    that did not prepare, or by a refused `prepare`, holds several frames' batches, and the
+    others are left out, so that no batch is applied over the removals of a later frame's
+    `Client` pass, nor, where a frame breaks its ordering and overlaps its `Client` pass and
+    its batch, over that pass's, in either order of their beginnings; a lost `Client` kind
+    applies none, since a loss has no place in the region to order it by. A batch that is
+    not applied, whichever the reason, counts its written rows in `FrameStats::remote_rows`
+    alone, and `dropped` counts only rows a writer could not write. In a pass, removed keys
+    free their slots, rows of held instances keep theirs, a full pass then frees every slot of
+    its kind it did not write, which is the reconciliation after a restore, a rollback or a
+    load, and only then do new instances take the lowest free slot, in ascending key order. So
+    a load that replaces a kind's key set needs no slots beyond `RendererDesc::instances`
+    where no kind applied after it frees slots in the same frame; rows that a later kind's
+    sweep would have made room for are unplaced and counted, and the next full pass places
+    them. The table is a function of
+    each kind's passes, each as its tick, its fullness, its removed keys and its set of rows,
+    and of which kinds are lost, whichever kind's pass began first. Rules out a slot column in
+    a world, a lookup by `EntityId`, a slot that follows an entity across a restore by its id, a
+    slot number that depends on the chunk layout, the worker count, the order of `write`
+    batches or which thread began first, a table changed on a writer's thread, and an older
+    remote batch replayed over a newer removal. A key held under two kinds holds two
+    slots: the prediction world's copy shadowing the replicated one is milestone 4's (decision
+    5.5).
+  - *The writers append, and the renderer resolves.* `ExtractSink`, the `InstanceSink` of D157,
+    and `RemoteWriter` leave rows and notes in the open region: a row goes to the device through
+    `Device::write_buffer` with its key and mesh beside it in the host's memory, and a note is a
+    pass's `begin`, its `end` or a removed key. Nothing reaches the slot table or a submit
+    before `prepare`. A `write` reserves its rows with one atomic addition, sends to the device
+    the part of its reservation that lies in the region, makes one device call, waits for
+    nothing, allocates nothing and never fails. Rules out a sink that allocates slots or takes a
+    lock on extract's jobs, a concurrent map, a channel, any read of the ring on the host, and a
+    resolve inside extract's measured pass: its cost is `prepare`'s, on the render side's job,
+    and `renderer-impl` reports it as steering at 50,000 incremental rows, at a full pass of
+    100,000 and at a load that replaces 100,000 keys, which `reviewer`'s round-1 model put at 18
+    to 20 ms on one worker.
+  - *What is shared is atomics, and the crate takes no lock.* The sinks and the renderer share
+    one private state: a word that says which region is open, under which open generation, and
+    how many passes are open on it, the generation in its high 32 bits, never zero, the
+    region's index in the next 16 and the count in the low 16; each region's 64-bit cursor,
+    which never wraps, and its
+    counts, which saturate; what is left beside each row, its open generation among it; and a
+    renderer-wide record of kinds lost and rows dropped while no region is open, which `prepare`
+    takes with a swap and `open` never resets. Every such field is an atomic; a `StableKey` and
+    an `AssetRef` go into words through public conversions, so the crate has no cell and no
+    `unsafe`. A pass's `begin` and `prepare`'s sealing change the one word, so they cannot both
+    succeed: `prepare` is refused while a pass is open, and a pass that begins after the sealing
+    is lost. `open`'s store of the word is `Release`, which also orders the previous
+    `prepare`'s reads of the region before the new use's writes; a `begin`'s compare-exchange
+    is `Acquire` on success; a pass's `end`, and a sink's drop with a pass open, give back the
+    count with a `Release` subtraction; every change of the word between `open`'s store and
+    the sealing is a read-modify-write, so the sealing's `Acquire` compare-exchange reads every
+    give-back; and a reservation is a `Relaxed` addition. `prepare` skips an entry of another
+    generation, so an index a writer reserved and did not fill is never read as an earlier
+    use's, and the entries start at a generation `open` never gives. A sink dropped with a pass
+    open leaves the pass lost and, where its `begin` took a count, gives it back after the lost
+    mark; only a pass whose `begin` took a count gives one back. The renderer's declared word is
+    the one shared atomic outside that state, set with a `Relaxed` compare-exchange, since
+    every other call reaches it through `&mut self`. The remote writer
+    borrows the renderer mutably, so no `prepare` runs beside it, and its batch takes no count:
+    a writer passed to `mem::forget` leaves a batch with no end note, which is left out whole
+    and counted as any batch that is not applied.
+    The frame orders two things: the `Client` world's pass ends before the frame's remote batch
+    begins, and no pass is open during `prepare`. The only locks a call takes are a device
+    backend's on its records (D158). Section 3 is not amended. Rules out a `Mutex`, an `RwLock`,
+    a condition variable or a channel in this crate, and a wait of the crate's on the per-frame
+    path. `renderer-impl` owes a loom model of the word and the cursors, through a `sync` shim
+    behind the crate's own `loom` feature, with the crate in xtask's `LOOM_MODELS`, and Miri
+    over the staging state's tests; an argument in place of the model is not enough.
+  - *The ring is regions, one a frame, and the renderer never waits for one.*
+    `RendererDesc::regions` regions, each buffers of its own: its rows, its frame's batch, the
+    draw's arguments and a camera buffer. A region is free, open, sealed, or held until the
+    point its frame was `submitted` with is reached, which `open` learns from
+    `Device::timeline_value`. With none free `open` returns `Opened::Wait(point)` and the frame
+    waits, off the frame-critical workers and outside extract's pass, where the cost tests of
+    decisions 5.2 and 5.3 leave the wait out of their median. Each region is buffers of its own
+    because null judges `unflushed` by buffer. Rules out a ring with one cursor that wraps under
+    frames in flight, a wait in the sink or in `prepare`, a region opened before its frame's
+    point is reached, and one camera buffer for every frame in flight.
+  - *A full region drops and counts, and a pass whose notes did not fit loses its kind for the
+    frame.* A row with no room, written with no region open or refused by the device is dropped
+    and counted in the next `prepare`'s `FrameStats`, an extract pass's also by kind
+    (`dropped_in`, as `unplaced_in` counts rows that found no free slot). A pass whose `begin`,
+    `end` or removed key had no room, or that began with no region open, is lost: `prepare`
+    applies nothing of its kind's passes, frees the kind's slots, forgets its bases and reports
+    it (`lost`), and the frame brings a full pass of that kind's world about with
+    `ExtractState::set_sink`, as it does for its dropped and unplaced rows. A remote batch with
+    no room is left out whole and frees nothing, its written rows counted in `remote_rows` and
+    those with no room in `dropped`, and a lost `Client` kind applies no batch;
+    after a full or a lost `Client` pass in the same frame the remote instances are missing
+    until the next frame's batch. Rules out a sink
+    that blocks, fails or grows the ring, a pass applied in part, and an instance left drawn
+    after its removal was lost.
+  - *The row is the placement and one flag.* `StagingRow` is 48 bytes: D41's cell, offset and
+    rotation, and `NO_INTERPOLATE`. The key and the mesh go to the slot table and never to the
+    device. Decision 5.4's condition for moving the scatter to milestone 3 is not met: the
+    scatter is specified from the row, a batch's entry and the instance record alone, and a
+    later milestone's instance data is keyed by slot and reaches the GPU scene beside the ring.
+    `StagingRow` is final; `InstanceRecord`, the instance buffer's layout, is milestone 2's,
+    and milestone 3's GPU scene may change it, with the scatter's rule and the scatter and
+    vertex shaders in the same change. Rules out a row that carries a slot, a key or a mesh,
+    and a staging format milestone 3 rewrites.
+  - *The scatter's rule is a function of the host, and a dispatch names each slot once.*
+    `InstanceRecord::scatter` and `free` are the rule and the shader is their transcription;
+    `InstanceRecord::drawn`, `CellTransform::apply` and `CameraData::clip` are the vertex
+    stage's. A record is 128 bytes: the previous placement, the current one, D157's base and a
+    `LIVE` flag. The base lives on the device: `prepare` decides on the host, for each entry,
+    whether the write is its instance's first of the tick (`TAKE_BASE`) and whether a base
+    counts (`HAS_BASE`), by present-api's lazy form with its count of drops, and the scatter
+    carries it out. The builder makes one run of entries for each applied pass, resolves two
+    rows of one instance to the later row and counts the other, and asserts in every build that
+    no run names a slot twice; a run is split into dispatches at
+    `min(compute_groups[0], u32::MAX / 64) * 64` entries, computed in `u64`, since the product
+    alone overflows `u32` under MoltenVK and on a desktop. The workgroup size, 64, is the
+    cook's to hold: `CookedShader` does not carry it, so `Renderer::new` cannot check it until
+    rhi-api's ask (c) adds it, and then refuses another. Rules out a host copy of every
+    placement, a scatter that resolves duplicates on the device, an order between two entries
+    of one dispatch, and an assertion a release build drops.
+  - *The triangle pass is one indexed indirect draw of every slot below the table's extent.*
+    One built-in triangle, `SV_VulkanInstanceID` as the slot, a record without `LIVE` placed at
+    `(2, 2, 2, 1)`, outside the clip volume, a transient `Depth32Float` and a palette colour by
+    slot. Cells are subtracted as `uint` and reinterpreted as `int` before anything becomes a
+    float, since a signed overflow is undefined in MSL. Every buffer is reached through an
+    address in a 32-byte push block, the fragment stage's being 0 or 32 bytes, with no heap.
+    Each push block is an entry-point `uniform` parameter, which Slang places at Metal buffer
+    index 0 whatever else the module declares, and the cook refuses a block at another index;
+    a block declared as a module global takes its place among the globals. Each placement is
+    declared as arrays of 4-byte scalars, and no vector or matrix member sits at an offset its
+    standard alignment does not allow (the camera's column-major `float4x4` at 0 and `int3` at
+    64), valid under Vulkan's standard layout with no `scalarBlockLayout`; and the cell size is
+    the
+    vertex stage's one specialisation constant, which the host sets from
+    `RenderPosition::CELL_SIZE`. Each pass declares its buffers one by one. The draw, the camera
+    and the instance buffer are declared only where the table's extent is above zero, the
+    instance buffer also in a frame with a scatter, which keeps the scatter on the graphics
+    queue, and the rows only where an entry is not `FREE`, so that null refuses no frame for
+    reading what nothing wrote. The instance buffer is imported from `ShaderRead`, the state
+    every frame leaves it in, and from `Undefined` only in the renderer's first frame and the
+    first after `torn`. `declare` refuses an extent beyond `Capabilities::viewport_extent`.
+    Rules out culling, a draw for each instance, a capability beyond rhi-api's required set,
+    and a cell size written in two places.
+  - *The camera is one statement and the latch one call.* `CameraData::orbit` computes the
+    buffer's 80 bytes from the pivot, the yaw, the pitch, the boom, the projection and the
+    extent, in section 5.3's world frame. `latch` reads `LatestSample` once, inside the call,
+    and writes the camera buffer of the frame's region, between `record` and `submit` (D160),
+    at the frame's one extent, the `FrameView::extent` `declare` stored: `CameraLatch` carries
+    no extent, and `latch` refuses a frame that was not declared. Rules out a latch that gates
+    a submit or waits for a device, a camera a recorder reads, one camera buffer that two
+    frames share, an aspect ratio that is not the viewport's, a second extent for one frame,
+    and the boom's recheck at the latch (decision 5.4).
+  - *Pipelines are made in `new`, from shaders the caller decoded.* `Renderer::new` holds each
+    `CookedShader`'s reflection to the interface as far as the format carries it, and refuses a
+    mismatch by name; the scatter's workgroup size is not yet carried. The renderer opens no
+    file: the cache file is the client binary's, written from `Device::pipeline_cache` once
+    `new` has returned. `RendererDesc::shaders: None` makes a renderer that stages and prepares
+    and declares nothing, which the cost tests are made with. Rules out a pipeline made in a
+    frame, the renderer naming `lactose-asset` or a path, and a second type for the cost tests.
+  - *A torn frame gives up the instance buffer and nothing else.* Of the renderer's buffers a
+    submit writes the instance buffer alone. `torn` frees every slot and forgets every base,
+    the next batch begins by freeing every record a slot was ever given, and the next frame
+    declared imports the instance buffer from `Undefined`; the instances return as extract's
+    full passes and the remote batch write them. The torn frame's region is held until the
+    point of the next `submitted`, since the graph signals a torn frame's point with its next
+    submit (D160); where only torn frames hold the regions, `open` returns
+    `Opened::Unsubmitted` and the caller submits a frame with no pass. Rules out a host copy of
+    the instance buffer, a torn batch run again, a region freed with no point, and a record a
+    torn frame left being drawn.
+  - *A provider declares after the renderer, into the caller's declaration.*
+    `RenderFeature::declare` is given the `FrameDecl` and a `FeatureView` of the target, the
+    depth, the camera buffer and the extent, in registration order. `FeatureView::new` builds
+    one, so that a provider tests its `declare` on null with no renderer, and a later milestone
+    that adds a field keeps it. Module `graph` re-exports what a provider names from
+    `lactose-render-graph`, since `crate-tiers.toml` gives `lactose-terrain` and
+    `lactose-debug-ui` this crate and not that one. Rules out a provider that writes the camera
+    or the instance buffer, a registry in a foundation crate, and an exception added to
+    `crate-tiers.toml` by this merge.
+  - *The drop waits for the last point it was told, but while the thread unwinds.* It then
+    destroys what it made; a destroy the device refuses under a pending submit is logged under
+    `cheddar` and the object is leaked. The renderer is dropped after the graph that submitted
+    its frames, off the frame-critical workers. Rules out a drop that waits while the thread
+    unwinds, and one that destroys under a pending submit.
+  - *The crate is outside the determinism boundary and declares nothing a world registers.* It
+    has no component, resource, system or applier, and nothing it reports is fed into a world.
+    Three things depend on how `write` batches fell, and each is counted: which rows a full
+    region drops, which kind is lost when a region has no room, and which of two duplicate rows
+    is kept. Rules out a system inside the boundary that names the crate, and a slot or a flag
+    that depends on a thread or on the order a hash map iterates in.
+- Driven by: architecture sections 3, 5.1, 5.3, 12.1 to 12.5, 13, 20 and 21; the milestone 2
+  plan's rows `renderer`, `renderer-impl`, `presentation`, `frame-design`, `frame-impl`, `slang`,
+  `extract-50k` and `remote-upload-5k` and decisions 5.1, 5.2, 5.3, 5.4, 5.5, 5.11, 5.13, 5.14
+  and 5.18; `crates/present-api/README.md` (D157), "What a pass gives the sink", "What the sink
+  keeps" and "Full and incremental passes"; `crates/render-graph/README.md` (D160),
+  "Declaring", "Imports", "Queues", "Submission" and "Errors and drops";
+  `crates/rhi-api/README.md` (D158), "Threads", "States", "Buffers and host access",
+  "Timelines", "Pipelines and the cooked shader format", "The pipeline cache" and "Handles and
+  lifetimes"; the two spike results of milestone 2; the facade's three round-1 and three
+  round-2 reviews; D41,
+  D43, D48, D49, D136, D150 and D153.
+- Replaced: section 12.4's "keyed by `StableKey`", where it is read as the key alone, and its
+  "freed from the structural change log", where it is read as the renderer reading the log;
+  this merge amends the sentence. Nothing of D157, D158 or D160 is replaced.
 
 ## 10. Review history
 
