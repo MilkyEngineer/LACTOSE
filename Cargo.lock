@@ -743,6 +743,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-rhi-null"
+version = "0.0.0"
+dependencies = [
+ "lactose-core",
+ "lactose-rhi-api",
+ "raw-window-handle",
+]
+
+[[package]]
 name = "lactose-sim"
 version = "0.0.0"
 dependencies = [

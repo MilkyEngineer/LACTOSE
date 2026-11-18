@@ -120,7 +120,9 @@ pub struct BufferReach {
 /// push-constant bytes or out of another buffer.
 ///
 /// The declaration is required on every backend and checked where a backend can see it
-/// (`README.md`, "What a pass declares"). A slot or buffer listed twice is listed once.
+/// (`README.md`, "What a pass declares"). A slot listed twice is listed once; a buffer
+/// listed twice is listed in one state, or the pass is refused on every backend
+/// ([`Rule::State`](crate::Rule::State)).
 /// The index and indirect buffers a draw names are not declared here: the call that names
 /// them is their declaration.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
