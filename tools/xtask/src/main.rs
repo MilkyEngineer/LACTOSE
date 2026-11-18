@@ -28,6 +28,7 @@ use lactose_xtask::heavy;
 use lactose_xtask::measure;
 use lactose_xtask::policy::Policy;
 use lactose_xtask::repo::Files;
+use lactose_xtask::slang;
 use lactose_xtask::tiers::TierFile;
 use lactose_xtask::vendor::{self, Repository};
 use lactose_xtask::workspace::{Workspace, cargo_metadata, load_metadata};
@@ -75,6 +76,14 @@ cargo xtask <command>
                              files to docs/results (or <dir>); --short cuts repetitions
                              and marks the files as short; the names are in
                              docs/results/README.md
+  slang                      install the pinned Slang release under the target directory,
+                             from tools/cook/slang.toml, and print its slangc's path
+  gpu --driver <name> [--cooked <dir>]
+                             run the device tests under a named driver (lavapipe, moltenvk,
+                             kosmickrisp or system); its one step yet is the Metal step, on
+                             macOS: cook the engine shaders, or with --cooked take the code
+                             `ricotta --code` wrote to <dir>, and make a Metal pipeline state
+                             from each under Metal's validation
   help                       print this text
 
 Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 could not run.";
@@ -195,6 +204,14 @@ fn main() -> ExitCode {
             Err(message) => ("heavy", Err(message)),
         },
         ["measure", ref rest @ ..] => ("measure", run_measurements(rest)),
+        ["slang"] => match install_slang() {
+            Ok(slangc) => {
+                println!("{}", slangc.display());
+                return ExitCode::SUCCESS;
+            }
+            Err(message) => ("slang", Err(message)),
+        },
+        ["gpu", ref rest @ ..] => ("gpu", run_gpu(rest)),
         ["group", name] => match group_arguments(name) {
             Ok(arguments) => {
                 println!("{arguments}");
@@ -252,6 +269,187 @@ fn check_boundary() -> Checked {
     findings.extend(check_groups::check(&context.policy, &context.workspace));
     findings.extend(check_groups::check_workflow(&context.policy, &files));
     Ok(findings)
+}
+
+/// Installs the pinned Slang release under the target directory and returns its `slangc`.
+fn install_slang() -> Result<PathBuf, String> {
+    let context = Context::load()?;
+    let pin = slang::Pin::parse(&read(slang::PIN_FILE)?)?;
+    slang::install(&pin, &context.target_dir)
+}
+
+/// The drivers `gpu` runs the device tests under (milestone 2 plan, decision 5.10).
+const DRIVERS: [&str; 4] = ["lavapipe", "moltenvk", "kosmickrisp", "system"];
+/// The engine's Slang sources, which `gpu` cooks.
+const SHADERS: &str = "shaders";
+/// The Swift script of the Metal step.
+const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
+
+/// `gpu --driver <name> [--cooked <dir>]`: its one step is the Metal step, which cooks the
+/// engine's shaders with the pinned Slang, or takes the code another runner cooked to
+/// `<dir>`, and makes a Metal pipeline state from each, through the Swift script run by the
+/// command line tools' `swift`. The canaries and the count of messages are the same either
+/// way. The driver selects nothing yet, since no step runs Vulkan; it is checked and
+/// recorded. The script's report is written to `target/gpu/<driver>-metal.txt` and to
+/// standard error.
+fn run_gpu(args: &[&str]) -> Checked {
+    let (driver, cooked) = match args {
+        ["--driver", name] if DRIVERS.contains(name) => (*name, None),
+        ["--driver", name, "--cooked", dir] if DRIVERS.contains(name) => (*name, Some(*dir)),
+        _ => return Err(format!("expected `--driver <{}> [--cooked <dir>]`", DRIVERS.join("|"))),
+    };
+    if !cfg!(target_os = "macos") {
+        return Err("the one step of `gpu` yet is the Metal step, which runs on macOS".to_owned());
+    }
+    let context = Context::load()?;
+    let pin = slang::Pin::parse(&read(slang::PIN_FILE)?)?;
+    let out = context.target_dir.join("gpu");
+    fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let (code, cooked_by) = match cooked {
+        Some(dir) => (PathBuf::from(dir), format!("cooked elsewhere, in {dir}")),
+        None => (cook_engine_shaders(&context, &pin, &out)?, format!("Slang {}", pin.version)),
+    };
+    eprintln!("gpu: the Metal step, under driver {driver}, with Metal's validation on");
+    // The canaries first, each in a process of its own: a layer that did not load reports
+    // nothing. API validation's aborts the process; shader validation's lets it complete.
+    // What each said, as it wrote it, is recorded: the wording differs between Xcodes.
+    let mut heard = Vec::with_capacity(CANARIES.len());
+    for (canary, phrasings, aborts) in CANARIES {
+        let run = metal_step(&["--canary", canary])?;
+        match said(phrasings, &run.stderr) {
+            Some(says) if run.status.success() != aborts => {
+                heard.push(format!("{canary} `{says}`"));
+            }
+            _ => {
+                return Err(format!(
+                    "Metal {canary} validation's canary yielded none of `{}`, so the layer is \
+                     not listening: it ended with {}:\n{}",
+                    phrasings.join("`, `"),
+                    run.status,
+                    run.stderr
+                ));
+            }
+        }
+    }
+    let step = metal_step(&[&code.to_string_lossy()])?;
+    eprint!("{}", step.stdout);
+    // Every line on standard error counts (decision 5.10), but the layers' own two.
+    let counted: Vec<&str> = step
+        .stderr
+        .lines()
+        .filter(|line| !VALIDATION_ON.iter().any(|on| line.ends_with(on)))
+        .collect();
+    let file = out.join(format!("{driver}-metal.txt"));
+    let written = format!(
+        "driver: {driver}\ncode: {cooked_by}\nvalidation: api and shader, canaries {}\n{}messages: \
+         {}\n{}",
+        heard.join(", "),
+        step.stdout,
+        counted.len(),
+        counted.iter().map(|line| format!("{line}\n")).collect::<String>()
+    );
+    fs::write(&file, written).map_err(|e| format!("{}: {e}", file.display()))?;
+    if !step.status.success() || !counted.is_empty() {
+        return Err(format!(
+            "the Metal step ended with {} and {} message(s) on standard error:\n{}",
+            step.status,
+            counted.len(),
+            counted.join("\n")
+        ));
+    }
+    eprintln!("gpu: the report is {}", file.display());
+    Ok(Vec::new())
+}
+
+/// Cooks the engine's shaders with the pinned Slang into `<out>/code`, emptied first, and
+/// returns that directory.
+fn cook_engine_shaders(context: &Context, pin: &slang::Pin, out: &Path) -> Result<PathBuf, String> {
+    let slangc = slang::install(pin, &context.target_dir)?;
+    let code = out.join("code");
+    // A shader cooked by an earlier run and since removed would otherwise be loaded again.
+    match fs::remove_dir_all(&code) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(format!("{}: {error}", code.display()));
+        }
+        _ => {}
+    }
+    eprintln!("gpu: cooking {SHADERS} with Slang {}", pin.version);
+    let status = Command::new(&context.cargo)
+        .args(["run", "--locked", "--quiet", "--package", "lactose-cook", "--bin", "ricotta", "--"])
+        .arg("--slangc")
+        .arg(&slangc)
+        .arg("--code")
+        .arg(&code)
+        .arg(SHADERS)
+        .arg(out.join("shaders.pack"))
+        .stdout(Stdio::from(io::stderr()))
+        .status()
+        .map_err(|e| format!("cannot run ricotta: {e}"))?;
+    if !status.success() {
+        return Err(format!("ricotta ended with {status}"));
+    }
+    Ok(code)
+}
+
+/// Each validator's canary in the Metal script, every phrasing seen so far of what the
+/// validator says of it, and whether that aborts the process. Each phrasing names the
+/// canary's own misuse: no buffer bound at index 0, and the `canary` kernel's store at
+/// offset 4194304, the script's index `1 << 20` into a buffer of one `uint`.
+const CANARIES: [(&str, &[&str], bool); 2] = [
+    // Xcode 16.4 writes `buffer`, Xcode 26.6 and 27.2 `Buffer`: `said` ignores ASCII case.
+    ("api", &["missing Buffer binding at index 0"], true),
+    (
+        "shader",
+        &[
+            // Xcode 27.2.
+            "Invalid store in 'device' or 'constant' address space at offset 4194304, executing \
+             compute function: \"canary\"",
+            // Xcode 26.6.
+            "Invalid device store at offset 4194304, executing kernel function: \"canary\"",
+        ],
+        false,
+    ),
+];
+
+/// The text of `stderr` that is one of `phrasings`, compared without regard to ASCII case,
+/// as the validator wrote it.
+fn said<'a>(phrasings: &[&str], stderr: &'a str) -> Option<&'a str> {
+    // ASCII lowercase keeps every byte where it was, so a match's offsets hold in `stderr`.
+    let lower = stderr.to_ascii_lowercase();
+    phrasings.iter().find_map(|phrasing| {
+        let at = lower.find(&phrasing.to_ascii_lowercase())?;
+        Some(&stderr[at..at + phrasing.len()])
+    })
+}
+/// The lines the two layers write when they load.
+const VALIDATION_ON: [&str; 2] = ["Metal API Validation Enabled", "Metal GPU Validation Enabled"];
+
+/// What one run of the Metal script printed.
+struct StepOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs the Metal script under Metal API and shader validation, set as the Metal spike set
+/// them: API validation's assertions abort, its warnings and shader validation's reports go to
+/// standard error.
+fn metal_step(args: &[&str]) -> Result<StepOutput, String> {
+    let output = Command::new("swift")
+        .arg(METAL_SCRIPT)
+        .args(args)
+        .env("MTL_DEBUG_LAYER", "1")
+        .env("MTL_DEBUG_LAYER_WARNING_MODE", "nslog")
+        .env("MTL_SHADER_VALIDATION", "1")
+        .env("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run swift: {e}"))?;
+    Ok(StepOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 /// The cargo arguments that select a check group's packages, for CI's check jobs.
@@ -535,4 +733,75 @@ fn heavy(args: &[&str]) -> Result<i32, String> {
     let code = run(command.env(heavy::HELD_VAR, slot.held_value()));
     drop(slot);
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CANARIES, said};
+
+    #[test]
+    fn a_canary_is_heard_in_each_phrasing_seen_and_no_other_misuse_is() {
+        let [(_, api, _), (_, shader, _)] = CANARIES;
+        for (phrasings, text, heard) in [
+            // Xcode 27.2 on the M1; Xcode 26.6 on the hosted runner wrote the same phrase.
+            (
+                api,
+                "validateComputeFunctionArguments:1043: failed assertion `Compute \
+                 Function(canary): missing Buffer binding at index 0 for o[0].'",
+                Some("missing Buffer binding at index 0"),
+            ),
+            // Xcode 16.4 on the oldest runner.
+            (
+                api,
+                "validateComputeFunctionArguments:1056: failed assertion `Compute \
+                 Function(canary): missing buffer binding at index 0 for o[0].'",
+                Some("missing buffer binding at index 0"),
+            ),
+            // Xcode 27.2 on the M1.
+            (
+                shader,
+                "Invalid Metal usage: Invalid store in 'device' or 'constant' address space at \
+                 offset 4194304, executing compute function: \"canary\" \nMTLBuffer: <no label>",
+                Some(
+                    "Invalid store in 'device' or 'constant' address space at offset 4194304, \
+                     executing compute function: \"canary\"",
+                ),
+            ),
+            // Xcode 26.6 on the hosted runner.
+            (
+                shader,
+                "Invalid device store at offset 4194304, executing kernel function: \"canary\" \
+                 encoder: \"0\", dispatch: 0",
+                Some(
+                    "Invalid device store at offset 4194304, executing kernel function: \"canary\"",
+                ),
+            ),
+            // Another binding index, another kernel's store, another offset, a load.
+            (
+                api,
+                "failed assertion `Compute Function(canary): missing buffer binding at index 1 \
+                 for at[0].'",
+                None,
+            ),
+            (
+                shader,
+                "Invalid device store at offset 4194304, executing kernel function: \"cull\" \
+                 encoder: \"0\", dispatch: 0",
+                None,
+            ),
+            (
+                shader,
+                "Invalid store in 'device' or 'constant' address space at offset 64, executing \
+                 compute function: \"canary\"",
+                None,
+            ),
+            (
+                shader,
+                "Invalid device load at offset 4194304, executing kernel function: \"canary\"",
+                None,
+            ),
+        ] {
+            assert_eq!(said(phrasings, text), heard, "{text}");
+        }
+    }
 }

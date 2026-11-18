@@ -787,10 +787,11 @@ device test with the GPU made to lag.
 **What neither spike shows.** The instance buffer is `MemoryClass::Device`: the host never
 writes or reads it, the scatter writes it through its address and a test reads it through a
 copy. RHI lists a buffer in device-only memory under "Not shown": every buffer of both
-spikes sat in host-visible memory. rhi-api's sentence
-"`MemoryClass::Device` is never touched by the host and is filled by a copy" is read here as
-a rule for the host: a pass that declares the buffer `BufferAccess::Write` fills it as a
-copy does (rhi-api ask (b), D161). The path is shown under MoltenVK on the M1 by
+spikes sat in host-visible memory. rhi-api's "Buffers and host access" says that a pass
+that declares the buffer `ShaderWrite`, as a graph pass that declares it
+`BufferAccess::Write` does, fills it as a copy does (ask (b) of D161, met at `rhi-null`'s
+merge; `device_buffer_written_by_a_pass_is_read_after_it` holds that null accepts it). The
+path is shown under MoltenVK on the M1 by
 `reviewer-gpu`'s round-1 probe, which is not checked in: a `DEVICE_ADDRESS` buffer in
 memory type 0, device-local and not host-visible, written by the scatter through its
 address, read by the vertex stage through its address in the same command buffer and

@@ -122,7 +122,7 @@ mod tests {
             ["lactose-reflect-macros", "lactose-ecs-macros", "lactose-present-api"]
         );
         assert!(!policy.harness_tests.is_empty());
-        assert_eq!(policy.miri_split, ["lactose-ecs"]);
+        assert_eq!(policy.miri_split, ["lactose-ecs", "lactose-rhi-null"]);
         assert!(policy.separate_test_targets.contains(&"lactose-ecs::alloc".to_owned()));
     }
 

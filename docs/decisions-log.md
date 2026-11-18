@@ -7362,6 +7362,66 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   buffers" as something `rhi-api` would hold; the RHI result's point 1 where it puts runtime
   descriptor arrays in the required set; the plan's decision 5.17 and `graph-impl` row where a
   readback's hazard is shown by a wrong readback, which every backend now refuses.
+- Addendum (lane `rhi-null`, 2026-11-18; review rounds 1 to 4): amended at `rhi-null`'s fix rounds 1
+  to 4, from the reviews of `rhi-null` and the package `graph`'s round named for it. The rules the
+  contract gains or tightens:
+  - `pending`, every backend: `write_buffer` of a buffer a pending submit writes, and
+    `read_buffer` and `invalidate_buffer` of one a pending submit writes or changes the state
+    of, are refused. A transition into `HostRead` is the barrier that makes the device's
+    writes visible to the host, and an invalidate made before it lands would be taken for the
+    one after. A barrier touches no bytes, so a submit that only transitions a buffer holds no
+    host write back. A device keeps, for each buffer and queue, the last submit that writes it
+    and the last that writes it or changes its state.
+  - `no-qfot` binds a use, not only a change: a submit that uses a resource while a pending
+    submit of another queue wrote it or changed its state or owner waits for a point that
+    submit, or a later one of its queue, signals, directly or through the submits it waits
+    for. A write with no transition, a transition with no write, and an alias call each
+    count as a change. It binds `Concurrent` resources, an `Exclusive` resource moved to
+    another queue by a transfer, and an `Exclusive` one moved by a transition from
+    `Undefined`, in every submit that uses the resource. An acquire is such a use: its own
+    submit waits for the release, directly or through the submits it waits for. An acquire,
+    a take from `Undefined` or a wait in an earlier submit of its queue orders no later
+    submit. Null alone refuses it.
+  - A transition from `Undefined` ends a release no acquire met and takes the resource with no
+    transfer: its contents are undefined, a buffer's as an image's, and an acquire of that
+    release is refused (`no-qfot`, null).
+  - rhi-api's "States" gives Vulkan's transition from `Undefined` a source scope of every
+    stage and every write access (`ALL_COMMANDS`, `MEMORY_WRITE`), where it said only that the
+    scope covers every earlier use on the queue. A re-take from `Undefined` may follow a write
+    on its own queue: the attachment store of a frame no present read, or of a torn frame
+    whose submit wrote the target before it failed, which this scope covers and an execution
+    dependency alone does not (`reviewer-gpu` on `frame-design`, G2: under syncval on one
+    queue, source access 0 gave one write-after-write error for each dropped frame, and
+    `MEMORY_WRITE` none). Null tracks states, not availability, so no null case is owed; the
+    evidence is the output case `retake_after_a_store_on_one_queue_is_clean`, whose body
+    arrives with `rhi-vulkan`: a pass stores a colour attachment, a later submit on the same
+    queue takes the image from `Undefined` and clears it, the readback equals the clear
+    colour exactly, and the run raises no validation message.
+  - `state`, every backend: a pass that declares one buffer in two states is refused, not
+    merged.
+  - `usage`, every backend: a transition of an image into a state its usage does not allow,
+    and a graphics pipeline of more colour targets than `colour_attachments`
+    (VUID-VkPipelineRenderingCreateInfo-colorAttachmentCount-09533).
+  - `bounds`, every backend: a buffer-image copy whose buffer offset is not a multiple of the
+    texel (VUID-vkCmdCopyBufferToImage-dstImage-07975 and -07978, and their image-to-buffer
+    counterparts), and two regions of one copy call that write one byte of the destination
+    buffer or one texel of the destination image (VUID-vkCmdCopyBuffer-pRegions-12482,
+    VUID-vkCmdCopyBufferToImage-pRegions-12483, VUID-vkCmdCopyImageToBuffer-pRegions-12485,
+    and their `VkCopy*Info2` forms), checked from the regions and the format.
+  rhi-api's "Buffers and host access" says that `MemoryClass::Device` is filled by a copy or
+  by a pass that declares it `ShaderWrite`, as `renderer`'s facade asked (D161, ask (b)); the
+  contract case `device_buffer_written_by_a_pass_is_read_after_it` holds that null accepts
+  such a pass and a later `ShaderRead` and copy of the buffer.
+  The signatures changed: `CookedShader::encode` and `seal_cache` return `Result<Vec<u8>>` and
+  no longer panic; `encode` refuses, naming the broken precondition, every shader `decode`
+  would refuse, and `seal_cache` refuses, `InvalidData`, an identity of 4 GiB or more, which its
+  four-byte length cannot hold. Nothing outside `lactose-rhi-api` and `lactose-rhi-null` calls
+  either. The conformance `Harness` gains `device_with_cache`, which starts a device from cache
+  bytes, so the cache cases check `pipeline_stats().cache` for bytes loaded, rejected and
+  absent. A case that needs a loss returns `Skipped` where the harness cannot lose a device, as
+  `Harness::lose` says, and `drop_that_is_not_the_last_returns_at_once` holds on every backend
+  that a drop that is not the device's last returns while a submit is held. The suite has 168
+  cases, 142 of them contract cases, and a device backend runs 64 of its refusal cases.
 
 **D159. `lactose-platform`: one window whose `Arc` is its lifetime, the two pumps over `lactose-task`'s lanes, a close and a resize as states, and a present thread over the caller's state** (§3, §4, §5.1, §21, `lactose-platform`, `crates/app/README.md`, `crates/task/README.md`)
 - Why: section 4 gives the crate four nouns and section 5.1 two threads, and the milestone 2

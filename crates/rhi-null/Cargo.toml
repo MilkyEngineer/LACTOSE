@@ -1,0 +1,31 @@
+[package]
+name = "lactose-rhi-null"
+description = "The null backend of the render hardware interface: every rule of the contract checked against kept state, under the capability set it is created with, with no GPU. Test support."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+# D150: the integration tests are one binary, whose root declares the others as modules.
+autotests = false
+
+[dependencies]
+# `Error`, `ErrorKind`, `Result`, `Handle` and `xxh64`, the cache's stage keys.
+lactose-core.workspace = true
+# The interface this crate implements: the device, the encoder, the swapchain and every
+# value they take, and `Rule::refuse` for each refusal.
+lactose-rhi-api.workspace = true
+# `NullSurface`: a surface a device presents to with no window.
+raw-window-handle.workspace = true
+
+[dev-dependencies]
+# The suite's cases, run against this backend by `tests/conformance.rs`. The feature is for
+# dev-dependency edges alone.
+lactose-rhi-api = { workspace = true, features = ["conformance"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true

@@ -253,7 +253,16 @@ pub trait Encoder: Any + Send {
     /// Copies ranges of `source`, in `CopySource`, to `destination`, in
     /// `CopyDestination`. The two are different buffers. A region outside either is
     /// refused at the submit ([`Rule::Bounds`](crate::Rule::Bounds), every backend), as
-    /// is one of the two copies below.
+    /// is one of the two copies below, and so are two regions of one call that write one
+    /// byte of the destination buffer or one texel of the destination image. Vulkan
+    /// forbids them (`VUID-vkCmdCopyBuffer-pRegions-12482`,
+    /// `VUID-vkCmdCopyBufferToImage-pRegions-12483`,
+    /// `VUID-vkCmdCopyImageToBuffer-pRegions-12485`, and their `VkCopy*Info2` forms
+    /// `VUID-VkCopyBufferInfo2-pRegions-12482`,
+    /// `VUID-VkCopyBufferToImageInfo2-pRegions-12483` and
+    /// `VUID-VkCopyImageToBufferInfo2-pRegions-12485`), and each backend checks them from
+    /// the regions and the image's format, with no driver call: an image-to-buffer
+    /// region's bytes are its rows packed at the format's texel size.
     fn copy_buffer(
         &mut self,
         source: BufferHandle,

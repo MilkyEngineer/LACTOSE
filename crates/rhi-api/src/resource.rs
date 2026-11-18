@@ -112,7 +112,8 @@ flags! {
 /// Where a buffer's memory is and who may touch it from the host.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum MemoryClass {
-    /// Device memory the host never touches: filled by a copy.
+    /// Device memory the host never touches: filled by a copy or by a pass that declares it
+    /// `ShaderWrite`.
     Device,
     /// Memory the host writes and the device reads. The host may not read it back.
     Upload,

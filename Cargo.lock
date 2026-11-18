@@ -483,9 +483,11 @@ dependencies = [
  "lactose-io",
  "lactose-math",
  "lactose-physics-api",
+ "lactose-rhi-api",
  "lactose-task",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -740,6 +742,15 @@ dependencies = [
 
 [[package]]
 name = "lactose-rhi-api"
+version = "0.0.0"
+dependencies = [
+ "lactose-core",
+ "lactose-rhi-api",
+ "raw-window-handle",
+]
+
+[[package]]
+name = "lactose-rhi-null"
 version = "0.0.0"
 dependencies = [
  "lactose-core",

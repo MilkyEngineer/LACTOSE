@@ -9,9 +9,22 @@
 //! and compares it with a reference computed on the CPU, never with a stored image. Only
 //! a device can pass it, and [`run`] skips it for a harness that does not render.
 //!
-//! The bodies are not the facade's: the contract cases' arrive with `lactose-rhi-null`,
-//! the output cases' and their shader sources with `lactose-rhi-vulkan` (milestone 2
-//! plan, section 3). `README.md`, "The conformance suite", says what each case holds.
+//! The contract cases' bodies are here, one function for each, by group, written with
+//! `lactose-rhi-null`; the output cases' and their shader sources arrive with
+//! `lactose-rhi-vulkan` (milestone 2 plan, section 3). `README.md`, "The conformance
+//! suite", says what each case holds.
+
+mod buffers;
+mod encoders;
+mod heap;
+mod images;
+mod kit;
+mod passes;
+mod queues;
+mod shaders;
+mod states;
+mod swapchain;
+mod timelines;
 
 use std::sync::Arc;
 
@@ -85,6 +98,21 @@ pub trait Harness {
         presents: bool,
     ) -> Result<Box<dyn Device>>;
 
+    /// A new device as [`device`](Self::device) makes with no surface, whose request's
+    /// `pipeline_cache` is `cache`: the bytes another device's `pipeline_cache` returned,
+    /// or bytes that fail its checks.
+    ///
+    /// # Errors
+    ///
+    /// What the backend's constructor returns, which bytes that fail a check never make it
+    /// return.
+    fn device_with_cache(
+        &self,
+        set: &Capabilities,
+        messages: Arc<dyn MessageSink>,
+        cache: Vec<u8>,
+    ) -> Result<Box<dyn Device>>;
+
     /// Whether the backend's devices produce output. `false` for null, and [`run`] then
     /// skips every output case.
     fn renders(&self) -> bool;
@@ -118,7 +146,56 @@ pub trait Harness {
 ///
 /// When the case fails, with the case's name and what did not hold.
 pub fn run(harness: &dyn Harness, case: &Case) -> Outcome {
-    todo!()
+    if case.kind == CaseKind::Output {
+        return Outcome::Skipped(if harness.renders() {
+            "an output case, whose body arrives with lactose-rhi-vulkan"
+        } else {
+            "an output case, on a harness that does not render"
+        });
+    }
+    if harness.renders() && !case.devices {
+        return Outcome::Skipped("a case of a check the null backend alone makes");
+    }
+    let Some(body) = body(case.name) else { panic!("{}: a contract case with no body", case.name) };
+    let mut ran = false;
+    let mut skipped = "no capability set of the harness";
+    for set in harness.sets() {
+        let ctx = kit::Ctx::new(harness, case, set);
+        match body(&ctx) {
+            Ok(()) => ran = true,
+            Err(why) => skipped = why,
+        }
+        let messages = ctx.messages();
+        assert!(
+            messages == 0,
+            "{} under {set:?}: {messages} messages a clean run does not send",
+            case.name
+        );
+    }
+    if ran { Outcome::Passed } else { Outcome::Skipped(skipped) }
+}
+
+/// Every contract case's body, by the case's name.
+fn bodies() -> impl Iterator<Item = (&'static str, kit::Body)> {
+    [
+        queues::BODIES,
+        buffers::BODIES,
+        images::BODIES,
+        states::BODIES,
+        heap::BODIES,
+        shaders::BODIES,
+        encoders::BODIES,
+        timelines::BODIES,
+        passes::BODIES,
+        swapchain::BODIES,
+    ]
+    .into_iter()
+    .flatten()
+    .copied()
+}
+
+fn body(name: &str) -> Option<kit::Body> {
+    bodies().find(|(case, _)| *case == name).map(|(_, body)| body)
 }
 
 /// Declares the case table: `contract "name";`, `output "name";`,
@@ -151,6 +228,7 @@ pub const CASES: &[Case] = cases! {
     contract "submit_to_the_present_role_is_refused" => PresentQueue everywhere;
     // Buffers and host access.
     contract "buffer_write_then_copy_then_read_returns_the_bytes";
+    contract "device_buffer_written_by_a_pass_is_read_after_it";
     contract "buffer_address_is_stable_and_distinct";
     contract "host_ranges_that_do_not_overlap_are_written_at_once";
     contract "overlapping_host_access_is_refused" => HostOverlap everywhere;
@@ -159,6 +237,7 @@ pub const CASES: &[Case] = cases! {
     contract "host_access_outside_the_memory_class_is_refused" => Usage everywhere;
     contract "address_of_a_buffer_without_the_usage_is_refused" => Usage everywhere;
     contract "read_under_a_pending_writer_is_refused" => Pending everywhere;
+    contract "read_under_a_pending_transition_to_host_read_is_refused" => Pending everywhere;
     contract "write_under_a_pending_writer_is_refused" => Pending everywhere;
     contract "submit_writing_under_a_host_access_is_refused" => HostOverlap everywhere;
     contract "submit_racing_a_host_access_refuses_one";
@@ -193,7 +272,18 @@ pub const CASES: &[Case] = cases! {
     contract "shared_and_discarded_resources_cross_without_a_transfer";
     contract "roles_on_one_queue_need_no_transfer";
     contract "image_taken_while_another_queue_reads_it_is_refused" => Queue;
+    contract "read_of_contents_left_undefined_is_refused" => UndefinedRead;
+    contract "use_under_another_queues_pending_write_is_refused" => Queue;
+    contract "use_under_another_queues_pending_transition_is_refused" => Queue;
+    contract "sampled_read_under_another_queues_pending_write_is_refused" => Queue;
+    contract "use_in_a_later_submit_than_the_waiting_change_is_refused" => Queue;
+    contract "acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused" => Queue;
+    contract "take_of_a_mip_after_an_acquire_of_another_is_refused" => Queue;
+    contract "use_waiting_through_another_submit_passes";
+    contract "acquire_of_a_release_a_retake_ended_is_refused" => Queue;
+    contract "read_after_a_retake_of_an_unmet_release_is_refused" => UndefinedRead;
     output "ownership_transfer_keeps_the_contents";
+    output "retake_after_a_store_on_one_queue_is_clean";
     // The heap, the sampler table and what a pass declares.
     contract "heap_slot_outside_the_heap_is_refused" => Bounds everywhere;
     contract "declared_slot_empty_is_refused" => HeapLayout everywhere;
@@ -207,6 +297,7 @@ pub const CASES: &[Case] = cases! {
     contract "undeclared_slot_argument_is_refused" => Undeclared everywhere;
     contract "undeclared_address_argument_is_refused" => Undeclared everywhere;
     contract "declared_buffer_in_another_state_is_refused" => State;
+    contract "buffer_declared_in_two_states_is_refused" => State everywhere;
     contract "sampler_table_is_bounded";
     output "heap_is_sampled_past_slot_zero";
     output "address_is_read_in_a_shader";
@@ -230,6 +321,8 @@ pub const CASES: &[Case] = cases! {
     // Encoders, submits and timelines.
     contract "encoder_recorded_on_another_thread_submits";
     contract "encoder_reset_while_pending_is_refused" => Pending everywhere;
+    contract "pending_encoder_drop_waits_for_its_submit";
+    contract "drop_that_is_not_the_last_returns_at_once";
     contract "encoder_in_two_submits_is_refused" => Encoding everywhere;
     contract "encoder_resubmitted_without_reset_is_refused" => Encoding everywhere;
     contract "recording_while_pending_records_nothing";
@@ -239,6 +332,7 @@ pub const CASES: &[Case] = cases! {
     contract "pass_left_open_is_refused" => Encoding everywhere;
     contract "push_outside_the_block_is_refused" => Bounds everywhere;
     contract "copy_region_outside_its_resource_is_refused" => Bounds everywhere;
+    contract "copy_regions_overlapping_in_the_destination_are_refused" => Bounds everywhere;
     contract "refused_submit_changes_nothing";
     contract "submit_of_no_encoders_waits_and_signals";
     contract "submit_is_pending_until_its_wait_is_reached";
@@ -246,6 +340,8 @@ pub const CASES: &[Case] = cases! {
     contract "dispatch_beyond_the_group_limit_is_refused" => Bounds everywhere;
     contract "timeline_is_signalled_waited_and_read_by_the_host";
     contract "timeline_wait_times_out";
+    contract "waits_are_woken_by_the_submit_that_reaches_them";
+    contract "wait_is_woken_by_a_host_signal";
     contract "timeline_value_that_does_not_grow_is_refused" => Timeline everywhere;
     contract "host_signal_above_a_pending_signal_is_refused" => Timeline everywhere;
     contract "host_signal_below_a_promise_that_does_not_wait_for_it_is_refused" => Timeline everywhere;
@@ -300,7 +396,30 @@ pub const CASES: &[Case] = cases! {
     // Device loss and messages.
     contract "loss_is_returned_and_stays";
     contract "waits_return_at_once_after_a_loss";
+    contract "wait_is_woken_by_a_loss";
     contract "teardown_succeeds_after_a_loss";
     contract "clean_run_sends_no_message";
     output "each_validator_reports_its_canary";
 };
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{CASES, CaseKind, bodies};
+
+    #[test]
+    fn every_contract_case_has_one_body_and_every_body_one_case() {
+        let mut named = HashSet::new();
+        for (name, _) in bodies() {
+            assert!(named.insert(name), "{name}: two bodies");
+            assert!(
+                CASES.iter().any(|case| case.name == name && case.kind == CaseKind::Contract),
+                "{name}: a body for no contract case"
+            );
+        }
+        for case in CASES.iter().filter(|case| case.kind == CaseKind::Contract) {
+            assert!(named.contains(case.name), "{}: a contract case with no body", case.name);
+        }
+    }
+}

@@ -1,0 +1,22 @@
+# The Slang release the cook runs, and the digest of each host's archive of it (decision 5.8 of
+# docs/plans/milestone-2.md). `cargo xtask slang` fetches the host's archive, refuses it unless
+# its SHA-256 is the one below, and unpacks it under `target/slang/<version>/`. The cook refuses
+# a `slangc` that reports any other version (tools/cook/README.md, "The shader kind").
+#
+# 2026.20 is the newest release of 2026.17 to 2026.22 on which every Slang behaviour the plan
+# records holds: 2026.21 and 2026.22 compile `NonUniformResourceIndex` for the Metal target,
+# which 2026.20 and every release before it refuse when it is written in the entry module
+# (inlined from an imported module, 2026.20 compiles it too).
+version = "2026.20"
+
+[archive.linux-x86_64]
+url = "https://github.com/shader-slang/slang/releases/download/v2026.20/slang-2026.20-linux-x86_64.tar.gz"
+sha256 = "e863e568c204810d6e8bc31852f056aef6763c55ea9925db2db7affa060347c9"
+
+[archive.macos-aarch64]
+url = "https://github.com/shader-slang/slang/releases/download/v2026.20/slang-2026.20-macos-aarch64.tar.gz"
+sha256 = "07fa8833fdbb343c3674c84fdd885910f495f3daaaa0c732b32980151e8b58c4"
+
+[archive.windows-x86_64]
+url = "https://github.com/shader-slang/slang/releases/download/v2026.20/slang-2026.20-windows-x86_64.tar.gz"
+sha256 = "7b9bb838b105de0bb86390196ac5bcb02efc610c0542517204105cf87ec98399"

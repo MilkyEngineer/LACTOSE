@@ -2,8 +2,9 @@
 //! graph, the renderer and the client's frame are written against, and that the null,
 //! Vulkan and Metal backends implement.
 //!
-//! **Status: facade.** Every signature here is final for milestone 2's lanes; the bodies
-//! that decide anything are `todo!()`, and the traits have no implementation yet.
+//! **Status: implemented by `lactose-rhi-null`.** Every signature here is final for
+//! milestone 2's lanes; the null backend implements the traits, and the cooked shader
+//! format, the sealed cache and the conformance suite's contract cases run here.
 //! `README.md` is the contract: it states what the signatures cannot, shows how the null
 //! backend and native Metal honour each call, and names the conformance suite's cases.
 //!
@@ -64,11 +65,6 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every deciding body is `todo!()` until an implementation lane replaces it, and the parameters it will use are declared now"
-)]
 
 mod caps;
 #[cfg(feature = "conformance")]

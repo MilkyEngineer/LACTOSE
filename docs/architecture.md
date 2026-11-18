@@ -171,7 +171,7 @@ crates/
   persist/        B            [SKIM] world overlay, save container [CARTON], migrations
   rhi-vulkan/     B            ash-based backend
   rhi-metal/      B            native Metal backend, milestone 3
-  rhi-null/       B            no-op backend for tests only
+  rhi-null/       B            the null backend for tests only: draws nothing, refuses each breach the RHI contract assigns it, by its rule
   rhi-dx12/       B            later
   render-graph/   B            [GOUDA] pass declaration, compile, barriers, aliasing, parallel record
   renderer/       B            GPU scene [CHEDDAR], bindless heap [BRIE], culling [CREAM], late-latch [LATTE], skinning, GPU VFX simulation [FROTH], deferred lighting, render slot table, RenderFeature pass-provider trait
@@ -1409,8 +1409,8 @@ The policy is in section 3.
   and the verification list; a long command that needs no interpretation runs in the
   background, never in a foreground agent turn.
 - CI: clippy `-D warnings`, fmt, nextest, SOUR in all applicable modes, Miri nightly on
-  `core`, `task` over each deque, `ecs`, `input-host` and `net-host`, `cargo-deny`, the tier,
-  boundary, feature and vendor checks, and the line-ending check.
+  `core`, `task` over each deque, `ecs`, `input-host`, `net-host` and `rhi-null`, `cargo-deny`,
+  the tier, boundary, feature and vendor checks, and the line-ending check.
 - A package with more than one integration test file builds them as one test binary,
   `integration`, whose root `tests/integration.rs` declares every other file of `tests/` as a
   module (`autotests = false`); a package of one test file keeps its own target name. A file

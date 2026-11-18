@@ -9,7 +9,8 @@
 //! prints what the checks return. [`heavy`] is not a check: it bounds how many heavy
 //! commands run at once on one machine. Nor is [`measure`]: it runs the milestone
 //! measurements and writes their result files. [`check_groups`] is a check, and also prints
-//! the packages of the group a CI check job builds.
+//! the packages of the group a CI check job builds. Nor is [`slang`]: it installs the pinned
+//! Slang release, which the binary's `gpu` command cooks the engine's shaders with.
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +24,7 @@ pub mod miri;
 pub mod policy;
 pub mod repo;
 mod rust_source;
+pub mod slang;
 pub mod test_targets;
 pub mod tiers;
 pub mod vendor;

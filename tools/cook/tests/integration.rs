@@ -6,4 +6,5 @@
 mod common;
 
 mod refusals;
+mod shader;
 mod skeleton;

@@ -64,9 +64,9 @@ Three things these consumers must know that no signature shows:
 - **`frame-design` and the present thread: the present thread never acquires a release it
   skipped.** A target released toward the present role and taken back from `Undefined` by
   a later frame is accepted whether or not the present thread acquired it: null's
-  transition from `Undefined` ends a release no acquire met. rhi-api's "States" does not
-  say so yet, and its "Between the two the resource is used by nothing" reads against it;
-  the sentence that does is routed to the `rhi-null` lane (D160). A present thread that
+  transition from `Undefined` ends a release no acquire met. rhi-api's "States" says so
+  since the `rhi-null` lane (D160, and D158's addendum at `rhi-null`), and
+  `acquire_of_a_release_a_retake_ended_is_refused` holds it. A present thread that
   then acquires a release older than the frame's re-take is refused on null (`no-qfot`:
   an acquire with no equal release submitted), and on Vulkan races the graphics queue's
   writes.
@@ -220,10 +220,14 @@ Three things these consumers must know that no signature shows:
   graph that used the import, where that submit may still be pending and the import is
   declared from `Undefined` or is `Concurrent`: rhi-api's rule that a change of state or
   owner waits for another queue's pending use (`no-qfot`) is met by this wait, and so is
-  the rule for a use under another queue's pending write or change, once rhi-api has it
-  ("What `graph-impl` proves on null"). An `Exclusive`
-  import declared in the state and on the queue it is in needs none, since its queue or
-  its transfer orders it, and a point given where none is needed costs a wait that is
+  its rule that a use under another queue's pending write or change waits for it
+  ("What `graph-impl` proves on null"). An `Exclusive` import needs a point as well where
+  the caller brought it onto its queue, by a transfer or a take from `Undefined` of its
+  own, after another queue's write or change of it: the point of that queue's submit, or
+  of a later submit to that queue. That write or change binds every submit that uses the
+  import while it is pending, and the caller's wait orders the caller's submit alone. An
+  `Exclusive` import already on its queue, which no pending submit of another queue wrote
+  or changed, needs none, and a point given where none is needed costs a wait that is
   already met. A target taken back from the present thread is imported from `Undefined`
   with `ready` the point the present thread's read signals (rhi-api, "The present
   thread"). The point is one a submit already made signals, or one the host signals: a
@@ -243,10 +247,12 @@ Three things these consumers must know that no signature shows:
   import waits, not the first of its queue alone. For an `Exclusive` import the first such
   use on a queue is ordered by a transfer's wait or, for an image imported from
   `Undefined`, which moves to another queue with no transfer, by these waits before that
-  transition. For a `Concurrent` one these waits are the only order. rhi-api has no rule
-  yet that refuses a graph that leaves out the wait before a use ("What `graph-impl`
-  proves on null"). The graph may make a frame's submit wait for an earlier frame's
-  submits to another queue where it need not; which such waits it makes is not promised.
+  transition. For a `Concurrent` one these waits are the only order. Null refuses a graph
+  that leaves out the wait before a use, by rhi-api's `no-qfot`, and
+  `use_in_a_later_submit_than_the_waiting_change_is_refused` with the cases beside it
+  holds that ("What `graph-impl` proves on null"). The graph may make a frame's submit
+  wait for an earlier frame's submits to another queue where it need not; which such
+  waits it makes is not promised.
 - One handle is imported once in a declaration. The graph cannot see a second import of it.
 - An import is never an image made with a memoryless request: the graph stores every
   import's attachments ("Transitions and store actions"), and storing such an image is
@@ -442,8 +448,10 @@ Three things these consumers must know that no signature shows:
   of a buffer or one texel of an image. Vulkan forbids it
   (`VUID-vkCmdCopyBuffer-pRegions-12482`, `VUID-vkCmdCopyBufferToImage-pRegions-12483`,
   `VUID-vkCmdCopyImageToBuffer-pRegions-12485`), which region lands last is the driver's
-  choice, and nothing refuses it yet (D160). A second call that writes a destination the
-  pass already wrote is a breach like the others, reported as above: rhi-api requires a
+  choice, and `bounds` refuses it on every backend (D160, and D158's addendum at
+  `rhi-null`), as `copy_regions_overlapping_in_the_destination_are_refused` holds. A
+  second call that writes a destination the pass already wrote is a breach like the
+  others, reported as above: rhi-api requires a
   transition between two copies into one resource ("States"), and a recorder cannot record
   one. Copies into one destination from two sources are two copy passes, and the graph
   records the transition between them.
@@ -599,8 +607,8 @@ Three things these consumers must know that no signature shows:
 | Record the same-state transition before an import's first use in the frame where its `initial` is that writing state: one declaration, an import written in that state every frame, submitted for two frames | `state` |
 | Record both halves of a transfer, the release submitted first, and wait for it | `no-qfot` |
 | Wait before a change of state while another queue's pending submit uses the resource | `no-qfot` |
-| Wait, in every submit that uses an import, a `sampled` one included, for each pending submit of another queue that wrote it or changed its state or owner, and for its `ready` point | none yet: `no-qfot`, once rhi-api amends it |
-| Never record two regions of one copy call that write one byte or texel | none yet: `bounds`, once rhi-api amends it |
+| Wait, in every submit that uses an import, a `sampled` one included, for each pending submit of another queue that wrote it or changed its state or owner, and for its `ready` point | `no-qfot`, where the submit that signals `ready` wrote the import or changed its state or owner: `use_under_another_queues_pending_write_is_refused`, `use_under_another_queues_pending_transition_is_refused`, `use_in_a_later_submit_than_the_waiting_change_is_refused`, `acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused`, `take_of_a_mip_after_an_acquire_of_another_is_refused` and, for a `sampled` read, `sampled_read_under_another_queues_pending_write_is_refused` |
+| Never record two regions of one copy call that write one byte or texel | `bounds`: `copy_regions_overlapping_in_the_destination_are_refused` |
 | Record the alias call before the first use of a transient whose bytes another used | `no-fence` |
 | Keep aliasing transients on one queue | `no-qfot` |
 | Begin every transient undefined; store an attachment a later pass uses | `undefined-read` |
@@ -614,16 +622,21 @@ Three things these consumers must know that no signature shows:
 | Give a submit only encoders of its role, each recorded once since its reset, with no pass left open | `encoding` |
 | Never submit to the present role | `present-queue` |
 
-The two rows with no rule yet wait on an amendment of rhi-api routed to the `rhi-null`
-lane (D160). rhi-api's `no-qfot` refuses a change of state or owner under another queue's
-pending use, not a use under another queue's pending write or change, so null accepts a
-graph that leaves that wait out; its `bounds` refuses a copy region outside its resource,
-not two regions of one call that overlap in the destination. The facade stands without
-the amendment, and `graph-impl` builds the waits and keeps regions apart all the same.
-Until it merges, no CI test proves the `Concurrent` path across queues, the wait for
-`ready` in a frame's later submits, or a copy's regions apart; and rhi-api's text does
-not yet say that a re-take from `Undefined` ends a release no acquire met, which the
-client's frame relies on ("What each consumer needs").
+The two rows above that waited on an amendment of rhi-api routed to the `rhi-null` lane
+(D160) have their rules since that lane merged (D158, its addendum at `rhi-null`).
+`no-qfot` refuses a use under another queue's pending write or change of state or
+owner in every submit that makes one, not the first of its queue alone, an acquire
+among them, and an acquire, a take from `Undefined` or a wait in an earlier submit
+orders no later one; `bounds` refuses two regions of one copy call that overlap in the
+destination. Null's conformance cases hold both in CI: the `Concurrent` path across
+queues by `use_under_another_queues_pending_write_is_refused` and
+`use_under_another_queues_pending_transition_is_refused`, the wait in a frame's later
+submits by `use_in_a_later_submit_than_the_waiting_change_is_refused` and
+`acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused`, and a copy's
+regions apart by `copy_regions_overlapping_in_the_destination_are_refused`. rhi-api's
+text says that a re-take from `Undefined` ends a release no acquire met, which the
+client's frame relies on ("What each consumer needs"), and
+`acquire_of_a_release_a_retake_ended_is_refused` holds it.
 
 Some proofs rest on this surface and not on a rule. An unreachable pass is culled and a
 pass whose only output is a readback or an import is kept (`is_culled`, and a culled pass's
