@@ -17,8 +17,8 @@ timelines; the swapchain; and the shape of the conformance suite every backend r
 2's lanes. What runs here: the cooked shader's `encode` and `decode`, `seal_cache` and
 `open_cache`, the rule names with `Rule::refuse` and `Rule::of`, the queue layout, the flag
 sets and the indirect record, and, behind `conformance`, the suite's `run` and the bodies of
-its contract cases, written with `lactose-rhi-null`, which implements the traits. The output
-cases' bodies arrive with `lactose-rhi-vulkan`. This file is the contract the backends meet
+its contract cases, written with `lactose-rhi-null`, which implements the traits, and of its
+output cases, written with `lactose-rhi-vulkan`. This file is the contract the backends meet
 (`rhi-null`, `vulkan`, `swapchain`, and `rhi-metal` at milestone 3), and every sentence
 under "Behaviour the
 signatures cannot express" is one a dependent crate may rely on. Architecture sections 12.1,
@@ -1019,9 +1019,10 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 ## The conformance suite
 
 `conformance::CASES` lists every case by name, each a *contract* case or an *output* case,
-and `conformance::run` runs one against a `Harness`. The bodies arrive with the backends:
-the contract cases' with `rhi-null`, the output cases' and their Slang sources with
-`vulkan`. A backend's tests carry one test for each case, named after it. There are 168: 142
+and `conformance::run` runs one against a `Harness`. The contract cases' bodies were written
+with `rhi-null` and the output cases' with `vulkan`; the output cases' Slang sources are the
+repository's `shaders/conformance/`, cooked before a run by `ricotta --shaders` and read
+through `Harness::shader` by the name `<source>.<entry>`. A backend's tests carry one test for each case, named after it. There are 168: 142
 contract cases and 26 output cases.
 
 - A **contract** case asserts what the contract says of calls and results. It needs no
@@ -1151,7 +1152,10 @@ column, one or more for each of its clauses, 64 in all: `unreported_capability_i
   compares it with a reference computed on the CPU, never with a stored image (decision
   5.10). Null skips it.
 - Every device a case makes has a sink that counts, and a case fails on any message it did
-  not provoke. `each_validator_reports_its_canary` is the one that provokes them.
+  not provoke. `each_validator_reports_its_canary` is the one that provokes them: a
+  transition from a state the image is not in, and two copies into one range with no
+  transition between, each on a device of its own; it fails unless each provoked a message,
+  and the harness checks which (`cargo xtask gpu`), since the wording is the validator's.
 - A harness names the capability sets it runs under. Null runs every contract case under
   each set its rules need: one queue and several, coherent memory and not, memoryless kept
   across a local read and lost, each optional capability on and off.

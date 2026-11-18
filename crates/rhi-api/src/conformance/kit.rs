@@ -66,13 +66,17 @@ pub(super) fn woken<T: Send>(
 /// The extent of the images the cases render into.
 pub(super) const EXTENT: Extent = Extent { width: 64, height: 64 };
 
-/// The sink of every device a case makes: it counts what it is sent.
+/// The sink of every device a case makes: it counts what it is sent, and what of it the
+/// case provoked.
 #[derive(Default)]
-pub(super) struct Counter(AtomicUsize);
+pub(super) struct Counter {
+    sent: AtomicUsize,
+    provoked: AtomicUsize,
+}
 
 impl MessageSink for Counter {
     fn message(&self, _: &Message<'_>) {
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.sent.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -90,9 +94,29 @@ impl<'a> Ctx<'a> {
         Self { harness, case, set, sink: Arc::default() }
     }
 
-    /// The messages the sink of every device of this context has been sent.
+    /// The messages the sink of every device of this context has been sent that the case
+    /// did not provoke ([`provoking`](Self::provoking)).
     pub(super) fn messages(&self) -> usize {
-        self.sink.0.load(Ordering::Relaxed)
+        self.sink.sent.load(Ordering::Relaxed) - self.sink.provoked.load(Ordering::Relaxed)
+    }
+
+    /// Runs `misuse`, a call sequence that provokes messages and has returned once they are
+    /// sent, and returns how many it provoked, which [`messages`](Self::messages) then
+    /// leaves out.
+    pub(super) fn provoking(&self, misuse: impl FnOnce()) -> usize {
+        let before = self.sink.sent.load(Ordering::Relaxed);
+        misuse();
+        let provoked = self.sink.sent.load(Ordering::Relaxed) - before;
+        self.sink.provoked.fetch_add(provoked, Ordering::Relaxed);
+        provoked
+    }
+
+    /// The suite's cooked shader of `name`, `<source>.<entry>` below `shaders/conformance/`,
+    /// for `stage`.
+    pub(super) fn shader(&self, name: &str, stage: ShaderStage) -> CookedShader {
+        let shader = self.ok(self.harness.shader(name, stage), "the harness's cooked shader");
+        self.check(shader.stage == stage, "a cooked shader of the stage asked for");
+        shader
     }
 
     /// Fails the case.

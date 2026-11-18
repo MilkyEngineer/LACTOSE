@@ -9,16 +9,17 @@
 //! and compares it with a reference computed on the CPU, never with a stored image. Only
 //! a device can pass it, and [`run`] skips it for a harness that does not render.
 //!
-//! The contract cases' bodies are here, one function for each, by group, written with
-//! `lactose-rhi-null`; the output cases' and their shader sources arrive with
-//! `lactose-rhi-vulkan` (milestone 2 plan, section 3). `README.md`, "The conformance
-//! suite", says what each case holds.
+//! Every case's body is here, one function for each, by group: the contract cases' written
+//! with `lactose-rhi-null`, the output cases' with `lactose-rhi-vulkan`. The output cases'
+//! shader sources are `shaders/conformance/`'s, cooked before a run and given by
+//! [`Harness::shader`]. `README.md`, "The conformance suite", says what each case holds.
 
 mod buffers;
 mod encoders;
 mod heap;
 mod images;
 mod kit;
+mod outputs;
 mod passes;
 mod queues;
 mod shaders;
@@ -146,17 +147,13 @@ pub trait Harness {
 ///
 /// When the case fails, with the case's name and what did not hold.
 pub fn run(harness: &dyn Harness, case: &Case) -> Outcome {
-    if case.kind == CaseKind::Output {
-        return Outcome::Skipped(if harness.renders() {
-            "an output case, whose body arrives with lactose-rhi-vulkan"
-        } else {
-            "an output case, on a harness that does not render"
-        });
+    if case.kind == CaseKind::Output && !harness.renders() {
+        return Outcome::Skipped("an output case, on a harness that does not render");
     }
     if harness.renders() && !case.devices {
         return Outcome::Skipped("a case of a check the null backend alone makes");
     }
-    let Some(body) = body(case.name) else { panic!("{}: a contract case with no body", case.name) };
+    let Some(body) = body(case.name) else { panic!("{}: a case with no body", case.name) };
     let mut ran = false;
     let mut skipped = "no capability set of the harness";
     for set in harness.sets() {
@@ -175,7 +172,7 @@ pub fn run(harness: &dyn Harness, case: &Case) -> Outcome {
     if ran { Outcome::Passed } else { Outcome::Skipped(skipped) }
 }
 
-/// Every contract case's body, by the case's name.
+/// Every case's body, by the case's name.
 fn bodies() -> impl Iterator<Item = (&'static str, kit::Body)> {
     [
         queues::BODIES,
@@ -188,6 +185,7 @@ fn bodies() -> impl Iterator<Item = (&'static str, kit::Body)> {
         timelines::BODIES,
         passes::BODIES,
         swapchain::BODIES,
+        outputs::BODIES,
     ]
     .into_iter()
     .flatten()
@@ -409,17 +407,25 @@ mod tests {
     use super::{CASES, CaseKind, bodies};
 
     #[test]
-    fn every_contract_case_has_one_body_and_every_body_one_case() {
+    fn every_case_has_one_body_and_every_body_one_case() {
         let mut named = HashSet::new();
         for (name, _) in bodies() {
             assert!(named.insert(name), "{name}: two bodies");
-            assert!(
-                CASES.iter().any(|case| case.name == name && case.kind == CaseKind::Contract),
-                "{name}: a body for no contract case"
-            );
+            assert!(CASES.iter().any(|case| case.name == name), "{name}: a body for no case");
         }
-        for case in CASES.iter().filter(|case| case.kind == CaseKind::Contract) {
-            assert!(named.contains(case.name), "{}: a contract case with no body", case.name);
+        for case in CASES {
+            assert!(named.contains(case.name), "{}: a case with no body", case.name);
+        }
+    }
+
+    #[test]
+    fn output_cases_run_on_devices_alone() {
+        for case in CASES.iter().filter(|case| case.kind == CaseKind::Output) {
+            assert!(
+                case.devices && case.refuses.is_none(),
+                "{}: an output case is a device's",
+                case.name
+            );
         }
     }
 }

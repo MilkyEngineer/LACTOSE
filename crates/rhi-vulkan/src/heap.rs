@@ -279,8 +279,8 @@ impl Heap {
             // command buffer is executable; the fence unsignalled.
             let submitted = unsafe { device.queue_submit2(queue.queue, &submit, fence) }
                 .map_err(|e| driver(e, "vkQueueSubmit2"))
-                // SAFETY: the fence is live and was submitted.
                 .and_then(|()| {
+                    // SAFETY: the fence is live and was submitted.
                     unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }
                         .map_err(|e| driver(e, "vkWaitForFences"))
                 });

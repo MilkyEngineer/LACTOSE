@@ -41,20 +41,17 @@ fn reported() -> Capabilities {
     })
 }
 
-/// The file a cooked shader of the suite is read from.
-pub(crate) fn shader_path(name: &str, stage: ShaderStage) -> Result<PathBuf> {
+/// The file the suite's cooked shader `name`, `<source>.<entry>`, is read from: what
+/// `ricotta --shaders` wrote for `shaders/conformance/<source>.slang`'s entry point and the
+/// SPIR-V target. The stage is the cooked shader's own, which the suite checks.
+fn shader_path(name: &str) -> Result<PathBuf> {
     let Some(dir) = std::env::var_os("LACTOSE_GPU_SHADERS").map(PathBuf::from) else {
         return Err(Error::new(
             ErrorKind::NotFound,
             "LACTOSE_GPU_SHADERS is not set: the suite's shaders were not cooked",
         ));
     };
-    let stage = match stage {
-        ShaderStage::Vertex => "vertex",
-        ShaderStage::Fragment => "fragment",
-        ShaderStage::Compute => "compute",
-    };
-    Ok(dir.join(format!("{name}.{stage}.cooked")))
+    Ok(dir.join("conformance").join(format!("{name}.spirv")))
 }
 
 impl Harness for Vulkan {
@@ -91,8 +88,8 @@ impl Harness for Vulkan {
         true
     }
 
-    fn shader(&self, name: &str, stage: ShaderStage) -> Result<CookedShader> {
-        let path = shader_path(name, stage)?;
+    fn shader(&self, name: &str, _: ShaderStage) -> Result<CookedShader> {
+        let path = shader_path(name)?;
         let bytes = std::fs::read(&path)
             .map_err(|e| Error::new(ErrorKind::NotFound, format!("{}: {e}", path.display())))?;
         CookedShader::decode(&bytes)

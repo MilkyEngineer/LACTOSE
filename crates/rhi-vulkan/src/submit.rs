@@ -169,9 +169,9 @@ pub(crate) fn submit(shared: &Shared, role: QueueRole, submit: Submit<'_>) -> Re
     let target = shared.queue(queue);
     let mut ended = Ok(());
     for encoder in encoders(&submit).flatten() {
-        // SAFETY: the command buffer is recording, outside any pass (checked), and this
-        // submit's alone: its encoder is borrowed by the submit.
         ended = ended.and_then(|()| {
+            // SAFETY: the command buffer is recording, outside any pass (checked), and this
+            // submit's alone: its encoder is borrowed by the submit.
             unsafe { raw.device.end_command_buffer(encoder.command_buffer) }
                 .map_err(|e| driver(e, "vkEndCommandBuffer"))
         });

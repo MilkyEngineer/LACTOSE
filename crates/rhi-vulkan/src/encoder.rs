@@ -532,7 +532,7 @@ impl VulkanEncoder {
         buffer: &BufferObj,
         image: &ImageObj,
         regions: &[BufferImageCopy],
-    ) -> Option<(Vec<vk::BufferImageCopy>, Vec<(u64, u64)>)> {
+    ) -> Option<(Vec<vk::BufferImageCopy>, Vec<Span>)> {
         let mut copies = Vec::with_capacity(regions.len());
         let mut ranges = Vec::with_capacity(regions.len());
         for region in regions {
@@ -1586,8 +1586,11 @@ const fn state_usage(state: ImageState) -> ImageUsage {
     }
 }
 
-/// Whether two of `ranges`, each a start and an end past it, share a byte.
-fn overlap(ranges: &[(u64, u64)]) -> bool {
+/// A byte range of a buffer: its start and the end past it.
+type Span = (u64, u64);
+
+/// Whether two of `ranges` share a byte.
+fn overlap(ranges: &[Span]) -> bool {
     let mut sorted = ranges.to_vec();
     sorted.sort_unstable();
     sorted.windows(2).any(|pair| pair[1].0 < pair[0].1)
