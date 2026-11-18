@@ -12,7 +12,7 @@
 //! # Where to start
 //!
 //! - [`Presentation`] runs the schedule of one shown world with [`Presentation::frame`], on
-//!   the pair the frame acquired, given a [`PresentView`]; [`Shown`] is the camera it placed,
+//!   the pair the frame acquired, given a [`PresentView`]; [`Presented`] is the camera it placed,
 //!   and [`Presentation::remote`] lends the remote rows it sampled.
 //! - [`interpolate`] is the transform a frame shows a presented row at.
 //! - [`CameraPose`] is the pivot and boom a frame's camera is latched with; [`Orbit`] is the
@@ -28,7 +28,7 @@ mod schedule;
 
 pub use camera::{CameraPose, Orbit, interpolate};
 pub use remote::upload;
-pub use schedule::{EventSink, PresentView, Presentation, RemoteView, Shown};
+pub use schedule::{EventSink, PresentView, Presentation, Presented, RemoteView};
 
 // The schedule moves between the frame's jobs with what it holds.
 const _: () = {
@@ -37,5 +37,5 @@ const _: () = {
     send::<Presentation>();
     plain::<CameraPose>();
     plain::<Orbit>();
-    plain::<Shown>();
+    plain::<Presented>();
 };

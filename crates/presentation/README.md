@@ -31,7 +31,7 @@ against this surface.
 |---|---|
 | `Presentation`, `Presentation::{new, frame, remote}` | The schedule of one shown world: what the remote sample keeps between frames. It runs once a frame on the pair the frame acquired, and lends the remote rows it sampled |
 | `PresentView`, `RemoteView` | What a frame is shown at: the frame's fraction, the row the camera follows, and the interpolation buffer and server time the remote rows are sampled at |
-| `Shown` | What `frame` returns by value: the camera, and the count of remote rows left out |
+| `Presented` | What `frame` returns by value: the camera, and the count of remote rows left out |
 | `EventSink` | Where the frame's events go, each once: `emitted`, `cancelled` |
 | `interpolate` | The transform a frame shows a presented row at |
 | `CameraPose` | The pivot and the boom a frame's camera is latched with |
@@ -45,7 +45,7 @@ reshape.
 
 | Consumer | Needs | Given by |
 |---|---|---|
-| `lactose-app` (the client's frame, `frame-impl`): `RenderSide::present` and `draw` | In `present`, on the pair the frame acquired: the frame's events delivered, the camera's pivot and boom for the latch, the remote rows sampled and kept for `draw`; in `draw`, the remote rows uploaded with no copy | `Presentation::new()`; `Presentation::frame(&pair, &view, sink)` with the pair `SnapshotReader::acquire` gave and a `PresentView` at `FrameTime::fraction`; `Shown::{camera, missing}`; `CameraPose::{pivot, boom}` into `CameraLatch`; `upload(ctx, presentation.remote(), \|rows\| writer.write(rows))` with the writer of `Renderer::remote` |
+| `lactose-app` (the client's frame, `frame-impl`): `RenderSide::present` and `draw` | In `present`, on the pair the frame acquired: the frame's events delivered, the camera's pivot and boom for the latch, the remote rows sampled and kept for `draw`; in `draw`, the remote rows uploaded with no copy | `Presentation::new()`; `Presentation::frame(&pair, &view, sink)` with the pair `SnapshotReader::acquire` gave and a `PresentView` at `FrameTime::fraction`; `Presented::{camera, missing}`; `CameraPose::{pivot, boom}` into `CameraLatch`; `upload(ctx, presentation.remote(), \|rows\| writer.write(rows))` with the writer of `Renderer::remote` |
 | Audio, effects and the debug overlay (milestone 5) | Requests to start, cancellations to stop, each once | `EventSink::{emitted, cancelled}` |
 | Boom collision (milestone 3) | The direction the rig casts along | `Orbit::forward` |
 | `game-present`, lights and decals of a world that simulates | A presented row's placement at the frame's time | `interpolate` on the acquired pair |
@@ -102,7 +102,7 @@ reshape.
 **The camera rig** (architecture section 13)
 
 - With a focus whose row the newer snapshot holds with a `Transform` and a `CameraRig`,
-  `Shown::camera` is `CameraPose { pivot, boom }`: the pivot `RenderPosition::from_sim` of
+  `Presented::camera` is `CameraPose { pivot, boom }`: the pivot `RenderPosition::from_sim` of
   `CameraRig::pivot_of` the row's interpolated transform, by the newer snapshot's rig; the
   boom its rest length as an `f32`, zero where it is negative or NaN. Without one it is `None`,
   and the frame keeps whatever camera it had.
@@ -139,7 +139,7 @@ reshape.
 - A sampled row's placement is `RenderTransform::from_sim` of the sample's position and
   rotation, `Interpolated` or `Held`. A row whose slot samples `Missing` (no state, or
   released and perhaps reused) keeps the placement it had in the previous frame's rows, as
-  net-host asks; one with none is left out of the rows and counted in `Shown::missing`.
+  net-host asks; one with none is left out of the rows and counted in `Presented::missing`.
 - `remote` is ascending by key, each key once, so that each remote instance is written
   once a frame: the renderer counts a second write of one as a duplicate. Every row carries
   `no_interpolate` set: the renderer sets both placements of a remote row to the row's

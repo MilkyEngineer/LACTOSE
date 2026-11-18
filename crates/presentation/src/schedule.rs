@@ -45,7 +45,7 @@ pub struct RemoteView<'a> {
 
 /// What a frame's schedule placed, beside the remote rows [`Presentation::remote`] lends.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Shown {
+pub struct Presented {
     /// The camera, if the view has a focus and the newer snapshot holds its transform and
     /// its `CameraRig`.
     pub camera: Option<CameraPose>,
@@ -86,7 +86,7 @@ impl Presentation {
         frame: &PresentFrame<'_>,
         view: &PresentView<'_>,
         events: &mut dyn EventSink,
-    ) -> Shown {
+    ) -> Presented {
         let batch = frame.events();
         for emission in &batch.emitted {
             events.emitted(emission);
@@ -99,7 +99,7 @@ impl Presentation {
             Some(remote) => self.remote.sample(frame.newer(), remote.buffer, remote.at),
             None => self.remote.clear(),
         }
-        Shown { camera, missing: self.remote.missing() }
+        Presented { camera, missing: self.remote.missing() }
     }
 
     /// The remote rows of the last [`frame`](Self::frame): every remote row with a
