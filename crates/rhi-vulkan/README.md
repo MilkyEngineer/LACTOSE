@@ -140,9 +140,13 @@ MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choos
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2 | 131 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363), a record (decision 5.7) | 126 | 49: 30 null alone, 8 no window, 4 no loss, 6 compute shared, every optional draw capability reported | 0 |
-| KosmicKrisp under GPU-assisted validation, a record | 124 | 49, as above | 0 |
+| MoltenVK 1.4.2 | 139 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363), a record (decision 5.7) | 134 | 49: 30 null alone, 8 no window, 4 no loss, 6 compute shared, every optional draw capability reported | 0 |
+| KosmicKrisp under GPU-assisted validation, a record | 131 | 49, as above | 0 |
+
+The counts are of the device tests: the suite's 174 cases, 146 contract and 28 output, and the
+device's own. Each driver passes 27 of the 28 output cases: MoltenVK skips the count draw, and
+KosmicKrisp the ownership transfer, since compute shares its one queue.
 
 GPU-assisted validation does not run under MoltenVK 1.4.2: its instrumented shaders fail in
 SPIRV-Cross (a `uint` to `ulong` `reinterpret_cast`). On an Apple GPU the device reports
