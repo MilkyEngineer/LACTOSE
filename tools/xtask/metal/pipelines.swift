@@ -1,10 +1,11 @@
-// The Metal step of `cargo xtask gpu` (tools/xtask/README.md, "gpu"), and the load the
-// `shaders` CI job makes on each macOS runner: every cooked shader in a directory that
+// The Metal step of `cargo xtask gpu` (tools/xtask/README.md, "GPU runs"), which the `shaders`
+// CI jobs run on each macOS runner: every cooked shader in a directory that
 // `ricotta --code` wrote, compiled or loaded through Metal and made into a pipeline state with
 // its function constants.
 //
 //   swift tools/xtask/metal/pipelines.swift <code directory>
 //   swift tools/xtask/metal/pipelines.swift --canary api|shader
+//   swift tools/xtask/metal/pipelines.swift --device
 //
 // Each file is `<source>.<entry>.<target>`. An `.msl` file is compiled at run time as MSL
 // 3.1, named in the options since their default is the system's newest; a `.metallib` file
@@ -13,7 +14,12 @@
 // with its one vertex entry, a vertex entry with no fragment beside it makes a depth-only
 // pipeline, and a kernel makes a compute pipeline. Every function constant is given the
 // zero of its type. The device is the first of `MTLCopyAllDevices`; with none, the step
-// fails. Prints one line per pipeline state to standard output and exits 1 at the first
+// fails. Its facts are printed first: its name, its argument buffers tier, its highest Apple
+// GPU family and whether it is of the Metal 3 family. A directory whose code takes the heap
+// needs tier 2, for the heap's 1024 textures in one argument buffer, and one whose fragment
+// code reads a colour needs an Apple GPU family, for framebuffer fetch; the step fails naming
+// each one the device lacks before it makes any pipeline state. `--device` prints the facts
+// alone. Prints one line per pipeline state to standard output and exits 1 at the first
 // failure, naming it on standard error.
 
 import Foundation
@@ -34,6 +40,10 @@ struct Entry {
     let constants: [(index: Int, type: MTLDataType)]
     /// The colour attachments it reads or writes, with the format the step gives each.
     let colours: [Int: MTLPixelFormat]
+    /// Whether it takes the heap's argument buffer, whose type Slang names `Heap_default_`.
+    let heap: Bool
+    /// Whether it reads a colour attachment, which Metal does through framebuffer fetch.
+    let readsColour: Bool
 }
 
 /// Each `[[<attribute>(<index>)]]` of `text`, with the type written first on its line or
@@ -101,8 +111,9 @@ func read(source: String, name: String, msl: String) -> Entry {
     }
     let constants = attributes(Substring(msl), "function_constant").map { ($0.index, dataType($0.type)) }
     var colours: [Int: MTLPixelFormat] = [:]
+    let inputs = stage == .fragment ? attributes(parameters, "color") : []
     if stage == .fragment {
-        for (index, type) in attributes(parameters, "color") { colours[index] = pixelFormat(type) }
+        for (index, type) in inputs { colours[index] = pixelFormat(type) }
         if returned != "void" {
             guard let header = msl.range(of: "struct \(returned)\n{\n"),
                   let end = msl[header.upperBound...].range(of: "\n};") else {
@@ -113,7 +124,10 @@ func read(source: String, name: String, msl: String) -> Entry {
             }
         }
     }
-    return Entry(source: source, name: name, stage: stage, constants: constants, colours: colours)
+    let heap = parameters.split(separator: ",").contains { $0.trimmingCharacters(in: .whitespaces).hasPrefix("Heap_default_") }
+    return Entry(
+        source: source, name: name, stage: stage, constants: constants, colours: colours,
+        heap: heap, readsColour: !inputs.isEmpty)
 }
 
 func function(_ library: MTLLibrary, _ entry: Entry) -> MTLFunction {
@@ -130,7 +144,7 @@ func function(_ library: MTLLibrary, _ entry: Entry) -> MTLFunction {
 }
 
 let arguments = CommandLine.arguments
-let usage = "usage: swift pipelines.swift <code directory> | --canary api | --canary shader"
+let usage = "usage: swift pipelines.swift <code directory> | --canary api | --canary shader | --device"
 guard arguments.count == 2 || (arguments.count == 3 && arguments[1] == "--canary") else {
     fail(usage)
 }
@@ -138,7 +152,15 @@ guard arguments.count == 2 || (arguments.count == 3 && arguments[1] == "--canary
 guard let device = MTLCopyAllDevices().first else {
     fail("no Metal device: MTLCopyAllDevices returned none")
 }
-print("device: \(device.name)")
+let tier2 = device.argumentBuffersSupport == .tier2
+// The highest of `MTLGPUFamily.apple1` to `apple10`, by raw value, so an SDK that lacks the
+// newest names still builds: 0 for none.
+let appleFamily = (1...10).last { family in
+    MTLGPUFamily(rawValue: 1000 + family).map { device.supportsFamily($0) } ?? false
+} ?? 0
+let metal3 = device.supportsFamily(.metal3)
+print("device: \(device.name), argument buffers tier \(tier2 ? 2 : 1), Apple family \(appleFamily == 0 ? "none" : String(appleFamily)), Metal 3 \(metal3 ? "yes" : "no")")
+if arguments[1] == "--device" { exit(0) }
 print("system: \(ProcessInfo.processInfo.operatingSystemVersionString)")
 
 // The validators' canaries (milestone 2 plan, decision 5.10), one per process. `api` binds no
@@ -213,6 +235,17 @@ for name in files.keys.sorted() {
     }
     entries[target]!.append((entry, library))
 }
+
+// What the code needs of the device, each one it lacks named before any pipeline is made.
+let cooked = entries.values.flatMap { $0.map { $0.0 } }
+var lacking: [String] = []
+if let entry = cooked.first(where: { $0.heap }), !tier2 {
+    lacking.append("argument buffers tier 2, for the heap's argument buffer that \(entry.source).\(entry.name) takes")
+}
+if let entry = cooked.first(where: { $0.readsColour }), appleFamily == 0 {
+    lacking.append("an Apple GPU family, for the framebuffer fetch of the colour that \(entry.source).\(entry.name) reads")
+}
+if !lacking.isEmpty { fail("the device lacks " + lacking.joined(separator: "; and ")) }
 
 var made = 0
 for target in ["msl", "metallib"] {

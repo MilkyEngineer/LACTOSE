@@ -326,8 +326,9 @@ jobs:
           fi
 
   # The metallibs macOS cooked, loaded on the oldest macOS image the hosted runners offer:
-  # macos-15, since macos-14 left them on 2 November 2026. The script alone, under both
-  # validators; the canaries are `cargo xtask gpu`'s, which ran on the cooking runner.
+  # macos-15, since macos-14 left them on 2 November 2026. The same Metal step as the cooking
+  # runner's, canaries and message count included, on the code it cooked: this runner runs no
+  # `metal`, so its facts do not require one.
   shaders-oldest:
     name: shaders (oldest macOS)
     needs: shaders
@@ -336,19 +337,22 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-        with:
-          sparse-checkout: tools/xtask
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v4
         with:
           name: shaders-macOS
           path: cooked
       - name: Runner facts
         shell: bash
-        run: bash tools/xtask/runner-facts.sh facts.txt
+        run: bash tools/xtask/runner-facts.sh --metal-optional target/gpu/facts.txt
       - name: Load each metallib and MSL
-        env:
-          MTL_DEBUG_LAYER: "1"
-          MTL_DEBUG_LAYER_WARNING_MODE: nslog
-          MTL_SHADER_VALIDATION: "1"
-          MTL_SHADER_VALIDATION_REPORT_TO_STDERR: "1"
-        run: swift tools/xtask/metal/pipelines.swift cooked/code
+        run: cargo xtask gpu --driver system --cooked cooked/code
+      - uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: gpu-oldest-macOS
+          path: |
+            target/gpu/facts.txt
+            target/gpu/system-metal.txt
+          if-no-files-found: ignore

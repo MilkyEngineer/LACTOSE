@@ -96,14 +96,17 @@ dependency.
 - **Where the toolchain writes.** It runs as subprocesses on the thread that polls the
   cook, in the sources directory, and reads the sources itself, outside the pool. A link
   module's compiled form and each metallib's MSL are written to a scratch directory of the
-  cook's under the system's temporary directory, removed when the source is cooked: the MSL
-  under the stable name `<file>.<entry>.metal`, since a metallib records its source's file
-  name.
+  cook's under the system's temporary directory, made anew for each source and removed when
+  it is cooked: Slang's reflection of each entry, and the MSL under the stable name
+  `<file>.<entry>.metal`, since a metallib records its source's file name.
 - **What a shader is cooked from.** The SPIR-V is read back for each entry
   (`src/spirv.rs`): the stage, the heap's arrays and capacities, the specialisation
-  constants and their lengths, the push-constant bytes, the input attachments and the
-  fragment outputs. The same fields are written for each target of the entry. The MSL is
-  read for its colours and function constants, and the two must agree.
+  constants and their lengths, the push-constant bytes, the input attachments, the varyings
+  and the fragment outputs. The same fields are written for each target of the entry.
+  Slang's reflection of the SPIR-V compile (`-reflection-json`, `src/semantics.rs`) is read
+  for each varying's and output's semantic beside its location, and the MSL
+  (`src/msl.rs`) for its colours, varyings, function constants and buffers; the three must
+  agree.
 - **`--code DIR`.** Each shader's code alone, the SPIR-V module, the MSL text or the
   metallib, is also written to `DIR/<asset name>` once every source has cooked, before the
   pack, each file replaced by rename. It is what `cargo xtask gpu` and the `shaders` CI job
@@ -124,29 +127,57 @@ and names the source, the entry and, where one alone is read, the target; nothin
   `RuntimeDescriptorArray`, that a runtime descriptor array declares it, such as the one
   behind `DescriptorHandle`.
 - **One entry point** in each module the cook reads back.
-- **The heap.** Set `HEAP_SET` holds an array of 2D sampled images at binding 0 and an array
-  of samplers at binding 1, each of a constant length, which is its capacity in `HeapUse`
+- **The heap.** Set `HEAP_SET` holds an array of images at binding 0 and an array of
+  samplers at binding 1, each of a constant length, which is its capacity in `HeapUse`
   (`HeapForm::FixedArray`); nothing else is in that set, and an unsized array is refused.
-  Set 0 holds the fragment stage's input attachments alone, input `i` at binding `i`. Any
-  other resource, a uniform or storage buffer among them, is refused: a buffer is reached
-  through its device address in the push block.
-- **Non-uniform access.** Every access chain into the heap, and every load through one,
-  carries the `NonUniform` decoration. So does an access whose index is uniform: the cook
-  cannot tell, and the heap's index is data. An array of the heap loaded whole, stored,
-  copied, or passed through a call, a copy, a conversion, a select or a phi is refused,
-  since the check could not follow it. The marker is `nonuniform_slot` of
+  The images are `HeapArrayKind::SampledImage2d`, as every view the heap holds is: 32-bit
+  float texels, 2D, not a depth image (`Texture2D<float>`'s depth of 2 is the same image),
+  neither arrayed nor multisampled, read through a sampler, of no declared format. Set 0
+  holds the fragment stage's input attachments alone, input `i` at binding `i`. Any other
+  resource, a uniform or storage buffer among them, is refused: a buffer is reached through
+  its device address in the push block.
+- **Metal's buffers.** The MSL takes the push block at `[[buffer(0)]]` and the heap's
+  argument buffer at `[[buffer(1)]]`, each once, whatever else the entry takes:
+  `modules/lactose/heap.slang` declares the heap at `register(b1)`, without which a shader
+  with no push block would take the heap at `[[buffer(0)]]`. A texture or a sampler bound
+  alone, `[[texture(i)]]` or `[[sampler(i)]]`, which a heap declared as globals gives, is
+  refused. The SPIR-V and the MSL must take the push block and the heap alike.
+- **Non-uniform access.** Every access chain into the heap, every load through one, and
+  every `OpSampledImage` that combines a loaded image or sampler, which is the operand
+  Vulkan's rule names for a sample, carries the `NonUniform` decoration. So does an access
+  whose index is uniform: the cook cannot tell, and the heap's index is data. An array of
+  the heap loaded whole, and a pointer into the heap or a value loaded through it that is
+  stored, copied, or passed through a call, a copy, a conversion, a select or a phi, are
+  refused, since the check could not follow it. The marker is `nonuniform_slot` of
   `modules/lactose/heap.slang`, which is `NonUniformResourceIndex` on SPIR-V and the index
   itself elsewhere, and is `[ForceInline]`: a helper that is not inlined takes the index
   as a parameter and the decoration is lost.
-- **Fragment outputs.** Each output has exactly one location, is neither an array nor a
-  struct, and no two share one; the MSL's `[[color(i)]]` must be the same set. Slang gives an
-  output without `[[vk::location(i)]]` location 0 on SPIR-V whatever its `SV_Target<i>`, so a
-  lone `SV_Target1` is refused by the comparison, and the message says to write both.
+- **Fragment outputs.** Each output has exactly one location, is neither an array, a matrix
+  nor a struct, and no two share one. Each is at its `SV_Target<i>`'s index, `i`, in Slang's
+  reflection, and the SPIR-V's locations, the reflection's targets and the MSL's
+  `[[color(i)]]` are the same set: Metal writes an output to the colour of its semantic and
+  Vulkan to its location, so an output at another location than its index would be written
+  to another attachment on each. Slang gives an output without `[[vk::location(i)]]` its
+  place in its struct, and a returned value location 0, whatever its `SV_Target<i>`: a
+  returned `SV_Target1`, or a struct whose outputs are out of their indices' order, is
+  refused, and the message names the `[[vk::location(i)]]` to write in a struct.
+- **Varyings.** A vertex entry's outputs and a fragment entry's inputs, the built-ins aside,
+  are each `TEXCOORD<i>` at location `i`, in Slang's reflection, of one location each:
+  Metal links the stages by semantic and Vulkan by location, so a varying at another
+  location than its index, or of another semantic, would link to another one on each. The
+  reflection's `TEXCOORD`s and the MSL's `[[user(TEXCOORD_i)]]` are the same set, and hold
+  the SPIR-V's locations, which leave out a fragment input the entry never reads.
+- **Stage inputs.** A vertex or compute entry reads no input but the built-ins: a pipeline
+  has no vertex buffer binding, so vertices are read through a device address, as
+  `surface.slang` reads them.
 - **Inputs and constants.** The input attachments the SPIR-V declares are the MSL's
   `[[color(i)]]` parameters, and its `SpecId`s, each of one byte for a `bool` or four for a
   32-bit scalar, are the MSL's `[[function_constant(i)]]`s.
 - **Push bytes.** At most one push-constant block, whose size, a device address counting
-  eight bytes, is at most `PUSH_BYTES_MAX`.
+  eight bytes, is at most `PUSH_BYTES_MAX`. It holds no 3-component vector, and no matrix of
+  3 rows or columns, at any depth: the SPIR-V lays a `float3` out in 12 bytes and the MSL in
+  16, so a member after one is at another offset on each target. A `float3` reached through
+  a device address is not in the block, and is read.
 
 ## The glTF reader
 
@@ -316,11 +347,10 @@ the SPIR-V and MSL of two hosts, and loads the macOS host's metallibs.
   source, meshes, textures, materials, scenes and collision (architecture section 2's
   list), and `.glb`.
 - For shaders: a compute shader, which the reader takes and `xtask gpu` makes a pipeline
-  of, but which no engine shader is and no test cooks; the Metal buffer indices of the
-  push block and the heap's argument buffer, which the format does not carry (Slang gives
-  them in declaration order, the push block at `[[buffer(0)]]` and the heap at
-  `[[buffer(1)]]` in the engine shader); and the constants' types, which the format
-  carries as lengths.
+  of, but which no engine shader is and no test cooks; the varyings, which the format does
+  not carry, so a vertex and a fragment entry of different sources are not matched; and the
+  constants' types, which the format carries as lengths. The Metal buffer indices are
+  checked, not carried: the push block at `[[buffer(0)]]` and the heap at `[[buffer(1)]]`.
 - A processor registry and a choice of processor by anything but the `.gltf` ending.
 - Incremental cooks, a cache, and the directory watch of milestone 3 (D153).
 - Dependencies between assets: a skeleton has none, so the cycle check of
@@ -334,13 +364,15 @@ The tests that run Slang are ignored, and run once `cargo xtask slang` has insta
 | Property | Where |
 |---|---|
 | Each refusal decision 5.8 names, on the engine shader mutated: the marker removed; the marker in a helper that is not inlined; `NonUniformResourceIndex` on a `DescriptorHandle`, which Slang only warns of, and the handle with Slang's own marker; a lone `SV_Target1`; `SV_VertexID`; a warning | `tests/shader.rs`, `the_marker_removed_is_refused`, `the_marker_in_a_helper_not_inlined_is_refused`, `non_uniform_resource_index_on_a_descriptor_handle_is_refused_and_so_is_the_handle`, `a_lone_sv_target1_is_refused`, `sv_vertex_id_is_refused`, `a_warning_is_an_error` |
+| What Slang emits that the two targets would read apart, each refused on a probe beside the engine's modules: outputs off their `SV_Target` index (in reverse order, at swapped locations, a returned `SV_Target1`); varyings off their `TEXCOORD` index and one of another semantic; a vertex input that is not a built-in; a push block's `float3`; a heap image arrayed, of `uint` texels or multisampled, by the SPIR-V's reader; the heap without its register, at `[[buffer(0)]]`, and as globals | `tests/shader.rs`, `outputs_off_their_target_index_are_refused`, `varyings_off_their_texcoord_index_are_refused`, `a_vertex_input_that_is_not_a_built_in_is_refused`, `a_push_block_float3_is_refused`, `a_heap_image_of_another_form_is_refused`, `the_heap_off_its_metal_buffer_or_bound_alone_is_refused` |
+| The heap at `[[buffer(1)]]` with no push block and with one declared and unread, and a `float3` reached through a device address, cook | `tests/shader.rs`, `the_heap_is_at_buffer_1_with_or_without_a_push_block_and_a_pointee_float3_is_read` |
 | A `slangc` of another version, the SDK's among them, and a missing one, are refused; a shader source with no `slangc`, a link module alone and `--code` without `--slangc` are refused | `tests/shader.rs`, `a_slangc_of_another_version_is_refused`, `a_shader_without_slangc_and_a_lone_link_module_are_refused`, `the_binary_refuses_code_without_slangc` |
 | Two checkouts at different paths cook the same SPIR-V and MSL, no cooked file names a path of either checkout or of the temporary directory, and the metallibs' equality is printed | `tests/shader.rs`, `two_checkouts_at_different_paths_cook_the_same_spirv_and_msl_and_name_no_path` |
 | The link-time constant folds into both targets: `discard_fragment` and `OpKill` with it true, neither with it false, and no specialisation constant for it | `tests/shader.rs`, `the_link_time_constant_folds_into_both_targets` |
 | The engine shader cooks to what its code declares, loaded back from the pack through a store: the heap's two arrays and capacities, the constant, the push bytes, the input attachment and each output | `tests/shader.rs`, `the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack` |
 | The shader kind's load against section 5.1's slice (row 136): the store's synchronous call, the version hash and the decode, the median of 101 calls per shader | `tests/shader.rs`, `the_shader_kind_loads_against_the_slice`, with `--release --no-capture` |
-| The SPIR-V reader refuses what is not a module, a capability or an extension off the list, and a module of two entry points | `src/spirv.rs`'s tests |
-| Every cooked MSL and metallib makes a pipeline state with its function constants under Metal API and shader validation, each shown listening by its canary | `cargo xtask gpu --driver system` (`tools/xtask/README.md`, "gpu") |
+| Each check of the SPIR-V reader, on modules built by hand where Slang cannot emit the case: what is not a module, a capability or an extension off the list and the reason given for three, two entry points, each descriptor rule and image form, each step of a sample without `NonUniform` and each way of using the heap the check cannot follow, the locations of outputs and varyings, a stage input, the constants, and the push block's size and refusals; Slang's reflection read and each of its refusals; the MSL's interface and each of its refusals; the three readings' agreement | `src/spirv.rs`'s, `src/semantics.rs`'s, `src/msl.rs`'s and `src/shader.rs`'s tests |
+| Every cooked MSL and metallib makes a pipeline state with its function constants, made and not run, under Metal API validation and with shader validation loaded, each shown listening by its canary, on a device with what the code needs of it | `cargo xtask gpu --driver system` (`tools/xtask/README.md`, "GPU runs") |
 
 ## Proof for milestone 1
 

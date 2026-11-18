@@ -50,6 +50,7 @@ const OP_IN_BOUNDS_PTR_ACCESS_CHAIN: u16 = 70;
 const OP_DECORATE: u16 = 71;
 const OP_MEMBER_DECORATE: u16 = 72;
 const OP_COPY_OBJECT: u16 = 83;
+const OP_SAMPLED_IMAGE: u16 = 86;
 const OP_CONVERT_PTR_TO_U: u16 = 117;
 const OP_BITCAST: u16 = 124;
 const OP_SELECT: u16 = 169;
@@ -57,6 +58,7 @@ const OP_PHI: u16 = 245;
 
 // Decorations.
 const SPEC_ID: u32 = 1;
+const ROW_MAJOR: u32 = 4;
 const ARRAY_STRIDE: u32 = 6;
 const MATRIX_STRIDE: u32 = 7;
 const BUILT_IN: u32 = 11;
@@ -69,6 +71,7 @@ const NON_UNIFORM: u32 = 5300;
 
 // Storage classes.
 const UNIFORM_CONSTANT: u32 = 0;
+const INPUT: u32 = 1;
 const UNIFORM: u32 = 2;
 const OUTPUT: u32 = 3;
 const PUSH_CONSTANT: u32 = 9;
@@ -124,6 +127,9 @@ pub(crate) struct Reflection {
     pub constants: Vec<ConstantSlot>,
     pub push_bytes: u32,
     pub inputs: u32,
+    /// Bit `i` for each varying at location `i`: a vertex entry's outputs, a fragment
+    /// entry's inputs.
+    pub varyings: u32,
     pub outputs: u32,
 }
 
@@ -152,7 +158,20 @@ pub(crate) fn reflect(code: &[u8]) -> Result<Reflection> {
     };
     let descriptors = module.descriptors(stage)?;
     module.check_heap_accesses(&descriptors.heap)?;
-    let outputs = if stage == ShaderStage::Fragment { module.outputs(entry)? } else { 0 };
+    let (varyings, outputs) = match stage {
+        ShaderStage::Vertex => {
+            module.check_no_inputs(entry, "vertex")?;
+            (module.locations(entry, OUTPUT, "varying")?, 0)
+        }
+        ShaderStage::Fragment => (
+            module.locations(entry, INPUT, "varying")?,
+            module.locations(entry, OUTPUT, "fragment output")?,
+        ),
+        ShaderStage::Compute => {
+            module.check_no_inputs(entry, "compute")?;
+            (0, 0)
+        }
+    };
     Ok(Reflection {
         stage,
         entry: entry.name.clone(),
@@ -160,6 +179,7 @@ pub(crate) fn reflect(code: &[u8]) -> Result<Reflection> {
         constants: module.constants()?,
         push_bytes: module.push_bytes()?,
         inputs: descriptors.inputs,
+        varyings,
         outputs,
     })
 }
@@ -175,13 +195,28 @@ enum Type {
     Float { width: u32 },
     Vector { component: u32, count: u32 },
     Matrix { column: u32, count: u32 },
-    Image { dim: u32 },
+    Image(Image),
     Sampler,
     Array { element: u32, length: u32 },
     RuntimeArray,
     Struct { members: Vec<u32> },
     Pointer { storage: u32, pointee: u32 },
     Other,
+}
+
+/// An `OpTypeImage`'s operands.
+#[derive(Clone, Copy, Debug)]
+struct Image {
+    /// The type of its texels' components.
+    sampled_type: u32,
+    dim: u32,
+    depth: u32,
+    arrayed: u32,
+    multisampled: u32,
+    /// 1 for an image read through a sampler, 2 for a storage image, 0 for one known only at
+    /// run time.
+    sampled: u32,
+    format: u32,
 }
 
 struct Entry {
@@ -277,8 +312,18 @@ impl Module {
                 let matrix = Type::Matrix { column: word(1)?, count: word(2)? };
                 self.types.insert(word(0)?, matrix);
             }
-            // The sampled type, then the dimension.
-            OP_TYPE_IMAGE => _ = self.types.insert(word(0)?, Type::Image { dim: word(2)? }),
+            OP_TYPE_IMAGE => {
+                let image = Image {
+                    sampled_type: word(1)?,
+                    dim: word(2)?,
+                    depth: word(3)?,
+                    arrayed: word(4)?,
+                    multisampled: word(5)?,
+                    sampled: word(6)?,
+                    format: word(7)?,
+                };
+                self.types.insert(word(0)?, Type::Image(image));
+            }
             OP_TYPE_SAMPLER => _ = self.types.insert(word(0)?, Type::Sampler),
             OP_TYPE_ARRAY => {
                 let array = Type::Array { element: word(1)?, length: word(2)? };
@@ -325,6 +370,12 @@ impl Module {
         let all = self.member_decorations.get(&member)?;
         let found = all.iter().find(|(d, _)| *d == decoration)?;
         found.1.first().copied()
+    }
+
+    fn member_is(&self, member: (u32, u32), decoration: u32) -> bool {
+        self.member_decorations
+            .get(&member)
+            .is_some_and(|all| all.iter().any(|(d, _)| *d == decoration))
     }
 
     fn is(&self, id: u32, decoration: u32) -> bool {
@@ -389,7 +440,17 @@ impl Module {
             match (set, binding, ty) {
                 (HEAP_SET, 0 | 1, Some(Type::Array { element, length })) => {
                     let kind = match (binding, self.types.get(element)) {
-                        (0, Some(Type::Image { dim: DIM_2D })) => HeapArrayKind::SampledImage2d,
+                        (0, Some(Type::Image(image))) => {
+                            if let Some(fault) = self.heap_image_fault(image) {
+                                return Err(invalid(format!(
+                                    "set {HEAP_SET}, binding 0 is the heap's array of 2D images \
+                                     of 32-bit floats, each read through a sampler, and the \
+                                     module's image there {fault}: the heap's images are \
+                                     `lactose.heap`'s `Texture2D<float4>`"
+                                )));
+                            }
+                            HeapArrayKind::SampledImage2d
+                        }
                         (1, Some(Type::Sampler)) => HeapArrayKind::Sampler,
                         _ => {
                             return Err(invalid(format!(
@@ -418,7 +479,7 @@ impl Module {
                         }
                     )));
                 }
-                (0, _, Some(Type::Image { dim: DIM_SUBPASS_DATA })) => {
+                (0, _, Some(Type::Image(Image { dim: DIM_SUBPASS_DATA, .. }))) => {
                     if stage != ShaderStage::Fragment {
                         return Err(invalid("an input attachment outside the fragment stage"));
                     }
@@ -447,21 +508,51 @@ impl Module {
         Ok(found)
     }
 
+    /// What makes `image` other than the heap's element, which `HeapArrayKind::SampledImage2d`
+    /// names and every view the heap holds is: `None` if nothing does. A depth of 0 or 2 is
+    /// the same image; Slang writes 2 for `Texture2D<float>`.
+    fn heap_image_fault(&self, image: &Image) -> Option<&'static str> {
+        [
+            (
+                !matches!(self.types.get(&image.sampled_type), Some(Type::Float { width: 32 })),
+                "has texels that are not 32-bit floats",
+            ),
+            (image.dim != DIM_2D, "is not 2D"),
+            (!matches!(image.depth, 0 | 2), "is a depth image"),
+            (image.arrayed != 0, "is arrayed"),
+            (image.multisampled != 0, "is multisampled"),
+            (image.sampled != 1, "is not read through a sampler"),
+            (image.format != 0, "declares a texel format"),
+        ]
+        .into_iter()
+        .find_map(|(fault, says)| fault.then_some(says))
+    }
+
     /// Every access through the heap carries the non-uniform decoration: each access chain
-    /// into one of its arrays, and each load through one. A use of the array itself, rather
-    /// than of an element reached by an access chain, is refused: the check would not see
-    /// the access.
+    /// into one of its arrays, each load through one, and each `OpSampledImage` that combines
+    /// a loaded image or sampler, the operand Vulkan's rule names for a sample. A use of the
+    /// array itself, rather than of an element reached by an access chain, is refused, and so
+    /// is a pointer into the heap or a value loaded through it passed on in any other way: the
+    /// check would not see the access.
     fn check_heap_accesses(&self, heap: &BTreeMap<u32, HeapArray>) -> Result<()> {
+        // The access chains' results, and the values loaded or combined from them.
         let mut reached: BTreeSet<u32> = BTreeSet::new();
+        let mut loaded: BTreeSet<u32> = BTreeSet::new();
         for instruction in &self.body {
             let operands = &instruction.operands;
-            let through = |id: &u32| heap.contains_key(id) || reached.contains(id);
+            let pointer = |id: &u32| heap.contains_key(id) || reached.contains(id);
+            let through = |id: &u32| pointer(id) || loaded.contains(id);
+            let undecorated = |what: &str, result: u32| {
+                invalid(format!(
+                    "{what} through the heap, %{result}, carries no non-uniform decoration"
+                ))
+            };
             match instruction.op {
                 OP_ACCESS_CHAIN
                 | OP_IN_BOUNDS_ACCESS_CHAIN
                 | OP_PTR_ACCESS_CHAIN
                 | OP_IN_BOUNDS_PTR_ACCESS_CHAIN
-                    if operands.get(2).is_some_and(through) =>
+                    if operands.get(2).is_some_and(pointer) =>
                 {
                     let result = operands[1];
                     if !self.is(result, NON_UNIFORM) {
@@ -479,24 +570,33 @@ impl Module {
                 OP_LOAD if operands.get(2).is_some_and(|id| reached.contains(id)) => {
                     let result = operands[1];
                     if !self.is(result, NON_UNIFORM) {
-                        return Err(invalid(format!(
-                            "a load through the heap, %{result}, carries no non-uniform \
-                             decoration"
-                        )));
+                        return Err(undecorated("a load", result));
                     }
+                    loaded.insert(result);
+                }
+                OP_SAMPLED_IMAGE if operands.iter().skip(2).any(|id| loaded.contains(id)) => {
+                    let result = operands[1];
+                    if !self.is(result, NON_UNIFORM) {
+                        return Err(undecorated("a sampled image", result));
+                    }
+                    loaded.insert(result);
                 }
                 OP_STORE | OP_COPY_MEMORY | OP_COPY_MEMORY_SIZED
                     if operands.iter().take(2).any(through) =>
                 {
-                    return Err(invalid("the heap is written or copied through a pointer"));
+                    return Err(invalid(
+                        "the heap, or a value loaded through it, is written or copied through a \
+                         pointer",
+                    ));
                 }
                 OP_FUNCTION_CALL | OP_COPY_OBJECT | OP_CONVERT_PTR_TO_U | OP_BITCAST
                 | OP_SELECT | OP_PHI
                     if operands.iter().skip(2).any(through) =>
                 {
                     return Err(invalid(format!(
-                        "a pointer into the heap is passed on (opcode {}), where the check can \
-                         follow an access chain alone",
+                        "a pointer into the heap or a value loaded through it is passed on \
+                         (opcode {}), where the check follows an access chain, a load and a \
+                         sampled image alone",
                         instruction.op
                     )));
                 }
@@ -506,12 +606,13 @@ impl Module {
         Ok(())
     }
 
-    /// Bit `i` for each fragment output at location `i`, each with one location.
-    fn outputs(&self, entry: &Entry) -> Result<u32> {
-        let mut outputs = 0;
+    /// Bit `i` for each variable of the entry's interface in `storage` at location `i`, the
+    /// built-ins aside: each has one location and takes one.
+    fn locations(&self, entry: &Entry, storage: u32, what: &str) -> Result<u32> {
+        let mut bits = 0;
         for &variable in &entry.interface {
-            let Some(&(_, storage)) = self.variables.get(&variable) else { continue };
-            if storage != OUTPUT || self.is(variable, BUILT_IN) {
+            let Some(&(_, class)) = self.variables.get(&variable) else { continue };
+            if class != storage || self.is_built_in(variable)? {
                 continue;
             }
             let (pointee, _) = self.pointee(variable)?;
@@ -519,24 +620,57 @@ impl Module {
                 self.decorations(variable, LOCATION).filter_map(|o| o.first().copied()).collect();
             let [location] = locations.as_slice() else {
                 return Err(invalid(format!(
-                    "a fragment output, %{variable}, with {} locations, where each has one",
+                    "a {what}, %{variable}, with {} locations, where each has one",
                     locations.len()
                 )));
             };
-            if matches!(self.types.get(&pointee), Some(Type::Array { .. } | Type::Struct { .. })) {
+            if matches!(
+                self.types.get(&pointee),
+                Some(Type::Array { .. } | Type::Struct { .. } | Type::Matrix { .. })
+            ) {
                 return Err(invalid(format!(
-                    "the fragment output at location {location} is an array or a struct, which \
+                    "the {what} at location {location} is an array, a matrix or a struct, which \
                      takes more than one location"
                 )));
             }
-            if *location >= u32::BITS || outputs & (1 << location) != 0 {
+            if *location >= u32::BITS || bits & (1 << location) != 0 {
+                return Err(invalid(format!("{what} location {location} twice or out of range")));
+            }
+            bits |= 1 << location;
+        }
+        Ok(bits)
+    }
+
+    /// A vertex or compute entry reads no input but the built-ins: a pipeline has no vertex
+    /// buffer binding, and a compute entry has no stage before it.
+    fn check_no_inputs(&self, entry: &Entry, stage: &str) -> Result<()> {
+        for &variable in &entry.interface {
+            let Some(&(_, INPUT)) = self.variables.get(&variable) else { continue };
+            if !self.is_built_in(variable)? {
+                let at = match self.decoration(variable, LOCATION) {
+                    Some(location) => format!("at location {location}"),
+                    None => "with no location".to_owned(),
+                };
                 return Err(invalid(format!(
-                    "fragment output location {location} twice or out of range"
+                    "a {stage} entry's input {at}, %{variable}, that is not a built-in: a \
+                     pipeline has no vertex buffer binding, so vertices are read through a \
+                     device address, as `shaders/surface.slang` reads them"
                 )));
             }
-            outputs |= 1 << location;
         }
-        Ok(outputs)
+        Ok(())
+    }
+
+    /// Whether a stage variable is a built-in: decorated as one, or a block whose members are.
+    fn is_built_in(&self, variable: u32) -> Result<bool> {
+        if self.is(variable, BUILT_IN) {
+            return Ok(true);
+        }
+        let (pointee, _) = self.pointee(variable)?;
+        Ok(matches!(self.types.get(&pointee), Some(Type::Struct { .. }))
+            && self.member_decorations.iter().any(|(&(ty, _), all)| {
+                ty == pointee && all.iter().any(|(decoration, _)| *decoration == BUILT_IN)
+            }))
     }
 
     /// The specialisation constants, in ascending id order.
@@ -590,23 +724,41 @@ impl Module {
     }
 
     /// The bytes a value of type `ty` takes in a block; `member` is the struct member it is,
-    /// for a matrix's stride.
+    /// or the member that holds the array it is an element of, for a matrix's stride and
+    /// order. A 3-component vector, and a matrix of 3 rows or columns, are refused at any
+    /// depth: SPIR-V's layout gives the vector 12 bytes and the MSL's struct 16, so a member
+    /// after one is at another offset on each target.
     fn size(&self, ty: u32, member: Option<(u32, u32)>) -> Result<u32> {
         let unsized_ = || {
             invalid(format!("the push-constant block holds type %{ty}, which the cook cannot size"))
         };
+        let three = || {
+            invalid(
+                "the push-constant block holds a 3-component vector or a matrix of 3 rows or \
+                 columns, which the SPIR-V lays out in 12 bytes a vector and the MSL in 16: use \
+                 4 components",
+            )
+        };
         let size = match self.types.get(&ty).ok_or_else(unsized_)? {
             Type::Int { width } | Type::Float { width } => width / 8,
+            Type::Vector { count: 3, .. } => return Err(three()),
             Type::Vector { component, count } => self.size(*component, None)? * count,
             Type::Matrix { column, count } => {
-                let stride = member.and_then(|m| self.member_decoration(m, MATRIX_STRIDE));
-                let column = match stride {
-                    Some(stride) => stride,
-                    None => self.size(*column, None)?,
+                let Some(Type::Vector { count: rows, .. }) = self.types.get(column) else {
+                    return Err(unsized_());
                 };
-                column * count
+                if *rows == 3 || *count == 3 {
+                    return Err(three());
+                }
+                let stride = member.and_then(|m| self.member_decoration(m, MATRIX_STRIDE));
+                let stride = stride.ok_or_else(unsized_)?;
+                // A row-major matrix is a stride per row, a column-major one per column.
+                let row_major = member.is_some_and(|m| self.member_is(m, ROW_MAJOR));
+                stride * if row_major { rows } else { count }
             }
-            Type::Array { length, .. } => {
+            Type::Array { element, length } => {
+                // The element's own size is the stride's; it is read for its members alone.
+                self.size(*element, member)?;
                 let stride = self.decoration(ty, ARRAY_STRIDE).ok_or_else(unsized_)?;
                 stride * self.constants.get(length).ok_or_else(unsized_)?
             }
@@ -725,5 +877,512 @@ mod tests {
         assert_eq!(entry_points(&code).unwrap(), ["vs_main", "fs_main"]);
         let error = reflect(&code).unwrap_err();
         assert!(error.message().starts_with("2 entry points, where one is cooked"), "{error}");
+    }
+
+    #[test]
+    fn the_refused_capabilities_say_why() {
+        let shader = (OP_CAPABILITY, &[1][..]);
+        for (capability, says) in [
+            (4427, "capability DrawParameters, which is outside rhi-api's list: `SV_VertexID`"),
+            (5302, "capability RuntimeDescriptorArray, which is outside rhi-api's list: a runtime"),
+            (12, "capability Int64Atomics, which is outside rhi-api's list: 64-bit atomics"),
+        ] {
+            let error = reflect(&module(&[shader, (OP_CAPABILITY, &[capability])])).unwrap_err();
+            assert!(error.message().starts_with(&format!("the module declares {says}")), "{error}");
+        }
+    }
+
+    // The ids of the modules below.
+    const MAIN: u32 = 1;
+    const VOID: u32 = 2;
+    const FLOAT: u32 = 3;
+    const UINT: u32 = 4;
+    const VEC4: u32 = 5;
+    const VEC3: u32 = 6;
+    const N1024: u32 = 7;
+    const N0: u32 = 8;
+    const IMAGE: u32 = 9;
+    const SAMPLER: u32 = 10;
+    const SAMPLED_IMAGE: u32 = 11;
+    const IMAGES: u32 = 12;
+    const SAMPLERS: u32 = 13;
+    const IMAGES_POINTER: u32 = 14;
+    const SAMPLERS_POINTER: u32 = 15;
+    const IMAGE_POINTER: u32 = 16;
+    const SAMPLER_POINTER: u32 = 17;
+    const HEAP_IMAGES: u32 = 18;
+    const HEAP_SAMPLERS: u32 = 19;
+    /// The heap's sample, as Slang writes it: an access chain into each array, a load
+    /// through each, and the sampled image of the two.
+    const IMAGE_AT: u32 = 20;
+    const IMAGE_LOADED: u32 = 21;
+    const SAMPLER_AT: u32 = 22;
+    const SAMPLER_LOADED: u32 = 23;
+    const COMBINED: u32 = 24;
+    /// The first id each test may use.
+    const FREE: u32 = 40;
+
+    const VERTEX: u32 = 0;
+    const FRAGMENT: u32 = 4;
+    const COMPUTE: u32 = 5;
+
+    type Instructions = Vec<(u16, Vec<u32>)>;
+
+    /// A module of one entry point, `main`, of `model` and with `interface`: the types every
+    /// test shares, then `globals`, then one function of `body`. A later type of an id
+    /// replaces an earlier one.
+    fn assemble(
+        model: u32,
+        interface: &[u32],
+        globals: &[(u16, Vec<u32>)],
+        body: &[(u16, Vec<u32>)],
+    ) -> Vec<u8> {
+        let mut entry = vec![model, MAIN];
+        entry.extend(literal("main"));
+        entry.extend_from_slice(interface);
+        let mut all: Instructions = vec![
+            (OP_CAPABILITY, vec![1]),
+            (OP_ENTRY_POINT, entry),
+            (19, vec![VOID]),
+            (OP_TYPE_FLOAT, vec![FLOAT, 32]),
+            (OP_TYPE_INT, vec![UINT, 32, 0]),
+            (OP_TYPE_VECTOR, vec![VEC4, FLOAT, 4]),
+            (OP_TYPE_VECTOR, vec![VEC3, FLOAT, 3]),
+            (OP_CONSTANT, vec![UINT, N1024, 1024]),
+            (OP_CONSTANT, vec![UINT, N0, 0]),
+            (OP_TYPE_IMAGE, vec![IMAGE, FLOAT, DIM_2D, 2, 0, 0, 1, 0]),
+            (OP_TYPE_SAMPLER, vec![SAMPLER]),
+            (27, vec![SAMPLED_IMAGE, IMAGE]),
+            (OP_TYPE_POINTER, vec![IMAGE_POINTER, UNIFORM_CONSTANT, IMAGE]),
+            (OP_TYPE_POINTER, vec![SAMPLER_POINTER, UNIFORM_CONSTANT, SAMPLER]),
+        ];
+        all.extend_from_slice(globals);
+        all.push((54, vec![VOID, MAIN, 0, FREE + 100]));
+        all.extend_from_slice(body);
+        all.push((56, vec![]));
+        let instructions: Vec<(u16, &[u32])> =
+            all.iter().map(|(opcode, operands)| (*opcode, operands.as_slice())).collect();
+        module(&instructions)
+    }
+
+    /// The heap's two arrays, of `length` each.
+    fn heap(length: u32) -> Instructions {
+        vec![
+            (OP_TYPE_ARRAY, vec![IMAGES, IMAGE, length]),
+            (OP_TYPE_ARRAY, vec![SAMPLERS, SAMPLER, length]),
+            (OP_TYPE_POINTER, vec![IMAGES_POINTER, UNIFORM_CONSTANT, IMAGES]),
+            (OP_TYPE_POINTER, vec![SAMPLERS_POINTER, UNIFORM_CONSTANT, SAMPLERS]),
+            (OP_VARIABLE, vec![IMAGES_POINTER, HEAP_IMAGES, UNIFORM_CONSTANT]),
+            (OP_VARIABLE, vec![SAMPLERS_POINTER, HEAP_SAMPLERS, UNIFORM_CONSTANT]),
+            (OP_DECORATE, vec![HEAP_IMAGES, DESCRIPTOR_SET, HEAP_SET]),
+            (OP_DECORATE, vec![HEAP_IMAGES, BINDING, 0]),
+            (OP_DECORATE, vec![HEAP_SAMPLERS, DESCRIPTOR_SET, HEAP_SET]),
+            (OP_DECORATE, vec![HEAP_SAMPLERS, BINDING, 1]),
+        ]
+    }
+
+    /// The heap's sample, and `after` it.
+    fn sample(after: &[(u16, Vec<u32>)]) -> Instructions {
+        let mut body = vec![
+            (OP_ACCESS_CHAIN, vec![IMAGE_POINTER, IMAGE_AT, HEAP_IMAGES, N0]),
+            (OP_LOAD, vec![IMAGE, IMAGE_LOADED, IMAGE_AT]),
+            (OP_ACCESS_CHAIN, vec![SAMPLER_POINTER, SAMPLER_AT, HEAP_SAMPLERS, N0]),
+            (OP_LOAD, vec![SAMPLER, SAMPLER_LOADED, SAMPLER_AT]),
+            (OP_SAMPLED_IMAGE, vec![SAMPLED_IMAGE, COMBINED, IMAGE_LOADED, SAMPLER_LOADED]),
+        ];
+        body.extend_from_slice(after);
+        body
+    }
+
+    /// A fragment module that samples the heap, with each of `decorated` non-uniform, then
+    /// does `after`, with `globals` beside the heap.
+    fn heap_module(
+        decorated: &[u32],
+        globals: &[(u16, Vec<u32>)],
+        after: &[(u16, Vec<u32>)],
+    ) -> Vec<u8> {
+        let mut all = heap(N1024);
+        all.extend(decorated.iter().map(|&id| (OP_DECORATE, vec![id, NON_UNIFORM])));
+        all.extend_from_slice(globals);
+        assemble(FRAGMENT, &[], &all, &sample(after))
+    }
+
+    const DECORATED: [u32; 5] = [IMAGE_AT, IMAGE_LOADED, SAMPLER_AT, SAMPLER_LOADED, COMBINED];
+
+    fn refused(code: &[u8], says: &str) {
+        let error = reflect(code).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+        assert!(error.message().contains(says), "{says}: {error}");
+    }
+
+    #[test]
+    fn the_heap_sampled_with_every_decoration_is_read() {
+        let reflection = reflect(&heap_module(&DECORATED, &[], &[])).unwrap();
+        let arrays = vec![
+            HeapArray { kind: HeapArrayKind::SampledImage2d, binding: 0, capacity: 1024 },
+            HeapArray { kind: HeapArrayKind::Sampler, binding: 1, capacity: 1024 },
+        ];
+        assert_eq!(
+            reflection.heap,
+            Some(HeapUse { form: HeapForm::FixedArray, set: HEAP_SET, arrays })
+        );
+        assert_eq!(reflection.stage, ShaderStage::Fragment);
+    }
+
+    #[test]
+    fn each_step_of_a_sample_without_the_decoration_is_refused() {
+        for (bare, says) in [
+            (IMAGE_AT, "an access through the heap, %20, carries no non-uniform decoration"),
+            (IMAGE_LOADED, "a load through the heap, %21, carries no non-uniform decoration"),
+            (SAMPLER_AT, "an access through the heap, %22, carries no non-uniform decoration"),
+            (SAMPLER_LOADED, "a load through the heap, %23, carries no non-uniform decoration"),
+            (COMBINED, "a sampled image through the heap, %24, carries no non-uniform decoration"),
+        ] {
+            let decorated: Vec<u32> = DECORATED.into_iter().filter(|&id| id != bare).collect();
+            refused(&heap_module(&decorated, &[], &[]), says);
+        }
+        // An access chain through another one is an access too.
+        let deeper = [(OP_ACCESS_CHAIN, vec![IMAGE_POINTER, FREE, IMAGE_AT])];
+        refused(&heap_module(&DECORATED, &[], &deeper), "an access through the heap, %40");
+        // Each opcode of an access chain, the pointer forms included.
+        for op in [OP_IN_BOUNDS_ACCESS_CHAIN, OP_PTR_ACCESS_CHAIN, OP_IN_BOUNDS_PTR_ACCESS_CHAIN] {
+            let other = [(op, vec![IMAGE_POINTER, FREE, IMAGE_AT, N0])];
+            refused(&heap_module(&DECORATED, &[], &other), "an access through the heap, %40");
+        }
+    }
+
+    #[test]
+    fn the_heap_used_whole_written_or_passed_on_is_refused() {
+        let whole = [(OP_LOAD, vec![IMAGES, FREE, HEAP_IMAGES])];
+        refused(&heap_module(&DECORATED, &[], &whole), "the heap's array is loaded whole");
+        for written in [
+            (OP_STORE, vec![IMAGE_AT, FREE]),
+            (OP_STORE, vec![FREE, IMAGE_LOADED]),
+            (OP_COPY_MEMORY, vec![FREE, SAMPLER_AT]),
+            (OP_COPY_MEMORY_SIZED, vec![HEAP_SAMPLERS, FREE, N0]),
+        ] {
+            let says = "the heap, or a value loaded through it, is written or copied through a \
+                        pointer";
+            refused(&heap_module(&DECORATED, &[], &[written]), says);
+        }
+        for (op, operands) in [
+            (OP_FUNCTION_CALL, vec![VOID, FREE, FREE + 1, IMAGE_AT]),
+            (OP_FUNCTION_CALL, vec![VOID, FREE, FREE + 1, COMBINED]),
+            (OP_COPY_OBJECT, vec![IMAGE, FREE, IMAGE_LOADED]),
+            (OP_CONVERT_PTR_TO_U, vec![UINT, FREE, SAMPLER_AT]),
+            (OP_BITCAST, vec![UINT, FREE, HEAP_IMAGES]),
+            (OP_SELECT, vec![SAMPLER, FREE, FREE + 1, SAMPLER_LOADED, SAMPLER_LOADED]),
+            (OP_PHI, vec![IMAGE_POINTER, FREE, IMAGE_AT, FREE + 1]),
+        ] {
+            let says = format!("is passed on (opcode {op})");
+            refused(&heap_module(&DECORATED, &[], &[(op, operands)]), &says);
+        }
+    }
+
+    #[test]
+    fn a_heap_image_of_another_form_is_refused() {
+        let int = (OP_TYPE_INT, vec![FREE, 32, 0]);
+        for (image, says) in [
+            (vec![IMAGE, FREE, DIM_2D, 2, 0, 0, 1, 0], "has texels that are not 32-bit floats"),
+            (vec![IMAGE, FLOAT, 2, 2, 0, 0, 1, 0], "is not 2D"),
+            (vec![IMAGE, FLOAT, DIM_2D, 1, 0, 0, 1, 0], "is a depth image"),
+            (vec![IMAGE, FLOAT, DIM_2D, 2, 1, 0, 1, 0], "is arrayed"),
+            (vec![IMAGE, FLOAT, DIM_2D, 2, 0, 1, 1, 0], "is multisampled"),
+            (vec![IMAGE, FLOAT, DIM_2D, 2, 0, 0, 2, 0], "is not read through a sampler"),
+            (vec![IMAGE, FLOAT, DIM_2D, 2, 0, 0, 1, 2], "declares a texel format"),
+        ] {
+            let globals = [int.clone(), (OP_TYPE_IMAGE, image)];
+            let says = format!(
+                "binding 0 is the heap's array of 2D images of 32-bit floats, each read through \
+                 a sampler, and the module's image there {says}"
+            );
+            refused(&heap_module(&DECORATED, &globals, &[]), &says);
+        }
+        // A depth of 0 is the same image as 2.
+        let zero = [(OP_TYPE_IMAGE, vec![IMAGE, FLOAT, DIM_2D, 0, 0, 0, 1, 0])];
+        reflect(&heap_module(&DECORATED, &zero, &[])).unwrap();
+    }
+
+    #[test]
+    fn a_descriptor_off_the_layout_is_refused() {
+        let at = |set: u32, binding: u32, ty: u32| -> Instructions {
+            vec![
+                (OP_TYPE_POINTER, vec![FREE, UNIFORM_CONSTANT, ty]),
+                (OP_VARIABLE, vec![FREE, FREE + 1, UNIFORM_CONSTANT]),
+                (OP_DECORATE, vec![FREE + 1, DESCRIPTOR_SET, set]),
+                (OP_DECORATE, vec![FREE + 1, BINDING, binding]),
+            ]
+        };
+        let subpass = (OP_TYPE_IMAGE, vec![FREE + 2, FLOAT, DIM_SUBPASS_DATA, 0, 0, 0, 2, 0]);
+        let mut runtime = at(HEAP_SET, 0, FREE + 2);
+        runtime.push((OP_TYPE_RUNTIME_ARRAY, vec![FREE + 2, IMAGE]));
+        let mut spec_length = at(HEAP_SET, 0, FREE + 2);
+        spec_length.push((OP_SPEC_CONSTANT, vec![UINT, FREE + 3, 4]));
+        spec_length.push((OP_TYPE_ARRAY, vec![FREE + 2, IMAGE, FREE + 3]));
+        let mut misindexed = at(0, 1, FREE + 2);
+        misindexed.push(subpass.clone());
+        misindexed.push((OP_DECORATE, vec![FREE + 1, INPUT_ATTACHMENT_INDEX, 0]));
+        for (globals, says) in [
+            (
+                vec![(OP_VARIABLE, vec![IMAGE_POINTER, FREE, UNIFORM])],
+                "a uniform or storage buffer, %40",
+            ),
+            (
+                vec![(OP_VARIABLE, vec![IMAGE_POINTER, FREE, STORAGE_BUFFER])],
+                "a uniform or storage buffer, %40",
+            ),
+            (
+                vec![(OP_VARIABLE, vec![IMAGE_POINTER, FREE, UNIFORM_CONSTANT])],
+                "a resource, %40, with no set and binding",
+            ),
+            (
+                at(HEAP_SET, 2, IMAGES),
+                "binding 2 there is not one of its fixed arrays (images at 0, samplers at 1)",
+            ),
+            (
+                runtime,
+                "binding 0 there is not one of its fixed arrays (images at 0, samplers at 1): it is a runtime array",
+            ),
+            (spec_length, "the heap's array at binding 0 has a length that is not a constant"),
+            (
+                at(2, 0, IMAGE),
+                "a resource at set 2, binding 0, which is neither the heap's nor an input attachment",
+            ),
+            (misindexed, "an input attachment at binding 1 whose index is Some(0)"),
+        ] {
+            refused(&heap_module(&DECORATED, &globals, &[]), says);
+        }
+        // The samplers at the images' binding, and the images declared twice.
+        let mut swapped = heap(N1024);
+        swapped[7] = (OP_DECORATE, vec![HEAP_IMAGES, BINDING, 1]);
+        swapped[9] = (OP_DECORATE, vec![HEAP_SAMPLERS, BINDING, 0]);
+        let says = "binding 1 is the heap's samplers, and the module declares another type there";
+        refused(&assemble(FRAGMENT, &[], &swapped, &[]), says);
+        let mut twice = heap(N1024);
+        twice.extend(at(HEAP_SET, 0, IMAGES));
+        refused(
+            &assemble(FRAGMENT, &[], &twice, &[]),
+            "the heap's array of one kind is declared twice",
+        );
+        // An input attachment, in a fragment entry alone.
+        let mut input = at(0, 0, FREE + 2);
+        input.push(subpass);
+        input.push((OP_DECORATE, vec![FREE + 1, INPUT_ATTACHMENT_INDEX, 0]));
+        assert_eq!(reflect(&assemble(FRAGMENT, &[], &input, &[])).unwrap().inputs, 0b1);
+        refused(
+            &assemble(VERTEX, &[], &input, &[]),
+            "an input attachment outside the fragment stage",
+        );
+    }
+
+    /// A stage variable `FREE + 1` of `storage`, its pointee `ty`, each of `decorations` its.
+    fn stage_variable(storage: u32, ty: u32, decorations: &[&[u32]]) -> Instructions {
+        let mut all = vec![
+            (OP_TYPE_POINTER, vec![FREE, storage, ty]),
+            (OP_VARIABLE, vec![FREE, FREE + 1, storage]),
+        ];
+        for decoration in decorations {
+            let mut operands = vec![FREE + 1];
+            operands.extend_from_slice(decoration);
+            all.push((OP_DECORATE, operands));
+        }
+        all
+    }
+
+    #[test]
+    fn the_outputs_and_varyings_are_read_and_each_takes_one_location() {
+        // A fragment output at location 3 and a varying at 1, beside a built-in of each.
+        let mut globals = stage_variable(OUTPUT, VEC4, &[&[LOCATION, 3]]);
+        globals.extend([
+            (OP_TYPE_POINTER, vec![FREE + 2, INPUT, VEC4]),
+            (OP_VARIABLE, vec![FREE + 2, FREE + 3, INPUT]),
+            (OP_DECORATE, vec![FREE + 3, LOCATION, 1]),
+            (OP_VARIABLE, vec![FREE + 2, FREE + 4, INPUT]),
+            (OP_DECORATE, vec![FREE + 4, BUILT_IN, 15]),
+        ]);
+        let reflection =
+            reflect(&assemble(FRAGMENT, &[FREE + 1, FREE + 3, FREE + 4], &globals, &[])).unwrap();
+        assert_eq!((reflection.outputs, reflection.varyings), (0b1000, 0b10));
+        let array = (OP_TYPE_ARRAY, vec![FREE + 2, VEC4, N1024]);
+        for (mut globals, says) in [
+            (stage_variable(OUTPUT, VEC4, &[]), "a fragment output, %41, with 0 locations"),
+            (
+                stage_variable(OUTPUT, VEC4, &[&[LOCATION, 0], &[LOCATION, 1]]),
+                "a fragment output, %41, with 2 locations",
+            ),
+            (
+                stage_variable(OUTPUT, FREE + 2, &[&[LOCATION, 0]]),
+                "the fragment output at location 0 is an array, a matrix or a struct",
+            ),
+            (
+                stage_variable(OUTPUT, VEC4, &[&[LOCATION, 32]]),
+                "fragment output location 32 twice or out of range",
+            ),
+            (
+                stage_variable(INPUT, FREE + 2, &[&[LOCATION, 2]]),
+                "the varying at location 2 is an array, a matrix or a struct",
+            ),
+        ] {
+            globals.push(array.clone());
+            refused(&assemble(FRAGMENT, &[FREE + 1], &globals, &[]), says);
+        }
+        let mut twice = stage_variable(OUTPUT, VEC4, &[&[LOCATION, 0]]);
+        twice.extend([
+            (OP_VARIABLE, vec![FREE, FREE + 2, OUTPUT]),
+            (OP_DECORATE, vec![FREE + 2, LOCATION, 0]),
+        ]);
+        refused(
+            &assemble(FRAGMENT, &[FREE + 1, FREE + 2], &twice, &[]),
+            "fragment output location 0 twice",
+        );
+        // A vertex entry's outputs are its varyings.
+        let output = stage_variable(OUTPUT, VEC4, &[&[LOCATION, 2]]);
+        let reflection = reflect(&assemble(VERTEX, &[FREE + 1], &output, &[])).unwrap();
+        assert_eq!((reflection.outputs, reflection.varyings), (0, 0b100));
+    }
+
+    #[test]
+    fn a_vertex_or_compute_input_that_is_not_a_built_in_is_refused() {
+        for (model, stage) in [(VERTEX, "vertex"), (COMPUTE, "compute")] {
+            let located = stage_variable(INPUT, VEC4, &[&[LOCATION, 0]]);
+            let says =
+                format!("a {stage} entry's input at location 0, %41, that is not a built-in");
+            refused(&assemble(model, &[FREE + 1], &located, &[]), &says);
+            let bare = stage_variable(INPUT, VEC4, &[]);
+            refused(&assemble(model, &[FREE + 1], &bare, &[]), "input with no location, %41");
+            // A built-in, and a block of built-ins, are read.
+            let built_in = stage_variable(INPUT, UINT, &[&[BUILT_IN, 42]]);
+            reflect(&assemble(model, &[FREE + 1], &built_in, &[])).unwrap();
+            let mut block = stage_variable(INPUT, FREE + 2, &[]);
+            block.extend([
+                (OP_TYPE_STRUCT, vec![FREE + 2, VEC4]),
+                (OP_MEMBER_DECORATE, vec![FREE + 2, 0, BUILT_IN, 0]),
+            ]);
+            reflect(&assemble(model, &[FREE + 1], &block, &[])).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_constants_are_read_and_each_has_an_id_and_a_width() {
+        let bool_ = (OP_TYPE_BOOL, vec![FREE]);
+        let long = (OP_TYPE_INT, vec![FREE + 1, 64, 0]);
+        let constants = vec![
+            bool_,
+            (OP_SPEC_CONSTANT_TRUE, vec![FREE, FREE + 2]),
+            (OP_DECORATE, vec![FREE + 2, SPEC_ID, 7]),
+            (OP_SPEC_CONSTANT, vec![FLOAT, FREE + 3, 0]),
+            (OP_DECORATE, vec![FREE + 3, SPEC_ID, 2]),
+            // A composite or an operation of constants has no id of its own.
+            (OP_SPEC_CONSTANT_OP, vec![UINT, FREE + 4, 128, FREE + 3]),
+        ];
+        let reflection = reflect(&assemble(FRAGMENT, &[], &constants, &[])).unwrap();
+        let expected = vec![ConstantSlot { id: 2, bytes: 4 }, ConstantSlot { id: 7, bytes: 1 }];
+        assert_eq!(reflection.constants, expected);
+        for (globals, says) in [
+            (
+                vec![(OP_SPEC_CONSTANT, vec![UINT, FREE + 2, 0])],
+                "a specialisation constant, %42, with no id",
+            ),
+            (
+                vec![
+                    long,
+                    (OP_SPEC_CONSTANT, vec![FREE + 1, FREE + 2, 0, 0]),
+                    (OP_DECORATE, vec![FREE + 2, SPEC_ID, 1]),
+                ],
+                "specialisation constant 1 is neither a boolean nor 32 bits wide",
+            ),
+            (
+                vec![
+                    (OP_SPEC_CONSTANT, vec![UINT, FREE + 2, 0]),
+                    (OP_DECORATE, vec![FREE + 2, SPEC_ID, 1]),
+                    (OP_SPEC_CONSTANT, vec![UINT, FREE + 3, 0]),
+                    (OP_DECORATE, vec![FREE + 3, SPEC_ID, 1]),
+                ],
+                "two specialisation constants share an id",
+            ),
+        ] {
+            refused(&assemble(FRAGMENT, &[], &globals, &[]), says);
+        }
+    }
+
+    /// A push block of `members` at `offsets`, its struct `FREE + 10`, with `globals`.
+    fn push_block(members: &[u32], offsets: &[u32], globals: &[(u16, Vec<u32>)]) -> Vec<u8> {
+        let block = FREE + 10;
+        let mut struct_ = vec![block];
+        struct_.extend_from_slice(members);
+        let mut all = vec![
+            (OP_TYPE_STRUCT, struct_),
+            (OP_TYPE_POINTER, vec![block + 1, PUSH_CONSTANT, block]),
+            (OP_VARIABLE, vec![block + 1, block + 2, PUSH_CONSTANT]),
+        ];
+        for (member, &offset) in (0u32..).zip(offsets) {
+            all.push((OP_MEMBER_DECORATE, vec![block, member, OFFSET, offset]));
+        }
+        all.extend_from_slice(globals);
+        assemble(FRAGMENT, &[], &all, &[])
+    }
+
+    #[test]
+    fn the_push_block_is_sized_to_its_last_member() {
+        let pointer = (OP_TYPE_POINTER, vec![FREE, PHYSICAL_STORAGE_BUFFER, VEC3]);
+        let bytes = |code: &[u8]| reflect(code).unwrap().push_bytes;
+        assert_eq!(bytes(&push_block(&[VEC4, FLOAT], &[0, 16], &[])), 20);
+        // A device address is 8 bytes, whatever it points to.
+        assert_eq!(bytes(&push_block(&[FREE, UINT], &[0, 8], &[pointer])), 12);
+        // An array is its stride a element; a matrix its stride a column, or a row if it is
+        // row-major.
+        let array = [
+            (OP_TYPE_ARRAY, vec![FREE, UINT, FREE + 1]),
+            (OP_CONSTANT, vec![UINT, FREE + 1, 3]),
+            (OP_DECORATE, vec![FREE, ARRAY_STRIDE, 4]),
+        ];
+        assert_eq!(bytes(&push_block(&[FREE], &[0], &array)), 12);
+        let matrix = (OP_TYPE_MATRIX, vec![FREE, VEC4, 2]);
+        let stride = (OP_MEMBER_DECORATE, vec![FREE + 10, 0, MATRIX_STRIDE, 16]);
+        assert_eq!(bytes(&push_block(&[FREE], &[0], &[matrix.clone(), stride.clone()])), 32);
+        let row_major = (OP_MEMBER_DECORATE, vec![FREE + 10, 0, ROW_MAJOR]);
+        assert_eq!(bytes(&push_block(&[FREE], &[0], &[matrix, stride, row_major])), 64);
+        assert_eq!(bytes(&assemble(FRAGMENT, &[], &[], &[])), 0);
+    }
+
+    #[test]
+    fn a_push_block_the_targets_lay_out_apart_or_out_of_bounds_is_refused() {
+        let three = "the push-constant block holds a 3-component vector or a matrix of 3 rows \
+                     or columns";
+        refused(&push_block(&[FLOAT, VEC3], &[0, 16], &[]), three);
+        // In a struct, an array or a matrix.
+        let inner = [
+            (OP_TYPE_STRUCT, vec![FREE, FLOAT, VEC3]),
+            (OP_MEMBER_DECORATE, vec![FREE, 0, OFFSET, 0]),
+            (OP_MEMBER_DECORATE, vec![FREE, 1, OFFSET, 4]),
+        ];
+        refused(&push_block(&[FREE], &[0], &inner), three);
+        let array =
+            [(OP_TYPE_ARRAY, vec![FREE, VEC3, N1024]), (OP_DECORATE, vec![FREE, ARRAY_STRIDE, 16])];
+        refused(&push_block(&[FREE], &[0], &array), three);
+        let stride = (OP_MEMBER_DECORATE, vec![FREE + 10, 0, MATRIX_STRIDE, 16]);
+        for matrix in [vec![FREE, VEC3, 4], vec![FREE, VEC4, 3]] {
+            refused(&push_block(&[FREE], &[0], &[(OP_TYPE_MATRIX, matrix), stride.clone()]), three);
+        }
+        // A device address to one is not in the block.
+        let pointer = (OP_TYPE_POINTER, vec![FREE, PHYSICAL_STORAGE_BUFFER, VEC3]);
+        reflect(&push_block(&[FREE], &[0], &[pointer])).unwrap();
+        let bool_ = (OP_TYPE_BOOL, vec![FREE]);
+        refused(
+            &push_block(&[FREE], &[0], &[bool_]),
+            "the push-constant block holds type %40, which the cook cannot size",
+        );
+        refused(&push_block(&[FLOAT], &[], &[]), "which the cook cannot size");
+        // A matrix or an array without its stride.
+        let matrix = (OP_TYPE_MATRIX, vec![FREE, VEC4, 4]);
+        refused(&push_block(&[FREE], &[0], &[matrix]), "which the cook cannot size");
+        let array = (OP_TYPE_ARRAY, vec![FREE, UINT, N1024]);
+        refused(&push_block(&[FREE], &[0], &[array]), "which the cook cannot size");
+        let max = PUSH_BYTES_MAX;
+        let says =
+            format!("a push-constant block of {} bytes, above PUSH_BYTES_MAX ({max})", max + 4);
+        refused(&push_block(&[FLOAT], &[max], &[]), &says);
+        let second = [(OP_VARIABLE, vec![FREE + 11, FREE + 13, PUSH_CONSTANT])];
+        refused(&push_block(&[FLOAT], &[0], &second), "more than one push-constant block");
     }
 }

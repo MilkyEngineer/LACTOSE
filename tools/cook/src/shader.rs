@@ -4,8 +4,8 @@
 //!
 //! The toolchain runs as subprocesses, which need no `unsafe`. Each reads and writes files
 //! of its own, outside the pool: the sources, and a scratch directory of the cook's that
-//! holds a link module's compiled form and the MSL `metal` reads, under a name that is the
-//! same at every cook.
+//! holds a link module's compiled form, Slang's reflection of each entry point and the MSL
+//! `metal` reads, under a name that is the same at every cook.
 
 use std::env;
 use std::fs;
@@ -17,7 +17,7 @@ use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::{CookedShader, ShaderTarget};
 use serde::Deserialize;
 
-use crate::{msl, spirv};
+use crate::{msl, semantics, spirv};
 
 /// The pin, which `cargo xtask slang` installs from.
 const PIN: &str = include_str!("../slang.toml");
@@ -143,20 +143,26 @@ pub(crate) fn cook(slang: &Slang, sources: &Path, source: &Source) -> Result<Vec
     let mut cooked = Vec::new();
     for entry in entries {
         let what = format!("{}: {entry}", source.path);
-        let compile = |target: &[&str]| {
+        let compile = |target: &[&str], reflection: Option<&Path>| {
             let mut command = slang.command(sources);
             command.arg(&source.path).args(["-entry", &entry]).args(&linked).args(target);
+            if let Some(json) = reflection {
+                command.arg("-reflection-json").arg(json);
+            }
             run(&mut command, &what)
         };
-        let code = compile(SPIRV)?;
+        let json = scratch.path.join(format!("{entry}.json"));
+        let code = compile(SPIRV, Some(&json))?;
         let reflection = spirv::reflect(&code).map_err(at(format!("{what} (SPIR-V)")))?;
-        let msl = compile(MSL)?;
+        let semantics = fs::read(&json).map_err(io_error(&json))?;
+        let semantics = semantics::read(&semantics, &entry).map_err(at(&what))?;
+        let msl = compile(MSL, None)?;
         let text = String::from_utf8(msl.clone()).map_err(|_| {
             Error::new(ErrorKind::InvalidData, format!("{what} (MSL): text that is not UTF-8"))
         })?;
         let interface = msl::read(&text, reflection.stage, &reflection.entry)
             .map_err(at(format!("{what} (MSL)")))?;
-        agree(&reflection, &interface).map_err(at(&what))?;
+        agree(&reflection, semantics, &interface).map_err(at(&what))?;
         let shader = |target, code| CookedShader {
             stage: reflection.stage,
             target,
@@ -203,17 +209,50 @@ impl Slang {
     }
 }
 
-/// The SPIR-V and the MSL agree on what the format carries once for both: each fragment
-/// output has one location on both targets, and the inputs and constants are the same.
-fn agree(reflection: &spirv::Reflection, interface: &msl::Interface) -> Result<()> {
+/// The SPIR-V and the MSL agree on what the format carries once for both, and on what Metal
+/// links by semantic where Vulkan links by location: the fragment outputs, at their locations
+/// in the SPIR-V, at their `SV_Target` indices in Slang's reflection, which `semantics` has
+/// held to be the locations it gives, and at their colours in the MSL; the varyings, the same
+/// way by `TEXCOORD` index, but for the inputs the SPIR-V leaves out; the input attachments,
+/// the constants, and the push block and the heap, each taken by both or by neither.
+fn agree(
+    reflection: &spirv::Reflection,
+    semantics: semantics::Semantics,
+    interface: &msl::Interface,
+) -> Result<()> {
     let refuse = |message: String| Err(Error::new(ErrorKind::InvalidData, message));
-    if reflection.outputs != interface.outputs {
+    if reflection.outputs != semantics.outputs || semantics.outputs != interface.outputs {
         return refuse(format!(
-            "the fragment outputs are at locations {} in the SPIR-V and colours {} in the MSL: \
-             give each output `[[vk::location(i)]]` beside its `SV_Target<i>`",
+            "the fragment outputs are at locations {} in the SPIR-V, `SV_Target` {} in Slang's \
+             reflection and colours {} in the MSL",
             bits(reflection.outputs),
+            bits(semantics.outputs),
             bits(interface.outputs)
         ));
+    }
+    // The SPIR-V leaves out an input the entry never reads, which the other two keep.
+    if reflection.varyings & !semantics.varyings != 0 || semantics.varyings != interface.varyings {
+        return refuse(format!(
+            "the varyings are at locations {} in the SPIR-V, `TEXCOORD` {} in Slang's \
+             reflection and `TEXCOORD` {} in the MSL, where the last two are the same and hold \
+             the first",
+            bits(reflection.varyings),
+            bits(semantics.varyings),
+            bits(interface.varyings)
+        ));
+    }
+    for (what, spirv, msl) in [
+        ("the push block", reflection.push_bytes > 0, interface.push),
+        ("the heap", reflection.heap.is_some(), interface.heap),
+    ] {
+        if spirv != msl {
+            let taken = |taken| if taken { "taken" } else { "not taken" };
+            return refuse(format!(
+                "{what} is {} in the SPIR-V and {} in the MSL",
+                taken(spirv),
+                taken(msl)
+            ));
+        }
     }
     if reflection.inputs != interface.inputs {
         return refuse(format!(
@@ -295,9 +334,11 @@ impl Scratch {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = env::temp_dir().join(format!("lactose-cook-{}-{n}", std::process::id()));
-        // One left by a process of the same id that did not finish.
+        // One left by a process of the same id that did not finish. A directory made again
+        // between the two calls, by another user under a shared temporary directory, fails
+        // the cook rather than receive its files.
         let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).map_err(io_error(&path))?;
+        fs::create_dir(&path).map_err(io_error(&path))?;
         Ok(Self { path })
     }
 }
@@ -307,5 +348,69 @@ impl Drop for Scratch {
         // Nothing reads it again, and a directory left under the temporary directory is
         // the system's to clear.
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lactose_rhi_api::{ConstantSlot, HEAP_SET, HeapForm, HeapUse, ShaderStage};
+
+    use super::*;
+
+    /// A fragment entry's three readings, the same: an input, varyings 0 and 2, outputs 0 and
+    /// 1, a constant, the push block and the heap.
+    fn agreeing() -> (spirv::Reflection, semantics::Semantics, msl::Interface) {
+        let heap = HeapUse { form: HeapForm::FixedArray, set: HEAP_SET, arrays: vec![] };
+        let reflection = spirv::Reflection {
+            stage: ShaderStage::Fragment,
+            entry: "fs".to_owned(),
+            heap: Some(heap),
+            constants: vec![ConstantSlot { id: 3, bytes: 4 }],
+            push_bytes: 16,
+            inputs: 0b1,
+            varyings: 0b101,
+            outputs: 0b11,
+        };
+        let semantics = semantics::Semantics { varyings: 0b101, outputs: 0b11 };
+        let interface = msl::Interface {
+            inputs: 0b1,
+            varyings: 0b101,
+            outputs: 0b11,
+            constants: vec![3],
+            push: true,
+            heap: true,
+        };
+        (reflection, semantics, interface)
+    }
+
+    #[test]
+    fn the_three_readings_agree_or_the_entry_is_refused() {
+        let (reflection, semantics, interface) = agreeing();
+        agree(&reflection, semantics, &interface).unwrap();
+        // An input the SPIR-V leaves out, which the entry does not read, is no disagreement.
+        let mut unread = reflection.clone();
+        unread.varyings = 0b1;
+        agree(&unread, semantics, &interface).unwrap();
+        type Change = fn(&mut spirv::Reflection, &mut semantics::Semantics, &mut msl::Interface);
+        let changes: [(Change, &str); 11] = [
+            (|r, _, _| r.outputs = 0b1, "the fragment outputs are at locations 0 in the SPIR-V"),
+            (|_, s, _| s.outputs = 0b1, "`SV_Target` 0 in Slang's reflection"),
+            (|_, _, i| i.outputs = 0b1, "and colours 0 in the MSL"),
+            (|r, _, _| r.varyings = 0b111, "the varyings are at locations 0, 1, 2 in the SPIR-V"),
+            (|_, s, _| s.varyings = 0b1, "`TEXCOORD` 0 in Slang's reflection"),
+            (|_, _, i| i.varyings = 0b1, "and `TEXCOORD` 0 in the MSL"),
+            (|r, _, _| r.push_bytes = 0, "the push block is not taken in the SPIR-V and taken"),
+            (|_, _, i| i.heap = false, "the heap is taken in the SPIR-V and not taken in the MSL"),
+            (|r, _, _| r.inputs = 0, "the input attachments are none in the SPIR-V and colours 0"),
+            (|_, _, i| i.inputs = 0b11, "are 0 in the SPIR-V and colours 0, 1 in the MSL"),
+            (|_, _, i| i.constants = vec![4], "constants are [3] in the SPIR-V and [4] in the MSL"),
+        ];
+        for (change, says) in changes {
+            let (mut reflection, mut semantics, mut interface) = agreeing();
+            change(&mut reflection, &mut semantics, &mut interface);
+            let error = agree(&reflection, semantics, &interface).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+            assert!(error.message().contains(says), "{says}: {error}");
+        }
     }
 }

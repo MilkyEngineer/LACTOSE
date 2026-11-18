@@ -15,6 +15,7 @@ mod cook;
 mod gltf;
 mod json;
 mod msl;
+mod semantics;
 mod shader;
 mod skeleton;
 mod space;

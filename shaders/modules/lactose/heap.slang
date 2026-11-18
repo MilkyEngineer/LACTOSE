@@ -11,13 +11,18 @@ public struct Heap
     public SamplerState samplers[64];
 };
 
+// `register(b1)` puts the argument buffer at `[[buffer(1)]]` on Metal whether or not the
+// shader has a push block, which is at `[[buffer(0)]]`; without it, a shader with no push
+// block would take the heap at index 0. The cook refuses either elsewhere.
 [[vk::binding(0, 1)]]
-public ParameterBlock<Heap> heap;
+public ParameterBlock<Heap> heap : register(b1);
 
 // The non-uniform marker: every index into the heap goes through it. SPIR-V carries the
 // decoration only where the marker is inlined into the access, and the cook refuses an access
-// that does not carry it; Slang's Metal target refuses `NonUniformResourceIndex`, so the
-// marker is the index alone there.
+// that does not carry it. The pinned Slang's Metal target refuses `NonUniformResourceIndex`
+// written in the entry module, though not inlined from this one, and later releases compile
+// it: the marker is the index alone on Metal, which needs no decoration, so what Metal is
+// given rests on neither.
 [ForceInline]
 public uint nonuniform_slot(uint slot)
 {

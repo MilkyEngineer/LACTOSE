@@ -78,10 +78,12 @@ cargo xtask <command>
                              docs/results/README.md
   slang                      install the pinned Slang release under the target directory,
                              from tools/cook/slang.toml, and print its slangc's path
-  gpu --driver <name>        run the device tests under a named driver (lavapipe, moltenvk,
+  gpu --driver <name> [--cooked <dir>]
+                             run the device tests under a named driver (lavapipe, moltenvk,
                              kosmickrisp or system); its one step yet is the Metal step, on
-                             macOS: cook the engine shaders and make a Metal pipeline state
-                             from each
+                             macOS: cook the engine shaders, or with --cooked take the code
+                             `ricotta --code` wrote to <dir>, and make a Metal pipeline state
+                             from each under Metal's validation
   help                       print this text
 
 Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 could not run.";
@@ -283,46 +285,30 @@ const SHADERS: &str = "shaders";
 /// The Swift script of the Metal step.
 const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
 
-/// `gpu --driver <name>`: its one step is the Metal step, which cooks the engine's shaders
-/// with the pinned Slang and makes a Metal pipeline state from each, through the Swift
-/// script run by the command line tools' `swift`. The driver selects nothing yet, since no
-/// step runs Vulkan; it is checked and recorded. The script's report is written to
-/// `target/gpu/<driver>-metal.txt` and to standard error.
+/// `gpu --driver <name> [--cooked <dir>]`: its one step is the Metal step, which cooks the
+/// engine's shaders with the pinned Slang, or takes the code another runner cooked to
+/// `<dir>`, and makes a Metal pipeline state from each, through the Swift script run by the
+/// command line tools' `swift`. The canaries and the count of messages are the same either
+/// way. The driver selects nothing yet, since no step runs Vulkan; it is checked and
+/// recorded. The script's report is written to `target/gpu/<driver>-metal.txt` and to
+/// standard error.
 fn run_gpu(args: &[&str]) -> Checked {
-    let driver = match args {
-        ["--driver", name] if DRIVERS.contains(name) => *name,
-        _ => return Err(format!("expected `--driver <{}>`", DRIVERS.join("|"))),
+    let (driver, cooked) = match args {
+        ["--driver", name] if DRIVERS.contains(name) => (*name, None),
+        ["--driver", name, "--cooked", dir] if DRIVERS.contains(name) => (*name, Some(*dir)),
+        _ => return Err(format!("expected `--driver <{}> [--cooked <dir>]`", DRIVERS.join("|"))),
     };
     if !cfg!(target_os = "macos") {
         return Err("the one step of `gpu` yet is the Metal step, which runs on macOS".to_owned());
     }
     let context = Context::load()?;
     let pin = slang::Pin::parse(&read(slang::PIN_FILE)?)?;
-    let slangc = slang::install(&pin, &context.target_dir)?;
     let out = context.target_dir.join("gpu");
-    let code = out.join("code");
-    // A shader cooked by an earlier run and since removed would otherwise be loaded again.
-    match fs::remove_dir_all(&code) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-            return Err(format!("{}: {error}", code.display()));
-        }
-        _ => {}
-    }
-    eprintln!("gpu: cooking {SHADERS} with Slang {}", pin.version);
-    let status = Command::new(&context.cargo)
-        .args(["run", "--locked", "--quiet", "--package", "lactose-cook", "--bin", "ricotta", "--"])
-        .arg("--slangc")
-        .arg(&slangc)
-        .arg("--code")
-        .arg(&code)
-        .arg(SHADERS)
-        .arg(out.join("shaders.pack"))
-        .stdout(Stdio::from(io::stderr()))
-        .status()
-        .map_err(|e| format!("cannot run ricotta: {e}"))?;
-    if !status.success() {
-        return Err(format!("ricotta ended with {status}"));
-    }
+    fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let (code, cooked_by) = match cooked {
+        Some(dir) => (PathBuf::from(dir), format!("cooked elsewhere, in {dir}")),
+        None => (cook_engine_shaders(&context, &pin, &out)?, format!("Slang {}", pin.version)),
+    };
     eprintln!("gpu: the Metal step, under driver {driver}, with Metal's validation on");
     // The canaries first, each in a process of its own: a layer that did not load reports
     // nothing. API validation's aborts the process; shader validation's lets it complete.
@@ -346,8 +332,8 @@ fn run_gpu(args: &[&str]) -> Checked {
         .collect();
     let file = out.join(format!("{driver}-metal.txt"));
     let written = format!(
-        "driver: {driver}\nslang: {}\nvalidation: api and shader, canaries {}\n{}messages: {}\n{}",
-        pin.version,
+        "driver: {driver}\ncode: {cooked_by}\nvalidation: api and shader, canaries {}\n{}messages: \
+         {}\n{}",
         CANARIES.map(|(canary, says, _)| format!("{canary} `{says}`")).join(", "),
         step.stdout,
         counted.len(),
@@ -364,6 +350,36 @@ fn run_gpu(args: &[&str]) -> Checked {
     }
     eprintln!("gpu: the report is {}", file.display());
     Ok(Vec::new())
+}
+
+/// Cooks the engine's shaders with the pinned Slang into `<out>/code`, emptied first, and
+/// returns that directory.
+fn cook_engine_shaders(context: &Context, pin: &slang::Pin, out: &Path) -> Result<PathBuf, String> {
+    let slangc = slang::install(pin, &context.target_dir)?;
+    let code = out.join("code");
+    // A shader cooked by an earlier run and since removed would otherwise be loaded again.
+    match fs::remove_dir_all(&code) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(format!("{}: {error}", code.display()));
+        }
+        _ => {}
+    }
+    eprintln!("gpu: cooking {SHADERS} with Slang {}", pin.version);
+    let status = Command::new(&context.cargo)
+        .args(["run", "--locked", "--quiet", "--package", "lactose-cook", "--bin", "ricotta", "--"])
+        .arg("--slangc")
+        .arg(&slangc)
+        .arg("--code")
+        .arg(&code)
+        .arg(SHADERS)
+        .arg(out.join("shaders.pack"))
+        .stdout(Stdio::from(io::stderr()))
+        .status()
+        .map_err(|e| format!("cannot run ricotta: {e}"))?;
+    if !status.success() {
+        return Err(format!("ricotta ended with {status}"));
+    }
+    Ok(code)
 }
 
 /// Each validator's canary in the Metal script, what the validator says of it, and whether

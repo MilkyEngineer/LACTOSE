@@ -26,7 +26,7 @@ of a manifest it writes under the target directory.
 | `heavy` | nothing: it bounds how many heavy commands run at once on one machine (below) |
 | `measure` | nothing: it runs the milestone measurements and writes their result files (below) |
 | `slang` | nothing: it installs the pinned Slang release under the target directory and prints its `slangc` (below) |
-| `gpu --driver <name>` | the GPU run's rule of decision 5.10 of the milestone 2 plan, so far its Metal step alone (below) |
+| `gpu --driver <name> [--cooked <dir>]` | the GPU run's rule of decision 5.10 of the milestone 2 plan, so far its Metal step alone (below) |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
 is printed there. The exit status is 0 for none, 1 for findings and 2 when a check could not
@@ -636,14 +636,15 @@ another version, the SDK's among them, is refused by the cook too.
 
 ## GPU runs
 
-`cargo xtask gpu --driver <lavapipe|moltenvk|kosmickrisp|system>` is the command decision
-5.10 of the milestone 2 plan names. So far it has its Metal step alone, which runs on macOS
-and is the same under each driver name, since the driver selects a Vulkan loader's
-environment and the Metal step uses none; on another host it exits 2.
+`cargo xtask gpu --driver <lavapipe|moltenvk|kosmickrisp|system> [--cooked <dir>]` is the
+command decision 5.10 of the milestone 2 plan names. So far it has its Metal step alone, which
+runs on macOS and is the same under each driver name, since the driver selects a Vulkan
+loader's environment and the Metal step uses none; on another host it exits 2.
 
 1. It installs the pinned Slang as `slang` does, and cooks `shaders/` with `ricotta --slangc
    <it> --code target/gpu/code` into `target/gpu/shaders.pack`, removing the code of an
-   earlier run first.
+   earlier run first. With `--cooked <dir>` it cooks nothing and takes the code in `<dir>`,
+   which `ricotta --code` wrote on another runner.
 2. It runs `swift tools/xtask/metal/pipelines.swift`, the command-line tools' `swift`, under
    Metal API validation (`MTL_DEBUG_LAYER=1`, warnings to the log) and Metal shader validation
    (`MTL_SHADER_VALIDATION=1`, reports to standard error), as the Metal spike set them:
@@ -652,15 +653,29 @@ environment and the Metal step uses none; on another host it exits 2.
      buffer's end, which shader validation must report with `Invalid store in 'device' or
      'constant' address space`. A canary that is silent fails the run;
    - then the step: the device is the first of `MTLCopyAllDevices`, and the run fails with
-     none. Each cooked MSL is compiled at run time as MSL 3.1 and each metallib loaded, and
-     each makes a pipeline state with every function constant given the zero of its type: a
+     none. It prints the device's facts: its name, its argument buffers tier, its highest
+     Apple GPU family and whether it is of the Metal 3 family. Code that takes the heap
+     needs argument buffers tier 2, for 1024 textures in one argument buffer, and fragment
+     code that reads a colour needs an Apple GPU family, for framebuffer fetch: the step
+     fails naming each one the device lacks, before it makes any pipeline state;
+   - each cooked MSL is compiled at run time as MSL 3.1 and each metallib loaded, and each
+     makes a pipeline state with every function constant given the zero of its type: a
      source's fragment entries each with its one vertex entry, a vertex entry alone as a
-     depth-only pipeline, a kernel as a compute pipeline.
+     depth-only pipeline, a kernel as a compute pipeline. No pipeline is run, so shader
+     validation is loaded, as its canary shows, and sees no execution of the engine's code.
 3. Every line the step writes on standard error counts, except the two validators' banners,
    and one fails the run. It writes `target/gpu/<driver>-metal.txt`: the driver, the Slang
-   version, the validators and their canaries, the device's name, the system's version, one
-   line per pipeline state, and the messages counted.
+   version or the directory the code was taken from, the validators and their canaries, the
+   device's facts, the system's version, one line per pipeline state, and the messages
+   counted.
 
-The script also loads what a runner cooked: `swift tools/xtask/metal/pipelines.swift <dir>`
-on a directory `ricotta --code` wrote, which is what the `shaders` CI job runs on each macOS
-image.
+The `shaders` CI job runs `gpu --driver system` on the macOS runner that cooks, and the
+`shaders-oldest` job runs `gpu --driver system --cooked` on the oldest macOS image, on the
+code the first cooked: the same canaries and count on both.
+
+Before either, `bash tools/xtask/runner-facts.sh [--metal-optional] <file>` records the
+runner's facts in `<file>` and in the job's summary: its system, and on macOS its Xcode, its
+SDK, its `metal`, its `swift` and its Metal device's facts, as
+`swift tools/xtask/metal/pipelines.swift --device` prints them. Each is recorded before any is
+judged, and a missing one fails the step, naming it. `--metal-optional`, for a runner that
+compiles no metallib, records a missing `metal` and does not fail on it.

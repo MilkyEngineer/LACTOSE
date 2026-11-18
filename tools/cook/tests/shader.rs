@@ -27,8 +27,8 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// The pinned `slangc`, as `cargo xtask slang` installs it under the default target
-/// directory.
+/// The pinned `slangc`, as `cargo xtask slang` installs it under the target directory these
+/// tests are built in, which is `CARGO_TARGET_TMPDIR`'s parent.
 fn slangc() -> PathBuf {
     #[derive(serde::Deserialize)]
     struct Pin {
@@ -37,7 +37,8 @@ fn slangc() -> PathBuf {
     let text = std::fs::read_to_string(root().join("tools/cook/slang.toml")).unwrap();
     let pin: Pin = toml::from_str(&text).unwrap();
     let file = if cfg!(windows) { "slangc.exe" } else { "slangc" };
-    let slangc = root().join("target").join("slang").join(&pin.version).join("bin").join(file);
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap();
+    let slangc = target.join("slang").join(&pin.version).join("bin").join(file);
     assert!(slangc.is_file(), "{} is missing: run `cargo xtask slang`", slangc.display());
     slangc
 }
@@ -51,11 +52,41 @@ fn slang() -> Slang {
 fn mutated(env: &Env, name: &str, file: &str, from: &str, to: &str) -> PathBuf {
     let sources = env.dir.join(name);
     copy(&root().join("shaders"), &sources);
+    edit(&sources, file, from, to);
+    sources
+}
+
+/// `from` replaced by `to` once in `file`, a path below `sources`; `from` must be there.
+fn edit(sources: &Path, file: &str, from: &str, to: &str) {
     let path = sources.join(file);
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains(from), "the mutation `{from}` no longer applies to {file}");
     std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+}
+
+/// The engine's modules alone copied to `<dir>/<name>/modules`, each of `edits` (a file below
+/// `shaders/modules/`, `from` and `to`) applied to them, and beside them each of `shaders`, a
+/// file name and its source.
+fn probe(env: &Env, name: &str, edits: &[(&str, &str, &str)], shaders: &[(&str, &str)]) -> PathBuf {
+    let sources = env.dir.join(name);
+    copy(&root().join("shaders").join("modules"), &sources.join("modules"));
+    for (file, from, to) in edits {
+        edit(&sources.join("modules"), file, from, to);
+    }
+    for (file, source) in shaders {
+        std::fs::write(sources.join(file), source).unwrap();
+    }
     sources
+}
+
+/// Asserts that `probe.slang`, of `source` and beside the modules `edits` changed, is refused
+/// as invalid with a message that contains `says`.
+fn assert_probe_refused(name: &str, edits: &[(&str, &str, &str)], source: &str, says: &str) {
+    let env = Env::new(name);
+    let sources = probe(&env, "sources", edits, &[("probe.slang", source)]);
+    let error = cook_shaders(&env, &sources, None).expect_err("the probe is refused");
+    assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+    assert!(error.message().contains(says), "{error}");
 }
 
 fn copy(from: &Path, to: &Path) {
@@ -155,9 +186,206 @@ fn a_lone_sv_target1_is_refused() {
         "surface.slang",
         "[[vk::location(1)]] ",
         "",
-        "surface.slang: fs_resolve: the fragment outputs are at locations 0 in the SPIR-V and \
-         colours 1 in the MSL",
+        "surface.slang: fs_resolve: the fragment output `colour` is `SV_Target1` at location 0",
     );
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn outputs_off_their_target_index_are_refused() {
+    // Each is at the same set of locations in the SPIR-V as of colours in the MSL, and at
+    // another location than its colour, for each output or for one.
+    for (name, source, says) in [
+        (
+            "reversed-order",
+            "struct Two { float4 a : SV_Target1; float4 b : SV_Target0; };\n\
+             [shader(\"fragment\")] Two fs_main() { Two r; r.a = 1; r.b = 0; return r; }\n",
+            "probe.slang: fs_main: the fragment output `a` is `SV_Target1` at location 0",
+        ),
+        (
+            "swapped-locations",
+            "struct Two {\n\
+             [[vk::location(1)]] float4 a : SV_Target0;\n\
+             [[vk::location(0)]] float4 b : SV_Target1;\n\
+             };\n\
+             [shader(\"fragment\")] Two fs_main() { Two r; r.a = 1; r.b = 0; return r; }\n",
+            "probe.slang: fs_main: the fragment output `a` is `SV_Target0` at location 1",
+        ),
+        (
+            "value-target1",
+            "[shader(\"fragment\")] float4 fs_main() : SV_Target1 { return 1; }\n",
+            "probe.slang: fs_main: the returned fragment output is `SV_Target1` at location 0",
+        ),
+    ] {
+        assert_probe_refused(name, &[], source, says);
+    }
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn varyings_off_their_texcoord_index_are_refused() {
+    // Metal links the two stages by semantic and Vulkan by location: each pair would be given
+    // other values on each target.
+    for (name, source, says) in [
+        (
+            "varyings-mismatch",
+            "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n\
+             [shader(\"vertex\")] V vs_p() { V v; v.p = 0; v.uv = 0; return v; }\n\
+             struct F { float4 p : SV_Position; float4 extra : TEXCOORD1; };\n\
+             [shader(\"fragment\")] float4 fs_p(F f) : SV_Target0 { return f.extra; }\n",
+            "probe.slang: fs_p: the varying `extra` is `TEXCOORD1` at location 0",
+        ),
+        (
+            "varyings-subset",
+            "struct V { float4 p : SV_Position; float4 a : TEXCOORD0; float4 b : TEXCOORD1; };\n\
+             [shader(\"vertex\")] V vs_p() { V v; v.p = 0; v.a = 0; v.b = 1; return v; }\n\
+             struct F { float4 p : SV_Position; float4 b : TEXCOORD1; };\n\
+             [shader(\"fragment\")] float4 fs_p(F f) : SV_Target0 { return f.b; }\n",
+            "probe.slang: fs_p: the varying `b` is `TEXCOORD1` at location 0",
+        ),
+        (
+            "varying-colour",
+            "struct V { float4 p : SV_Position; float4 c : COLOR0; };\n\
+             [shader(\"vertex\")] V vs_p() { V v; v.p = 0; v.c = 1; return v; }\n",
+            "probe.slang: vs_p: the varying `c` is `COLOR`, where each varying is `TEXCOORD<i>`",
+        ),
+    ] {
+        assert_probe_refused(name, &[], source, says);
+    }
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_vertex_input_that_is_not_a_built_in_is_refused() {
+    let vertex = "struct V { float4 p : SV_Position; };\n\
+                  [shader(\"vertex\")] V vs_p(float3 pos : POSITION) \
+                  { V v; v.p = float4(pos, 1); return v; }\n";
+    let says = "probe.slang: vs_p (SPIR-V): a vertex entry's input at location 0, %";
+    assert_probe_refused("vertex-input", &[], vertex, says);
+    // Beside a fragment entry, which the vertex entry's input is not a varying of.
+    let pair = format!(
+        "{vertex}[shader(\"fragment\")] float4 fs_p(float4 p : SV_Position) : SV_Target0 \
+         {{ return 1; }}\n"
+    );
+    assert_probe_refused("vertex-input-pair", &[], &pair, says);
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_push_block_float3_is_refused() {
+    // The SPIR-V puts `b` at offset 12 and the MSL at 16.
+    let source = "struct Push { float3 a; float b; uint64_t address; uint c; };\n\
+                  [[vk::push_constant]] ConstantBuffer<Push> push;\n\
+                  [shader(\"fragment\")] float4 fs_p() : SV_Target0 \
+                  { return float4(push.a, push.b) + float(push.c) + float(push.address); }\n";
+    let says = "probe.slang: fs_p (SPIR-V): the push-constant block holds a 3-component vector";
+    assert_probe_refused("push-float3", &[], source, says);
+}
+
+const HEAP: &str = "lactose/heap.slang";
+
+/// A fragment entry that reads the heap's image at `push.slot` with `read`.
+fn heap_reader(read: &str) -> String {
+    format!(
+        "import lactose.heap;\n\
+         struct Push {{ uint slot; uint sampler; }};\n\
+         [[vk::push_constant]] ConstantBuffer<Push> push;\n\
+         [shader(\"fragment\")] float4 fs_main(float4 position : SV_Position, \
+         float2 uv : TEXCOORD0) : SV_Target0\n\
+         {{\n    let image = heap.images[nonuniform_slot(push.slot)];\n    return {read};\n}}\n"
+    )
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_heap_image_of_another_form_is_refused() {
+    let sampler = "heap.samplers[nonuniform_slot(push.sampler)]";
+    // Each is refused by the SPIR-V's reader, so on every host, Metal's or not.
+    for (name, form, read, says) in [
+        (
+            "array-image",
+            "Texture2DArray<float4> images",
+            format!("image.Sample({sampler}, float3(uv, 0))"),
+            "is arrayed",
+        ),
+        (
+            "uint-image",
+            "Texture2D<uint4> images",
+            "float4(image.Load(int3(int2(position.xy), 0)))".to_owned(),
+            "has texels that are not 32-bit floats",
+        ),
+        (
+            "multisampled-image",
+            "Texture2DMS<float4> images",
+            "image.Load(int2(position.xy), 0)".to_owned(),
+            "is multisampled",
+        ),
+    ] {
+        let says = format!(
+            "probe.slang: fs_main (SPIR-V): set 1, binding 0 is the heap's array of 2D images of \
+             32-bit floats, each read through a sampler, and the module's image there {says}"
+        );
+        let edit = (HEAP, "Texture2D<float4> images", form);
+        assert_probe_refused(name, &[edit], &heap_reader(&read), &says);
+    }
+}
+
+/// The heap as `lactose.heap` declares it, which the tests below move.
+const HEAP_BLOCK: &str = "public ParameterBlock<Heap> heap : register(b1);";
+
+/// A fragment entry with no push block that samples the heap at a varying's slot.
+const HEAP_WITHOUT_PUSH: &str = "import lactose.heap;\n\
+     [shader(\"fragment\")] float4 fs_p(float2 uv : TEXCOORD0, \
+     nointerpolation uint slot : TEXCOORD1) : SV_Target0\n\
+     { return heap.images[nonuniform_slot(slot)].Sample(heap.samplers[nonuniform_slot(slot)], \
+     uv); }\n";
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn the_heap_off_its_metal_buffer_or_bound_alone_is_refused() {
+    // Without the register, a shader with no push block takes the heap at index 0.
+    let edit = (HEAP, HEAP_BLOCK, "public ParameterBlock<Heap> heap;");
+    let says = "probe.slang: fs_p (MSL): the entry takes the heap's argument buffer at \
+                [[buffer(0)]], where it is at [[buffer(1)]] once";
+    assert_probe_refused("heap-at-buffer0", &[edit], HEAP_WITHOUT_PUSH, says);
+    // As globals, which Metal binds a texture and a sampler at a time.
+    let globals = "public Texture2D<float4> images[16];\n\
+                   [[vk::binding(1, 1)]] public SamplerState samplers[4];";
+    let source = HEAP_WITHOUT_PUSH.replace("heap.", "");
+    let says =
+        "probe.slang: fs_p (MSL): the entry takes a texture or a sampler bound alone, `array<";
+    assert_probe_refused("heap-globals", &[(HEAP, HEAP_BLOCK, globals)], &source, says);
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn the_heap_is_at_buffer_1_with_or_without_a_push_block_and_a_pointee_float3_is_read() {
+    let env = Env::new("heap-at-buffer1");
+    let with_push = "import lactose.heap;\n\
+                     struct Push { uint slot; uint sampler; };\n\
+                     [[vk::push_constant]] ConstantBuffer<Push> push;\n";
+    let with_push =
+        format!("{with_push}{}", HEAP_WITHOUT_PUSH.replace("import lactose.heap;\n", ""));
+    let pointee = "struct Vertex { float3 p; float w; };\n\
+                   struct Push { Vertex* vertices; };\n\
+                   [[vk::push_constant]] ConstantBuffer<Push> push;\n\
+                   [shader(\"vertex\")] float4 vs_p(uint i : SV_VulkanVertexID) : SV_Position \
+                   { Vertex v = push.vertices[i]; return float4(v.p, v.w); }\n";
+    let shaders = [
+        ("without.slang", HEAP_WITHOUT_PUSH),
+        ("with.slang", &with_push),
+        ("pointee.slang", pointee),
+    ];
+    let sources = probe(&env, "sources", &[], &shaders);
+    let code = env.dir.join("code");
+    cook_shaders(&env, &sources, Some(&code)).unwrap();
+    for shader in ["without", "with"] {
+        let msl = std::fs::read_to_string(code.join(format!("{shader}.fs_p.msl"))).unwrap();
+        // The heap's parameter, up to its attribute's end.
+        let at = msl.find("Heap_default_0 constant* ").expect("the heap's parameter");
+        let parameter = msl[at..].split_once("]]").unwrap().0;
+        assert!(parameter.ends_with("[[buffer(1)"), "{shader}: {parameter}");
+    }
 }
 
 #[test]

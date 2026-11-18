@@ -5,7 +5,8 @@
 #
 # 2026.20 is the newest release of 2026.17 to 2026.22 on which every Slang behaviour the plan
 # records holds: 2026.21 and 2026.22 compile `NonUniformResourceIndex` for the Metal target,
-# which 2026.20 and every release before it refuse.
+# which 2026.20 and every release before it refuse when it is written in the entry module
+# (inlined from an imported module, 2026.20 compiles it too).
 version = "2026.20"
 
 [archive.linux-x86_64]

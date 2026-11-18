@@ -84,8 +84,9 @@ Colour fs_main(Varyings varyings)
 
 struct Resolved
 {
-    // One location on both targets: without `vk::location`, SPIR-V would put a lone
-    // `SV_Target1` at location 0 and MSL at colour 1, and the cook refuses that.
+    // At location 1, its target's index: without `vk::location`, SPIR-V would put a lone
+    // `SV_Target1` at location 0 and MSL at colour 1, and the cook refuses an output whose
+    // location is not its target's index.
     [[vk::location(1)]] float4 colour : SV_Target1;
 };
 

@@ -1,32 +1,49 @@
 //! The MSL Slang emitted for one entry point, read back for what the SPIR-V of the same entry
-//! must agree with: its colour inputs and outputs and its function constants (`README.md`,
-//! "The checks").
+//! must agree with: its colour inputs and outputs, its varyings, its function constants and
+//! its buffers (`README.md`, "The checks").
 //!
 //! The reader knows the form Slang writes an entry point in, `[[fragment]] <type> <name>(`
-//! on one line and the returned struct's fields one to a line, and refuses MSL in which it
-//! does not find it rather than read nothing from it.
+//! and its parameters on one line, and the structs it takes and returns with their fields
+//! one to a line, and refuses MSL in which it does not find it rather than read nothing from
+//! it.
 
 use std::collections::BTreeSet;
 
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::ShaderStage;
 
+/// The Metal buffer index of the push block.
+const PUSH_BUFFER: u32 = 0;
+/// The Metal buffer index of the heap's argument buffer, which `lactose.heap` declares.
+const HEAP_BUFFER: u32 = 1;
+/// The start of the type Slang gives `lactose.heap`'s parameter block.
+const HEAP_TYPE: &str = "Heap_default_";
+
 /// What the SPIR-V's reflection is compared with.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Interface {
     /// Bit `i` for each `[[color(i)]]` parameter of the entry point.
     pub inputs: u32,
+    /// Bit `i` for each `[[user(TEXCOORD_i)]]` field, `TEXCOORD` for 0: of the struct a vertex
+    /// entry returns, or of the one a fragment entry takes as its stage input.
+    pub varyings: u32,
     /// Bit `i` for each `[[color(i)]]` field of the struct it returns.
     pub outputs: u32,
     /// The index of each `[[function_constant(i)]]`, ascending.
     pub constants: Vec<u32>,
+    /// Whether it takes the push block, at `[[buffer(0)]]`.
+    pub push: bool,
+    /// Whether it takes the heap's argument buffer, at `[[buffer(1)]]`.
+    pub heap: bool,
 }
 
 /// Reads the entry point `entry` of `stage` from `source`.
 ///
 /// # Errors
 /// `InvalidData` if the entry point is not found once, a colour is named twice, a field has
-/// two colours, or the returned type is neither `void` nor a struct the source declares.
+/// two colours, a varying is not `TEXCOORD<i>`, a buffer is off its index or taken twice, a
+/// texture or a sampler is bound alone, or a struct it takes or returns is not one the source
+/// declares.
 pub(crate) fn read(source: &str, stage: ShaderStage, entry: &str) -> Result<Interface> {
     let qualifier = match stage {
         ShaderStage::Vertex => "[[vertex]] ",
@@ -47,25 +64,87 @@ pub(crate) fn read(source: &str, stage: ShaderStage, entry: &str) -> Result<Inte
     if constants.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(invalid("the MSL declares a function constant index twice"));
     }
-    let (mut inputs, mut outputs) = (0, 0);
-    if stage == ShaderStage::Fragment {
-        let returned = line[qualifier.len()..line.find(&call).expect("found by the filter")].trim();
-        let parameters = &line[line.find(&call).expect("found by the filter") + call.len()..];
-        inputs = colours(parameters, false)?;
-        if returned != "void" {
-            let body = struct_body(source, returned).ok_or_else(|| {
-                invalid(format!(
-                    "the fragment entry returns `{returned}`, a struct the MSL does not declare"
-                ))
-            })?;
-            outputs = colours(body, true)?;
+    let at = line.find(&call).expect("found by the filter");
+    let returned = line[qualifier.len()..at].trim();
+    let list = parameters(&line[at + call.len()..]);
+    let mut interface =
+        Interface { inputs: 0, varyings: 0, outputs: 0, constants, push: false, heap: false };
+    for &parameter in &list {
+        if parameter.contains("[[texture(") || parameter.contains("[[sampler(") {
+            return Err(invalid(format!(
+                "the entry takes a texture or a sampler bound alone, `{parameter}`: the heap is \
+                 `lactose.heap`'s parameter block, one argument buffer at \
+                 [[buffer({HEAP_BUFFER})]]"
+            )));
         }
+        let Some((index, _)) = attributes(parameter, "buffer").next() else { continue };
+        let index = index?;
+        let (expected, taken, what) = if parameter.starts_with(HEAP_TYPE) {
+            (HEAP_BUFFER, &mut interface.heap, "the heap's argument buffer")
+        } else {
+            (PUSH_BUFFER, &mut interface.push, "the push block")
+        };
+        if index != expected || *taken {
+            return Err(invalid(format!(
+                "the entry takes {what} at [[buffer({index})]], where it is at \
+                 [[buffer({expected})]] once: `lactose.heap` declares the heap at `register(b1)`, \
+                 and every other buffer is reached through a device address"
+            )));
+        }
+        *taken = true;
     }
-    Ok(Interface { inputs, outputs, constants })
+    let declared = |name: &str| {
+        struct_body(source, name).ok_or_else(|| {
+            invalid(format!(
+                "the entry takes or returns `{name}`, a struct the MSL does not declare"
+            ))
+        })
+    };
+    match stage {
+        ShaderStage::Vertex if returned != "void" => {
+            interface.varyings = varyings(declared(returned)?)?;
+        }
+        ShaderStage::Fragment => {
+            for parameter in &list {
+                interface.inputs |= colours(parameter, false)?;
+            }
+            let stage_in = list.iter().find(|parameter| parameter.ends_with("[[stage_in]]"));
+            if let Some(name) = stage_in.and_then(|parameter| parameter.split(' ').next()) {
+                interface.varyings = varyings(declared(name)?)?;
+            }
+            if returned != "void" {
+                interface.outputs = colours(declared(returned)?, true)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(interface)
 }
 
 fn invalid(message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
     Error::new(ErrorKind::InvalidData, message)
+}
+
+/// The parameters of a declaration whose text after the opening parenthesis is `text`, each
+/// trimmed: split at its commas outside brackets, up to the parenthesis that closes it.
+fn parameters(text: &str) -> Vec<&str> {
+    let (mut found, mut depth, mut start) = (Vec::new(), 0usize, 0);
+    for (at, char) in text.char_indices() {
+        match char {
+            '(' | '<' | '[' => depth += 1,
+            ')' if depth == 0 => {
+                found.push(&text[start..at]);
+                break;
+            }
+            ')' | '>' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                found.push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    found.into_iter().map(str::trim).filter(|parameter| !parameter.is_empty()).collect()
 }
 
 /// Each `[[<name>(<index>)]]` in `text`, with its index, and the line it is on.
@@ -102,6 +181,33 @@ fn colours(text: &str, one_per_line: bool) -> Result<u32> {
     Ok(bits)
 }
 
+/// The bits of the varyings the fields of `body` name, `[[user(TEXCOORD_i)]]` each, or
+/// `[[user(TEXCOORD)]]` for 0.
+fn varyings(body: &str) -> Result<u32> {
+    let open = "[[user(";
+    let mut bits = 0u32;
+    for line in body.lines() {
+        let Some(at) = line.find(open) else { continue };
+        let name = line[at + open.len()..].split_once(")]]").map_or("", |(name, _)| name);
+        let index = match name.strip_prefix("TEXCOORD") {
+            Some("") => Some(0),
+            Some(rest) => rest.strip_prefix('_').and_then(|index| index.parse::<u32>().ok()),
+            None => None,
+        };
+        let Some(index) = index.filter(|index| *index < u32::BITS) else {
+            return Err(invalid(format!(
+                "an MSL varying that is not `TEXCOORD<i>`: {}",
+                line.trim()
+            )));
+        };
+        if bits & (1 << index) != 0 {
+            return Err(invalid(format!("MSL varying TEXCOORD_{index} twice")));
+        }
+        bits |= 1 << index;
+    }
+    Ok(bits)
+}
+
 /// The text between `struct <name>` and its closing `};`.
 fn struct_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
     let header = format!("struct {name}\n{{\n");
@@ -120,15 +226,50 @@ struct ROut_0
     float4 resolved_0 [[color(1)]];
 };
 
+struct pixelInput_0
+{
+    float2 uv_0 [[user(TEXCOORD)]];
+    float4 tint_0 [[user(TEXCOORD_2)]];
+};
+
 constant uint fc_TINT_0 [[function_constant(3)]];
-[[fragment]] ROut_0 fs_resolve(pixelInput_0 _S1 [[stage_in]], float4 lit_0 [[color(0)]], float4 pos_0 [[position]])
+[[fragment]] ROut_0 fs_resolve(pixelInput_0 _S1 [[stage_in]], float4 lit_0 [[color(0)]], float4 pos_0 [[position]], Push_0 constant* push_1 [[buffer(0)]], Heap_default_0 constant* heap_1 [[buffer(1)]])
+{
+";
+
+    const VERTEX: &str = "\
+struct vs_main_Result_0
+{
+    float4 position_0 [[position]];
+    float2 uv_0 [[user(TEXCOORD_1)]];
+};
+
+[[vertex]] vs_main_Result_0 vs_main(uint vertex_0 [[vertex_id]], Push_0 constant* push_0 [[buffer(0)]])
 {
 ";
 
     #[test]
-    fn colours_and_constants_are_read() {
-        let read = read(RESOLVE, ShaderStage::Fragment, "fs_resolve").unwrap();
-        assert_eq!(read, Interface { inputs: 0b1, outputs: 0b10, constants: vec![3] });
+    fn colours_varyings_constants_and_buffers_are_read() {
+        let fragment = read(RESOLVE, ShaderStage::Fragment, "fs_resolve").unwrap();
+        let expected = Interface {
+            inputs: 0b1,
+            varyings: 0b101,
+            outputs: 0b10,
+            constants: vec![3],
+            push: true,
+            heap: true,
+        };
+        assert_eq!(fragment, expected);
+        let vertex = read(VERTEX, ShaderStage::Vertex, "vs_main").unwrap();
+        let expected = Interface {
+            inputs: 0,
+            varyings: 0b10,
+            outputs: 0,
+            constants: vec![],
+            push: true,
+            heap: false,
+        };
+        assert_eq!(vertex, expected);
     }
 
     #[test]
@@ -140,10 +281,33 @@ constant uint fc_TINT_0 [[function_constant(3)]];
     }
 
     #[test]
-    fn a_returned_type_that_is_not_declared_is_refused() {
-        let source = RESOLVE.replace("struct ROut_0", "struct Other_0");
+    fn an_entry_a_function_constant_or_a_colour_declared_twice_is_refused() {
+        let entry = RESOLVE.lines().find(|line| line.starts_with("[[fragment]]")).unwrap();
+        let source = format!("{RESOLVE}{entry}\n");
         let error = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap_err();
         assert!(error.message().contains("does not declare"), "{error}");
+        let source = RESOLVE.replace(
+            "constant uint fc_TINT_0 [[function_constant(3)]];",
+            "constant uint fc_TINT_0 [[function_constant(3)]];\n\
+             constant bool fc_FLAG_0 [[function_constant(3)]];",
+        );
+        let error = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap_err();
+        assert!(error.message().contains("function constant index twice"), "{error}");
+        let source =
+            RESOLVE.replace("[[color(1)]];", "[[color(1)]];\n    float4 b_0 [[color(1)]];");
+        let error = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap_err();
+        assert!(error.message().contains("colour 1 twice"), "{error}");
+    }
+
+    #[test]
+    fn a_struct_taken_or_returned_that_is_not_declared_is_refused() {
+        for (from, to) in
+            [("struct ROut_0", "struct Other_0"), ("struct pixelInput_0", "struct P_0")]
+        {
+            let source = RESOLVE.replace(from, to);
+            let error = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap_err();
+            assert!(error.message().contains("a struct the MSL does not declare"), "{error}");
+        }
     }
 
     #[test]
@@ -151,5 +315,66 @@ constant uint fc_TINT_0 [[function_constant(3)]];
         let source = RESOLVE.replace("[[color(1)]];", "[[color(1)]] [[color(2)]];");
         let error = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap_err();
         assert!(error.message().contains("two colours"), "{error}");
+    }
+
+    #[test]
+    fn a_varying_that_is_not_texcoord_i_is_refused() {
+        for (from, to, says) in [
+            ("[[user(TEXCOORD_2)]]", "[[user(_SLANG_ATTR)]]", "not `TEXCOORD<i>`: float4 tint_0"),
+            ("[[user(TEXCOORD_2)]]", "[[user(TEXCOORDS)]]", "not `TEXCOORD<i>`"),
+            ("[[user(TEXCOORD_2)]]", "[[user(TEXCOORD_0)]]", "TEXCOORD_0 twice"),
+        ] {
+            let source = RESOLVE.replace(from, to);
+            let error = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap_err();
+            assert!(error.message().contains(says), "{says}: {error}");
+        }
+        let source = VERTEX.replace("[[user(TEXCOORD_1)]]", "[[user(COLOR)]]");
+        let error = read(&source, ShaderStage::Vertex, "vs_main").unwrap_err();
+        assert!(error.message().contains("not `TEXCOORD<i>`"), "{error}");
+    }
+
+    #[test]
+    fn a_buffer_off_its_index_and_a_texture_or_sampler_alone_are_refused() {
+        for (from, to, says) in [
+            // The heap of a shader with no push block, before `register(b1)`.
+            (
+                "Push_0 constant* push_1 [[buffer(0)]], Heap_default_0 constant* heap_1 [[buffer(1)]]",
+                "Heap_default_0 constant* heap_1 [[buffer(0)]]",
+                "the heap's argument buffer at [[buffer(0)]], where it is at [[buffer(1)]]",
+            ),
+            ("push_1 [[buffer(0)]]", "push_1 [[buffer(1)]]", "the push block at [[buffer(1)]]"),
+            (
+                "Heap_default_0 constant* heap_1 [[buffer(1)]]",
+                "Other_0 constant* other_1 [[buffer(0)]]",
+                "the push block at [[buffer(0)]], where it is at [[buffer(0)]] once",
+            ),
+            (
+                "Heap_default_0 constant* heap_1 [[buffer(1)]]",
+                "array<texture2d<float, access::sample>, int(16)> images_1 [[texture(0)]]",
+                "a texture or a sampler bound alone, `array<texture2d<float, access::sample>, \
+                 int(16)> images_1 [[texture(0)]]`",
+            ),
+            (
+                "Heap_default_0 constant* heap_1 [[buffer(1)]]",
+                "array<sampler, int(4)> samplers_1 [[sampler(0)]]",
+                "a texture or a sampler bound alone",
+            ),
+        ] {
+            assert!(RESOLVE.contains(from), "{from}");
+            let source = RESOLVE.replace(from, to);
+            let error = read(&source, ShaderStage::Fragment, "fs_resolve").unwrap_err();
+            assert!(error.message().contains(says), "{says}: {error}");
+        }
+    }
+
+    #[test]
+    fn parameters_split_outside_brackets() {
+        assert_eq!(
+            parameters(
+                "array<texture2d<float, access::sample>, int(16)> a [[texture(0)]], uint b)\n{"
+            ),
+            ["array<texture2d<float, access::sample>, int(16)> a [[texture(0)]]", "uint b"],
+        );
+        assert_eq!(parameters(")"), Vec::<&str>::new());
     }
 }
