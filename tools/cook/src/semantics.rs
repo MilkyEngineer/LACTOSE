@@ -245,7 +245,7 @@ mod tests {
         assert!(error.message().contains(clause), "{error}");
         // An `out` parameter, and a field of a returned struct.
         let out = leaf("b", "varyingOutput", 0, "SV_TARGET", Some(1));
-        let field = fields("", "varyingOutput", 0, &[out.clone()]);
+        let field = fields("", "varyingOutput", 0, std::slice::from_ref(&out));
         for (parameter, result) in [(out.as_str(), none), (none, field.as_str())] {
             let error = read(&reflection(parameter, result), "fs").unwrap_err();
             assert!(error.message().ends_with("`[[vk::location(1)]]`"), "{error}");
