@@ -154,6 +154,17 @@ impl NullEncoder {
         }
     }
 
+    /// Whether the encoder may record `what`, which the graphics role alone takes: the
+    /// compute role's queue may be of a family that does not draw, so a `Compute` encoder
+    /// records none on any layout (`lactose-rhi-api`, "Queues by role").
+    fn draws(&mut self, what: &str) -> bool {
+        if self.role == QueueRole::Compute {
+            self.fail(Rule::Encoding, format!("{what} on a compute encoder"));
+            return false;
+        }
+        true
+    }
+
     fn outside(&mut self, what: &str) -> bool {
         if self.open() {
             self.fail(Rule::Encoding, format!("{what} inside a pass"));
@@ -272,6 +283,9 @@ impl NullEncoder {
 
     /// The checks a draw makes of what its pass holds, then the command.
     fn draw_command(&mut self, indexed: bool, indirect: Vec<BufferHandle>) {
+        if !self.draws("a draw") {
+            return;
+        }
         let survives = self.shared.caps.memoryless_survives_local_read;
         let checked = match &mut self.scope {
             Scope::Render(pass) => draw_checks(pass, indexed, survives),
@@ -503,6 +517,9 @@ impl Encoder for NullEncoder {
         }
         let Some(buffer) = self.buffer_for(source, BufferUsage::COPY_SOURCE) else { return };
         let Some(image) = self.image_for(destination, ImageUsage::COPY_DESTINATION) else { return };
+        if image.format.is_depth() && !self.draws("a depth image's copy") {
+            return;
+        }
         let Some((subresources, _)) = self.image_regions(&buffer, &image, regions) else { return };
         let shared = regions.iter().enumerate().any(|(at, one)| {
             regions[at + 1..].iter().any(|other| {
@@ -526,6 +543,9 @@ impl Encoder for NullEncoder {
             return;
         }
         let Some(image) = self.image_for(source, ImageUsage::COPY_SOURCE) else { return };
+        if image.format.is_depth() && !self.draws("a depth image's copy") {
+            return;
+        }
         let Some(buffer) = self.buffer_for(destination, BufferUsage::COPY_DESTINATION) else {
             return;
         };
@@ -540,7 +560,7 @@ impl Encoder for NullEncoder {
     }
 
     fn begin_render_pass(&mut self, pass: &RenderPass<'_>) {
-        if !self.recording() || !self.outside("a pass begun") {
+        if !self.recording() || !self.outside("a pass begun") || !self.draws("a render pass") {
             return;
         }
         let limit = self.shared.caps.colour_attachments;
@@ -703,7 +723,7 @@ impl Encoder for NullEncoder {
     }
 
     fn bind_graphics_pipeline(&mut self, pipeline: GraphicsPipelineHandle) {
-        if !self.recording() {
+        if !self.recording() || !self.draws("a graphics pipeline bound") {
             return;
         }
         if !matches!(self.scope, Scope::Render(_)) {

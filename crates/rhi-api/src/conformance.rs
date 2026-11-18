@@ -332,6 +332,7 @@ pub const CASES: &[Case] = cases! {
     contract "recording_while_pending_records_nothing";
     contract "encoder_of_another_role_or_device_is_refused" => Encoding everywhere;
     contract "command_outside_its_scope_is_refused" => Encoding everywhere;
+    contract "graphics_on_a_compute_encoder_is_refused" => Encoding everywhere;
     contract "draw_with_nothing_bound_is_refused" => Encoding everywhere;
     contract "pass_left_open_is_refused" => Encoding everywhere;
     contract "push_outside_the_block_is_refused" => Bounds everywhere;

@@ -186,6 +186,7 @@ a row for each place and a third that removes both.
 | `encoding` | an encoder submitted again | `conformance::encoder_in_two_submits_is_refused`, `encoder_resubmitted_without_reset_is_refused` |
 | `encoding` | a pass left open | `conformance::pass_left_open_is_refused` |
 | `encoding` | a draw outside a render pass | `conformance::command_outside_its_scope_is_refused` |
+| `encoding` | a render pass, a graphics bind, a draw or a depth image's copy on a `Compute` encoder | `conformance::graphics_on_a_compute_encoder_is_refused` |
 | `encoding` | a draw with no pipeline | `conformance::draw_with_nothing_bound_is_refused` |
 | `usage` | a buffer used outside its usage | `conformance::buffer_use_outside_its_usage_is_refused` |
 | `usage` | an image used outside its usage | `conformance::image_use_outside_its_usage_is_refused` |

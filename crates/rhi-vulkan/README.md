@@ -37,33 +37,55 @@ contract leaves to the backend.
   updated after bind and while unused by pending submits, non-uniform indexing of sampled
   images, independent blend, `shaderInt64`, storage image reads without a format and indirect
   draws' first instance. Its limits must be at or above `Capabilities::LEAST`'s, and at or
-  above the heap and sampler table the request asks for, and it must offer host-visible
-  memory. A lack is `Unsupported`, naming it. Each optional capability the adapter offers is
+  above the heap and sampler table the request asks for: the update-after-bind sampled
+  images and samplers, per stage and per set, `maxPerStageUpdateAfterBindResources` against
+  the heap, the table and a pass's attachments together, and `maxSamplerAllocationCount`
+  against the table and its placeholder. It must offer host-visible memory. A lack is
+  `Unsupported`, naming it. Each optional capability the adapter offers is
   enabled and reported.
 - **Queues by role.** The graphics queue is the first of a family that draws and computes.
   Compute has a queue of its own in a family that computes and does not draw, else in another
   family that computes, else as a second queue of the graphics family; with none it shares the
   graphics queue (`QueueLayout`). Present shares the graphics queue until the swapchain gives
-  it one. Every queue has a timeline semaphore that each submit to it signals to the submit's
-  stamp after its last command; the device reads its value before each check, so what the
-  device counts as pending is completion.
+  it one. The compute family may not draw, so a `Compute` encoder's render pass, graphics
+  bind, draw and depth image copy are refused (`encoding`) on every layout, as the contract
+  says. Every queue has a timeline semaphore that each submit to it signals to the submit's
+  stamp after its last command. Before each check the device learns how far a queue or a
+  timeline has run with a wait of no time on each value it awaits, never a read of the
+  counter, so what it counts as pending is completion: synchronization validation takes a
+  counter read as the host seeing every batch complete, and then reports no hazard across
+  submits.
 - **Memory.** One `VkDeviceMemory` per buffer and per image not placed in a block, of the type
   its class prefers: `Device` a device-local type that is not host-visible where there is one,
   `Upload` a host-visible coherent one, `Readback` host-visible, cached and coherent. Host
   memory is mapped whole for the resource's life; a flush or an invalidate is rounded out to
   `nonCoherentAtomSize`. A memoryless request takes a lazily allocated type where the device
-  reports the attachment's kind memoryless, and ordinary memory otherwise.
+  reports the attachment's kind memoryless, and ordinary memory otherwise. An allocation
+  larger than its type's heap or `maxMemoryAllocationSize`, and a buffer larger than
+  `maxBufferSize`, is refused `ResourceExhausted` before any driver call, as null refuses a
+  buffer past its bound.
 - **The heap and the sampler table** are one descriptor set (set 1), partially bound and
   updated after bind, with a placeholder image in each empty slot and a placeholder sampler in
   each free entry, so a slot is never unbound. A slot write and a sampler's free are the
-  contract's two holds, under the heap's lock.
+  contract's two holds, under the heap's lock. The device asks the driver whether it
+  supports the set's layout (`vkGetDescriptorSetLayoutSupport`), and the input attachments',
+  before it makes them, and refuses a request it does not (`Unsupported`): a driver may
+  support fewer descriptors in one set than its per-type limits name. MoltenVK 1.4.2's
+  `maxPerSetDescriptors` is 1212, so beside the default 64 samplers its heap holds at most
+  1148 slots; KosmicKrisp supports a million. The renderer's heap must fit the smaller. A
+  sampler that would make the device's live samplers, the placeholder and those retired
+  under a pending submit included, reach `maxSamplerAllocationCount` is refused
+  `ResourceExhausted`.
 - **Pipelines** are made from cooked SPIR-V (`CookedShader` version 2), one stage module per
   creation, through one pipeline cache. Before the driver sees a stage, `CookedShader::check`
   holds it to the format's rules and, for a graphics pipeline, `check_varyings` holds the
   fragment stage's reads to the vertex stage's writes: the layer reports nothing for a `uint`
   varying read as an `int` on MoltenVK or KosmicKrisp (the GPU review of `shader-format`), so
   the format's refusal is the only guard. The module's header is checked and its `OpCapability` and `OpExtension` instructions
-  are compared with what the device enabled (`capability`). Each given constant is one
+  are compared with what the device enabled (`capability`). The module must declare an
+  `OpEntryPoint` of the stage's `entry` name and its execution model (`Vertex`, `Fragment`,
+  `GLCompute`), or the stage is refused `InvalidData`: the driver takes an entry by its name
+  alone. Each given constant is one
   four-byte map entry of its specialisation data, its `ConstantValue` of its slot's type, a
   `Bool` widened to a `VkBool32` of 0 or 1 (VUID-VkSpecializationMapEntry-constantID-00776);
   an unwidened one-byte `Bool` reads back right on both Apple drivers, so the layer's message

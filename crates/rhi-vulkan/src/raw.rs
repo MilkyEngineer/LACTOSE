@@ -54,6 +54,11 @@ pub(crate) struct Queue {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MemoryTypes {
     pub(crate) properties: [vk::MemoryPropertyFlags; vk::MAX_MEMORY_TYPES],
+    /// The largest allocation of each type: its heap's size, and no more than
+    /// `maxMemoryAllocationSize`.
+    pub(crate) largest: [u64; vk::MAX_MEMORY_TYPES],
+    /// `maxBufferSize`.
+    pub(crate) buffer_max: u64,
     pub(crate) count: u32,
     /// The types a memory block takes, which every colour and depth image accepts.
     pub(crate) block: Option<u32>,
@@ -223,7 +228,7 @@ unsafe extern "system" fn on_message(
     vk::FALSE
 }
 
-fn unsupported(what: impl Into<String>) -> Error {
+pub(crate) fn unsupported(what: impl Into<String>) -> Error {
     Error::new(ErrorKind::Unsupported, what.into())
 }
 
@@ -460,10 +465,14 @@ fn device(
     partial: &mut Partial,
 ) -> Result<Opened> {
     let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
+    let mut v11_props = vk::PhysicalDeviceVulkan11Properties::default();
     let mut v12_props = vk::PhysicalDeviceVulkan12Properties::default();
+    let mut v13_props = vk::PhysicalDeviceVulkan13Properties::default();
     let mut properties2 = vk::PhysicalDeviceProperties2::default()
         .push_next(&mut driver_props)
-        .push_next(&mut v12_props);
+        .push_next(&mut v11_props)
+        .push_next(&mut v12_props)
+        .push_next(&mut v13_props);
     // SAFETY: `physical` is the instance's; the chain's structures live through the call.
     unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
     let properties = properties2.properties;
@@ -520,7 +529,27 @@ fn device(
             request.samplers,
         ),
     ];
-    for (limit, offered, wanted) in descriptor_limits {
+    // A fragment stage reaches the heap, the sampler table and a render pass's inputs, and
+    // writes its colour attachments; the sampler table's entries and its placeholder are all
+    // live samplers. The heap's set layout is asked of the driver as it is made
+    // (`Heap::new`), as a driver may support fewer descriptors in one set than these name.
+    let inputs = u64::from(limits.max_color_attachments.min(32));
+    let fragment = u64::from(request.heap_slots) + u64::from(request.samplers) + 2 * inputs;
+    let resource_limits = [
+        (
+            "maxPerStageUpdateAfterBindResources",
+            u64::from(v12_props.max_per_stage_update_after_bind_resources),
+            fragment,
+        ),
+        (
+            "maxSamplerAllocationCount",
+            u64::from(limits.max_sampler_allocation_count),
+            u64::from(request.samplers) + 1,
+        ),
+    ];
+    let descriptor_limits = descriptor_limits
+        .map(|(limit, offered, wanted)| (limit, u64::from(offered), u64::from(wanted)));
+    for (limit, offered, wanted) in descriptor_limits.into_iter().chain(resource_limits) {
         if offered < wanted {
             return Err(unsupported(format!("{adapter}: {limit} is {offered}, below {wanted}")));
         }
@@ -597,8 +626,14 @@ fn device(
     partial.device = Some(device.clone());
     // SAFETY: as above.
     let memory_props = unsafe { instance.get_physical_device_memory_properties(physical) };
+    let allocation = v11_props.max_memory_allocation_size;
     let mut memory = MemoryTypes {
         properties: memory_props.memory_types.map(|t| t.property_flags),
+        largest: memory_props.memory_types.map(|t| {
+            let heap = memory_props.memory_heaps.get(t.heap_index as usize);
+            heap.map_or(0, |heap| heap.size.min(allocation))
+        }),
+        buffer_max: v13_props.max_buffer_size,
         count: memory_props.memory_type_count,
         block: None,
         lazy_colour: None,

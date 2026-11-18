@@ -228,6 +228,7 @@ cases! {
     recording_while_pending_records_nothing
     encoder_of_another_role_or_device_is_refused
     command_outside_its_scope_is_refused
+    graphics_on_a_compute_encoder_is_refused
     draw_with_nothing_bound_is_refused
     pass_left_open_is_refused
     push_outside_the_block_is_refused

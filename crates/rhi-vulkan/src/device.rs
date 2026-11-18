@@ -643,6 +643,16 @@ impl VulkanDevice {
         memory_type: u32,
         address: bool,
     ) -> Result<vk::DeviceMemory> {
+        let largest = self.shared.raw.memory.largest[memory_type as usize];
+        if requirements.size > largest {
+            return Err(Error::new(
+                ErrorKind::ResourceExhausted,
+                format!(
+                    "an allocation of {} bytes, above the {largest} its memory type allows",
+                    requirements.size
+                ),
+            ));
+        }
         let mut flags =
             vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let mut info = vk::MemoryAllocateInfo::default()
@@ -895,6 +905,13 @@ impl Device for VulkanDevice {
         alive(&self.records())?;
         if desc.size == 0 {
             return Err(Rule::Usage.refuse("a buffer of no bytes"));
+        }
+        let max = self.shared.raw.memory.buffer_max;
+        if desc.size > max {
+            return Err(Error::new(
+                ErrorKind::ResourceExhausted,
+                format!("a buffer of more than the device's {max} bytes"),
+            ));
         }
         let object = self.make_buffer(desc)?;
         let mut records = self.records();
@@ -1191,6 +1208,18 @@ impl Device for VulkanDevice {
         let Some(index) = index else {
             return Err(Error::new(ErrorKind::ResourceExhausted, "the sampler table is full"));
         };
+        // The table's samplers, those retired that a pending submit may still read, and the
+        // placeholder are all live: the device's count bounds them together.
+        let live = state.samplers.iter().flatten().count() + state.retired.len() + 1;
+        let max = shared.raw.properties.limits.max_sampler_allocation_count;
+        if live >= max as usize {
+            return Err(Error::new(
+                ErrorKind::ResourceExhausted,
+                format!(
+                    "{live} samplers live, the device's {max} at most, until a retired one is reaped"
+                ),
+            ));
+        }
         let info = vk::SamplerCreateInfo::default()
             .mag_filter(convert::filter(desc.magnify))
             .min_filter(convert::filter(desc.minify))

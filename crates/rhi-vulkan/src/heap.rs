@@ -12,7 +12,7 @@ use lactose_core::Result;
 use lactose_rhi_api::{Format, HEAP_SET, ImageUsage, PUSH_BYTES_MAX};
 
 use crate::convert::image_usage;
-use crate::raw::{Raw, Want, driver, image_info};
+use crate::raw::{Raw, Want, driver, image_info, unsupported};
 
 /// The objects of the heap and the layouts. Destroyed with the device.
 pub(crate) struct Heap {
@@ -38,6 +38,23 @@ pub(crate) struct Heap {
 pub(crate) const GRAPHICS_PUSH: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
     vk::ShaderStageFlags::VERTEX.as_raw() | vk::ShaderStageFlags::FRAGMENT.as_raw(),
 );
+
+/// Refuses a set layout the device does not support, `what` naming it: a driver may support
+/// fewer descriptors in one set than its limits name, as MoltenVK 1.4.2's
+/// `maxPerSetDescriptors` of 1212 bounds the heap and the sampler table together.
+fn supported(
+    device: &ash::Device,
+    info: &vk::DescriptorSetLayoutCreateInfo<'_>,
+    what: impl FnOnce() -> String,
+) -> Result<()> {
+    let mut support = vk::DescriptorSetLayoutSupport::default();
+    // SAFETY: the device is live; the info and what it chains live through the call.
+    unsafe { device.get_descriptor_set_layout_support(info, &mut support) };
+    if support.supported == vk::FALSE {
+        return Err(unsupported(format!("{}: the device does not support its set", what())));
+    }
+    Ok(())
+}
 
 impl Heap {
     /// Makes the heap of `slots` and `samplers` entries, each holding its placeholder,
@@ -92,7 +109,9 @@ impl Heap {
             .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
             .bindings(&bindings)
             .push_next(&mut flags_info);
-        // SAFETY: the device is live; the info and what it chains live through the call.
+        supported(device, &info, || format!("a heap of {slots} slots and {samplers} samplers"))?;
+        // SAFETY: the device is live and supports the layout; the info and what it chains
+        // live through the call.
         heap.layout = unsafe { device.create_descriptor_set_layout(&info, None) }
             .map_err(|e| driver(e, "vkCreateDescriptorSetLayout"))?;
         let input_bindings: Vec<_> = (0..heap.input_count)
@@ -110,6 +129,8 @@ impl Heap {
         let info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&input_bindings)
             .push_next(&mut input_flags_info);
+        let count = heap.input_count;
+        supported(device, &info, || format!("a render pass's {count} input attachments"))?;
         // SAFETY: as above.
         heap.inputs = unsafe { device.create_descriptor_set_layout(&info, None) }
             .map_err(|e| driver(e, "vkCreateDescriptorSetLayout"))?;

@@ -14,9 +14,9 @@ use lactose_rhi_api::{
     BufferTransition, BufferUsage, CacheStart, ColourAttachment, ColourTargetDesc, ComputePass,
     ComputePipelineDesc, ComputePipelineHandle, Constant, ConstantValue, CookedShader, Cull,
     Device, DeviceRequest, Encoder, Extent, Format, GraphicsPipelineDesc, ImageDesc, ImageMemory,
-    ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryClass, PassReach, QueuePath,
-    QueueRole, Rect, RenderPass, Sharing, StageDesc, StateOn, Store, Submit, Target, TimelinePoint,
-    WriteMask,
+    ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryBlockDesc, MemoryClass,
+    PassReach, QueuePath, QueueRole, Rect, RenderPass, Sharing, StageDesc, StateOn, Store, Submit,
+    Target, TimelinePoint, WriteMask,
 };
 use lactose_rhi_vulkan::VulkanDevice;
 
@@ -390,6 +390,96 @@ fn workgroup_other_than_the_modules_is_refused() {
         assert_eq!(refused.kind(), ErrorKind::InvalidData, "{refused}");
     }
     make(&shader).expect("the module's own workgroup");
+    drop(device);
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn entry_point_the_module_does_not_declare_is_refused() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    let shader = |name: &str| suite_shader(name).expect("the suite's cooked shaders");
+    let (vertex, fragment) = (shader("fill.vs_main"), shader("fill.fs_main"));
+    let targets = [ColourTargetDesc { format: Format::Rgba8Unorm, write_mask: WriteMask::ALL }];
+    let make = |vertex: &CookedShader, fragment: &CookedShader| {
+        device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            label: "device",
+            vertex: StageDesc { shader: vertex, constants: &[] },
+            fragment: Some(StageDesc { shader: fragment, constants: &[] }),
+            colour: &targets,
+            depth: None,
+            cull: Cull::None,
+        })
+    };
+    let renamed = |shader: &CookedShader, entry: &str| CookedShader {
+        entry: entry.to_owned(),
+        ..shader.clone()
+    };
+    // A name the module lacks, and the other stage's name, which the module declares of the
+    // other execution model.
+    let cases = [
+        (renamed(&vertex, "no_such_entry"), fragment.clone()),
+        (renamed(&vertex, &fragment.entry), fragment.clone()),
+        (vertex.clone(), renamed(&fragment, "no_such_entry")),
+        (vertex.clone(), renamed(&fragment, &vertex.entry)),
+    ];
+    for (vertex, fragment) in &cases {
+        let refused = make(vertex, fragment).expect_err("an entry the module does not declare");
+        assert_eq!(refused.kind(), ErrorKind::InvalidData, "{refused}");
+    }
+    make(&vertex, &fragment).expect("the module's own entries");
+    drop(device);
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn heap_past_the_drivers_support_is_refused() {
+    // MoltenVK 1.4.2 supports 1148 slots beside 64 samplers in one set and 1024 samplers
+    // live, so it makes the first and refuses the rest; KosmicKrisp makes all six.
+    for (slots, samplers) in
+        [(1148, 64), (1149, 64), (4096, 64), (1_000_000, 64), (1024, 256), (1024, 1024)]
+    {
+        let sink = Arc::new(Counting::default());
+        let made = VulkanDevice::new(DeviceRequest {
+            heap_slots: slots,
+            samplers,
+            ..request(Arc::clone(&sink) as _)
+        });
+        match &made {
+            Ok(_) => eprintln!("{slots} slots and {samplers} samplers: made"),
+            Err(refused) => {
+                eprintln!("{slots} slots and {samplers} samplers: {refused}");
+                assert_eq!(refused.kind(), ErrorKind::Unsupported, "{refused}");
+            }
+        }
+        drop(made);
+        // A device made past its support is one the layer reports.
+        assert_eq!(sink.count(), 0, "{slots} slots, {samplers} samplers: {:?}", sink.texts());
+    }
+}
+
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn resource_past_the_devices_size_is_refused() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    for size in [1 << 40, 1 << 62] {
+        let desc = BufferDesc {
+            label: "device",
+            size,
+            usage: BufferUsage::COPY_DESTINATION,
+            memory: MemoryClass::Device,
+            sharing: Sharing::Exclusive,
+        };
+        let refused = device.create_buffer(&desc).expect_err("a buffer past the device's size");
+        assert_eq!(refused.kind(), ErrorKind::ResourceExhausted, "{refused}");
+        let block = MemoryBlockDesc { label: "device", size };
+        let refused =
+            device.create_memory_block(&block).expect_err("a block past the device's size");
+        assert_eq!(refused.kind(), ErrorKind::ResourceExhausted, "{refused}");
+    }
     drop(device);
     assert_eq!(sink.count(), 0, "{:?}", sink.texts());
 }

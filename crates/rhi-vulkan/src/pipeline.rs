@@ -33,6 +33,9 @@ const OP_DECORATE: u32 = 71;
 /// The execution mode `LocalSize`, the decoration `BuiltIn` and the built-in
 /// `WorkgroupSize`.
 const LOCAL_SIZE: u32 = 17;
+const MODEL_VERTEX: u32 = 0;
+const MODEL_FRAGMENT: u32 = 4;
+const MODEL_GL_COMPUTE: u32 = 5;
 const BUILT_IN: u32 = 11;
 const WORKGROUP_SIZE: u32 = 25;
 /// The capabilities the required set enables (`lactose-rhi-api`'s README, "Pipelines and
@@ -160,6 +163,12 @@ fn stage(caps: &Capabilities, desc: &StageDesc<'_>, place: ShaderStage) -> Resul
     }
     shader.check()?;
     let module = module(&shader.code, caps.buffer_atomics_64)?;
+    if !module.declares(&shader.entry, place) {
+        return Err(invalid(format!(
+            "a {place:?} stage whose module declares no {place:?} entry point `{}`",
+            shader.entry
+        )));
+    }
     if let Some(size) = shader.workgroup {
         let stated = module.workgroup(&shader.entry);
         if stated != Some(size) {
@@ -225,8 +234,8 @@ fn specialisation(value: ConstantValue) -> [u8; 4] {
 /// A checked SPIR-V module: its words, and what its entry points state of their workgroups.
 struct Module {
     words: Vec<u32>,
-    /// Each entry point's name and id.
-    entries: Vec<(Vec<u8>, u32)>,
+    /// Each entry point's execution model, name and id.
+    entries: Vec<(u32, Vec<u8>, u32)>,
     /// Each `OpExecutionMode LocalSize`: the entry point's id and its three sizes.
     local_sizes: Vec<(u32, [u32; 3])>,
     /// Whether an id is decorated `BuiltIn WorkgroupSize`, which sets the workgroup in place
@@ -235,14 +244,29 @@ struct Module {
 }
 
 impl Module {
+    /// Whether the module has an entry point named `entry` of the execution model of
+    /// `stage`: the driver takes a stage's entry by its name alone, and a module without it
+    /// is a pipeline the specification forbids (VUID-VkPipelineShaderStageCreateInfo-pName-00707).
+    fn declares(&self, entry: &str, stage: ShaderStage) -> bool {
+        let model = match stage {
+            ShaderStage::Vertex => MODEL_VERTEX,
+            ShaderStage::Fragment => MODEL_FRAGMENT,
+            ShaderStage::Compute => MODEL_GL_COMPUTE,
+        };
+        self.entries.iter().any(|(of, name, _)| *of == model && name == entry.as_bytes())
+    }
+
     /// The workgroup the module states for `entry`: its one `LocalSize`, and `None` where it
     /// has none, more than one, or a `BuiltIn WorkgroupSize` overrides it.
     fn workgroup(&self, entry: &str) -> Option<[u32; 3]> {
         if self.workgroup_builtin {
             return None;
         }
-        let mut ids = self.entries.iter().filter(|(name, _)| name == entry.as_bytes());
-        let (_, id) = ids.next()?;
+        let mut ids = self
+            .entries
+            .iter()
+            .filter(|(model, name, _)| *model == MODEL_GL_COMPUTE && name == entry.as_bytes());
+        let (_, _, id) = ids.next()?;
         let mut sizes = self.local_sizes.iter().filter(|(of, _)| of == id);
         match (sizes.next(), sizes.next()) {
             (Some(&(_, size)), None) => Some(size),
@@ -303,7 +327,7 @@ fn module(code: &[u8], int64_atomics: bool) -> Result<Module> {
                     )));
                 }
             }
-            (OP_ENTRY_POINT, [_, id, name @ ..]) => entries.push((literal(name), *id)),
+            (OP_ENTRY_POINT, [model, id, name @ ..]) => entries.push((*model, literal(name), *id)),
             (OP_EXECUTION_MODE, &[id, LOCAL_SIZE, x, y, z]) => local_sizes.push((id, [x, y, z])),
             (OP_DECORATE, &[_, BUILT_IN, WORKGROUP_SIZE]) => workgroup_builtin = true,
             _ => {}
@@ -548,19 +572,26 @@ mod tests {
     use super::*;
 
     /// A SPIR-V 1.0 module declaring `Shader`, whose entry points are `entries`, each a
-    /// name and an id, with `rest` after them: execution modes and decorations, each an
-    /// opcode and its operands.
+    /// name and an id of the `GLCompute` model, with `rest` after them: execution modes and
+    /// decorations, each an opcode and its operands.
     fn words(entries: &[(&str, u32)], rest: &[(u32, &[u32])]) -> Vec<u8> {
+        let entries: Vec<_> =
+            entries.iter().map(|&(name, id)| (MODEL_GL_COMPUTE, name, id)).collect();
+        modelled(&entries, rest)
+    }
+
+    /// As `words`, each entry point of its own execution model.
+    fn modelled(entries: &[(u32, &str, u32)], rest: &[(u32, &[u32])]) -> Vec<u8> {
         let mut words = vec![SPIRV_MAGIC, 0x0001_0000, 0, 16, 0];
         let mut op = |code: u32, operands: &[u32]| {
             words.push(((operands.len() as u32 + 1) << 16) | code);
             words.extend_from_slice(operands);
         };
         op(OP_CAPABILITY, &[1]);
-        for &(name, id) in entries {
+        for &(model, name, id) in entries {
             let mut bytes = name.as_bytes().to_vec();
             bytes.resize((bytes.len() / 4 + 1) * 4, 0);
-            let mut operands = vec![5, id];
+            let mut operands = vec![model, id];
             operands.extend(bytes.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word)));
             op(OP_ENTRY_POINT, &operands);
         }
@@ -598,6 +629,32 @@ mod tests {
         let built_in: (u32, &[u32]) = (OP_DECORATE, &[7, BUILT_IN, WORKGROUP_SIZE]);
         assert_eq!(stated(&one, &[local, built_in], "main"), None, "BuiltIn WorkgroupSize");
         assert_eq!(stated(&one, &[local], "main"), Some([1, 1, 1]));
+    }
+
+    #[test]
+    fn an_entry_is_declared_by_its_name_and_its_stages_model() {
+        let entries = [
+            (MODEL_VERTEX, "vs_main", 3),
+            (MODEL_FRAGMENT, "fs_main", 4),
+            (MODEL_GL_COMPUTE, "cs_main", 5),
+        ];
+        let made = module(&modelled(&entries, &[]), false).expect("a module");
+        assert!(made.declares("vs_main", ShaderStage::Vertex));
+        assert!(made.declares("fs_main", ShaderStage::Fragment));
+        assert!(made.declares("cs_main", ShaderStage::Compute));
+        assert!(!made.declares("fs_main", ShaderStage::Vertex), "a fragment entry as a vertex one");
+        assert!(!made.declares("vs_main", ShaderStage::Compute), "a vertex entry as a compute one");
+        assert!(!made.declares("main", ShaderStage::Fragment), "a name the module lacks");
+        assert!(!made.declares("vs_mai", ShaderStage::Vertex), "a prefix of a name");
+        // A vertex entry of a compute entry's name states no workgroup.
+        let same = module(
+            &modelled(
+                &[(MODEL_VERTEX, "main", 3)],
+                &[(OP_EXECUTION_MODE, &[3, LOCAL_SIZE, 1, 1, 1])],
+            ),
+            false,
+        );
+        assert_eq!(same.expect("a module").workgroup("main"), None);
     }
 
     #[test]
