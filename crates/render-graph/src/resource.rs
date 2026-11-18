@@ -60,7 +60,7 @@ pub struct ImageImport<'a> {
     /// graph did not make: the point of the last submit outside this graph that used the
     /// image, such as the present thread's read, where that submit may still be pending
     /// and the image is imported from `Undefined` or is `Concurrent`. A wait for a point
-    /// already reached costs nothing on a timeline. `None` otherwise:
+    /// already reached costs no GPU wait. `None` otherwise:
     /// the graph orders its own frames, and an `Exclusive` image imported in the state
     /// and on the queue it is in is ordered by that queue or by its transfer.
     pub ready: Option<TimelinePoint>,

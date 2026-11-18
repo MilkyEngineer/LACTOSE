@@ -154,15 +154,18 @@ impl RenderGraph {
     /// `Device::submit` returned, unchanged, so that `Rule::of` names the rule a refusal
     /// broke. An error from the frame's first submit leaves every import as the
     /// declaration found it. An error from a later one leaves the frame torn: the
-    /// submits before it were made, the frame's point is never signalled for it, and the
+    /// submits before it were made, the frame's point is not yet signalled, and the
     /// states of the frame's imports are no longer the graph's word. The error does not
     /// say which submit failed, so the caller takes every error as a torn frame: it
     /// imports the frame's imports next from `Undefined`, relies on no buffer's bytes, and
     /// calls [`History::reset`](crate::History::reset) on every history the frame
-    /// imported. The next frame submitted whole waits for what the torn frame submitted,
-    /// and its point covers it, but for a submit the torn frame made to the queue of its
-    /// planned last submit: that one is covered by the next point signalled on its queue
-    /// (`README.md`, "Submission").
+    /// imported.
+    ///
+    /// After a torn frame, the next call first makes, in the torn frame's place, its
+    /// planned last submit with no encoders: it waits as that submit would have and
+    /// signals the torn frame's point. Where that submit is refused, `frame` is not
+    /// submitted, its encoders are free, the graph still owes that submit, and the error
+    /// is returned unchanged (`README.md`, "Submission").
     pub fn submit(&mut self, frame: RecordedFrame) -> Result<TimelinePoint> {
         todo!()
     }
@@ -184,11 +187,12 @@ impl RenderGraph {
 impl Drop for RenderGraph {
     /// Waits until every submit the graph made has completed, then destroys what the
     /// graph made. An error from a destroy is logged under [`LOG_TARGET`] and dropped. On
-    /// a lost device the wait returns at once. A torn frame's submit that no point covers
-    /// yet is not waited for: its encoders are dropped first, and nothing it used is
-    /// destroyed where the device would refuse it. While the thread unwinds a panic it
-    /// waits for nothing: it makes no destroy a pending submit would refuse, and its
-    /// encoders' drops leak what is pending.
+    /// a lost device the wait returns at once. After a torn frame with no `submit`
+    /// since, it first makes the submit in the torn frame's place, as `submit` would;
+    /// where that is refused, the error is logged and the drop waits for nothing, as
+    /// below. While the thread unwinds a panic it makes no submit and waits for nothing:
+    /// it makes no destroy a pending submit would refuse, and its encoders' drops leak
+    /// what is pending.
     fn drop(&mut self) {
         todo!()
     }

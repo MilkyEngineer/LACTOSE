@@ -216,7 +216,7 @@ Three things these consumers must know that no signature shows:
 - `ready` is for a use the graph did not make: a point every submit of the frame that
   names the import waits for, not the first alone, as each submit that uses an import
   another queue wrote or changed waits for it (below). A wait for a point already reached
-  costs nothing on a timeline. The caller gives the point of the last submit outside this
+  costs no GPU wait. The caller gives the point of the last submit outside this
   graph that used the import, where that submit may still be pending and the import is
   declared from `Undefined` or is `Concurrent`: rhi-api's rule that a change of state or
   owner waits for another queue's pending use (`no-qfot`) is met by this wait, and so is
@@ -486,27 +486,31 @@ Three things these consumers must know that no signature shows:
   refusal of the frame's first submit changes nothing (rhi-api, "Timelines"): every import
   is as the declaration found it, and the frame's encoders are reset and free. An error
   from a later submit leaves the frame torn. The submits before it were made and stay
-  made, the frame's point is not signalled for it, and its imports are in no state the
-  graph vouches for. The error does not say which submit failed, so the caller treats
-  every error from `submit` as a torn frame: it imports the frame's imports next from
-  `Undefined`, relies on no buffer's bytes, and calls `History::reset` on every history
-  whose halves the frame imported.
-- After a torn frame the graph still takes later frames, with these waits. No frame waits
-  for the torn frame's point, which nothing signals, and the next frame's point is above
-  it. The last submit of the next frame the graph submits whole waits, by the rule above,
-  for a point of each submit the torn frame made to another queue, and for the point of
-  the last whole frame before it where that is signalled from another queue, so its point
-  covers the torn frame's submits, those on its own queue by submission order, but for the
-  one case below. The torn frame's submitted encoders and its plan are held, as a pending
-  frame's are, until that point is seen reached, so nothing is reset or destroyed under a
-  submit the torn frame made; the encoders of the submits it never made are reset and free
-  at once.
-- A submit the torn frame made to the queue of its planned last submit signals no point
-  of its own. It is covered by the next point signalled on that queue, and its encoders
-  and what it used are held until that point is seen reached: a next whole frame with no
-  submit to that queue does not cover it. A drop before such a point drops those encoders
-  first, which on a device waits for the submit, and on null makes no destroy of what it
-  used and leaks it.
+  made, the frame's point is not signalled until the graph's next `submit` (below), and
+  its imports are in no state the graph vouches for. The error does not say which submit
+  failed, so the caller treats every error from `submit` as a torn frame: it imports the
+  frame's imports next from `Undefined`, relies on no buffer's bytes, and calls
+  `History::reset` on every history whose halves the frame imported.
+- A torn frame's planned last submit is never made: it is the frame's last, so the
+  failed submit is it or comes before it. The graph's next `submit` therefore first makes
+  that submit in the torn frame's place, with no encoders, to the queue the torn frame's
+  last submit was planned for (rhi-api, "Recording and submitting": a submit with no
+  encoders waits and signals alone). It waits and signals as that last submit would have,
+  by the rule above: for a point of each submit the torn frame made to another queue, and
+  for the last frame point where that was signalled from another queue, and it signals the
+  torn frame's point. Then the new frame is submitted. The torn frame's point is reached
+  like any other frame's, the next frame's point is above it, and every later submit waits
+  for it by the rules above. The torn frame's submitted encoders and its plan are held, as
+  a pending frame's are, until its point is seen reached, so nothing is reset or destroyed
+  under a submit it made; the encoders of the submits it never made are reset and free at
+  once.
+- If that submit is refused, the new frame is not submitted: its encoders are reset and
+  free, the graph is as it was before the call, still owing that submit, and `submit`
+  returns the error unchanged, which the caller takes as a torn frame like any other. The
+  call still waits for nothing: the submit in the torn frame's place is a wait on the
+  device's queue, not on the host.
+- A device with one queue never tears a frame: its frame is one `Device::submit`, which a
+  refusal leaves unmade.
 - A `RecordedFrame` dropped unsubmitted drops its encoders, none of which is pending.
 
 ### History
@@ -565,15 +569,19 @@ Three things these consumers must know that no signature shows:
   that did not make it. Every other error is the device's, returned as the device gave it:
   `Unsupported`, `ResourceExhausted`, `DeviceLost`, and a refusal that names its rule.
 - `RenderGraph`'s drop waits, with no bound, until every submit it made has completed,
-  a torn frame's among them, then destroys its transients, blocks, timelines and encoders;
-  a torn frame's submit that no point covers is dropped as "Submission" says.
+  a torn frame's among them, then destroys its transients, blocks, timelines and encoders.
+  After a torn frame with no `submit` since, it first makes the submit in the torn frame's
+  place ("Submission"), then waits as above; an error from that submit is logged under
+  `gouda` and dropped, and the drop then waits for nothing: it destroys what no pending
+  submit uses and leaks the rest, as an unwinding drop does.
   It is dropped off the frame-critical workers (rhi-api, "Handles and lifetimes"), and
   after the host has signalled every `ready` point a pending frame waits for that the host
   owes: the drop cannot release such a frame. On a lost device the wait ends at once.
 - A drop made while the thread unwinds a panic does not wait. It reads the timelines,
   destroys what no pending submit uses, makes no destroy a pending submit would refuse,
   and drops its encoders, which leak what is pending, as rhi-api's drops do ("Handles and
-  lifetimes"). So a test that fails holding a pending frame fails instead of hanging.
+  lifetimes"). It makes no submit, the one in a torn frame's place among them. So a test
+  that fails holding a pending frame fails instead of hanging.
 - A `FrameDecl` and a `CompiledFrame` drop as plain values and leave the graph as it was.
 
 ## What `graph-impl` proves on null, and the rule each proof rests on
