@@ -59,19 +59,7 @@ fn check(shared: &Shared, records: &Records, role: QueueRole, submit: &Submit<'_
             return Err(Rule::Destroyed.refuse("a handle destroyed after it was recorded"));
         }
         for &(slot, image) in &encoder.slots {
-            let rec = &records.slots[slot.0 as usize];
-            if rec.mark {
-                return Err(Rule::HeapWrite.refuse(format!(
-                    "a pass that declares slot {}, whose write is in progress",
-                    slot.0
-                )));
-            }
-            if rec.image != image {
-                return Err(Rule::HeapLayout.refuse(format!(
-                    "a pass that declares slot {}, written since the pass began",
-                    slot.0
-                )));
-            }
+            records.check_slot(slot.0 as usize, image)?;
         }
         for (handle, (_, touch)) in &encoder.buffers {
             let host = records.buffers.get(*handle).is_some_and(|rec| !rec.host.is_empty());

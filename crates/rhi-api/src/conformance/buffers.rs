@@ -2,7 +2,9 @@
 
 use std::sync::mpsc;
 
-use super::kit::{Body, Ctx, PATIENCE, attachment, begin, buffer_to, compute_pass, image_to};
+use super::kit::{
+    Body, Ctx, Lead, Orders, PATIENCE, attachment, begin, buffer_to, compute_pass, image_to,
+};
 use crate::{
     BufferCopy, BufferHandle, BufferReach, BufferState, BufferUsage, Device, Encoder, ImageState,
     Load, MemoryClass, PassReach, QueueRole, Rule, Store, Submit,
@@ -217,6 +219,30 @@ fn overlapping_host_access_is_refused(ctx: &Ctx<'_>) -> Applies {
         inner.unwrap_or_else(|| ctx.fail("the read was not called")),
         "a read overlapping one in progress",
     );
+    // A flush or an invalidate of a range a host access in progress holds.
+    let (mut flush, mut invalidate) = (None, None);
+    ctx.ok(
+        device.write_buffer(buffer, 0, 128, &mut |bytes| {
+            bytes.fill(3);
+            flush = Some(device.flush_buffer(buffer, 64, 128));
+        }),
+        "the write",
+    );
+    ctx.ok(device.flush_buffer(buffer, 0, 128), "the flush once the write returned");
+    ctx.ok(
+        device.read_buffer(readback, 0, 128, &mut |_| {
+            invalidate = Some(device.invalidate_buffer(readback, 64, 128));
+        }),
+        "the read",
+    );
+    ctx.refused(
+        flush.unwrap_or_else(|| ctx.fail("the fill was not called")),
+        "a flush overlapping a write in progress",
+    );
+    ctx.refused(
+        invalidate.unwrap_or_else(|| ctx.fail("the read was not called")),
+        "an invalidate overlapping a read in progress",
+    );
     Ok(())
 }
 
@@ -261,6 +287,17 @@ fn host_access_outside_the_memory_class_is_refused(ctx: &Ctx<'_>) -> Applies {
         [(readback, "a write of a readback buffer"), (local, "a write of device memory")]
     {
         ctx.refused(device.write_buffer(buffer, 0, 16, &mut |bytes| bytes.fill(0)), what);
+    }
+    let upload = ctx.buffer(&*device, 64, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
+    for (buffer, what) in
+        [(readback, "a flush of a readback buffer"), (local, "a flush of device memory")]
+    {
+        ctx.refused(device.flush_buffer(buffer, 0, 16), what);
+    }
+    for (buffer, what) in
+        [(upload, "an invalidate of an upload buffer"), (local, "an invalidate of device memory")]
+    {
+        ctx.refused(device.invalidate_buffer(buffer, 0, 16), what);
     }
     Ok(())
 }
@@ -573,56 +610,67 @@ fn submit_writing_under_a_host_access_is_refused(ctx: &Ctx<'_>) -> Applies {
 }
 
 /// A submit that copies into an upload buffer races a write of it whose fill stays until
-/// the submit has returned: exactly one of the two is refused.
+/// the submit has returned: exactly one of the two is refused. A round led by the write
+/// submits once the fill has begun; one led by the submit writes once it has returned.
 fn submit_racing_a_host_access_refuses_one(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let queue = QueueRole::Graphics;
     let source = ctx.upload(&*device, BufferUsage::EMPTY, &pattern(5));
-    let mut submits_refused = 0;
-    let mut writes_refused = 0;
-    for _ in 0..ROUNDS {
+    let mut orders = Orders::new(["the write first", "the submit first"]);
+    for lead in Lead::rounds(ROUNDS) {
         let upload = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Upload);
         let mut encoder = ctx.encoder(&*device, queue);
         copy(&mut *encoder, source, upload);
         let mut encoders = [encoder];
         let gate = ctx.gate(&*device);
         let (returned, returned_seen) = mpsc::channel::<()>();
+        let (filling, filling_seen) = mpsc::channel::<()>();
         let device: &dyn Device = &*device;
-        let (write, submit) = std::thread::scope(|scope| {
-            let write = scope.spawn(move || {
-                device.write_buffer(upload, 0, SIZE, &mut |bytes| {
-                    bytes.fill(1);
-                    returned_seen.recv_timeout(PATIENCE).ok();
-                })
-            });
-            let encoders = &mut encoders;
-            let submit = scope.spawn(move || {
-                let submit = device
-                    .submit(queue, Submit { encoders, waits: &[gate.wait], signals: &[gate.done] });
-                returned.send(()).ok();
-                submit
-            });
-            (
-                write.join().unwrap_or_else(|_| ctx.fail("the writer panicked")),
-                submit.join().unwrap_or_else(|_| ctx.fail("the submitter panicked")),
-            )
-        });
-        match (&write, &submit) {
-            (Ok(()), Err(error)) if Rule::of(error) == Some(Rule::HostOverlap) => {
-                submits_refused += 1
+        let encoders = &mut encoders;
+        let mut submit = move || {
+            if lead == Lead::First {
+                filling_seen.recv_timeout(PATIENCE).ok();
             }
-            (Err(error), Ok(())) if Rule::of(error) == Some(Rule::Pending) => writes_refused += 1,
+            let submit = device
+                .submit(queue, Submit { encoders, waits: &[gate.wait], signals: &[gate.done] });
+            returned.send(()).ok();
+            submit
+        };
+        let write = move || {
+            device.write_buffer(upload, 0, SIZE, &mut |bytes| {
+                filling.send(()).ok();
+                bytes.fill(1);
+                returned_seen.recv_timeout(PATIENCE).ok();
+            })
+        };
+        let (write, submit) = if lead == Lead::Second {
+            let submit = submit();
+            (write(), submit)
+        } else {
+            std::thread::scope(|scope| {
+                let write = scope.spawn(write);
+                let submit = scope.spawn(submit);
+                (
+                    write.join().unwrap_or_else(|_| ctx.fail("the writer panicked")),
+                    submit.join().unwrap_or_else(|_| ctx.fail("the submitter panicked")),
+                )
+            })
+        };
+        let order = match (&write, &submit) {
+            (Ok(()), Err(error)) if Rule::of(error) == Some(Rule::HostOverlap) => 0,
+            (Err(error), Ok(())) if Rule::of(error) == Some(Rule::Pending) => 1,
             _ => ctx.fail(format_args!(
                 "not exactly one refused: the write {write:?}, the submit {submit:?}"
             )),
-        }
+        };
+        orders.reached(ctx, lead, order);
         if submit.is_ok() {
             gate.open(ctx, device);
         } else {
             ctx.ok(device.flush_buffer(upload, 0, SIZE), "a flush");
         }
     }
-    ctx.check(submits_refused + writes_refused == ROUNDS, "every round refused one");
+    orders.report(ctx);
     Ok(())
 }
 

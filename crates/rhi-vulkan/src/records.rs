@@ -562,6 +562,54 @@ impl Records {
         self.settle();
     }
 
+    /// The first hold of a heap slot's write: refused while a pass of a pending submit
+    /// declares the slot; then the slot is marked, and the image it is given counted from
+    /// now.
+    pub(crate) fn begin_slot_write(
+        &mut self,
+        index: usize,
+        image: Option<ImageHandle>,
+    ) -> Result<()> {
+        if self.pending(&self.slots[index].stamps) {
+            return Err(Rule::HeapWrite.refuse(format!(
+                "slot {index} written while a pass of a pending submit declares it"
+            )));
+        }
+        self.slots[index].mark = true;
+        if let Some(rec) = image.and_then(|image| self.images.get_mut(image)) {
+            rec.slots += 1;
+        }
+        Ok(())
+    }
+
+    /// The second hold of a heap slot's write: the mark cleared, the slot's image
+    /// recorded, and the image it held no longer counted.
+    pub(crate) fn end_slot_write(&mut self, index: usize, image: Option<ImageHandle>) {
+        let rec = &mut self.slots[index];
+        rec.mark = false;
+        let old = core::mem::replace(&mut rec.image, image);
+        if let Some(rec) = old.and_then(|old| self.images.get_mut(old)) {
+            rec.slots -= 1;
+        }
+    }
+
+    /// A submit's check of a slot its pass declared, holding `image` when the pass began:
+    /// refused while a write of the slot is in progress, and once a write has given the
+    /// slot another image.
+    pub(crate) fn check_slot(&self, index: usize, image: Option<ImageHandle>) -> Result<()> {
+        let rec = &self.slots[index];
+        if rec.mark {
+            return Err(Rule::HeapWrite
+                .refuse(format!("a pass that declares slot {index}, whose write is in progress")));
+        }
+        if rec.image != image {
+            return Err(Rule::HeapLayout.refuse(format!(
+                "a pass that declares slot {index}, written since the pass began"
+            )));
+        }
+        Ok(())
+    }
+
     /// Whether any submit has not completed.
     pub(crate) fn any_pending(&self) -> bool {
         self.queues.iter().any(|queue| queue.next - 1 > queue.known)
@@ -575,9 +623,9 @@ impl Records {
 
 #[cfg(test)]
 mod tests {
-    use lactose_rhi_api::{CacheStart, Rule, TimelinePoint};
+    use lactose_rhi_api::{CacheStart, ImageHandle, Rule, TimelineHandle, TimelinePoint};
 
-    use super::{Records, TimelineRec};
+    use super::{DIFFERENCE_LIMIT, ImageRec, QUEUES, Records, TimelineRec};
 
     fn records() -> Records {
         Records::new(4, 4, CacheStart::Empty)
@@ -643,5 +691,346 @@ mod tests {
         assert_eq!(records.timeline(timeline).unwrap().known, 1);
         let above = records.begin_host_signal(TimelinePoint { timeline, value: 4 }).unwrap_err();
         assert_eq!(rule(&above), Some(Rule::Timeline));
+    }
+
+    // The fixed interleavings `lactose-rhi-api`'s README asks of a device backend's records
+    // ("Threads"), each a device call's read, holds and driver call in the order the
+    // device makes them, against a model of the driver's values.
+
+    /// The driver's values, as a device's calls would read and change them.
+    struct Driver {
+        queues: [u64; QUEUES],
+        timelines: Vec<(TimelineHandle, u64)>,
+    }
+
+    impl Driver {
+        fn new() -> Self {
+            Self { queues: [0; QUEUES], timelines: Vec::new() }
+        }
+
+        fn value(&self, timeline: TimelineHandle) -> u64 {
+            self.timelines.iter().find(|(t, _)| *t == timeline).map_or(0, |&(_, v)| v)
+        }
+
+        /// A signal, by the host or a submit; a value not above the semaphore's is a breach
+        /// of the driver's rules the records exist to prevent.
+        fn signal(&mut self, point: TimelinePoint) {
+            let now = self.value(point.timeline);
+            assert!(point.value > now, "a signal of {} to a semaphore at {now}", point.value);
+            self.timelines.retain(|(t, _)| *t != point.timeline);
+            self.timelines.push((point.timeline, point.value));
+        }
+
+        /// What `Shared::read_timeline` learns, with no lock held: the greatest value the
+        /// timeline is awaited to reach that the driver's has reached.
+        fn read_timeline(
+            &self,
+            records: &Records,
+            timeline: TimelineHandle,
+        ) -> Option<(TimelineHandle, u64)> {
+            let value = self.value(timeline);
+            let reached = records.awaited(timeline).into_iter().filter(|&v| v <= value).max();
+            reached.map(|reached| (timeline, reached))
+        }
+
+        /// What `Shared::read_queues` learns: each queue's greatest received stamp the
+        /// driver has reached.
+        fn read_queues(&self, records: &Records) -> [Option<u64>; QUEUES] {
+            core::array::from_fn(|queue| {
+                let rec = &records.queues[queue];
+                (rec.known + 1..=rec.received).filter(|&seq| seq <= self.queues[queue]).max()
+            })
+        }
+
+        /// A submit's completion on the device: its queue's own value and its signals.
+        fn complete(&mut self, queue: usize, seq: u64, signals: &[TimelinePoint]) {
+            self.queues[queue] = seq;
+            for &point in signals {
+                self.signal(point);
+            }
+        }
+    }
+
+    /// The check after every hold: no value the records know a caller's timeline has
+    /// reached is above the driver's. A queue's own value may be known ahead of its
+    /// semaphore, from a caller's point its submit signals.
+    fn behind(records: &Records, driver: &Driver) {
+        for &(timeline, value) in &driver.timelines {
+            if let Some(rec) = records.timelines.get(timeline) {
+                assert!(rec.known <= value, "known {} above the driver's {value}", rec.known);
+            }
+        }
+    }
+
+    /// A host signal's first hold, after a read made at `read`.
+    fn begin(
+        records: &mut Records,
+        driver: &Driver,
+        read: Option<(TimelineHandle, u64)>,
+        point: TimelinePoint,
+    ) -> lactose_core::Result<()> {
+        records.fold(&[None; QUEUES], read.as_slice());
+        let begun = records.begin_host_signal(point);
+        behind(records, driver);
+        begun
+    }
+
+    /// A host signal's driver call and second hold.
+    fn end(records: &mut Records, driver: &mut Driver, point: TimelinePoint) {
+        driver.signal(point);
+        records.end_host_signal(point, true);
+        behind(records, driver);
+    }
+
+    /// A host signal made in full.
+    fn host_signal(records: &mut Records, driver: &mut Driver, point: TimelinePoint) {
+        let read = driver.read_timeline(records, point.timeline);
+        begin(records, driver, read, point).expect("a host signal");
+        end(records, driver, point);
+    }
+
+    /// A submit's read of the driver, before its first hold.
+    struct Read {
+        queues: [Option<u64>; QUEUES],
+        points: Vec<(TimelineHandle, u64)>,
+    }
+
+    fn read(records: &Records, driver: &Driver, points: &[TimelinePoint]) -> Read {
+        Read {
+            queues: driver.read_queues(records),
+            points: points
+                .iter()
+                .filter_map(|p| driver.read_timeline(records, p.timeline))
+                .collect(),
+        }
+    }
+
+    /// A submit's first hold, the driver call and the second hold, after `read`: its stamp,
+    /// or its refusal.
+    fn submit(
+        records: &mut Records,
+        driver: &Driver,
+        read: &Read,
+        queue: usize,
+        waits: &[TimelinePoint],
+        signals: &[TimelinePoint],
+        failed: bool,
+    ) -> lactose_core::Result<u64> {
+        records.fold(&read.queues, &read.points);
+        let checked = records.check_points(queue, waits, signals);
+        behind(records, driver);
+        checked?;
+        let seq = records.stamp(queue, waits, signals);
+        records.received(queue, seq, failed);
+        behind(records, driver);
+        Ok(seq)
+    }
+
+    fn timeline(records: &mut Records, driver: &mut Driver, known: u64) -> TimelineHandle {
+        let timeline =
+            records.timelines.insert(TimelineRec { known, mark: None }).expect("a timeline");
+        driver.timelines.push((timeline, known));
+        timeline
+    }
+
+    fn at(timeline: TimelineHandle, value: u64) -> TimelinePoint {
+        TimelinePoint { timeline, value }
+    }
+
+    /// A host signal made in full between another host signal's driver read and its hold,
+    /// and between a submit's: each hold folds a read older than what it then knows.
+    #[test]
+    fn a_host_signal_made_between_a_read_and_its_hold_is_seen_by_the_hold() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let t = timeline(&mut records, &mut driver, 0);
+        let stale = driver.read_timeline(&records, t);
+        host_signal(&mut records, &mut driver, at(t, 2));
+        let below = begin(&mut records, &driver, stale, at(t, 1)).unwrap_err();
+        assert_eq!(rule(&below), Some(Rule::Timeline), "{below:?}");
+        begin(&mut records, &driver, stale, at(t, 3)).expect("a signal above the landed one");
+        end(&mut records, &mut driver, at(t, 3));
+
+        let stale = read(&records, &driver, &[at(t, 4)]);
+        host_signal(&mut records, &mut driver, at(t, 4));
+        let below = submit(&mut records, &driver, &stale, 0, &[], &[at(t, 4)], false).unwrap_err();
+        assert_eq!(rule(&below), Some(Rule::Timeline), "{below:?}");
+        submit(&mut records, &driver, &stale, 0, &[], &[at(t, 5)], false).expect("a signal above");
+        assert_eq!(records.timeline(t).unwrap().known, 4);
+    }
+
+    /// A promise reached, and its submit dropped by a third call's fold, in the same two
+    /// windows: the late hold's read names a value the records have folded in already.
+    #[test]
+    fn a_promise_dropped_between_a_read_and_its_hold_is_seen_by_the_hold() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let t = timeline(&mut records, &mut driver, 0);
+        let none = read(&records, &driver, &[]);
+        let promised = submit(&mut records, &driver, &none, 0, &[], &[at(t, 2)], false).unwrap();
+        let stale = driver.read_timeline(&records, t);
+        let stale_submit = read(&records, &driver, &[at(t, 3)]);
+        assert_eq!((stale, stale_submit.queues[0]), (None, None), "read before the completion");
+        driver.complete(0, promised, &[at(t, 2)]);
+        // The third call: `timeline_value`'s read and hold.
+        let third = driver.read_timeline(&records, t).expect("the promise reached");
+        records.fold_timeline(t, third.1);
+        records.settle();
+        behind(&records, &driver);
+        assert!(records.queues[0].submits.is_empty(), "the promise's submit dropped");
+        let below = begin(&mut records, &driver, stale, at(t, 2)).unwrap_err();
+        assert_eq!(rule(&below), Some(Rule::Timeline), "{below:?}");
+        let seq = submit(&mut records, &driver, &stale_submit, 0, &[], &[at(t, 3)], false)
+            .expect("a signal above the dropped promise");
+        assert!(!records.pending(&[promised, 0, 0]) && records.pending(&[seq, 0, 0]));
+    }
+
+    /// A pass that begins between a heap write's first hold and its descriptor write
+    /// declares the slot's old image, and its submit's walk before the write's second hold
+    /// is refused; after it, the walk sees the image changed under the pass.
+    #[test]
+    fn a_pass_begun_during_a_slot_write_is_refused_at_its_walk() {
+        let (mut records, driver) = (records(), Driver::new());
+        let image: ImageHandle = records
+            .images
+            .insert(ImageRec { stamps: [0; QUEUES], slots: 0, placed: None })
+            .unwrap();
+        records.begin_slot_write(0, Some(image)).expect("the first hold");
+        let declared = None;
+        let walked = records.check_slot(0, declared).unwrap_err();
+        assert_eq!(rule(&walked), Some(Rule::HeapWrite), "{walked:?}");
+        records.end_slot_write(0, Some(image));
+        let walked = records.check_slot(0, declared).unwrap_err();
+        assert_eq!(rule(&walked), Some(Rule::HeapLayout), "{walked:?}");
+        assert_eq!(records.images.get(image).unwrap().slots, 1);
+        // A pass begun after the write: its submit holds the slot from another write.
+        records.check_slot(0, Some(image)).expect("a walk of the written image");
+        let none = read(&records, &driver, &[]);
+        let seq = submit(&mut records, &driver, &none, 0, &[], &[], false).unwrap();
+        records.slots[0].stamps[0] = seq;
+        let again = records.begin_slot_write(0, None).unwrap_err();
+        assert_eq!(rule(&again), Some(Rule::HeapWrite), "{again:?}");
+    }
+
+    /// A destroy made at once after a wait that returned `true`: the wait's point is
+    /// folded in, which completes its submit with the queue's own value still behind it,
+    /// and the destroy's check is accepted.
+    #[test]
+    fn a_destroy_at_once_after_a_wait_with_the_queue_behind_is_accepted() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let t = timeline(&mut records, &mut driver, 0);
+        let none = read(&records, &driver, &[]);
+        let seq = submit(&mut records, &driver, &none, 0, &[], &[at(t, 1)], false).unwrap();
+        let stamps = [seq, 0, 0];
+        assert!(records.pending(&stamps));
+        // The caller's semaphore signalled; the queue's own, at the batch's end, not yet.
+        driver.signal(at(t, 1));
+        // `wait_timeline` returned `true`: its hold.
+        records.fold_timeline(t, 1);
+        records.settle();
+        behind(&records, &driver);
+        assert_eq!(driver.queues[0], 0, "the queue's semaphore behind the stamp");
+        assert!(!records.pending(&stamps), "the destroy's check, accepted");
+        assert_eq!(driver.read_queues(&records), [None; QUEUES], "nothing left to read");
+    }
+
+    /// A failed submit's point signalled from the host while an earlier submit of its
+    /// queue is pending: the failed submit kept no promise, so the signal completes
+    /// nothing, and a destroy of what the earlier submit uses is refused.
+    #[test]
+    fn a_failed_submits_point_signalled_from_the_host_completes_no_earlier_submit() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let t = timeline(&mut records, &mut driver, 0);
+        let none = read(&records, &driver, &[]);
+        let earlier = submit(&mut records, &driver, &none, 0, &[], &[], false).unwrap();
+        let failed = submit(&mut records, &driver, &none, 0, &[], &[at(t, 1)], true).unwrap();
+        assert!(failed > earlier);
+        host_signal(&mut records, &mut driver, at(t, 1));
+        assert!(records.pending(&[earlier, 0, 0]), "the destroy's check, refused");
+        driver.complete(0, earlier, &[]);
+        let read = driver.read_queues(&records);
+        records.fold(&read, &[]);
+        behind(&records, &driver);
+        assert!(!records.pending(&[earlier, 0, 0]));
+    }
+
+    /// A submit that only waits, made between a host signal's two holds, 2^31 below the
+    /// marked value, is refused; one just within it is not.
+    #[test]
+    fn a_wait_only_submit_2_31_below_a_marked_host_signal_is_refused() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let t = timeline(&mut records, &mut driver, 0);
+        host_signal(&mut records, &mut driver, at(t, 10));
+        let marked = 10 + DIFFERENCE_LIMIT - 1;
+        let read_first = driver.read_timeline(&records, t);
+        begin(&mut records, &driver, read_first, at(t, marked)).expect("the first hold");
+        let waits = [at(t, marked - DIFFERENCE_LIMIT)];
+        let now = read(&records, &driver, &waits);
+        let beyond = submit(&mut records, &driver, &now, 0, &waits, &[], false).unwrap_err();
+        assert_eq!(rule(&beyond), Some(Rule::Timeline), "{beyond:?}");
+        let waits = [at(t, marked - DIFFERENCE_LIMIT + 1)];
+        submit(&mut records, &driver, &now, 0, &waits, &[], false).expect("a wait within");
+        end(&mut records, &mut driver, at(t, marked));
+        assert_eq!(records.timeline(t).unwrap().known, marked);
+    }
+
+    /// Host signals of one timeline from several threads, and reads of it, each making its
+    /// driver read with no lock held, as the device does: after every hold the known value
+    /// is at most the driver's, and the timeline ends at the greatest accepted signal. Run
+    /// under Miri with many seeds by the nightly job.
+    #[test]
+    fn host_signals_racing_on_one_timeline_keep_it_behind_the_driver() {
+        use std::sync::{Arc, Mutex};
+        const ROUNDS: u64 = if cfg!(miri) { 12 } else { 2_000 };
+        let (mut records, mut driver) = (records(), Driver::new());
+        let t = timeline(&mut records, &mut driver, 0);
+        let shared = Arc::new((Mutex::new(records), Mutex::new(driver)));
+        let signaller = |offset: u64| {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let (records, driver) = &*shared;
+                let mut accepted = 0;
+                for round in 0..ROUNDS {
+                    let point = at(t, round * 2 + offset);
+                    let read = {
+                        let records = records.lock().unwrap();
+                        let awaited = records.awaited(t);
+                        drop(records);
+                        let value = driver.lock().unwrap().value(t);
+                        awaited.into_iter().filter(|&v| v <= value).max().map(|v| (t, v))
+                    };
+                    {
+                        let mut records = records.lock().unwrap();
+                        let driver = driver.lock().unwrap();
+                        if begin(&mut records, &driver, read, point).is_err() {
+                            continue;
+                        }
+                    }
+                    driver.lock().unwrap().signal(point);
+                    let mut records = records.lock().unwrap();
+                    records.end_host_signal(point, true);
+                    behind(&records, &driver.lock().unwrap());
+                    accepted = point.value;
+                }
+                accepted
+            })
+        };
+        let (one, two) = (signaller(1), signaller(2));
+        let reader = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let (records, driver) = &*shared;
+                for _ in 0..ROUNDS {
+                    let value = driver.lock().unwrap().value(t);
+                    let mut records = records.lock().unwrap();
+                    records.fold_timeline(t, value);
+                    records.settle();
+                    behind(&records, &driver.lock().unwrap());
+                }
+            })
+        };
+        let greatest = one.join().unwrap().max(two.join().unwrap());
+        reader.join().unwrap();
+        let (records, driver) = &*shared;
+        let known = records.lock().unwrap().timeline(t).unwrap().known;
+        assert_eq!((known, driver.lock().unwrap().value(t)), (greatest, greatest));
     }
 }

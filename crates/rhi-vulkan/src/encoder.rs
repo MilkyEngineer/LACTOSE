@@ -646,9 +646,11 @@ impl Drop for VulkanEncoder {
                 pending = waited.is_err() && !self.shared.records().lost;
             }
         }
-        // A pending command buffer is leaked with its pool, as an unwinding drop does not
-        // wait.
-        if !pending && !raw.leaking() {
+        if pending {
+            // Unwinding with its submit pending: the drop does not wait, and the last holder
+            // destroys the pools once the device is idle, or leaks them with the device.
+            self.shared.orphan(self.pool, core::mem::take(&mut self.inputs));
+        } else if !raw.leaking() {
             // SAFETY: no submit of the command buffer is pending, or the device is lost;
             // the pools are this encoder's.
             unsafe {

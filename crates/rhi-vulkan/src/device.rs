@@ -3,7 +3,7 @@
 
 use core::ptr::NonNull;
 use core::time::Duration;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -277,6 +277,10 @@ pub(crate) type SlotEntry = Option<(ImageHandle, Arc<ImageObj>)>;
 struct HeapState {
     samplers: Vec<Option<vk::Sampler>>,
     retired: Vec<(Stamps, vk::Sampler)>,
+    /// The command pool and input set pools of each encoder dropped while its thread
+    /// unwound with its submit pending, which the last holder destroys once the device is
+    /// idle.
+    orphans: Vec<(vk::CommandPool, Vec<vk::DescriptorPool>)>,
 }
 
 /// What a device, its encoders and its submits share.
@@ -285,7 +289,9 @@ struct HeapState {
 /// (`heap_state`), never both and never two queues'; then the records' (`records`); then
 /// one entry's, a handle's in a table or a heap slot's (`slots`). Recording takes an entry's
 /// lock alone. No lock but a queue's or the heap's is held across a driver call, and none
-/// across a wait or the caller's closure.
+/// across a wait or the caller's closure. A destroying call is one: the last count of a
+/// driver object is dropped, and a reaped sampler destroyed, once the records', entry and
+/// slot locks are given up.
 pub(crate) struct Shared {
     pub(crate) raw: Arc<Raw>,
     pub(crate) caps: Capabilities,
@@ -320,37 +326,60 @@ impl Shared {
 
     /// A new holder of the device: an encoder.
     pub(crate) fn hold(self: &Arc<Self>) -> Arc<Self> {
-        // Relaxed: the count decides only which drop is the last, which its RMW settles.
+        // Relaxed: a new holder is made from one that lives, as `Arc::clone` is; the
+        // decrement orders what each holder did before the last one's teardown.
         self.holders.fetch_add(1, Ordering::Relaxed);
         Arc::clone(self)
     }
 
+    /// Takes an unwinding encoder's pools, its submit pending, for the last holder to
+    /// destroy once the device is idle.
+    pub(crate) fn orphan(&self, pool: vk::CommandPool, inputs: Vec<vk::DescriptorPool>) {
+        lock(&self.heap_state).orphans.push((pool, inputs));
+    }
+
     /// A holder's drop. The last waits for the device to idle, as the contract's last drop
-    /// waits for every submit; one made while the thread unwinds a panic with a submit
-    /// pending leaks the device instead.
+    /// waits for every submit, and destroys the samplers and the orphaned pools; one made
+    /// while the thread unwinds a panic with a submit pending leaks the device instead, and
+    /// one made so with none pending tears down as any other.
     pub(crate) fn let_go(&self) {
-        if self.holders.fetch_sub(1, Ordering::Relaxed) != 1 {
+        // Release, and Acquire at the last, as `Arc`'s drop: every queue call another
+        // holder made before its drop happens before the last holder's wait for idle,
+        // which needs every queue of the device externally synchronised.
+        if self.holders.fetch_sub(1, Ordering::Release) != 1 {
             return;
         }
+        atomic::fence(Ordering::Acquire);
         if std::thread::panicking() {
             let read = self.read_queues();
-            let mut records = self.records();
-            records.fold(&read, &[]);
-            if records.any_pending() && !records.lost {
+            let pending = {
+                let mut records = self.records();
+                records.fold(&read, &[]);
+                records.any_pending() && !records.lost
+            };
+            if pending {
                 self.raw.leak();
+                return;
             }
-            return;
         }
         // SAFETY: the last holder: no other call of the device is in progress.
         let _ = unsafe { self.raw.device.device_wait_idle() };
-        let mut state = lock(&self.heap_state);
-        for (_, sampler) in state.retired.drain(..) {
+        let mut guard = lock(&self.heap_state);
+        let state = &mut *guard;
+        let device = &self.raw.device;
+        let retired = state.retired.drain(..).map(|(_, sampler)| sampler);
+        for sampler in retired.chain(state.samplers.iter_mut().filter_map(Option::take)) {
             // SAFETY: the device is idle.
-            unsafe { self.raw.device.destroy_sampler(sampler, None) };
+            unsafe { device.destroy_sampler(sampler, None) };
         }
-        for sampler in state.samplers.iter_mut().filter_map(Option::take) {
-            // SAFETY: as above.
-            unsafe { self.raw.device.destroy_sampler(sampler, None) };
+        for (pool, inputs) in state.orphans.drain(..) {
+            // SAFETY: as above; the pools are an encoder's that is gone.
+            unsafe {
+                for inputs in inputs {
+                    device.destroy_descriptor_pool(inputs, None);
+                }
+                device.destroy_command_pool(pool, None);
+            }
         }
     }
 
@@ -483,18 +512,27 @@ impl Shared {
         records
     }
 
-    /// Destroys the retired samplers no pending submit may read.
-    fn reap(&self, state: &mut HeapState, records: &Records) {
-        let device = &self.raw.device;
-        state.retired.retain(|(stamps, sampler)| {
-            if records.pending(stamps) && !records.lost {
-                return true;
+    /// Takes out the retired samplers no pending submit may read, for `destroy_samplers`
+    /// once the records' lock is given up.
+    fn reap(state: &mut HeapState, records: &Records) -> Vec<vk::Sampler> {
+        let mut reaped = Vec::new();
+        state.retired.retain(|&(stamps, sampler)| {
+            let kept = records.pending(&stamps) && !records.lost;
+            if !kept {
+                reaped.push(sampler);
             }
+            kept
+        });
+        reaped
+    }
+
+    /// Destroys the samplers `reap` took out, under the heap's lock and no other.
+    fn destroy_samplers(&self, samplers: Vec<vk::Sampler>) {
+        for sampler in samplers {
             // SAFETY: every submit stamped before the sampler's entry held the placeholder
             // has completed; later submits read the placeholder.
-            unsafe { device.destroy_sampler(*sampler, None) };
-            false
-        });
+            unsafe { self.raw.device.destroy_sampler(sampler, None) };
+        }
     }
 }
 
@@ -559,7 +597,11 @@ impl VulkanDevice {
             info: opened.info,
             roles: opened.roles,
             queues: [Mutex::new(()), Mutex::new(()), Mutex::new(())],
-            heap_state: Mutex::new(HeapState { samplers, retired: Vec::new() }),
+            heap_state: Mutex::new(HeapState {
+                samplers,
+                retired: Vec::new(),
+                orphans: Vec::new(),
+            }),
             heap,
             records: Mutex::new(Records::new(caps.heap_slots, caps.samplers, start)),
             lost: AtomicBool::new(false),
@@ -609,30 +651,17 @@ impl VulkanDevice {
                     Some((image, object))
                 }
             };
-            if records.pending(&records.slots[index].stamps) {
-                return Err(Rule::HeapWrite.refuse(format!(
-                    "slot {} written while a pass of a pending submit declares it",
-                    slot.0
-                )));
-            }
-            records.slots[index].mark = true;
-            if let Some(rec) = image.and_then(|image| records.images.get_mut(image)) {
-                rec.slots += 1;
-            }
+            records.begin_slot_write(index, image)?;
             resolved
         };
         let view = resolved.as_ref().and_then(|(_, object)| object.sampled);
         // SAFETY: the heap's lock is held; the view's image is counted by the slot from the
         // first hold, so no destroy frees it while the slot holds it (`pending`).
         unsafe { shared.heap.write_slot(slot.0, view) };
-        *lock(&shared.slots[index]) = resolved;
-        let mut records = self.records();
-        let rec = &mut records.slots[index];
-        rec.mark = false;
-        let old = core::mem::replace(&mut rec.image, image);
-        if let Some(rec) = old.and_then(|old| records.images.get_mut(old)) {
-            rec.slots -= 1;
-        }
+        // The image the slot held may be its last count: it is dropped after the slot's lock.
+        let replaced = core::mem::replace(&mut *lock(&shared.slots[index]), resolved);
+        drop(replaced);
+        self.records().end_slot_write(index, image);
         Ok(())
     }
 
@@ -914,9 +943,11 @@ impl Device for VulkanDevice {
             ));
         }
         let object = self.make_buffer(desc)?;
-        let mut records = self.records();
-        alive(&records)?;
-        let handle = records.buffers.insert(BufferRec::new(desc.size, desc.memory))?;
+        let handle = {
+            let mut records = self.records();
+            alive(&records)?;
+            records.buffers.insert(BufferRec::new(desc.size, desc.memory))?
+        };
         self.shared.buffers.insert(handle, Arc::new(object));
         Ok(handle)
     }
@@ -956,7 +987,7 @@ impl Device for VulkanDevice {
         len: u64,
         fill: &mut dyn FnMut(&mut [u8]),
     ) -> Result<()> {
-        let (object, end) = self.lend(buffer, offset, len, MemoryClass::Upload)?;
+        let (object, end) = self.lend(buffer, offset, len, Access::Write)?;
         let lend = Lend { shared: &self.shared, buffer, start: offset, end };
         let mut bytes = vec![0; usize::try_from(len).unwrap_or(usize::MAX)];
         fill(&mut bytes);
@@ -972,7 +1003,7 @@ impl Device for VulkanDevice {
         len: u64,
         read: &mut dyn FnMut(&[u8]),
     ) -> Result<()> {
-        let (object, end) = self.lend(buffer, offset, len, MemoryClass::Readback)?;
+        let (object, end) = self.lend(buffer, offset, len, Access::Read)?;
         let lend = Lend { shared: &self.shared, buffer, start: offset, end };
         let bytes = object.read(offset, len);
         if let Ok(bytes) = &bytes {
@@ -983,30 +1014,21 @@ impl Device for VulkanDevice {
     }
 
     fn flush_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()> {
-        let object = {
-            let records = self.records();
-            alive(&records)?;
-            let rec = records.buffers.live(buffer, "a buffer")?;
-            range(offset, len, rec.size, "a flush")?;
-            self.shared.buffers.resolve(buffer).ok_or_else(|| stale("a buffer"))?
-        };
-        object.sync(offset, offset + len, true)
+        // A lend for the driver's call, rounded out to the atom: no host access of the
+        // range starts or is in progress while it runs.
+        let (object, end) = self.lend(buffer, offset, len, Access::Flush)?;
+        let lend = Lend { shared: &self.shared, buffer, start: offset, end };
+        let flushed = object.sync(offset, end, true);
+        drop(lend);
+        flushed
     }
 
     fn invalidate_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()> {
-        let object = {
-            let records = self.shared.settled();
-            alive(&records)?;
-            let rec = records.buffers.live(buffer, "a buffer")?;
-            range(offset, len, rec.size, "an invalidate")?;
-            if records.pending(&rec.changed) {
-                return Err(Rule::Pending.refuse(
-                    "an invalidate of a buffer a pending submit writes or changes the state of",
-                ));
-            }
-            self.shared.buffers.resolve(buffer).ok_or_else(|| stale("a buffer"))?
-        };
-        object.sync(offset, offset + len, false)
+        let (object, end) = self.lend(buffer, offset, len, Access::Invalidate)?;
+        let lend = Lend { shared: &self.shared, buffer, start: offset, end };
+        let invalidated = object.sync(offset, end, false);
+        drop(lend);
+        invalidated
     }
 
     fn create_image(&self, desc: &ImageDesc<'_>) -> Result<ImageHandle> {
@@ -1096,13 +1118,15 @@ impl Device for VulkanDevice {
             }
         }
         self.views(&mut object)?;
-        let mut records = self.records();
-        alive(&records)?;
-        let placed = block.as_ref().map(|(handle, ..)| *handle);
-        if let Some(handle) = placed {
-            records.blocks.live_mut(handle, "a memory block")?.images += 1;
-        }
-        let handle = records.images.insert(ImageRec { stamps: [0; QUEUES], slots: 0, placed })?;
+        let handle = {
+            let mut records = self.records();
+            alive(&records)?;
+            let placed = block.as_ref().map(|(handle, ..)| *handle);
+            if let Some(handle) = placed {
+                records.blocks.live_mut(handle, "a memory block")?.images += 1;
+            }
+            records.images.insert(ImageRec { stamps: [0; QUEUES], slots: 0, placed })?
+        };
         self.shared.images.insert(handle, Arc::new(object));
         Ok(handle)
     }
@@ -1167,9 +1191,11 @@ impl Device for VulkanDevice {
         };
         let memory = self.allocate(requirements, memory_type, false)?;
         let object = BlockObj { raw: Arc::clone(raw), memory, memory_type };
-        let mut records = self.records();
-        alive(&records)?;
-        let handle = records.blocks.insert(BlockRec { size: desc.size, images: 0 })?;
+        let handle = {
+            let mut records = self.records();
+            alive(&records)?;
+            records.blocks.insert(BlockRec { size: desc.size, images: 0 })?
+        };
         self.shared.blocks.insert(handle, Arc::new(object));
         Ok(handle)
     }
@@ -1199,12 +1225,13 @@ impl Device for VulkanDevice {
     fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerIndex> {
         let shared = &*self.shared;
         let mut state = lock(&shared.heap_state);
-        let index = {
+        let (index, reaped) = {
             let records = shared.settled();
             alive(&records)?;
-            shared.reap(&mut state, &records);
-            records.samplers.iter().position(|live| !live)
+            let reaped = Shared::reap(&mut state, &records);
+            (records.samplers.iter().position(|live| !live), reaped)
         };
+        shared.destroy_samplers(reaped);
         let Some(index) = index else {
             return Err(Error::new(ErrorKind::ResourceExhausted, "the sampler table is full"));
         };
@@ -1259,10 +1286,13 @@ impl Device for VulkanDevice {
         if let Some(object) = state.samplers[index].take() {
             // A submit stamped before the entry held the placeholder may read it: it waits
             // for those, past which every submit reads the placeholder.
-            let records = self.records();
-            let stamps = records.next_stamps().map(|next| next - 1);
-            state.retired.push((stamps, object));
-            shared.reap(&mut state, &records);
+            let reaped = {
+                let records = self.records();
+                let stamps = records.next_stamps().map(|next| next - 1);
+                state.retired.push((stamps, object));
+                Shared::reap(&mut state, &records)
+            };
+            shared.destroy_samplers(reaped);
         }
         Ok(())
     }
@@ -1274,10 +1304,12 @@ impl Device for VulkanDevice {
         alive(&self.records())?;
         let start = Instant::now();
         let (object, hits, misses) = pipeline::graphics(&self.shared, desc)?;
-        let mut records = self.records();
-        alive(&records)?;
-        pipeline::count(&mut records.stats, hits, misses, start);
-        let handle = records.graphics.insert(PipelineRec::default())?;
+        let handle = {
+            let mut records = self.records();
+            alive(&records)?;
+            pipeline::count(&mut records.stats, hits, misses, start);
+            records.graphics.insert(PipelineRec::default())?
+        };
         self.shared.graphics.insert(handle, Arc::new(object));
         Ok(handle)
     }
@@ -1289,10 +1321,12 @@ impl Device for VulkanDevice {
         alive(&self.records())?;
         let start = Instant::now();
         let (object, hits, misses) = pipeline::compute(&self.shared, desc)?;
-        let mut records = self.records();
-        alive(&records)?;
-        pipeline::count(&mut records.stats, hits, misses, start);
-        let handle = records.compute.insert(PipelineRec::default())?;
+        let handle = {
+            let mut records = self.records();
+            alive(&records)?;
+            pipeline::count(&mut records.stats, hits, misses, start);
+            records.compute.insert(PipelineRec::default())?
+        };
         self.shared.compute.insert(handle, Arc::new(object));
         Ok(handle)
     }
@@ -1341,9 +1375,11 @@ impl Device for VulkanDevice {
         let semaphore = unsafe { raw.device.create_semaphore(&info, None) }
             .map_err(|e| driver(e, "vkCreateSemaphore"))?;
         let object = TimelineObj { raw: Arc::clone(raw), semaphore };
-        let mut records = self.records();
-        alive(&records)?;
-        let handle = records.timelines.insert(TimelineRec { known: initial, mark: None })?;
+        let handle = {
+            let mut records = self.records();
+            alive(&records)?;
+            records.timelines.insert(TimelineRec { known: initial, mark: None })?
+        };
         self.shared.timelines.insert(handle, Arc::new(object));
         Ok(handle)
     }
@@ -1492,35 +1528,49 @@ impl VulkanDevice {
         buffer: BufferHandle,
         offset: u64,
         len: u64,
-        class: MemoryClass,
+        access: Access,
     ) -> Result<(Arc<BufferObj>, u64)> {
         let mut records = self.shared.settled();
         alive(&records)?;
         let rec = records.buffers.live(buffer, "a buffer")?;
-        let write = class == MemoryClass::Upload;
+        let (class, what) = match access {
+            Access::Write => (MemoryClass::Upload, "a host write"),
+            Access::Read => (MemoryClass::Readback, "a host read"),
+            Access::Flush => (MemoryClass::Upload, "a flush"),
+            Access::Invalidate => (MemoryClass::Readback, "an invalidate"),
+        };
         if rec.memory != class {
-            return Err(Rule::Usage.refuse(if write {
-                "a host write of a buffer that is not Upload"
-            } else {
-                "a host read of a buffer that is not Readback"
-            }));
+            return Err(Rule::Usage.refuse(format!("{what} of a buffer that is not {class:?}")));
         }
-        let end = range(offset, len, rec.size, if write { "a host write" } else { "a host read" })?;
+        let end = range(offset, len, rec.size, what)?;
         if rec.host.overlaps(offset, end) {
-            return Err(Rule::HostOverlap.refuse("a host access over a host access in progress"));
+            return Err(Rule::HostOverlap.refuse(format!("{what} over a host access in progress")));
         }
-        if write && records.pending(&rec.writers) {
+        if access == Access::Write && records.pending(&rec.writers) {
             return Err(Rule::Pending.refuse("a host write of a buffer a pending submit writes"));
         }
-        if !write && records.pending(&rec.changed) {
-            return Err(Rule::Pending.refuse(
-                "a host read of a buffer a pending submit writes or changes the state of",
-            ));
+        if matches!(access, Access::Read | Access::Invalidate) && records.pending(&rec.changed) {
+            return Err(Rule::Pending.refuse(format!(
+                "{what} of a buffer a pending submit writes or changes the state of"
+            )));
         }
         let object = self.shared.buffers.resolve(buffer).ok_or_else(|| stale("a buffer"))?;
         records.buffers.live_mut(buffer, "a buffer")?.host.add(offset, end);
         Ok((object, end))
     }
+}
+
+/// What a host lend is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Access {
+    /// `write_buffer`, of an `Upload` buffer.
+    Write,
+    /// `read_buffer`, of a `Readback` buffer.
+    Read,
+    /// `flush_buffer`, of an `Upload` buffer.
+    Flush,
+    /// `invalidate_buffer`, of a `Readback` buffer.
+    Invalidate,
 }
 
 /// A host lend in progress: its range, removed by the second hold when the lend ends,

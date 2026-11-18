@@ -4,19 +4,20 @@
 //! directory that cannot be written, and each validator's canary. `cargo xtask gpu` runs every canary in a process of its own and
 //! checks that it said its known message and nothing else.
 
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lactose_core::ErrorKind;
 use lactose_rhi_api::{
-    BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferReach, BufferState,
+    AddressMode, BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferReach, BufferState,
     BufferTransition, BufferUsage, CacheStart, ColourAttachment, ColourTargetDesc, ComputePass,
     ComputePipelineDesc, ComputePipelineHandle, Constant, ConstantValue, CookedShader, Cull,
-    Device, DeviceRequest, Encoder, Extent, Format, GraphicsPipelineDesc, ImageDesc, ImageMemory,
-    ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryBlockDesc, MemoryClass,
-    PassReach, QueuePath, QueueRole, Rect, RenderPass, Sharing, StageDesc, StateOn, Store, Submit,
-    Target, TimelinePoint, WriteMask,
+    Device, DeviceRequest, Encoder, Extent, Filter, Format, GraphicsPipelineDesc, ImageDesc,
+    ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryBlockDesc,
+    MemoryClass, PassReach, QueuePath, QueueRole, Rect, RenderPass, SamplerDesc, Sharing,
+    StageDesc, StateOn, Store, Submit, Target, TimelinePoint, WriteMask,
 };
 use lactose_rhi_vulkan::VulkanDevice;
 
@@ -683,3 +684,95 @@ fn canary_gpu_assisted_validation_reports_a_read_past_a_buffer() {
 
 /// What GPU-assisted validation's canary must say.
 const GPU_ASSISTED_CANARY: &str = "VUID-RuntimeSpirv-PhysicalStorageBuffer64";
+
+/// Whether the run turns GPU-assisted validation on, whose teardown at the process's exit
+/// aborts over a device leaked on purpose.
+fn gpu_assisted() -> bool {
+    std::env::var("VK_KHRONOS_VALIDATION_GPUAV_ENABLE").is_ok_and(|value| value == "true")
+}
+
+/// Submits an encoder with nothing in it to the graphics queue, held by a wait for `gate`.
+fn held(device: &VulkanDevice, gate: TimelinePoint) -> [Box<dyn Encoder>; 1] {
+    let encoder = device.create_encoder(QueueRole::Graphics, "held").expect("an encoder");
+    let mut encoders = [encoder];
+    device
+        .submit(
+            QueueRole::Graphics,
+            Submit { encoders: &mut encoders, waits: &[gate], signals: &[] },
+        )
+        .expect("the submit, held by its wait");
+    encoders
+}
+
+/// A last holder dropped while its thread unwinds, with a submit pending, leaks the device
+/// whole and returns: nothing the leaked messengers name is freed, so the box their user
+/// data points at keeps its count of the sink.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn a_drop_while_unwinding_with_a_submit_pending_keeps_the_messengers_sink() {
+    if gpu_assisted() {
+        eprintln!(
+            "a_drop_while_unwinding_with_a_submit_pending_keeps_the_messengers_sink: skipped, \
+             GPU-assisted validation aborts at exit over a leaked device"
+        );
+        return;
+    }
+    let sink = Arc::new(Counting::default());
+    let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let device = device(&sink);
+        let timeline = device.create_timeline(0).expect("a timeline");
+        let _encoders = held(&device, TimelinePoint { timeline, value: 1 });
+        assert_eq!(Arc::strong_count(&sink), 2, "the device's count of the sink");
+        panic!("the test's panic, with a submit pending");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(Arc::strong_count(&sink), 2, "the leaked messengers' sink was freed");
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+/// A last holder dropped while its thread unwinds, with nothing pending, tears the device
+/// down as a drop that does not unwind does, its sampler included, which validation would
+/// report left alive.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn a_drop_while_unwinding_with_nothing_pending_destroys_everything() {
+    let sink = Arc::new(Counting::default());
+    let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let device = device(&sink);
+        let desc = SamplerDesc {
+            magnify: Filter::Linear,
+            minify: Filter::Linear,
+            mip: Filter::Nearest,
+            address_u: AddressMode::ClampToEdge,
+            address_v: AddressMode::Repeat,
+        };
+        device.create_sampler(&desc).expect("a sampler");
+        run(&device, lagging(&device));
+        panic!("the test's panic, with nothing pending");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(Arc::strong_count(&sink), 1, "the device's count of the sink was kept");
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+/// An encoder dropped while its thread unwinds, with its submit pending, hands its pools to
+/// the device; the last holder, on another thread, destroys them once the device is idle.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn an_encoder_dropped_while_unwinding_hands_its_pools_to_the_last_holder() {
+    let sink = Arc::new(Counting::default());
+    let device = Arc::new(device(&sink));
+    let timeline = device.create_timeline(0).expect("a timeline");
+    let gate = TimelinePoint { timeline, value: 1 };
+    let worker = Arc::clone(&device);
+    let unwound = std::thread::spawn(move || {
+        let _encoders = held(&worker, gate);
+        panic!("the test's panic, with its encoder's submit held");
+    })
+    .join();
+    assert!(unwound.is_err());
+    device.signal_timeline(gate).expect("the gate's signal");
+    drop(Arc::into_inner(device).expect("the last count of the device"));
+    assert_eq!(Arc::strong_count(&sink), 1, "the device's count of the sink was kept");
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}

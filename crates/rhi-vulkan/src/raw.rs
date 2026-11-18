@@ -3,6 +3,8 @@
 //! and the reported one (`lactose-rhi-api`'s README, "Capabilities").
 
 use core::ffi::{CStr, c_void};
+use core::mem::ManuallyDrop;
+use core::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -122,16 +124,16 @@ impl MemoryTypes {
 /// The driver's own objects. Every object of the device holds it, so the device is
 /// destroyed after the last of them.
 pub(crate) struct Raw {
-    /// The loader, kept open while any of its functions may be called.
-    _entry: ash::Entry,
+    /// The loader, kept open while any of its functions may be called: closed after the
+    /// instance is destroyed, and never on the leak path, where the instance lives on.
+    entry: ManuallyDrop<ash::Entry>,
     pub(crate) instance: ash::Instance,
     pub(crate) physical: vk::PhysicalDevice,
     pub(crate) device: ash::Device,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
-    /// The sink the messenger's callback reaches through its user data. Boxed so that its
-    /// address holds from the instance's creation, whose `pNext` names it, to its
-    /// destruction; dropped after both, as a field after `drop`.
-    _sink: Box<Arc<dyn MessageSink>>,
+    /// The sink the messengers' callback reaches through their user data, freed after the
+    /// instance is destroyed.
+    sink: Sink,
     pub(crate) queues: Vec<Queue>,
     pub(crate) memory: MemoryTypes,
     pub(crate) properties: vk::PhysicalDeviceProperties,
@@ -155,12 +157,16 @@ impl Raw {
 
 impl Drop for Raw {
     fn drop(&mut self) {
+        // On the leak path the instance and its messengers live on, so the sink and the
+        // loader they reach do too: neither is freed.
         if self.leaking() {
             return;
         }
         // SAFETY: every object made from the device holds this `Raw` and is gone, and the
         // last holder of the device waited for the device to idle; the messenger and the
-        // instance outlive what was made from them, and are destroyed last.
+        // instance outlive what was made from them, and are destroyed last. No messenger
+        // names the sink once the instance is destroyed, and no function of the loader is
+        // called after it.
         unsafe {
             for queue in &self.queues {
                 self.device.destroy_semaphore(queue.timeline, None);
@@ -170,7 +176,41 @@ impl Drop for Raw {
                 utils.destroy_debug_utils_messenger(*messenger, None);
             }
             self.instance.destroy_instance(None);
+            self.sink.free();
+            ManuallyDrop::drop(&mut self.entry);
         }
+    }
+}
+
+/// The sink the messengers' callback reaches through their user data: the allocation of a
+/// box, taken with `Box::leak`, so that its address and its provenance hold from the
+/// instance's creation, whose `pNext` names it, to its destruction. Dropped, it leaks;
+/// only `free` frees it.
+struct Sink(NonNull<Arc<dyn MessageSink>>);
+
+// SAFETY: a `Sink` owns its `Arc` as a `Box` would, and `MessageSink` is `Send + Sync`.
+unsafe impl Send for Sink {}
+// SAFETY: as above; the callback reads it through a shared reference alone.
+unsafe impl Sync for Sink {}
+
+impl Sink {
+    fn new(sink: Arc<dyn MessageSink>) -> Self {
+        Self(NonNull::from(Box::leak(Box::new(sink))))
+    }
+
+    /// The messengers' user data.
+    fn user(&self) -> *mut c_void {
+        self.0.as_ptr().cast()
+    }
+
+    /// Frees the sink.
+    ///
+    /// # Safety
+    ///
+    /// No instance or messenger that names it lives, and it is freed once.
+    unsafe fn free(&self) {
+        // SAFETY: the pointer is a leaked box's, freed once, by the caller's promise.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
     }
 }
 
@@ -206,8 +246,8 @@ unsafe extern "system" fn on_message(
         };
         (string(data.p_message_id_name), string(data.p_message))
     };
-    // SAFETY: `user` is the address of the `Box`ed sink in `Raw`, which outlives the
-    // instance and the messenger (`Raw::_sink`).
+    // SAFETY: `user` is the address of the sink in `Raw` or `Partial`, freed only after
+    // the instance and its messengers are destroyed, and never while they live (`Sink`).
     let sink = unsafe { &*user.cast::<Arc<dyn MessageSink>>() };
     let severity = if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
         Severity::Error
@@ -360,8 +400,15 @@ pub(crate) fn open(request: &DeviceRequest) -> Result<Opened> {
     if debug {
         extensions.push(ash::ext::debug_utils::NAME.as_ptr());
     }
-    let sink: Box<Arc<dyn MessageSink>> = Box::new(Arc::clone(&request.messages));
-    let user = core::ptr::from_ref::<Arc<dyn MessageSink>>(&sink).cast_mut().cast::<c_void>();
+    // From here every failure destroys what it made, and frees the sink after: `Partial`
+    // does on its drop.
+    let mut partial = Partial {
+        instance: None,
+        debug: None,
+        device: None,
+        sink: Some(Sink::new(Arc::clone(&request.messages))),
+    };
+    let user = partial.sink.as_ref().map_or(core::ptr::null_mut(), Sink::user);
     let mut messenger_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
         .message_severity(
             vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
@@ -391,12 +438,10 @@ pub(crate) fn open(request: &DeviceRequest) -> Result<Opened> {
         instance_info = instance_info.push_next(&mut messenger_info);
     }
     // SAFETY: the create info and what it names live through the call; the messenger's
-    // user data is the boxed sink, which outlives the instance (`Raw::_sink`).
+    // user data is the sink, which outlives the instance (`Sink`).
     let instance = unsafe { entry.create_instance(&instance_info, None) }
         .map_err(|e| driver(e, "vkCreateInstance"))?;
-    // From here every failure destroys what it made: `Partial` does on its drop.
-    let mut partial =
-        Partial { instance: Some(instance.clone()), debug: None, device: None, sink: Some(sink) };
+    partial.instance = Some(instance.clone());
     if debug {
         let utils = ash::ext::debug_utils::Instance::new(&entry, &instance);
         // SAFETY: as the instance's, with the instance live.
@@ -429,14 +474,14 @@ pub(crate) fn open(request: &DeviceRequest) -> Result<Opened> {
     device(&entry, &instance, physical, request, &mut partial)
 }
 
-/// What `open` has made so far, destroyed on a failure. The sink is a field, dropped after
-/// the instance is destroyed: the messenger the instance's creation named may call it until
+/// What `open` has made so far, destroyed on a failure. The sink is freed after the
+/// instance is destroyed: the messenger the instance's creation named may call it until
 /// then.
 struct Partial {
     instance: Option<ash::Instance>,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     device: Option<ash::Device>,
-    sink: Option<Box<Arc<dyn MessageSink>>>,
+    sink: Option<Sink>,
 }
 
 impl Drop for Partial {
@@ -452,6 +497,9 @@ impl Drop for Partial {
             }
             if let Some(instance) = self.instance.take() {
                 instance.destroy_instance(None);
+            }
+            if let Some(sink) = self.sink.take() {
+                sink.free();
             }
         }
     }
@@ -759,12 +807,12 @@ fn device(
     let device = partial.device.take().ok_or_else(|| unsupported("no device"))?;
     let sink = partial.sink.take().ok_or_else(|| unsupported("no sink"))?;
     let raw = Raw {
-        _entry: entry.clone(),
+        entry: ManuallyDrop::new(entry.clone()),
         instance,
         physical,
         device,
         debug,
-        _sink: sink,
+        sink,
         queues,
         memory,
         properties,

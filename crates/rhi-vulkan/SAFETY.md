@@ -43,17 +43,21 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   is of that physical device.
 - On a failure partway, `Partial` destroys what was made, once each, children first; on
   success every field is taken out of it before its drop.
-- `Raw` owns the instance and the device. Every object of the device holds an `Arc<Raw>`, so
-  `Raw`'s drop runs after the last of them, and the last holder of the device waited for the
-  device to idle first (`Shared::let_go`). The messenger is destroyed before the instance.
+- `Raw` owns the instance, the device, the messengers' sink and the loader. Every object of
+  the device holds an `Arc<Raw>`, so `Raw`'s drop runs after the last of them, and the last
+  holder of the device waited for the device to idle first (`Shared::let_go`). The messenger
+  is destroyed before the instance, and the sink is freed and the loader released after the
+  instance, never before: the loader is a `ManuallyDrop` and the sink a pointer with no drop
+  of its own, so neither goes with the fields. On the leak path neither is freed.
 
 ### The messenger's callback (`raw.rs`, `on_message`)
 
 - The loader passes callback data valid for the call, with strings null or NUL-terminated;
   each is copied into an owned `String` before the sink sees it.
-- `user` is the address of the `Box<Arc<dyn MessageSink>>` that `Raw` keeps. The box's address
-  is fixed from the instance's creation, whose `pNext` names it, to the instance's
-  destruction, and `Raw` drops the box after both (a field dropped after `Drop::drop`).
+- `user` is the address of a leaked `Box<Arc<dyn MessageSink>>` (`Sink`), made before the
+  instance, whose `pNext` names it. It is freed once, by `Raw`'s drop or `Partial`'s, after
+  the instance is destroyed, and never while an instance or a messenger that names it
+  lives: a device leaked while unwinding keeps it for the life of the process.
 - The sink's call runs inside `catch_unwind`, so a panicking sink never unwinds into the
   driver.
 
@@ -67,6 +71,11 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   `Arc` for each object it recorded. A destroy that would end the entry while a submit that
   names the object is pending is refused (`pending`), and the encoder's count lasts until
   its submit is seen complete, so the GPU is done with each object before its drop.
+- No destroying call is made under the records' lock, an entry's or a slot's: a table's
+  replaced or removed count, a slot's replaced image and a reaped sampler are dropped or
+  destroyed once those locks are given up, under a queue's or the heap's lock alone. A
+  message the layer sends from such a call reaches the sink with no lock held that the
+  sink's own calls of the device would take.
 - A shader module lives through the one creation that uses it (`Modules`), and is destroyed
   when that creation returns, however it returns.
 - The pipeline cache is created from a payload whose seal names this device's identity and
@@ -103,8 +112,9 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   render pass, inside a compute pass with a pipeline bound, outside a pass), with every
   resource it names held by the encoder and every range inside its resource.
 - A reset, and the drop that frees the pool, come after the encoder's submit is seen complete,
-  or after the device is lost; a drop that would wait while the thread unwinds a panic leaks
-  the pool instead.
+  or after the device is lost. A drop that would wait while the thread unwinds a panic hands
+  its pools to the device instead (`Shared::orphan`), whose last holder destroys them after
+  the device is idle, or leaks them with the device.
 
 ### Submission and waits (`submit.rs`, `device.rs`)
 
@@ -119,8 +129,24 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
 
 - A drop of the device's last holder, made while the thread unwinds a panic with a submit
   pending, does not wait; it marks the device leaking (`Raw::leak`), and every object's drop
-  after it returns without destroying anything. Nothing is destroyed under the GPU's use, at
-  the cost of the device's memory.
+  after it returns without destroying anything, `Raw`'s included, which frees neither the
+  sink nor the loader the leaked messengers reach. Nothing is destroyed under the GPU's use,
+  at the cost of the device's memory. With nothing pending, the unwinding last holder tears
+  the device down as any last holder does.
+- The holders' count is decremented with `Release` and the last holder takes an `Acquire`
+  fence, as `Arc`'s drop does, so every queue call another holder made happens before the
+  last holder's wait for idle.
+
+## What Miri covers
+
+Nightly runs the crate's unit tests under Miri with four seeds: the records' fixed
+interleavings, a race of host signals and reads on threads over them, the handle table's
+drops outside its entry lock and a race of its generations on threads, and the conversions
+and module reads. Those are this crate's state that has no driver in it. Miri cannot load a
+driver, so nothing that reaches `ash` runs under it: `Raw`, `Mapping`, `on_message`, the
+holders' count, `leaking` and `lost`, and the encoders. Those run on devices in `cargo xtask
+gpu`, the unwinding drops included, where a data race between two of this crate's threads is
+seen only if a validator or a test's assertion meets it.
 
 ## What no test here shows
 

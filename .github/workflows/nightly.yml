@@ -90,6 +90,13 @@ jobs:
           - name: rhi-null, doc
             key: rhi-null-doc
             args: -p lactose-rhi-null --doc
+          # The Vulkan backend's unit tests: its records' fixed interleavings and their race,
+          # its handle table and its shader module reads. Nothing here reaches a driver, which
+          # Miri cannot load; the device's own paths run in `cargo xtask gpu`.
+          - name: rhi-vulkan, unit tests
+            key: rhi-vulkan-lib
+            args: -p lactose-rhi-vulkan --lib
+            miriflags: -Zmiri-many-seeds=0..4
     steps:
       - uses: actions/checkout@v4
       # Miri is the one sanctioned use of a nightly toolchain (architecture section 8.3).

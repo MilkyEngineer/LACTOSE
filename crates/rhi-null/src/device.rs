@@ -710,7 +710,13 @@ impl Device for NullDevice {
         let mut records = self.records();
         alive(&records)?;
         let rec = records.buffers.live_mut(buffer, "a buffer")?;
+        if rec.memory != MemoryClass::Upload {
+            return Err(Rule::Usage.refuse("a flush of a buffer that is not Upload"));
+        }
         let end = range(offset, len, rec.size, "a flush")?;
+        if rec.host.overlaps(offset, end) {
+            return Err(Rule::HostOverlap.refuse("a flush over a host access in progress"));
+        }
         rec.unflushed.subtract(offset, end);
         Ok(())
     }
@@ -719,7 +725,13 @@ impl Device for NullDevice {
         let mut records = self.records();
         alive(&records)?;
         let rec = records.buffers.live(buffer, "a buffer")?;
+        if rec.memory != MemoryClass::Readback {
+            return Err(Rule::Usage.refuse("an invalidate of a buffer that is not Readback"));
+        }
         let end = range(offset, len, rec.size, "an invalidate")?;
+        if rec.host.overlaps(offset, end) {
+            return Err(Rule::HostOverlap.refuse("an invalidate over a host access in progress"));
+        }
         // An invalidate made before the writer, or the barrier into `HostRead`, runs makes
         // nothing it writes visible.
         if records.pending(&rec.changed) {

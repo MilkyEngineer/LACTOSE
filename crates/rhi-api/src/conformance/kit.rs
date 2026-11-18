@@ -63,6 +63,88 @@ pub(super) fn woken<T: Send>(
     })
 }
 
+/// Which call of a race goes first in a round. In a `Free` round the two are made at once
+/// on two threads; in a led round the one named returns before the other is made, so that
+/// each order a race can take is reached on every run, however rarely the free rounds
+/// reach it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Lead {
+    Free,
+    First,
+    Second,
+}
+
+impl Lead {
+    /// A race case's rounds: one led each way, then `free` rounds that race.
+    pub(super) fn rounds(free: usize) -> impl Iterator<Item = Self> {
+        [Self::First, Self::Second].into_iter().chain(core::iter::repeat_n(Self::Free, free))
+    }
+}
+
+/// Makes `first` and `second` at once on two threads in a `Free` round, and otherwise one
+/// after the other, the one `lead` names first.
+pub(super) fn race<A: Send, B: Send>(
+    ctx: &Ctx<'_>,
+    lead: Lead,
+    first: impl FnOnce() -> A + Send,
+    second: impl FnOnce() -> B + Send,
+) -> (A, B) {
+    match lead {
+        Lead::First => {
+            let first = first();
+            (first, second())
+        }
+        Lead::Second => {
+            let second = second();
+            (first(), second)
+        }
+        Lead::Free => std::thread::scope(|scope| {
+            let first = scope.spawn(first);
+            let second = scope.spawn(second);
+            (
+                first.join().unwrap_or_else(|_| ctx.fail("a racer panicked")),
+                second.join().unwrap_or_else(|_| ctx.fail("a racer panicked")),
+            )
+        }),
+    }
+}
+
+/// The orders a race case's rounds reached, by name: a round led by the first call must
+/// reach the first order, one led by the second the second, and the free rounds' counts
+/// are printed, so that a run whose races met one order alone says so.
+pub(super) struct Orders<const N: usize> {
+    names: [&'static str; N],
+    free: [usize; N],
+}
+
+impl<const N: usize> Orders<N> {
+    pub(super) const fn new(names: [&'static str; N]) -> Self {
+        Self { names, free: [0; N] }
+    }
+
+    /// Counts a round of `lead` that reached the order at `order`.
+    #[track_caller]
+    pub(super) fn reached(&mut self, ctx: &Ctx<'_>, lead: Lead, order: usize) {
+        match lead {
+            Lead::First => ctx.check(order == 0, self.names[0]),
+            Lead::Second => ctx.check(order == 1, self.names[1]),
+            Lead::Free => self.free[order] += 1,
+        }
+    }
+
+    /// Prints the free rounds' counts of each order.
+    pub(super) fn report(&self, ctx: &Ctx<'_>) {
+        let counts: Vec<String> =
+            self.names.iter().zip(self.free).map(|(name, n)| format!("{name} {n}")).collect();
+        eprintln!(
+            "orders of {} under {:?}, free rounds: {}",
+            ctx.case.name,
+            ctx.set.queues,
+            counts.join(", ")
+        );
+    }
+}
+
 /// The extent of the images the cases render into.
 pub(super) const EXTENT: Extent = Extent { width: 64, height: 64 };
 

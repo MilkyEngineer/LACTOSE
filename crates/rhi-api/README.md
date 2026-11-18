@@ -383,7 +383,11 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   do nothing where `coherent_host_memory` is reported (the M1's shared memory: Metal point
   3). On a device that reports it `false`, null refuses a submit that declares, binds or
   copies from a buffer with a written range not flushed since, and a `read_buffer` of a
-  range a submit wrote with no invalidate since (`unflushed`).
+  range a submit wrote with no invalidate since (`unflushed`). A flush is of an `Upload`
+  buffer and an invalidate of a `Readback` one (`usage`), and neither may overlap a host
+  access in progress (`host-overlap`), on every backend: a device backend rounds both out
+  to the driver's atom, so an invalidate racing a write of memory that is not coherent
+  would discard the bytes the write has not flushed.
 - A host write is seen by every submit made after its flush returns. The host does not
   write a range a pending submit reads; null cannot see every such read and does not check
   it. A breach gives that submit a torn read, a wrong image, which is the residual "The
@@ -1185,9 +1189,14 @@ column, one or more for each of its clauses, 64 in all: `unreported_capability_i
   `host_signals_racing_on_one_timeline_keep_it_growing` races two host signals of one
   timeline, to two values above its own, and where both are accepted the timeline ends at
   the greater. The race cases catch a backend whose check and update are split only where
-  something falls between them. A device backend's records are a type of its own that makes
-  no driver call, and its tests run the same interleavings under Miri with many seeds and
-  under stress, with fixed interleavings among them: a host signal made in full between
+  something falls between them. Every race case but the one of submits to one queue, whose
+  order no call can see, leads one round each way, the second call made once the first has
+  returned (or, for the host write, once its `fill` has begun), and fails where a led round
+  ends in another order; its free rounds then race, and it prints how many reached each
+  order, as a device's free rounds can meet one order in nearly every round. A device
+  backend's records are a type of its own that makes no driver call, and its tests run the
+  same interleavings under Miri with many seeds and under stress, with fixed interleavings
+  among them: a host signal made in full between
   another host signal's driver read and its hold, and between a submit's read and its hold;
   a promise reached, and dropped by a third call's check, in the same two windows; a pass
   that begins between a heap write's first hold and its descriptor write, with its submit's
@@ -1196,7 +1205,9 @@ column, one or more for each of its clauses, 64 in all: `unreported_capability_i
   failed submit's point signalled from the host while an earlier submit of its queue is
   pending, after which a destroy of what that submit uses is refused; and a submit that only
   waits, made between a host signal's two holds, 2^31 below its value, which is refused.
-  Each asserts after every hold that the known value is at most the driver's.
+  Each asserts after every hold that the value known of each caller's timeline is at most
+  the driver's; a queue's own value may be known ahead of its semaphore, from a caller's
+  point its submit signals.
 - `destroy_at_once_after_the_wait_is_accepted` holds a device to "Queues by role": a lagging
   submit, a wait for its point, then at once a destroy and a reset, repeated, each accepted.
 - `dispatch_beyond_the_group_limit_is_refused` and `viewport_outside_its_rules_is_refused`

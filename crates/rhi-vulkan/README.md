@@ -119,13 +119,19 @@ contract leaves to the backend.
 heap's, never both and never two queues'; then the records'; then one entry's, a handle's in a
 table or a heap slot's. Recording takes one entry's lock alone, once for each handle between
 resets, and never the records'. No lock but a queue's or the heap's is held across a driver
-call, and none across a wait or the caller's closure: a host access lends its range under the
-records' lock, copies with none held, and clears the range in a second hold.
+call, and none across a wait or the caller's closure: a host access, a flush and an
+invalidate lend their range under the records' lock, call or copy with none held, and clear
+the range in a second hold. A destroying call is a driver call too: a table's replaced or
+removed count, a slot's replaced image and a reaped sampler are dropped or destroyed once the
+records', entry and slot locks are given up, so a message the layer sends from one reaches
+the sink under a queue's or the heap's lock at most.
 
 The drops that wait: an encoder's, for its pending submit, and the last holder of the device's
 (the device or an encoder), for the device to idle. A drop while the thread unwinds a panic
-does not wait: with work possibly in flight it leaks the device's objects rather than destroy
-them under the GPU's use.
+does not wait. An encoder's, with its submit pending, hands its pools to the device, whose
+last holder destroys them once the device is idle. The last holder's, with a submit pending,
+leaks the device whole, the messengers' sink and the loader included, rather than destroy
+anything under the GPU's use; with nothing pending it tears down as any last holder does.
 
 ## Tests
 
