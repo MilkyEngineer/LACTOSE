@@ -23,7 +23,7 @@ fn refused(env: &Env, files: &[(&str, &[u8])]) -> Error {
     let sources = env.dir.join("sources");
     env.write_tree(&sources, files);
     let pack = env.dir.join("out").join("refused.pack");
-    let error = env.wait(cook(&env.io, &sources, &pack)).expect_err("the cook is refused");
+    let error = env.wait(cook(&env.io, &sources, &pack, None)).expect_err("the cook is refused");
     let read = env.wait(env.io.read_file(&pack)).expect_err("no pack is written");
     assert_eq!(read.kind(), ErrorKind::NotFound);
     error
@@ -92,7 +92,7 @@ fn a_source_whose_buffers_are_missing_still_cooks() {
     let sources = env.dir.join("sources");
     env.write_tree(&sources, &[("knight.gltf", &knight())]);
     let pack = env.dir.join("knight.pack");
-    let published = env.wait(cook(&env.io, &sources, &pack)).unwrap();
+    let published = env.wait(cook(&env.io, &sources, &pack, None)).unwrap();
     assert_eq!(published.len(), 1);
 }
 
@@ -200,7 +200,7 @@ fn a_seventeenth_bone_is_refused_and_sixteen_cook() {
     let env = Env::new("sixteen");
     let sources = env.dir.join("sources");
     env.write_tree(&sources, &[("rig.gltf", &gltf(&chain(16), ""))]);
-    env.wait(cook(&env.io, &sources, &env.dir.join("rig.pack"))).expect("sixteen bones cook");
+    env.wait(cook(&env.io, &sources, &env.dir.join("rig.pack"), None)).expect("sixteen bones cook");
 }
 
 /// A struct written as an array, its fields by position, is refused wherever the reader
@@ -285,7 +285,7 @@ fn a_key_written_twice_in_the_mark_is_refused() {
     let sources = env.dir.join("sources");
     let nodes = r#"{"name": "hips", "extras": {"tool": 1, "tool": 2, "lactose": {"bone": {}}}}"#;
     env.write_tree(&sources, &[("rig.gltf", &gltf(nodes, ""))]);
-    let published = env.wait(cook(&env.io, &sources, &env.dir.join("rig.pack"))).unwrap();
+    let published = env.wait(cook(&env.io, &sources, &env.dir.join("rig.pack"), None)).unwrap();
     assert_eq!(published.len(), 1);
 }
 
@@ -373,7 +373,7 @@ fn a_pack_name_without_the_ending_an_empty_tree_and_a_link_are_refused() {
     let env = Env::new("pack-name");
     let sources = env.dir.join("sources");
     env.write_tree(&sources, &[("knight.gltf", &knight())]);
-    let error = env.wait(cook(&env.io, &sources, &env.dir.join("knight.pak"))).unwrap_err();
+    let error = env.wait(cook(&env.io, &sources, &env.dir.join("knight.pak"), None)).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidData);
     assert!(error.message().starts_with("the pack's file name ends in `.pack`"), "{error}");
 
@@ -388,7 +388,7 @@ fn a_pack_name_without_the_ending_an_empty_tree_and_a_link_are_refused() {
         env.write_tree(&sources, &[("knight.gltf", &knight())]);
         std::os::unix::fs::symlink(sources.join("knight.gltf"), sources.join("linked.gltf"))
             .unwrap();
-        let error = env.wait(cook(&env.io, &sources, &env.dir.join("out.pack"))).unwrap_err();
+        let error = env.wait(cook(&env.io, &sources, &env.dir.join("out.pack"), None)).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert!(error.message().starts_with("linked.gltf: neither a file nor"), "{error}");
     }
@@ -411,5 +411,8 @@ fn the_binary_exits_one_with_the_refusal_and_two_with_the_usage() {
     assert!(output.stdout.is_empty());
     let output = binary().arg(&sources).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert_eq!(String::from_utf8(output.stderr).unwrap(), "usage: ricotta SOURCES PACK\n");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "usage: ricotta [--slangc SLANGC] [--code DIR] SOURCES PACK\n"
+    );
 }

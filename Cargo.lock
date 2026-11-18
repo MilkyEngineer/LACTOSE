@@ -478,9 +478,11 @@ dependencies = [
  "lactose-io",
  "lactose-math",
  "lactose-physics-api",
+ "lactose-rhi-api",
  "lactose-task",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

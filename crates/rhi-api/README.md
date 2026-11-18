@@ -101,7 +101,7 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   | A render pass begun with its attachments, and the local read | `dynamicRendering`, `dynamicRenderingLocalRead` | an Apple-family GPU (framebuffer fetch) |
   | A write mask for each attachment | `independentBlend` | nothing to require |
   | 64-bit integers in a shader: an address held as a `uint64_t` | `shaderInt64` | an Apple-family GPU |
-  | The local read as Slang lowers it, an image read with no format | `shaderStorageImageReadWithoutFormat` | an Apple-family GPU |
+  | An image read with no format, which the SDK's Slang 2026.17-25 declared for the local read; the pinned 2026.20 declares `InputAttachment` alone for it | `shaderStorageImageReadWithoutFormat` | an Apple-family GPU |
   | An indirect draw's `first_instance` | `drawIndirectFirstInstance` | an Apple-family GPU |
 
   The RHI spike's list also had runtime descriptor arrays. The heap's form is a fixed array
@@ -562,6 +562,10 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   the images at binding 0 and the samplers at binding 1, in descriptor set `HEAP_SET` on
   SPIR-V and one argument buffer on Metal (Metal, "The heap's shader form"; the second
   array is the review's probe under its "Not shown", and no spike ran it).
+  On Metal the heap's argument buffer is at buffer index 1 and the push block at index 0,
+  in every stage and whether or not the shader has a push block: `lactose.heap` declares
+  the heap at `register(b1)`, and the cook refuses an entry that takes either at another
+  index, or a texture or a sampler bound alone (`tools/cook/README.md`, "The checks").
 
 **What a pass declares** (RHI point 5, Metal point 5 and item 2)
 
@@ -655,9 +659,13 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   `inputs` and `outputs` are what the code reads and writes, and that the SPIR-V declares no
   capability outside this list, each of which the required set enables: `Shader`,
   `PhysicalStorageBufferAddresses`, `Int64`, `ShaderNonUniform`,
-  `SampledImageArrayNonUniformIndexing`, `InputAttachment`, `StorageImageReadWithoutFormat`.
-  Slang declares `Int64` for an address held as a `uint64_t` and
-  `StorageImageReadWithoutFormat` for the local read.
+  `SampledImageArrayNonUniformIndexing`, `InputAttachment`, `ImageQuery`,
+  `StorageImageReadWithoutFormat`. Vulkan 1.0 enables `ImageQuery`, which a size query of
+  an image declares, unconditionally, as it enables `InputAttachment` (`vk.xml` of SDK
+  1.4.363.1), and Metal's `get_width` and `get_height` need no feature.
+  Slang declares `Int64` for an address held as a `uint64_t`, and `InputAttachment` alone
+  for the local read: the SDK's 2026.17-25 build also declared
+  `StorageImageReadWithoutFormat` for it, and the pinned 2026.20 does not.
 - `DrawParameters`, `RuntimeDescriptorArray` and `Int64Atomics` are outside the list.
   `SV_VertexID` and `SV_InstanceID` declare `DrawParameters`, so the cook refuses both and
   requires `SV_VulkanVertexID` and `SV_VulkanInstanceID` ("Render passes and the local

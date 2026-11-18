@@ -25,11 +25,14 @@ of a manifest it writes under the target directory.
 | `sour run`, `sour compare`, `sour self-test`, `sour matrix` | SOUR, the determinism harness (section 8.3) |
 | `heavy` | nothing: it bounds how many heavy commands run at once on one machine (below) |
 | `measure` | nothing: it runs the milestone measurements and writes their result files (below) |
+| `slang` | nothing: it installs the pinned Slang release under the target directory and prints its `slangc` (below) |
+| `gpu --driver <name> [--cooked <dir>]` | the GPU run's rule of decision 5.10 of the milestone 2 plan, so far its Metal step alone (below) |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
 is printed there. The exit status is 0 for none, 1 for findings and 2 when a check could not
-run. `heavy` and `measure` are not checks and are outside this contract, except that they too
-write nothing to standard output themselves. Nor is `group`, which prints one line of cargo
+run. `heavy`, `measure` and `gpu` are not checks and are outside this contract, except that
+they too write nothing to standard output themselves. `slang` prints the path of `slangc`
+there, and nothing else. Nor is `group`, which prints one line of cargo
 arguments there, and nothing when it exits with 2.
 
 ## Where the rules live
@@ -608,3 +611,71 @@ standard error as it comes.
 
 It loads the machine for minutes: under other agents' load, wrap it in `heavy`, and read its
 numbers as steering only. The numbers that prove a criterion come from a quiet machine.
+
+## Slang
+
+`cargo xtask slang` installs the Slang release that `tools/cook/slang.toml` pins (decision 5.8
+of the milestone 2 plan) and prints its `slangc`, which `ricotta --slangc` takes. The pin is
+the version and, for each of `linux-x86_64`, `macos-aarch64` and `windows-x86_64`, the
+release archive's URL and SHA-256; the pin is refused if a host is missing or another is
+named, a digest is not 64 lowercase hexadecimal digits, or a URL is not that version's and
+host's archive.
+
+- The archive is fetched with the host's `curl` into `target/slang/download/` and refused,
+  and deleted, unless its SHA-256 is the pin's. A download whose digest is already the pin's
+  is not fetched again.
+- It is unpacked with the host's `tar` into `target/slang/<version>.partial/`, its `slangc`
+  must report the pinned version, and the directory is then renamed to
+  `target/slang/<version>/`: an interrupted install leaves nothing that passes for one.
+- With the pinned release already installed it does nothing but print the path.
+- On Windows `curl` and `tar` are the copies in `System32`, since a `tar` found first on the
+  path (Git's) reads `C:` as a remote host.
+
+The cook's own copy of the pin is the same file, read at build time: a `slangc` that reports
+another version, the SDK's among them, is refused by the cook too.
+
+## GPU runs
+
+`cargo xtask gpu --driver <lavapipe|moltenvk|kosmickrisp|system> [--cooked <dir>]` is the
+command decision 5.10 of the milestone 2 plan names. So far it has its Metal step alone, which
+runs on macOS and is the same under each driver name, since the driver selects a Vulkan
+loader's environment and the Metal step uses none; on another host it exits 2.
+
+1. It installs the pinned Slang as `slang` does, and cooks `shaders/` with `ricotta --slangc
+   <it> --code target/gpu/code` into `target/gpu/shaders.pack`, removing the code of an
+   earlier run first. With `--cooked <dir>` it cooks nothing and takes the code in `<dir>`,
+   which `ricotta --code` wrote on another runner.
+2. It runs `swift tools/xtask/metal/pipelines.swift`, the command-line tools' `swift`, under
+   Metal API validation (`MTL_DEBUG_LAYER=1`, warnings to the log) and Metal shader validation
+   (`MTL_SHADER_VALIDATION=1`, reports to standard error), as the Metal spike set them:
+   - first each validator's canary, in a process of its own: an unbound buffer, which API
+     validation must abort on with `missing Buffer binding at index 0`, and a store past a
+     buffer's end, which shader validation must report with `Invalid store in 'device' or
+     'constant' address space`. A canary that is silent fails the run;
+   - then the step: the device is the first of `MTLCopyAllDevices`, and the run fails with
+     none. It prints the device's facts: its name, its argument buffers tier, its highest
+     Apple GPU family and whether it is of the Metal 3 family. Code that takes the heap
+     needs argument buffers tier 2, for 1024 textures in one argument buffer, and fragment
+     code that reads a colour needs an Apple GPU family, for framebuffer fetch: the step
+     fails naming each one the device lacks, before it makes any pipeline state;
+   - each cooked MSL is compiled at run time as MSL 3.1 and each metallib loaded, and each
+     makes a pipeline state with every function constant given the zero of its type: a
+     source's fragment entries each with its one vertex entry, a vertex entry alone as a
+     depth-only pipeline, a kernel as a compute pipeline. No pipeline is run, so shader
+     validation is loaded, as its canary shows, and sees no execution of the engine's code.
+3. Every line the step writes on standard error counts, except the two validators' banners,
+   and one fails the run. It writes `target/gpu/<driver>-metal.txt`: the driver, the Slang
+   version or the directory the code was taken from, the validators and their canaries, the
+   device's facts, the system's version, one line per pipeline state, and the messages
+   counted.
+
+The `shaders` CI job runs `gpu --driver system` on the macOS runner that cooks, and the
+`shaders-oldest` job runs `gpu --driver system --cooked` on the oldest macOS image, on the
+code the first cooked: the same canaries and count on both.
+
+Before either, `bash tools/xtask/runner-facts.sh [--metal-optional] <file>` records the
+runner's facts in `<file>` and in the job's summary: its system, and on macOS its Xcode, its
+SDK, its `metal`, its `swift` and its Metal device's facts, as
+`swift tools/xtask/metal/pipelines.swift --device` prints them. Each is recorded before any is
+judged, and a missing one fails the step, naming it. `--metal-optional`, for a runner that
+compiles no metallib, records a missing `metal` and does not fail on it.

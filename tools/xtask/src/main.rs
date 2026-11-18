@@ -28,6 +28,7 @@ use lactose_xtask::heavy;
 use lactose_xtask::measure;
 use lactose_xtask::policy::Policy;
 use lactose_xtask::repo::Files;
+use lactose_xtask::slang;
 use lactose_xtask::tiers::TierFile;
 use lactose_xtask::vendor::{self, Repository};
 use lactose_xtask::workspace::{Workspace, cargo_metadata, load_metadata};
@@ -75,6 +76,14 @@ cargo xtask <command>
                              files to docs/results (or <dir>); --short cuts repetitions
                              and marks the files as short; the names are in
                              docs/results/README.md
+  slang                      install the pinned Slang release under the target directory,
+                             from tools/cook/slang.toml, and print its slangc's path
+  gpu --driver <name> [--cooked <dir>]
+                             run the device tests under a named driver (lavapipe, moltenvk,
+                             kosmickrisp or system); its one step yet is the Metal step, on
+                             macOS: cook the engine shaders, or with --cooked take the code
+                             `ricotta --code` wrote to <dir>, and make a Metal pipeline state
+                             from each under Metal's validation
   help                       print this text
 
 Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 could not run.";
@@ -195,6 +204,14 @@ fn main() -> ExitCode {
             Err(message) => ("heavy", Err(message)),
         },
         ["measure", ref rest @ ..] => ("measure", run_measurements(rest)),
+        ["slang"] => match install_slang() {
+            Ok(slangc) => {
+                println!("{}", slangc.display());
+                return ExitCode::SUCCESS;
+            }
+            Err(message) => ("slang", Err(message)),
+        },
+        ["gpu", ref rest @ ..] => ("gpu", run_gpu(rest)),
         ["group", name] => match group_arguments(name) {
             Ok(arguments) => {
                 println!("{arguments}");
@@ -252,6 +269,154 @@ fn check_boundary() -> Checked {
     findings.extend(check_groups::check(&context.policy, &context.workspace));
     findings.extend(check_groups::check_workflow(&context.policy, &files));
     Ok(findings)
+}
+
+/// Installs the pinned Slang release under the target directory and returns its `slangc`.
+fn install_slang() -> Result<PathBuf, String> {
+    let context = Context::load()?;
+    let pin = slang::Pin::parse(&read(slang::PIN_FILE)?)?;
+    slang::install(&pin, &context.target_dir)
+}
+
+/// The drivers `gpu` runs the device tests under (milestone 2 plan, decision 5.10).
+const DRIVERS: [&str; 4] = ["lavapipe", "moltenvk", "kosmickrisp", "system"];
+/// The engine's Slang sources, which `gpu` cooks.
+const SHADERS: &str = "shaders";
+/// The Swift script of the Metal step.
+const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
+
+/// `gpu --driver <name> [--cooked <dir>]`: its one step is the Metal step, which cooks the
+/// engine's shaders with the pinned Slang, or takes the code another runner cooked to
+/// `<dir>`, and makes a Metal pipeline state from each, through the Swift script run by the
+/// command line tools' `swift`. The canaries and the count of messages are the same either
+/// way. The driver selects nothing yet, since no step runs Vulkan; it is checked and
+/// recorded. The script's report is written to `target/gpu/<driver>-metal.txt` and to
+/// standard error.
+fn run_gpu(args: &[&str]) -> Checked {
+    let (driver, cooked) = match args {
+        ["--driver", name] if DRIVERS.contains(name) => (*name, None),
+        ["--driver", name, "--cooked", dir] if DRIVERS.contains(name) => (*name, Some(*dir)),
+        _ => return Err(format!("expected `--driver <{}> [--cooked <dir>]`", DRIVERS.join("|"))),
+    };
+    if !cfg!(target_os = "macos") {
+        return Err("the one step of `gpu` yet is the Metal step, which runs on macOS".to_owned());
+    }
+    let context = Context::load()?;
+    let pin = slang::Pin::parse(&read(slang::PIN_FILE)?)?;
+    let out = context.target_dir.join("gpu");
+    fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let (code, cooked_by) = match cooked {
+        Some(dir) => (PathBuf::from(dir), format!("cooked elsewhere, in {dir}")),
+        None => (cook_engine_shaders(&context, &pin, &out)?, format!("Slang {}", pin.version)),
+    };
+    eprintln!("gpu: the Metal step, under driver {driver}, with Metal's validation on");
+    // The canaries first, each in a process of its own: a layer that did not load reports
+    // nothing. API validation's aborts the process; shader validation's lets it complete.
+    for (canary, says, aborts) in CANARIES {
+        let run = metal_step(&["--canary", canary])?;
+        if run.status.success() == aborts || !run.stderr.contains(says) {
+            return Err(format!(
+                "Metal {canary} validation's canary did not yield `{says}`, so the layer is \
+                 not listening: it ended with {}:\n{}",
+                run.status, run.stderr
+            ));
+        }
+    }
+    let step = metal_step(&[&code.to_string_lossy()])?;
+    eprint!("{}", step.stdout);
+    // Every line on standard error counts (decision 5.10), but the layers' own two.
+    let counted: Vec<&str> = step
+        .stderr
+        .lines()
+        .filter(|line| !VALIDATION_ON.iter().any(|on| line.ends_with(on)))
+        .collect();
+    let file = out.join(format!("{driver}-metal.txt"));
+    let written = format!(
+        "driver: {driver}\ncode: {cooked_by}\nvalidation: api and shader, canaries {}\n{}messages: \
+         {}\n{}",
+        CANARIES.map(|(canary, says, _)| format!("{canary} `{says}`")).join(", "),
+        step.stdout,
+        counted.len(),
+        counted.iter().map(|line| format!("{line}\n")).collect::<String>()
+    );
+    fs::write(&file, written).map_err(|e| format!("{}: {e}", file.display()))?;
+    if !step.status.success() || !counted.is_empty() {
+        return Err(format!(
+            "the Metal step ended with {} and {} message(s) on standard error:\n{}",
+            step.status,
+            counted.len(),
+            counted.join("\n")
+        ));
+    }
+    eprintln!("gpu: the report is {}", file.display());
+    Ok(Vec::new())
+}
+
+/// Cooks the engine's shaders with the pinned Slang into `<out>/code`, emptied first, and
+/// returns that directory.
+fn cook_engine_shaders(context: &Context, pin: &slang::Pin, out: &Path) -> Result<PathBuf, String> {
+    let slangc = slang::install(pin, &context.target_dir)?;
+    let code = out.join("code");
+    // A shader cooked by an earlier run and since removed would otherwise be loaded again.
+    match fs::remove_dir_all(&code) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(format!("{}: {error}", code.display()));
+        }
+        _ => {}
+    }
+    eprintln!("gpu: cooking {SHADERS} with Slang {}", pin.version);
+    let status = Command::new(&context.cargo)
+        .args(["run", "--locked", "--quiet", "--package", "lactose-cook", "--bin", "ricotta", "--"])
+        .arg("--slangc")
+        .arg(&slangc)
+        .arg("--code")
+        .arg(&code)
+        .arg(SHADERS)
+        .arg(out.join("shaders.pack"))
+        .stdout(Stdio::from(io::stderr()))
+        .status()
+        .map_err(|e| format!("cannot run ricotta: {e}"))?;
+    if !status.success() {
+        return Err(format!("ricotta ended with {status}"));
+    }
+    Ok(code)
+}
+
+/// Each validator's canary in the Metal script, what the validator says of it, and whether
+/// that aborts the process.
+const CANARIES: [(&str, &str, bool); 2] = [
+    ("api", "missing Buffer binding at index 0", true),
+    ("shader", "Invalid store in 'device' or 'constant' address space", false),
+];
+/// The lines the two layers write when they load.
+const VALIDATION_ON: [&str; 2] = ["Metal API Validation Enabled", "Metal GPU Validation Enabled"];
+
+/// What one run of the Metal script printed.
+struct StepOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs the Metal script under Metal API and shader validation, set as the Metal spike set
+/// them: API validation's assertions abort, its warnings and shader validation's reports go to
+/// standard error.
+fn metal_step(args: &[&str]) -> Result<StepOutput, String> {
+    let output = Command::new("swift")
+        .arg(METAL_SCRIPT)
+        .args(args)
+        .env("MTL_DEBUG_LAYER", "1")
+        .env("MTL_DEBUG_LAYER_WARNING_MODE", "nslog")
+        .env("MTL_SHADER_VALIDATION", "1")
+        .env("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run swift: {e}"))?;
+    Ok(StepOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 /// The cargo arguments that select a check group's packages, for CI's check jobs.
