@@ -1,0 +1,27 @@
+[package]
+name = "lactose-render-graph"
+description = "The render graph: a frame's passes declared by what they use, compiled into kept passes, transient lifetimes and aliased memory, state transitions and queue assignments, recorded on the frame-critical workers and submitted in graph order."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+# D150: the integration tests are one binary, whose root declares the others as modules.
+autotests = false
+
+[dependencies]
+# `Result` and `ErrorKind`: what a refused declaration and a device's error are returned as.
+lactose-core.workspace = true
+# The one surface the graph reaches a device through: handles, states, encoders, the
+# submit and its timeline points.
+lactose-rhi-api.workspace = true
+# `JobContext`: `RenderGraph::record` forks its recording jobs in a scope of the job that
+# calls it (architecture section 12.3, "each pass records on a frame-critical worker").
+lactose-task.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true
