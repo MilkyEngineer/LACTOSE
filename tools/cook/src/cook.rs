@@ -7,7 +7,7 @@ use lactose_asset::{PackBuilder, Storage};
 use lactose_asset_api::{AssetId, AssetKind, AssetVersion, CookedAsset, CookedHeader, Processor};
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_io::{EntryKind, Io};
-use lactose_rhi_api::{COOKED_SHADER_VERSION, CookedShader};
+use lactose_rhi_api::COOKED_SHADER_VERSION;
 
 use crate::shader::{self, LINK, MODULES, Slang, Source};
 use crate::skeleton::SkeletonProcessor;
@@ -110,7 +110,7 @@ pub async fn cook(
         };
         for source in &listed.shaders {
             for cooked in shader::cook(shaders.slang, sources, source)? {
-                let bytes = encoded(&cooked.shader).map_err(at(&cooked.name))?;
+                let bytes = cooked.shader.encode().map_err(at(&cooked.name))?;
                 let asset = CookedAsset {
                     header: CookedHeader::new(SHADER_KIND, COOKED_SHADER_VERSION, []),
                     bytes,
@@ -247,12 +247,6 @@ fn lowercase_ending(name: &str) -> Option<String> {
     let lower = ending.to_ascii_lowercase();
     (lower != ending && [SOURCE, BINARY, SLANG].contains(&format!(".{lower}").as_str()))
         .then(|| format!("{stem}.{lower}"))
-}
-
-/// The cooked format's bytes of `shader`. `encode` returns a `Result` once `rhi-null` merges,
-/// and this becomes `shader.encode()`.
-fn encoded(shader: &CookedShader) -> Result<Vec<u8>> {
-    Ok(shader.encode())
 }
 
 /// The error of a request or a processor on `what`, a path, prefixed by it: the pool's

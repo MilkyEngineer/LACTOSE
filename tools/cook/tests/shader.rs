@@ -666,10 +666,6 @@ impl Loader for ShaderLoader {
     }
 }
 
-fn encode(shader: &CookedShader) -> Vec<u8> {
-    shader.encode()
-}
-
 /// The engine's shaders cooked into a pack, mounted alone in a store, and each loaded, resolved
 /// and pinned through [`ShaderLoader`]: what the cook published, and each shader in that order.
 fn cook_and_load(env: &Env) -> (Vec<lactose_cook::Published>, Vec<CookedShader>) {
@@ -767,7 +763,7 @@ fn the_shader_kind_loads_against_the_slice() {
     let loader = ErasedLoader::new(ShaderLoader);
     for (asset, shader) in published.iter().zip(&loaded) {
         // The bytes the pack holds: the format's encoding is a function of the shader.
-        let bytes = encode(shader);
+        let bytes = shader.encode().unwrap();
         let header = lactose_asset_api::CookedHeader::new(SHADER_KIND, COOKED_SHADER_VERSION, []);
         let version = header.version_of(&bytes);
         assert_eq!(version, asset.version);
