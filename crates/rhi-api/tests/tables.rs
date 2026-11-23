@@ -77,7 +77,7 @@ fn indirect_record_is_five_little_endian_words() {
 
 /// The refusal cases a device backend runs: one or more for each clause of the rules
 /// table's "Every backend" column.
-const EVERYWHERE: [&str; 64] = [
+const EVERYWHERE: [&str; 65] = [
     "unreported_capability_is_refused",
     "submit_to_the_present_role_is_refused",
     "overlapping_host_access_is_refused",
@@ -112,6 +112,7 @@ const EVERYWHERE: [&str; 64] = [
     "encoder_resubmitted_without_reset_is_refused",
     "encoder_of_another_role_or_device_is_refused",
     "command_outside_its_scope_is_refused",
+    "graphics_on_a_compute_encoder_is_refused",
     "draw_with_nothing_bound_is_refused",
     "pass_left_open_is_refused",
     "push_outside_the_block_is_refused",

@@ -63,16 +63,111 @@ pub(super) fn woken<T: Send>(
     })
 }
 
+/// Which call of a race goes first in a round. In a `Free` round the two are made at once
+/// on two threads, the second's spawned first where `second_first` says so, since the
+/// thread spawned first wins most rounds; in a led round the one named returns before the
+/// other is made, so that each order a race can take is reached on every run, however
+/// rarely the free rounds reach it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Lead {
+    Free { second_first: bool },
+    First,
+    Second,
+}
+
+impl Lead {
+    /// A race case's rounds: one led each way, then `free` rounds that race, the second
+    /// call's thread spawned first in every other one.
+    pub(super) fn rounds(free: usize) -> impl Iterator<Item = Self> {
+        [Self::First, Self::Second]
+            .into_iter()
+            .chain((0..free).map(|round| Self::Free { second_first: round % 2 == 1 }))
+    }
+}
+
+/// Makes `first` and `second` at once on two threads in a `Free` round, and otherwise one
+/// after the other, the one `lead` names first.
+pub(super) fn race<A: Send, B: Send>(
+    ctx: &Ctx<'_>,
+    lead: Lead,
+    first: impl FnOnce() -> A + Send,
+    second: impl FnOnce() -> B + Send,
+) -> (A, B) {
+    match lead {
+        Lead::First => {
+            let first = first();
+            (first, second())
+        }
+        Lead::Second => {
+            let second = second();
+            (first(), second)
+        }
+        Lead::Free { second_first } => std::thread::scope(|scope| {
+            let (first, second) = if second_first {
+                let second = scope.spawn(second);
+                (scope.spawn(first), second)
+            } else {
+                let first = scope.spawn(first);
+                (first, scope.spawn(second))
+            };
+            (
+                first.join().unwrap_or_else(|_| ctx.fail("a racer panicked")),
+                second.join().unwrap_or_else(|_| ctx.fail("a racer panicked")),
+            )
+        }),
+    }
+}
+
+/// The orders a race case's rounds reached, by name: a round led by the first call must
+/// reach the first order, one led by the second the second, and the free rounds' counts
+/// are printed, so that a run whose races met one order alone says so.
+pub(super) struct Orders<const N: usize> {
+    names: [&'static str; N],
+    free: [usize; N],
+}
+
+impl<const N: usize> Orders<N> {
+    pub(super) const fn new(names: [&'static str; N]) -> Self {
+        Self { names, free: [0; N] }
+    }
+
+    /// Counts a round of `lead` that reached the order at `order`.
+    #[track_caller]
+    pub(super) fn reached(&mut self, ctx: &Ctx<'_>, lead: Lead, order: usize) {
+        match lead {
+            Lead::First => ctx.check(order == 0, self.names[0]),
+            Lead::Second => ctx.check(order == 1, self.names[1]),
+            Lead::Free { .. } => self.free[order] += 1,
+        }
+    }
+
+    /// Prints the free rounds' counts of each order.
+    pub(super) fn report(&self, ctx: &Ctx<'_>) {
+        let counts: Vec<String> =
+            self.names.iter().zip(self.free).map(|(name, n)| format!("{name} {n}")).collect();
+        eprintln!(
+            "orders of {} under {:?}, free rounds: {}",
+            ctx.case.name,
+            ctx.set.queues,
+            counts.join(", ")
+        );
+    }
+}
+
 /// The extent of the images the cases render into.
 pub(super) const EXTENT: Extent = Extent { width: 64, height: 64 };
 
-/// The sink of every device a case makes: it counts what it is sent.
+/// The sink of every device a case makes: it counts what it is sent, and what of it the
+/// case provoked.
 #[derive(Default)]
-pub(super) struct Counter(AtomicUsize);
+pub(super) struct Counter {
+    sent: AtomicUsize,
+    provoked: AtomicUsize,
+}
 
 impl MessageSink for Counter {
     fn message(&self, _: &Message<'_>) {
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.sent.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -90,9 +185,29 @@ impl<'a> Ctx<'a> {
         Self { harness, case, set, sink: Arc::default() }
     }
 
-    /// The messages the sink of every device of this context has been sent.
+    /// The messages the sink of every device of this context has been sent that the case
+    /// did not provoke ([`provoking`](Self::provoking)).
     pub(super) fn messages(&self) -> usize {
-        self.sink.0.load(Ordering::Relaxed)
+        self.sink.sent.load(Ordering::Relaxed) - self.sink.provoked.load(Ordering::Relaxed)
+    }
+
+    /// Runs `misuse`, a call sequence that provokes messages and has returned once they are
+    /// sent, and returns how many it provoked, which [`messages`](Self::messages) then
+    /// leaves out.
+    pub(super) fn provoking(&self, misuse: impl FnOnce()) -> usize {
+        let before = self.sink.sent.load(Ordering::Relaxed);
+        misuse();
+        let provoked = self.sink.sent.load(Ordering::Relaxed) - before;
+        self.sink.provoked.fetch_add(provoked, Ordering::Relaxed);
+        provoked
+    }
+
+    /// The suite's cooked shader of `name`, `<source>.<entry>` below `shaders/conformance/`,
+    /// for `stage`.
+    pub(super) fn shader(&self, name: &str, stage: ShaderStage) -> CookedShader {
+        let shader = self.ok(self.harness.shader(name, stage), "the harness's cooked shader");
+        self.check(shader.stage == stage, "a cooked shader of the stage asked for");
+        shader
     }
 
     /// Fails the case.

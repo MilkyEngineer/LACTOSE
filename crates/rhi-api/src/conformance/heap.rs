@@ -4,7 +4,10 @@ use std::collections::HashSet;
 
 use lactose_core::ErrorKind;
 
-use super::kit::{Body, Ctx, EXTENT, buffer_to, compute_pass, image_desc, image_to, whole_image};
+use super::kit::{
+    Body, Ctx, EXTENT, Lead, Orders, buffer_to, compute_pass, image_desc, image_to, race,
+    whole_image,
+};
 use crate::{
     AddressMode, BufferReach, BufferState, BufferUsage, ComputePipelineHandle, Device, Encoder,
     Filter, Format, HeapSlot, ImageState, ImageUsage, MemoryClass, PassReach, QueueRole, Rule,
@@ -183,38 +186,42 @@ fn heap_write_after_its_reader_completes_passes(ctx: &Ctx<'_>) -> Applies {
 }
 
 /// A write of a slot races the submit of a pass that declared the slot before the race:
-/// exactly one is refused.
+/// exactly one is refused, in a round of each order led and in rounds that race.
 fn heap_write_racing_a_submit_refuses_one(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let pipeline = ctx.compute(&*device);
     let (first, second) = (ctx.sampled(&*device), ctx.sampled(&*device));
     let mut encoders = [ctx.encoder(&*device, G)];
-    for _ in 0..ROUNDS {
+    let mut orders = Orders::new(["the write first", "the submit first"]);
+    for lead in Lead::rounds(ROUNDS) {
         ctx.ok(encoders[0].reset(), "a reset");
         ctx.ok(device.write_heap_slot(SLOT, first), "the slot's write before the pass");
         reader(&mut *encoders[0], pipeline, SLOT);
         let gate = ctx.gate(&*device);
         let device: &dyn Device = &*device;
-        let (write, submit) = std::thread::scope(|scope| {
-            let write = scope.spawn(move || device.write_heap_slot(SLOT, second));
-            let encoders = &mut encoders;
-            let submit = scope.spawn(move || {
+        let encoders = &mut encoders;
+        let (write, submit) = race(
+            ctx,
+            lead,
+            move || device.write_heap_slot(SLOT, second),
+            move || {
                 device.submit(G, Submit { encoders, waits: &[gate.wait], signals: &[gate.done] })
-            });
-            (
-                write.join().unwrap_or_else(|_| ctx.fail("the writer panicked")),
-                submit.join().unwrap_or_else(|_| ctx.fail("the submitter panicked")),
-            )
-        });
+            },
+        );
         let rule = |result: &lactose_core::Result<()>| result.as_ref().err().and_then(Rule::of);
-        match (rule(&write), rule(&submit)) {
-            (Some(Rule::HeapWrite), None) if submit.is_ok() => gate.open(ctx, device),
-            (None, Some(Rule::HeapWrite | Rule::HeapLayout)) if write.is_ok() => {}
+        let order = match (rule(&write), rule(&submit)) {
+            (Some(Rule::HeapWrite), None) if submit.is_ok() => {
+                gate.open(ctx, device);
+                1
+            }
+            (None, Some(Rule::HeapWrite | Rule::HeapLayout)) if write.is_ok() => 0,
             _ => ctx.fail(format_args!(
                 "not exactly one refused: the write {write:?}, the submit {submit:?}"
             )),
-        }
+        };
+        orders.reached(ctx, lead, order);
     }
+    orders.report(ctx);
     Ok(())
 }
 

@@ -61,8 +61,11 @@ crates = ["game-sim", "game-present", "game-ai", "game-content"]
 
 [test_support]
 # Crates any crate may name as a dev-dependency, whatever its tier. Each is also in a tier
-# section, whose rules govern its normal and build edges.
-crates = ["lactose-rhi-null"]
+# section, whose rules govern its normal and build edges. `lactose-rhi-vulkan` is here so that
+# the render crates run on a device in their own tests (decision 5.12 of the milestone 2 plan);
+# a boundary crate's test that names it is still refused by `cargo xtask boundary`, since what
+# it compiles is held to [boundary_internal] at any depth.
+crates = ["lactose-rhi-null", "lactose-rhi-vulkan"]
 
 [dev_only_features]
 # Features that compile library code for tests, which nothing that ships may compile. Each

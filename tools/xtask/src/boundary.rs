@@ -2593,6 +2593,34 @@ mod tests {
     }
 
     #[test]
+    fn a_boundary_crates_test_may_not_run_on_a_device() {
+        // Decision 5.12 of the milestone 2 plan, against the real tier file: the Vulkan
+        // backend is on [test_support] for the render crates' tests, and a boundary crate's
+        // test that names it is still refused, by the interface the backend compiles.
+        let tiers = TierFile::parse(include_str!("../../../crate-tiers.toml")).unwrap();
+        assert!(tiers.test_support.iter().any(|c| c == "lactose-rhi-vulkan"));
+        let sim = package("lactose-sim", &[("lactose-core", Normal), ("lactose-rhi-vulkan", Dev)]);
+        let ws = workspace(vec![
+            package("lactose-core", &[("bytemuck", Normal)]),
+            sim.clone(),
+            package(
+                "lactose-rhi-vulkan",
+                &[("ash", Normal), ("lactose-core", Normal), ("lactose-rhi-api", Normal)],
+            ),
+            package("lactose-rhi-api", &[("lactose-core", Normal)]),
+        ]);
+        let mut findings = Vec::new();
+        dependency_allowlist(&tiers, &ws, &sim, &mut findings);
+        let found: Vec<String> = findings.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            found,
+            [
+                "crates/sim/Cargo.toml: boundary crate `lactose-sim` reaches non-boundary crate `lactose-rhi-api` in its tests (lactose-sim -> lactose-rhi-vulkan -> lactose-rhi-api), which [boundary_internal] in crate-tiers.toml does not allow at any depth"
+            ]
+        );
+    }
+
+    #[test]
     fn what_a_boundary_crates_tests_name_is_held_to_the_allowlist_at_any_depth() {
         // Review of the closure check, finding 2: `[boundary_internal] dev` lets a test name
         // `task`, and what `task` compiles is a test's to compile too.

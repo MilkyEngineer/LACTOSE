@@ -38,6 +38,10 @@ pub struct Shaders<'a> {
     /// A directory that also receives each cooked shader's code alone, the SPIR-V module,
     /// the MSL or the metallib, as the file `<directory>/<asset name>`; or `None`.
     pub code: Option<&'a Path>,
+    /// A directory that also receives each cooked shader whole, as `CookedShader::encode`
+    /// wrote it and `CookedShader::decode` reads it, as the file `<directory>/<asset name>`;
+    /// or `None`.
+    pub cooked: Option<&'a Path>,
 }
 
 /// One asset a cook wrote: its name, the ID that name hashes to (`AssetId::from_name`) and
@@ -111,11 +115,12 @@ pub async fn cook(
         for source in &listed.shaders {
             for cooked in shader::cook(shaders.slang, sources, source)? {
                 let bytes = cooked.shader.encode().map_err(at(&cooked.name))?;
+                let whole = shaders.cooked.map(|_| bytes.clone());
                 let asset = CookedAsset {
                     header: CookedHeader::new(SHADER_KIND, COOKED_SHADER_VERSION, []),
                     bytes,
                 };
-                assets.push((cooked.name, asset, Some(cooked.shader.code)));
+                assets.push((cooked.name, asset, Some((cooked.shader.code, whole))));
             }
         }
     }
@@ -127,14 +132,18 @@ pub async fn cook(
     for (name, cooked, shader_code) in assets {
         let id = claim(&mut claimed, &name)?;
         let version = builder.add(id, &cooked, STORAGE)?;
-        if let Some(shader_code) = shader_code {
-            code.push((name.clone(), shader_code));
+        if let Some((shader_code, whole)) = shader_code {
+            code.push((name.clone(), shader_code, whole));
         }
         published.push(Published { name, id, version });
     }
     let bytes = builder.finish()?;
-    if let Some(directory) = shaders.and_then(|shaders| shaders.code) {
-        for (name, bytes) in code {
+    let (code_dir, cooked_dir) =
+        shaders.map_or((None, None), |shaders| (shaders.code, shaders.cooked));
+    for (name, shader_code, whole) in code {
+        let written = [(code_dir, Some(shader_code)), (cooked_dir, whole)];
+        for (directory, bytes) in written {
+            let (Some(directory), Some(bytes)) = (directory, bytes) else { continue };
             let file = directory.join(&name);
             let parent = file.parent().expect("a file below the directory");
             io.create_dir_all(parent).await.map_err(at(parent.display()))?;

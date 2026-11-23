@@ -290,7 +290,9 @@ pub trait Encoder: Any + Send {
 
     /// Begins a render pass. The viewport and the scissor are the attachments' extent
     /// until set. Nothing is bound: a pass starts with no pipeline, no index buffer and a
-    /// push-constant block of zeros.
+    /// push-constant block of zeros. A `Compute` encoder begins none on any layout, and
+    /// copies no depth image ([`Rule::Encoding`](crate::Rule::Encoding), every backend):
+    /// the compute role's queue may be of a family that does not draw.
     fn begin_render_pass(&mut self, pass: &RenderPass<'_>);
 
     /// Begins a compute pass, with no pipeline and a push-constant block of zeros.

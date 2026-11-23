@@ -34,11 +34,12 @@ the cooker writes, is `lactose-asset`'s ("The cooked pack set" below).
 
 ## The command line
 
-`ricotta [--slangc SLANGC] [--code DIR] SOURCES PACK`, the two paths required and each
-option at most once, before them; nothing else is accepted (exit 2 and the usage otherwise).
-`--slangc` names the pinned `slangc`, which a tree with a shader source needs
-(`NotFound` without it), and `--code` a directory that also receives each cooked shader's
-code ("The shader kind"); `--code` without `--slangc` is refused (`InvalidData`).
+`ricotta [--slangc SLANGC] [--code DIR] [--shaders DIR] SOURCES PACK`, the two paths required
+and each option at most once, before them; nothing else is accepted (exit 2 and the usage
+otherwise). `--slangc` names the pinned `slangc`, which a tree with a shader source needs
+(`NotFound` without it), `--code` a directory that also receives each cooked shader's code,
+and `--shaders` one that receives each cooked shader whole ("The shader kind"); either
+without `--slangc` is refused (`InvalidData`).
 
 - **Sources.** Every regular file under the directory `SOURCES`, at any depth, whose name
   ends in `.gltf` is a source, hidden files included (a `._knight.gltf` a copy left behind
@@ -115,6 +116,10 @@ dependency.
   metallib, is also written to `DIR/<asset name>` once every source has cooked, before the
   pack, each file replaced by rename. It is what `cargo xtask gpu` and the `shaders` CI job
   load through Metal.
+- **`--shaders DIR`.** Each cooked shader whole, the bytes of `CookedShader::encode` that
+  `CookedShader::decode` reads, is written to `DIR/<asset name>` in the same way: what a
+  device test reads with no pack reader, which a backend crate may not depend on
+  (`cargo xtask gpu`, `lactose-rhi-vulkan`).
 
 ## The checks
 

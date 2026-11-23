@@ -10,7 +10,7 @@ use super::kit::{
 use crate::{
     BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferUsage, Device,
     Encoder, Format, ImageDesc, ImageRange, ImageState, ImageUsage, Load, MemoryClass,
-    PUSH_BYTES_MAX, PassReach, QueueRole, Rect, Rule, Store, Submit, SwapchainDesc,
+    PUSH_BYTES_MAX, PassReach, QueueRole, Rect, Rule, Sharing, Store, Submit, SwapchainDesc,
 };
 
 type Applies = Result<(), &'static str>;
@@ -25,6 +25,7 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     ("recording_while_pending_records_nothing", recording_while_pending_records_nothing),
     ("encoder_of_another_role_or_device_is_refused", encoder_of_another_role_or_device_is_refused),
     ("command_outside_its_scope_is_refused", command_outside_its_scope_is_refused),
+    ("graphics_on_a_compute_encoder_is_refused", graphics_on_a_compute_encoder_is_refused),
     ("draw_with_nothing_bound_is_refused", draw_with_nothing_bound_is_refused),
     ("pass_left_open_is_refused", pass_left_open_is_refused),
     ("push_outside_the_block_is_refused", push_outside_the_block_is_refused),
@@ -356,6 +357,106 @@ fn command_outside_its_scope_is_refused(ctx: &Ctx<'_>) -> Applies {
     Ok(())
 }
 
+/// A render pass, a graphics bind, a draw and a copy into or out of a depth image, each
+/// recorded on a `Compute` encoder, are refused on every layout: the compute role's queue may
+/// be of a family that does not draw. The same commands on a graphics encoder pass. Every
+/// resource a refused recording reaches is `Concurrent` or taken from `Undefined`. The render
+/// pass and the copies break the role's rule alone, so a build without that check fails this
+/// case; a bind and a draw need a render pass, which none begins on a `Compute` encoder, so
+/// the scope rule refuses them, with the role's check or without it.
+fn graphics_on_a_compute_encoder_is_refused(ctx: &Ctx<'_>) -> Applies {
+    const C: QueueRole = QueueRole::Compute;
+    let device = ctx.device();
+    let target = ctx.target(&*device);
+    let pipeline = ctx.plain(&*device);
+    let usage =
+        ImageUsage::DEPTH.union(ImageUsage::COPY_SOURCE).union(ImageUsage::COPY_DESTINATION);
+    let depth = ctx.image(
+        &*device,
+        &ImageDesc {
+            sharing: Sharing::Concurrent,
+            ..image_desc(Format::Depth32Float, EXTENT, usage)
+        },
+    );
+    let bytes = u64::from(EXTENT.width * EXTENT.height * 4);
+    let copies = BufferUsage::COPY_SOURCE.union(BufferUsage::COPY_DESTINATION);
+    let source =
+        ctx.buffer_shared(&*device, bytes, copies, MemoryClass::Upload, Sharing::Concurrent);
+    ctx.write(&*device, source, 0, &vec![0; bytes as usize]);
+    let readback =
+        ctx.buffer(&*device, bytes, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let into_depth = |encoder: &mut dyn Encoder| {
+        let queue = encoder.queue();
+        encoder.transition_buffers(&[buffer_to(
+            source,
+            BufferState::Undefined,
+            BufferState::CopySource,
+            queue,
+        )]);
+        encoder.transition_images(&[image_to(
+            depth,
+            ImageState::Undefined,
+            ImageState::CopyDestination,
+            queue,
+        )]);
+        encoder.copy_buffer_to_image(source, depth, &[whole_image()]);
+    };
+    let out_of_depth = |encoder: &mut dyn Encoder| {
+        encoder.transition_buffers(&[buffer_to(
+            readback,
+            BufferState::Undefined,
+            BufferState::CopyDestination,
+            encoder.queue(),
+        )]);
+        encoder.copy_image_to_buffer(depth, readback, &[whole_image()]);
+    };
+    let breaches: [Recording<'_>; 4] = [
+        ("a render pass on a compute encoder", &|encoder| {
+            encoder.transition_images(&[image_to(
+                target,
+                ImageState::Undefined,
+                ImageState::ColourAttachment,
+                C,
+            )]);
+            begin(
+                encoder,
+                &[attachment(target, Load::Clear([0.0; 4]), Store::Store, false)],
+                PassReach::NOTHING,
+            );
+            encoder.end_pass();
+        }),
+        ("a graphics pipeline bound on a compute encoder", &|encoder| {
+            encoder.bind_graphics_pipeline(pipeline);
+        }),
+        ("a draw on a compute encoder", &|encoder| encoder.draw(0..3, 0..1)),
+        ("a copy into a depth image on a compute encoder", &|encoder| into_depth(encoder)),
+    ];
+    for (what, record) in breaches {
+        let mut encoder = ctx.encoder(&*device, C);
+        record(&mut *encoder);
+        ctx.refused_by(submit(&*device, C, &mut [encoder]), Rule::Encoding, what);
+    }
+    // The depth image holds what a graphics copy wrote, in `CopySource`, seen complete.
+    let mut writer = ctx.encoder(&*device, G);
+    into_depth(&mut *writer);
+    writer.transition_images(&[image_to(
+        depth,
+        ImageState::CopyDestination,
+        ImageState::CopySource,
+        G,
+    )]);
+    run(ctx, &*device, &mut [writer]);
+    let mut reader = ctx.encoder(&*device, C);
+    out_of_depth(&mut *reader);
+    let what = "a copy out of a depth image on a compute encoder";
+    ctx.refused_by(submit(&*device, C, &mut [reader]), Rule::Encoding, what);
+    let mut graphics = ctx.encoder(&*device, G);
+    clear(&mut *graphics, target, Some(pipeline));
+    out_of_depth(&mut *graphics);
+    run(ctx, &*device, &mut [graphics]);
+    Ok(())
+}
+
 fn draw_with_nothing_bound_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let target = ctx.target(&*device);
@@ -648,7 +749,8 @@ fn copy_regions_overlapping_in_the_destination_are_refused(ctx: &Ctx<'_>) -> App
 
 /// A submit of a good encoder and a bad one is refused: the good one is still recorded,
 /// the state it would have changed is unchanged, and the point it would have signalled is
-/// free for another submit.
+/// free for another submit. The bad one breaks a rule every backend checks, an encoder of
+/// another role, so that the case holds on a device too.
 fn refused_submit_changes_nothing(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let usage =
@@ -669,18 +771,12 @@ fn refused_submit_changes_nothing(ctx: &Ctx<'_>) -> Applies {
         ImageState::SampledRead,
         G,
     )]);
-    let mut bad = ctx.encoder(&*device, G);
-    bad.transition_images(&[image_to(
-        image,
-        ImageState::ColourAttachment,
-        ImageState::CopySource,
-        G,
-    )]);
+    let bad = ctx.encoder(&*device, QueueRole::Compute);
     let mut encoders = [good, bad];
     let done = ctx.point(&*device, 1);
     let refused =
         device.submit(G, Submit { encoders: &mut encoders, waits: &[], signals: &[done] });
-    ctx.refused_by(refused, Rule::State, "a submit with a bad encoder");
+    ctx.refused_by(refused, Rule::Encoding, "a submit with an encoder of another role");
     ctx.check(
         ctx.ok(device.timeline_value(done.timeline), "a read") == 0,
         "a refused submit signals nothing",

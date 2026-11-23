@@ -1,0 +1,30 @@
+[package]
+name = "lactose-rhi-vulkan"
+description = "The Vulkan backend of the render hardware interface: a device against the required and reported sets, every rule of the contract's every-backend column checked before its driver call, barriers from the states a caller gives, timeline semaphores and the pipeline cache."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+# D150: the integration tests are one binary, whose root declares the others as modules.
+autotests = false
+
+[dependencies]
+# The loader, opened at run time (`Entry::load`), and every driver call.
+ash.workspace = true
+# `Error`, `ErrorKind`, `Result`, `Handle` and `xxh64`.
+lactose-core.workspace = true
+# The interface this crate implements, and `Rule::refuse` for each refusal.
+lactose-rhi-api.workspace = true
+
+[dev-dependencies]
+# The suite's cases, run against a driver by `tests/conformance.rs` when `cargo xtask gpu`
+# selects them. The feature is for dev-dependency edges alone.
+lactose-rhi-api = { workspace = true, features = ["conformance"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true
