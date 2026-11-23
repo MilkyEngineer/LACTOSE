@@ -103,7 +103,12 @@ struct Frames<'a> {
     /// The present role has a queue of its own: an exclusive target crosses with a release
     /// on the graphics queue and an acquire on the present queue.
     own: bool,
-    timeline: TimelineHandle,
+    /// Signalled by each frame's graphics submit with its frame's number.
+    drawn: TimelineHandle,
+    /// Signalled by each present's submit with its frame's number. A timeline of its own:
+    /// on one timeline, a frame's graphics signal would follow an earlier present's pending
+    /// signal with nothing ordering the two, which the records refuse (`timeline`).
+    shown: TimelineHandle,
 }
 
 impl Frames<'_> {
@@ -149,8 +154,8 @@ impl Frames<'_> {
             Acquired::None => panic!("no image within {PATIENCE:?}"),
         };
         let rgba = unorm(colour(frame));
-        let drawn = TimelinePoint { timeline: self.timeline, value: 2 * frame - 1 };
-        let shown = TimelinePoint { timeline: self.timeline, value: 2 * frame };
+        let drawn = TimelinePoint { timeline: self.drawn, value: frame };
+        let shown = TimelinePoint { timeline: self.shown, value: frame };
         let mut draw = self.device.create_encoder(G, "frame").expect("an encoder");
         draw.transition_images(&[image_to(
             slot.target,
@@ -252,7 +257,8 @@ fn frames_in_flight_are_presented_across_a_resize() {
             device: &device,
             sharing,
             own: own && sharing == Sharing::Exclusive,
-            timeline: device.create_timeline(0).expect("a timeline"),
+            drawn: device.create_timeline(0).expect("a timeline"),
+            shown: device.create_timeline(0).expect("a timeline"),
         };
         let first = Extent { width: 64, height: 64 };
         let mut swapchain =
@@ -324,7 +330,8 @@ fn shutdown_with_frames_in_flight_ends_cleanly() {
             device: &device,
             sharing: Sharing::Exclusive,
             own,
-            timeline: device.create_timeline(0).expect("a timeline"),
+            drawn: device.create_timeline(0).expect("a timeline"),
+            shown: device.create_timeline(0).expect("a timeline"),
         };
         let mut swapchain = device
             .create_swapchain(&SwapchainDesc { extent: Extent { width: 32, height: 32 } })
