@@ -41,6 +41,8 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     ),
     ("acquire_without_a_release_is_refused", acquire_without_a_release_is_refused),
     ("release_and_acquire_cross_a_resource", release_and_acquire_cross_a_resource),
+    ("transfer_into_host_read_is_read_back", transfer_into_host_read_is_read_back),
+    ("transfer_out_of_host_read_is_copied", transfer_out_of_host_read_is_copied),
     (
         "shared_and_discarded_resources_cross_without_a_transfer",
         shared_and_discarded_resources_cross_without_a_transfer,
@@ -692,6 +694,91 @@ fn release_and_acquire_cross_a_resource(ctx: &Ctx<'_>) -> Applies {
     ctx.submit(&*device, C, &mut [acquire], &[released], &[done]);
     ctx.reached(&*device, done);
     ctx.check(ctx.read(&*device, readback, 0, SIZE) == [5; SIZE as usize], "the bytes crossed");
+    Ok(())
+}
+
+/// A buffer the compute queue copies into, moved into `HostRead` on the graphics queue: the
+/// host reads, after the acquire's submit, the bytes the copy wrote. On Vulkan between two
+/// families neither half of the transfer may name the host
+/// (`VUID-VkBufferMemoryBarrier2-srcStageMask-03851`), so the host's dependency is a barrier
+/// of the acquiring family's own.
+fn transfer_into_host_read_is_read_back(ctx: &Ctx<'_>) -> Applies {
+    several_queues(ctx)?;
+    let device = ctx.device();
+    let bytes: Vec<u8> = (0..SIZE).map(|at| (at % 251) as u8).collect();
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &bytes);
+    let readback = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let region = [BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }];
+    let crossing =
+        buffer_across(readback, (BufferState::CopyDestination, C), (BufferState::HostRead, G));
+    let mut release = ctx.encoder(&*device, C);
+    release.transition_buffers(&[
+        buffer_to(source, BufferState::Undefined, BufferState::CopySource, C),
+        buffer_to(readback, BufferState::Undefined, BufferState::CopyDestination, C),
+    ]);
+    release.copy_buffer(source, readback, &region);
+    release.transition_buffers(&[crossing]);
+    let released = ctx.point(&*device, 1);
+    ctx.submit(&*device, C, &mut [release], &[], &[released]);
+    let mut acquire = ctx.encoder(&*device, G);
+    acquire.transition_buffers(&[crossing]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, G, &mut [acquire], &[released], &[done]);
+    ctx.reached(&*device, done);
+    ctx.check(ctx.read(&*device, readback, 0, SIZE) == bytes, "the bytes the copy wrote");
+    Ok(())
+}
+
+/// A buffer the host has read in `HostRead` on the compute queue, moved out of it to the
+/// graphics queue and copied there: the copy reads the bytes the host read. As in
+/// [`transfer_into_host_read_is_read_back`], neither half may name the host on Vulkan; the
+/// submit orders the host's read before the release.
+fn transfer_out_of_host_read_is_copied(ctx: &Ctx<'_>) -> Applies {
+    several_queues(ctx)?;
+    let device = ctx.device();
+    let bytes: Vec<u8> = (0..SIZE).map(|at| (at % 241) as u8).collect();
+    let source = ctx.upload(&*device, BufferUsage::EMPTY, &bytes);
+    let usage = BufferUsage::COPY_SOURCE.union(BufferUsage::COPY_DESTINATION);
+    let read = ctx.buffer(&*device, SIZE, usage, MemoryClass::Readback);
+    let out = ctx.buffer(&*device, SIZE, BufferUsage::COPY_DESTINATION, MemoryClass::Readback);
+    let region = [BufferCopy { source_offset: 0, destination_offset: 0, size: SIZE }];
+    let mut writer = ctx.encoder(&*device, C);
+    writer.transition_buffers(&[
+        buffer_to(source, BufferState::Undefined, BufferState::CopySource, C),
+        buffer_to(read, BufferState::Undefined, BufferState::CopyDestination, C),
+    ]);
+    writer.copy_buffer(source, read, &region);
+    writer.transition_buffers(&[buffer_to(
+        read,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        C,
+    )]);
+    let written = ctx.point(&*device, 1);
+    ctx.submit(&*device, C, &mut [writer], &[], &[written]);
+    ctx.reached(&*device, written);
+    ctx.check(ctx.read(&*device, read, 0, SIZE) == bytes, "the host reads the bytes");
+    let crossing = buffer_across(read, (BufferState::HostRead, C), (BufferState::CopySource, G));
+    let mut release = ctx.encoder(&*device, C);
+    release.transition_buffers(&[crossing]);
+    let released = ctx.point(&*device, 1);
+    ctx.submit(&*device, C, &mut [release], &[], &[released]);
+    let mut acquire = ctx.encoder(&*device, G);
+    acquire.transition_buffers(&[
+        crossing,
+        buffer_to(out, BufferState::Undefined, BufferState::CopyDestination, G),
+    ]);
+    acquire.copy_buffer(read, out, &region);
+    acquire.transition_buffers(&[buffer_to(
+        out,
+        BufferState::CopyDestination,
+        BufferState::HostRead,
+        G,
+    )]);
+    let done = ctx.point(&*device, 1);
+    ctx.submit(&*device, G, &mut [acquire], &[released], &[done]);
+    ctx.reached(&*device, done);
+    ctx.check(ctx.read(&*device, out, 0, SIZE) == bytes, "the copy reads the bytes");
     Ok(())
 }
 

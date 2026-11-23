@@ -13,9 +13,10 @@ name this crate; `lactose-app` never does (milestone 2 plan, decision 5.11).
 | Determinism boundary | outside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final for milestone 2's lanes and every body
-that decides anything is `todo!()`. What runs is plain data: the ids, a key's value and
-`History`. This file is the contract `graph-impl` meets, and every sentence under "Behaviour
+**Status: implemented.** Every public signature is final for milestone 2's lanes and every
+body is written (D160's addendum at `graph-impl`). The proofs run on null under both queue
+layouts and on Vulkan under `cargo xtask gpu` ("Proof"). This file is the contract
+`graph-impl` meets, and every sentence under "Behaviour
 the signatures cannot express" is one a dependent crate may rely on. Architecture sections
 12.3, 3 and 5.1 are the design, with the milestone 2 plan's decisions 5.4, 5.6, 5.11 and
 5.17; where this file and the architecture disagree, the architecture wins and this file is
@@ -70,18 +71,20 @@ Three things these consumers must know that no signature shows:
   then acquires a release older than the frame's re-take is refused on null (`no-qfot`:
   an acquire with no equal release submitted), and on Vulkan races the graphics queue's
   writes.
-- **`frame-design` and `frame-impl`: the one lock-free way to hold `&mut RenderGraph` and
-  `&mut JobContext` together** is a system with a `Job` parameter, whose `context()` is
-  the `&mut JobContext` that `record` takes, beside a `ResMut` of a `dyn` trait. The trait
-  belongs to a foundation crate and its method takes `&mut JobContext`;
-  `World::insert_service` holds any `Send + Sync + 'static` type. A `#[system]` is shipped
-  only in a boundary crate or a lint-file carrier (decision 5.18), and none of them may
-  name this crate, a backend crate. Where that system and trait are declared, and which
-  world runs the system once a frame, are `frame-design`'s; any other route takes a lock
-  that section 3 would have to permit. A `GraphNode`'s `run` has `&self` and would need a
-  lock to reach `&mut RenderGraph`, which section 3 does not permit on the per-frame path;
-  a scope child holds a `ChildContext`, not a `JobContext`; and the main thread holds
-  neither.
+- **`frame-design` and `frame-impl`: two lock-free ways to hold `&mut RenderGraph` and
+  `&mut JobContext` together**, of which the client's frame takes the second (D162). One
+  is a system with a `Job` parameter, whose `context()` is the `&mut JobContext` that
+  `record` takes, beside a `ResMut` of a `dyn` trait. The trait belongs to a foundation
+  crate and its method takes `&mut JobContext`; `World::insert_service` holds any `Send +
+  Sync + 'static` type. A `#[system]` is shipped only in a boundary crate or a lint-file
+  carrier (decision 5.18), and none of them may name this crate, a backend crate. The
+  other is a closure that `lactose-task`'s `Executor::run_job` runs as one job, with the
+  graph's owner moved in and handed back in its value: no system, no world and no `Sync`
+  bound. The frame's object is a `lactose_app::RenderSide`, a trait of `lactose-app`'s own
+  (D162); any other route takes a lock that section 3 would have to permit. A
+  `GraphNode`'s `run` has `&self` and would need a lock to reach `&mut RenderGraph`, which
+  section 3 does not permit on the per-frame path; a scope child holds a `ChildContext`,
+  not a `JobContext`; and the main thread holds neither.
 - **`graph-impl`: a frame of another graph.** `record` and `submit` refuse a frame another
   graph made (`InvalidData`, "Errors and drops"). Two `compile`s may precede a `record`,
   since a `CompiledFrame` borrows no graph, so the second may evict the first frame's plan:
@@ -286,14 +289,21 @@ Three things these consumers must know that no signature shows:
   of their first kept use, declaration order breaking a tie, each at the lowest offset of
   the lowest-numbered block where its bytes, at its alignment, overlap those of no
   transient whose lifetime overlaps its own, and makes a block where none has room. How
-  large it makes a block is its choice. So a transient takes the bytes of one that has
-  ended wherever those are the lowest that fit, and in a frame whose kept passes use two
-  placed transients and no more, of equal format, extent, mips, layers and usage, whose
-  lifetimes do not overlap, the two have one placement.
+  large it makes a block is its choice: at milestone 2 a plan has one block, sized to the
+  high-water mark of its placements, and a device refuses a block past its largest
+  allocation (`ResourceExhausted`), which `compile` returns. So a transient takes the
+  bytes of one that has ended wherever those are the lowest that fit, and in a frame whose
+  kept passes use two placed transients and no more, of equal format, extent, mips, layers
+  and usage, whose lifetimes do not overlap, the two have one placement. Two whose
+  lifetimes meet in one pass, the last use of one and the first of the other, overlap.
 - Before the first use, in each frame, of a placed transient whose range another's
   overlaps, the graph records `Encoder::alias` for it. That covers the first frame, where
   rhi-api accepts the call though nothing came before, and every later frame, where the
   transient that last used the bytes is one of the frame before.
+- On native Metal the one block is suspected to cost order: D158 fences placed images by
+  block, so every encoder that uses a placed transient would wait for every earlier one
+  that did, whether or not their bytes overlap. `rhi-metal` measures it; a block for each
+  group of transients that share bytes is the remedy where it is so.
 - **The graph does not judge a read before the first write.** A declaration whose pass
   keeps, copies from or locally reads a transient no earlier pass wrote compiles and
   records. Null refuses its submit (`undefined-read`); a device reads undefined bytes.
@@ -329,6 +339,14 @@ Three things these consumers must know that no signature shows:
 - The graph records no transition the declaration does not imply and omits none it does.
   On null a missing or a wrong one is refused (`state`), which is how `graph-impl` shows a
   build that drops one.
+- **The graph never names a resource twice in one transition call.** The elements of one
+  `transition_images` or `transition_buffers` call are not ordered with one another on a
+  device (one `vkCmdPipelineBarrier2` on Vulkan), so where a resource has two transitions
+  in a row, such as a closing transition and then the release toward `handoff`, or a take
+  from `Undefined` and then a release, each is in a call of its own, in that order. A call
+  that names a subresource twice is refused on every backend (`state`, rhi-api's
+  "States"); the graph's rule, by resource, is the wider of the two, and the tests' logging
+  device refuses a submit whose encoder had a call that named one twice.
 
 ### What a pass reaches
 
@@ -485,11 +503,24 @@ Three things these consumers must know that no signature shows:
   each frame submitted, so a point reached means that frame's submits, and every earlier
   frame's, have completed: those on the last submit's queue by submission order, and those
   on another queue by these waits.
-- One point a frame serialises the frame's end. The last submit waits for the frame's
-  compute-queue work before any of its own passes run, so compute work overlaps only the
-  graphics submits made before the last one, and no compute work overlaps graphics across
-  the frame's end at milestone 2. A trailing submit with no encoder that signals the point
-  is for a later milestone ("Not in this crate yet").
+- Across frames, under several queues, each submit of a frame waits for the last submit
+  the graph made to the other queue before the frame, where it has made one: that covers
+  every earlier frame's use, write and change there, and is how the graph makes the
+  cross-frame waits of "Imports" (null credits a submit with its own waits alone). The
+  frame's last submit also waits for the frame point before where that was signalled from
+  the other queue. The wait for the other queue's point does not imply it, though one
+  submit signalled both: the signals of one submit are unordered with one another on
+  Vulkan, so only a wait for the frame point itself keeps the frame timeline's values
+  growing (`VUID-VkSubmitInfo2-semaphore-03882`).
+- The two cost the frame's ends. The last submit waits for the frame's work on the other
+  queue before any of its own passes run, so the other queue's work overlaps only the
+  submits made before the last one; and where a graph has used both queues, a frame's
+  first submit on a queue starts after the other queue's last submit of the frame before,
+  so no work of one queue overlaps the other's across the frame's end. A frame all of
+  whose work is on one queue, on a graph that has used no other, makes neither wait, which
+  is every frame of milestone 2: its work overlaps the frame before's on that queue as the
+  device allows. A trailing submit with no encoder that signals the point is for a later
+  milestone ("Not in this crate yet").
 - `submit` waits for nothing and returns an error from `Device::submit` unchanged. A
   refusal of the frame's first submit changes nothing (rhi-api, "Timelines"): every import
   is as the declaration found it, and the frame's encoders are reset and free. An error
@@ -504,14 +535,15 @@ Three things these consumers must know that no signature shows:
   that submit in the torn frame's place, with no encoders, to the queue the torn frame's
   last submit was planned for (rhi-api, "Recording and submitting": a submit with no
   encoders waits and signals alone). It waits and signals as that last submit would have,
-  by the rule above: for a point of each submit the torn frame made to another queue, and
-  for the last frame point where that was signalled from another queue, and it signals the
-  torn frame's point. Then the new frame is submitted. The torn frame's point is reached
-  like any other frame's, the next frame's point is above it, and every later submit waits
-  for it by the rules above. The torn frame's submitted encoders and its plan are held, as
-  a pending frame's are, until its point is seen reached, so nothing is reset or destroyed
-  under a submit it made; the encoders of the submits it never made are reset and free at
-  once.
+  by the rule above, except that it waits for the frame point before wherever that was
+  signalled: for the last submit made to the other queue, where there is one, which covers
+  each submit the torn frame made there, and for the frame point before, and it signals
+  the torn frame's point. Then the new frame is submitted. The torn frame's point is
+  reached like any other frame's and the next frame's point is above it: the next frame's
+  last submit waits for it where that submit goes to the other queue, and submission order
+  covers the rest. The torn frame's submitted encoders and its plan are held, as a pending
+  frame's are, until its point is seen reached, so nothing is reset or destroyed under a
+  submit it made; the encoders of the submits it never made are reset and free at once.
 - If that submit is refused, the new frame is not submitted: its encoders are reset and
   free, the graph is as it was before the call, still owing that submit, and `submit`
   returns the error unchanged, which the caller takes as a torn frame like any other. The
@@ -650,6 +682,15 @@ A copy pass's second call into one destination fails `record`. Two transients al
 honour is not refused, it is given memory). No submit waits for a point that only a later
 submit to its own queue signals: null does not refuse that, neither submit completes, so
 the proof is every frame's point reached within a bounded wait under both capability sets.
+The tests' logging device refuses a submit whose encoder had a transition call that named
+one resource twice, whatever the device under it checks, over the five chains of two
+transitions a frame can give one resource at its end; every backend refuses the same call
+(`state`, rhi-api's "States"). The waits for the frame point before hold with the frame
+before held pending, where null refuses a frame point's signal without them (`timeline`: a
+wait orders the signal it waits for, not the other signals of its submit), and by the waits
+the logging device records. Each queue rule's clause holds by the queue a pass is given
+(`PlannedPass::queue`), and a wait inside the graph, such as a pending encoder's drop,
+fails its test at a bound, with a message, rather than at nextest's kill.
 
 ## How each call is honoured
 
@@ -713,33 +754,102 @@ kind section 20 allows, a new field, variant or call, and changes what no call a
 
 ## Proof
 
-There is nothing to run against a facade but `History`. `tests/consumers.rs` compiles what
-each consumer writes: `graph-impl`'s proofs on null (aliasing, culling and null's refusal;
-the key's inputs and the cap, and a use moved between lists; a write in one state across
-the frame's edge; a copy's second call into one destination; both queue paths; encoders
-under a lagging device), the minimal renderer's scatter and triangle passes through a
-pass-provider trait and its readback, the client's frame through a `dyn` object with the
-latch between record and submit and the target's hand-off to the present thread, and a
-history's frame.
+`tests/integration.rs` runs, on null and under both queue layouts, every row of "What
+`graph-impl` proves on null" and the proofs that rest on this surface, through a device that
+wraps null to keep each submit's commands and each destroy (`tests/common/mod.rs`), and the
+tests of recording itself but its spans, which `tests/spans.rs`, a binary of its own, holds.
+Its `device` module runs the graph on Vulkan under `cargo xtask gpu`, below; a plain run
+ignores those tests. `tests/consumers.rs` compiles what each consumer writes: `graph-impl`'s
+proofs on null (aliasing, culling and null's refusal; the key's inputs and the cap, and a
+use moved between lists; a write in one state across the frame's edge; a copy's second
+call into one destination; both queue paths; encoders under a lagging device), the minimal
+renderer's scatter and triangle passes through a pass-provider trait and its readback, the
+client's frame through a `dyn` object with the latch between record and submit and the
+target's hand-off to the present thread, and a history's frame.
 `tests/values.rs` runs the ping-pong and holds this file's surface table to the crate's
 exports. The static assertions in `src/lib.rs` hold `RenderGraph`, `RecordedFrame` and
 `CompiledPlan` to `Send + Sync + 'static`, `FrameDecl` and `CompiledFrame` to `Send + Sync`
 whatever their recorders borrow, and every declaration and report type to plain data.
 
-`graph-impl` owes the rows of "What `graph-impl` proves on null", each with the build that
-fails it. On devices, by class of hazard (decision 5.17), it owes the dropped barrier on a
-tracked attachment or buffer, which synchronisation validation reports; a host write under
-a pending reader, which yields a wrong readback with the GPU made to lag; a host access
-under a pending writer, refused on every backend (`pending`); and the encoder reset held
-back with the GPU made to lag (`VUID-vkResetCommandPool-commandPool-00040`). Every device
-run, the `gpu (lavapipe)` job's included, sets the Khronos layer's
+On devices, by class of hazard (decision 5.17), the `device` tests run under `cargo xtask
+gpu`, each in a process of its own, under the Khronos layer's core, thread-safety and
+synchronisation validation and, under MoltenVK, Metal's API and shader validation, whose
+canaries the run hears first. A test passes only where neither the layer, the driver nor
+Metal speaks, and each test that makes the GPU lag checks that the lag held:
+- Frames on both queues read back what each pass wrote: words written on the compute
+  queue, where it has one of its own, and read on the graphics queue in the next frame,
+  and a target filled in a colour of its frame's and read, its readback ending each frame
+  on the compute queue, which is not its last user's where compute has a queue of its own.
+  A build that drops the barrier on an attachment, or on a buffer between two copies, fails
+  it by the layer's message.
+- Under rhi-api the layer's synchronisation validation at 1.4.363 tracks no shader access
+  at all: none through a device address, which is every shader's access to a buffer here;
+  none through a descriptor array, since it skips every binding of more than one
+  descriptor; and none through any descriptor unless `syncval_shader_accesses_heuristic` is
+  set, which is off by default (`CollectDescriptorAccesses` in the layer's
+  `layers/sync/sync_command_buffer.cpp`, and the SDK's `VkLayer_khronos_validation.json`, at
+  `vulkan-sdk-1.4.363`). Nor does it report a missing ownership transfer that a semaphore
+  orders. A build that drops every transition out of `ShaderWrite` passes every device test
+  on the M1 with the words read back right, and fails 13 tests on null: null's state rule,
+  and a readback, are the proof for a buffer a shader uses.
+- The five chains of two transitions of "Transitions and store actions" are clean, and the
+  three image chains again toward the compute queue where it has a family of its own. A
+  chain is two transitions only where its hand-off's queue is not its last use's: under
+  MoltenVK on the M1, where present shares the graphics queue, the buffer chains and the
+  image chains toward the compute queue are two, and a build that puts a frame's-end chain
+  in one call is refused there (`state`); under KosmicKrisp and lavapipe, one queue, every
+  chain is one. The image chains toward a present family of their own are the desktop's.
+- A host write under a pending reader is what the reader reads, a wrong readback, and one
+  after the frame's point is not; a host read or invalidate under a pending writer is
+  refused (`pending`).
+- An encoder is reset only after its frame's point
+  (`VUID-vkResetCommandPool-commandPool-00040`, which `rhi-vulkan` refuses as `pending`).
+- Under several queues, a frame after one that ended on the compute queue waits for its
+  point, and a torn frame is finished by the next: the frame timeline's values grow by one
+  a frame, the torn point is reached while the next frame lags, so by the submit made in
+  its place, and its encoders are held until it.
+- A buffer moved into `HostRead` or out of it between two families: `rhi-vulkan` recorded
+  the transfer into `HostRead` with the host's stage as its acquire's destination, and the
+  one out of it with the host's stage as its release's source, which Vulkan forbids
+  between two families (`VUID-VkBufferMemoryBarrier2-srcStageMask-03851`); null accepts
+  both. It is fixed in `rhi-vulkan` at `graph-impl`: neither half names the host; a release
+  out of `HostRead` takes no source stage, since the submit orders the host's earlier read;
+  an acquire into `HostRead` takes every command as its destination, and a barrier on its
+  own family after it takes every write to the host's read. rhi-api's conformance cases
+  `transfer_into_host_read_is_read_back` and `transfer_out_of_host_read_is_copied` show, on
+  every device with two families, that neither half is refused and that the bytes are read
+  back, and so here do a readback that ends on a queue other than its last user's and one
+  left on its writer's queue and copied on the other queue the next frame. The host's
+  barrier after the acquire is held by reading and by `rhi-vulkan`'s unit test
+  `the_hosts_barrier_follows_an_acquire_into_host_read_in_a_call_of_its_own`: a build that
+  drops it, or records it in the acquire's call, passes on the M1's coherent memory.
+- A depth transient of one pass orders two triangles as a CPU reference does, `Memoryless`
+  where the device reports it and `Placed` where it places images.
+- Two figures, printed and asserted of nothing, each frame's lag checked: what the waits
+  across queues cost, against the same work on two graphs, one for each queue, that make
+  none; and whether two images placed at one offset of one block share bytes, which they
+  do, every byte, under MoltenVK and KosmicKrisp. The cost is unpriced on the M1: under
+  MoltenVK 1.4.2 the two queues' work ran one after the other even on the two graphs that
+  wait for nothing across queues, so the figure shows nothing and discharges nothing
+  (decision 5.17). Measured at review: one lagging dispatch on each queue, with no graph
+  and no waits, takes 256 ms alone and 511 ms for both under MoltenVK; native Metal
+  overlaps the two queues almost fully, about 260 ms wall for both, and not at all when
+  each encoder declares a shared buffer read-write. So the serialisation is MoltenVK's,
+  suspected to be its marking every buffer with a device address read-write in each
+  encoder (`encodeGPUAddressableBuffers`); the price is owed to a device that overlaps
+  queues, the desktop's, and to `rhi-metal`.
+
+Where the compute role shares the graphics queue, as on lavapipe in the `gpu (lavapipe)`
+job, the tests of the several-queue path say they are skipped and why, and the rest run
+with every pass on the graphics queue. Every device run, the `gpu (lavapipe)` job's
+included, sets the Khronos layer's
 `VK_KHRONOS_VALIDATION_SYNCVAL_LOAD_OP_AFTER_STORE_OP_VALIDATION=true` beside
 `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`: without it the layer does not report a load
 after a store between two render pass instances, which is the write across the frame's
 edge of "Transitions and store actions" (verification, the row of D160 on the layer).
 
-It owes three tests of recording itself, because none of the above fails a `graph-impl`
-that records its jobs one at a time:
+Three tests hold recording itself, because none of the above fails a `graph-impl` that
+records its jobs one at a time:
 - **Recording runs in parallel.** On at least two frame-critical workers, a recorder of one
   job and a recorder of another each wait, with a bound, for the other, so the test fails
   rather than hangs where the jobs do not run at once, and each job's commands are still

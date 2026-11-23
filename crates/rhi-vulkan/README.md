@@ -189,7 +189,13 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   execution model, a `Bool` widened to four bytes and `Int64Atomics` refused unless enabled.
   In `src/convert.rs`: the re-take from `Undefined`, the transfer within a family as one
   layout change, the transfer between families as a release and an acquire of equal values,
-  a family without `GRAPHICS`, and two writes in one writing state. In `src/raw.rs`: compute
+  no barrier between two families naming the host, the host's barrier after an acquire into
+  `HostRead` on the acquiring family alone, a family without `GRAPHICS`, and two writes in
+  one writing state. In `src/encoder.rs`: `buffer_calls` puts the host barrier after an
+  acquire into `HostRead` between two families in its second list, on the acquiring side
+  alone, and none after a release or a change within one family; that `transition_buffers`
+  records the two lists in that order, as two calls, is held by reading. In `src/raw.rs`:
+  compute
   takes a family that does not draw first, and viewport bounds rounded inward to what an Apple
   GPU honours. In `src/records.rs`: a reached point completing its submit and the earlier ones
   of its queue, a failed submit's promise kept until its stamp and its wait are known
@@ -220,11 +226,11 @@ MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choos
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2, under Metal API and shader validation | 158 | 45: 31 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363) | 147 | 55: 31 null alone, 8 no window, 4 no loss, 9 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
-| KosmicKrisp under GPU-assisted validation | 142 | 55: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
+| MoltenVK 1.4.2, under Metal API and shader validation | 160 | 45: 31 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363) | 147 | 57: 31 null alone, 8 no window, 4 no loss, 11 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
+| KosmicKrisp under GPU-assisted validation | 142 | 57: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
 
-The counts are of the device tests: the suite's 183 cases, 155 contract and 28 output, and the
+The counts are of the device tests: the suite's 185 cases, 157 contract and 28 output, and the
 device's own; the Metal canary runs under MoltenVK alone. Each driver passes 27 of the 28
 output cases: MoltenVK skips the count draw, and KosmicKrisp the ownership transfer, since
 compute shares its one queue. Under Metal's validation every case that does not skip prints
