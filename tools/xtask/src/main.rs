@@ -554,7 +554,7 @@ fn run_vulkan(
             }
             let entry = vulkan::entry(package, test, &verdict, &ended);
             if verdict.failure.is_some() {
-                eprint!("gpu: {entry}");
+                eprint!("gpu: {entry}{}", vulkan::output(test, &ended));
                 failed.push(test.to_owned());
             }
             lines.push(entry);

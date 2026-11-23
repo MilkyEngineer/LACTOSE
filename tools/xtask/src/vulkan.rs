@@ -706,8 +706,9 @@ pub const DEADLINE: Duration = Duration::from_secs(120);
 pub struct Ended {
     /// Whether it exited with success.
     pub succeeded: bool,
-    /// Its exit status as the platform words it: `exit status: 101`, or on unix `signal: 11
-    /// (SIGSEGV)` for a process a signal killed.
+    /// Its exit status as std's `ExitStatus` words it: on unix `exit status: 101`, or
+    /// `signal: 11 (SIGSEGV)` for a process a signal killed, with ` (core dumped)` where a
+    /// core was written; on Windows `exit code: 101`, or `exit code: 0xc0000005`.
     pub status: String,
     /// Its standard output.
     pub stdout: String,
@@ -786,8 +787,7 @@ pub const TAIL_LINES: usize = 40;
 /// then each message, report and driver line it printed; for a failed test, how its process
 /// ended and the last lines of its standard output and of its standard error, [`TAIL_LINES`]
 /// at most between them, each half of them and a share one leaves to the other. The run
-/// prints a failed test's entry to standard error too: nothing else of a process that died
-/// silently, of a signal, would reach the log.
+/// prints a failed test's entry to standard error too, then its [`output`] in full.
 #[must_use]
 pub fn entry(package: &str, test: &str, verdict: &Verdict, ended: &Ended) -> String {
     let mut entry = format!("{package} {test}: {}\n", verdict.word());
@@ -815,6 +815,25 @@ pub fn entry(package: &str, test: &str, verdict: &Verdict, ended: &Ended) -> Str
         }
     }
     entry
+}
+
+/// The whole of what the failed device test `test` wrote, for the run's log: its standard
+/// output, then its standard error, each in full under a heading of its own. The report keeps
+/// the [`entry`] alone, whose tail is cut at [`TAIL_LINES`].
+#[must_use]
+pub fn output(test: &str, ended: &Ended) -> String {
+    let mut output = String::new();
+    for (stream, text) in [("standard output", &ended.stdout), ("standard error", &ended.stderr)] {
+        if text.is_empty() {
+            output.push_str(&format!("gpu: {test}, its {stream}: nothing\n"));
+            continue;
+        }
+        output.push_str(&format!("gpu: {test}, its {stream} in full:\n{text}"));
+        if !text.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output
 }
 
 impl Verdict {
@@ -1056,6 +1075,11 @@ mod tests {
              (SIGSEGV)\n  standard output, its last 3 of 3 line(s):\n    \n    running 1 \
              test\n    test device::a_canary ... \n  standard error: nothing\n"
         );
+        // Where the system wrote a core, std's wording says so, and the entry keeps it.
+        let dumped = ended("signal: 11 (SIGSEGV) (core dumped)", "", "");
+        let verdict = judge_ended(test, &dumped, Some(&["AN-ID"]), false);
+        let dumped = entry("a-package", test, &verdict, &dumped);
+        assert!(dumped.contains("  ended with signal: 11 (SIGSEGV) (core dumped)\n"), "{dumped}");
         // A passing test's entry is its word and messages alone.
         let passed = ended("exit status: 0", &message("AN-ID"), "");
         let verdict = judge_ended(test, &passed, Some(&["AN-ID"]), false);
@@ -1069,6 +1093,27 @@ mod tests {
         let sent = entry("a-package", "conformance::a_case", &verdict, &sent);
         assert!(sent.contains("FAILED, 1 message(s)\n  message: Message {"), "{sent}");
         assert!(sent.contains("ended with exit status: 0\n"), "{sent}");
+    }
+
+    /// The log has a failed test's whole output, past the entry's tail: each stream as it was
+    /// written, under its heading, a line it left open ended.
+    #[test]
+    fn a_failed_tests_whole_output_is_for_the_log() {
+        let lines: String = (1..=100).map(|at| format!("err {at}\n")).collect();
+        let died = ended("signal: 6 (SIGABRT)", "running 1 test\ntest device::a ... ", &lines);
+        assert_eq!(
+            output("device::a", &died),
+            format!(
+                "gpu: device::a, its standard output in full:\nrunning 1 test\ntest device::a \
+                 ... \ngpu: device::a, its standard error in full:\n{lines}"
+            )
+        );
+        let silent = ended("signal: 11 (SIGSEGV)", "", "");
+        assert_eq!(
+            output("device::a", &silent),
+            "gpu: device::a, its standard output: nothing\ngpu: device::a, its standard error: \
+             nothing\n"
+        );
     }
 
     /// The tail holds [`TAIL_LINES`] at most: each stream half, and what one leaves the other.
@@ -1106,11 +1151,11 @@ mod tests {
         let died = run_bounded(&mut command, Duration::from_secs(60)).expect("sh runs");
         assert!(!died.succeeded);
         assert_eq!((died.stdout.as_str(), died.stderr.as_str()), ("out\n", "err\n"));
-        // Linux adds ` (core dumped)` where core dumps are on.
+        // ` (core dumped)` follows where the system writes a core.
         assert!(died.status.starts_with("signal: 11 (SIGSEGV)"), "{}", died.status);
         let verdict = judge_ended("device::a_case", &died, None, false);
         let entry = entry("a-package", "device::a_case", &verdict, &died);
-        assert!(entry.contains("  ended with signal: 11 (SIGSEGV)\n"), "{entry}");
+        assert!(entry.contains(&format!("  ended with {}\n", died.status)), "{entry}");
     }
 
     #[test]

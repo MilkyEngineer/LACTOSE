@@ -791,9 +791,10 @@ writes its report.
    `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed. Under a
    failed test it writes how its process ended, its exit status or on unix the signal that
    killed it, and the last lines of its standard output and of its standard error, 40 at
-   most between them (`TAIL_LINES` in `src/vulkan.rs`), and prints the same to standard
-   error, so a process that died silently still says how. A failed test fails the run, under
-   every driver.
+   most between them (`TAIL_LINES` in `src/vulkan.rs`), so a process that died silently still
+   says how. It prints the same to standard error, the job's log, followed by the test's whole
+   standard output and standard error, each under a heading of its own: the log keeps all of
+   a failed test's output, the file its tail. A failed test fails the run, under every driver.
 
 The `shaders` CI job runs `gpu --driver system --only metal` on the macOS runner that cooks,
 and the `shaders-oldest` job runs `gpu --driver system --only metal --cooked` on the oldest
