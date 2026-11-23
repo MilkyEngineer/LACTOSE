@@ -8,14 +8,71 @@ use lactose_core::ErrorKind;
 use lactose_render_graph::{
     BufferAccess, BufferImport, BufferUse, ComputePassDecl, CopyPassDecl, FrameDecl,
 };
-use lactose_rhi_api::{BufferCopy, BufferState, ImageState, Load, QueueRole, Sharing};
+use lactose_rhi_api::{BufferCopy, BufferState, ImageState, Load, QueueRole, Rule, Sharing};
 use lactose_task::ChaosConfig;
 
 use crate::common::{
     G, LAYOUTS, Recorded, buffer, colour, compute_pipeline, define_buffer, device, draws, executor,
-    frame, fresh_buffer, graph, held, home, image, image_import, in_job, in_job_of, lock, on,
-    reached,
+    frame, fresh_buffer, graph, held, home, image, image_import, in_job, in_job_of, lines, lock,
+    on, reached,
 };
+
+/// A copy call's regions reach the device as the recorder gave them: two that write apart
+/// are accepted as one call, and two that write one byte are null's `bounds`, which
+/// `submit` returns unchanged.
+#[test]
+fn a_copys_regions_reach_the_device_as_given() {
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let source = buffer(&*device, "source", Sharing::Exclusive);
+        let out = buffer(&*device, "out", Sharing::Exclusive);
+        define_buffer(&*device, source, on(BufferState::CopySource, G));
+        device.take_submitted();
+        in_job(move |ctx| {
+            let mut graph = graph(&device, 1, 2);
+            for overlap in [false, true] {
+                let mut decl = FrameDecl::new(1);
+                let source = decl.import_buffer(&BufferImport {
+                    label: "source",
+                    buffer: source,
+                    sharing: Sharing::Exclusive,
+                    initial: on(BufferState::CopySource, G),
+                    last: on(BufferState::CopySource, G),
+                    ready: None,
+                });
+                let out = decl.import_buffer(&fresh_buffer("out", out, G, BufferState::HostRead));
+                let second = if overlap { 8 } else { 16 };
+                let regions = [
+                    BufferCopy { source_offset: 0, destination_offset: 0, size: 16 },
+                    BufferCopy { source_offset: 16, destination_offset: second, size: 16 },
+                ];
+                decl.copy_pass(
+                    &CopyPassDecl {
+                        label: "two regions",
+                        image_sources: &[],
+                        image_destinations: &[],
+                        buffer_sources: &[source],
+                        buffer_destinations: &[out],
+                    },
+                    move |copy| copy.copy_buffer(source, out, &regions),
+                );
+                let result = frame(&mut graph, ctx, decl);
+                if overlap {
+                    let refused = result.expect_err("null refuses the overlap");
+                    assert_eq!(Rule::of(&refused), Some(Rule::Bounds), "{refused}");
+                    assert!(device.take_submitted().is_empty());
+                } else {
+                    reached(&**graph.device(), result.expect("null accepts the regions"));
+                    let lines = lines(&device.take_submitted());
+                    let copies: Vec<&String> =
+                        lines.iter().filter(|line| line.starts_with("copy_buffer")).collect();
+                    assert_eq!(copies.len(), 1, "{lines:#?}");
+                    assert_eq!(copies[0].matches("BufferCopy {").count(), 2, "{}", copies[0]);
+                }
+            }
+        });
+    }
+}
 
 /// A copy pass's second call into one destination, and a recorder's use of an id its pass did
 /// not declare for that use, each fail `record` with `InvalidData` naming the pass, submit
@@ -108,6 +165,7 @@ fn a_recorders_breach_fails_record_and_frees_the_encoders() {
                 let message = error.to_string();
                 assert!(message.contains(pass) && message.contains(call), "{message}");
                 assert!(device.take_submitted().is_empty());
+                assert_eq!(graph.stats().encoders, encoders, "the frame's encoders are free");
                 let point =
                     frame(&mut graph, ctx, declare(None)).expect("a frame after the breach");
                 reached(&**graph.device(), point);

@@ -1321,6 +1321,9 @@ fn order_queues(
         let other = 1 - queue;
         let mut wait: Option<u32> = None;
         for at in (0..resources).filter(|&at| named[at]) {
+            // Under the queue rule ("Queues") a submit that follows another queue's write or
+            // change in the frame changes the resource itself, so the wait below covers it
+            // too; this one holds the README's rule whole should the rule change.
             wait = wait.max(changed[at][other]);
             if touched[at].changes {
                 wait = wait.max(used[at][other]);

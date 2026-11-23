@@ -111,7 +111,7 @@ fn each_pass_runs_on_its_queue_and_each_queue_run_is_a_submit() {
     }
 }
 
-/// A compute pass, held pending, that writes a buffer the graphics queue left and one the
+/// A compute pass, after a frame held pending, that writes a buffer the graphics queue left and one the
 /// graphics queue takes after the frame: the crossings are at the frame's edges, where a
 /// compute-role pass's dependencies are ("Queues"). An `Exclusive` buffer's crossing is a
 /// release on the queue that had it, in a submit made first, and an acquire with equal
@@ -131,7 +131,26 @@ fn a_crossing_is_both_halves_of_a_transfer_or_one_change_and_a_wait() {
             device.take_submitted();
             in_job(move |ctx| {
                 let several = several(&*device);
-                let mut graph = graph(&device, 1, 1);
+                let mut graph = graph(&device, 1, 2);
+                // A frame held pending, which every submit of the next waits for under
+                // several queues: so the next frame's submits are pending as they are made.
+                let mut decl = FrameDecl::new(1);
+                let hold = decl.import_buffer(&BufferImport {
+                    ready: Some(gate),
+                    ..fresh_buffer("hold", hold, C, BufferState::ShaderWrite)
+                });
+                decl.compute_pass(
+                    &ComputePassDecl {
+                        label: "hold",
+                        sampled: &[],
+                        buffers: &writes(hold),
+                        slots: &[],
+                    },
+                    |_| {},
+                );
+                let holding = frame(&mut graph, ctx, decl).expect("the held frame");
+                device.take_submitted();
+
                 let mut decl = FrameDecl::new(1);
                 let coming = decl.import_buffer(&BufferImport {
                     label: "coming",
@@ -146,12 +165,8 @@ fn a_crossing_is_both_halves_of_a_transfer_or_one_change_and_a_wait() {
                     last: on(BufferState::ShaderRead, G),
                     ..fresh_buffer("going", going, C, BufferState::ShaderRead)
                 });
-                let hold = decl.import_buffer(&BufferImport {
-                    ready: Some(gate),
-                    ..fresh_buffer("hold", hold, C, BufferState::ShaderWrite)
-                });
-                let all = [coming, going, hold]
-                    .map(|buffer| BufferUse { buffer, access: BufferAccess::Write });
+                let all =
+                    [coming, going].map(|buffer| BufferUse { buffer, access: BufferAccess::Write });
                 decl.compute_pass(
                     &ComputePassDecl { label: "produce", sampled: &[], buffers: &all, slots: &[] },
                     |_| {},
@@ -179,6 +194,7 @@ fn a_crossing_is_both_halves_of_a_transfer_or_one_change_and_a_wait() {
                     assert_eq!(roles, [G, C, G], "{submitted:#?}");
                 }
                 graph.device().signal_timeline(gate).expect("the host's signal");
+                reached(&**graph.device(), holding);
                 reached(&**graph.device(), point);
             });
         }
@@ -187,7 +203,7 @@ fn a_crossing_is_both_halves_of_a_transfer_or_one_change_and_a_wait() {
 
 /// The test's own graphics submit, held pending, writes a `Concurrent` buffer and changes a
 /// `Concurrent` image, and signals the point each import names as its `ready`. The frame's
-/// two compute-queue submits, a graphics one between them, each use both, one of them
+/// two compute-queue submits, each followed by a graphics one, each use both, one of them
 /// sampled through a declared slot: each waits for the point, not the first alone (`no-qfot`
 /// refuses a use under another queue's pending write or change, and a wait in an earlier
 /// submit orders no later one).
@@ -271,18 +287,154 @@ fn every_submit_that_uses_an_import_waits_for_its_ready_point() {
                         pass.dispatch([1, 1, 1]);
                     },
                 ));
-                if at == 0 {
-                    decl.render_pass(
-                        &draws("between", &[colour(target, Load::Clear([0.0; 4]))]),
-                        |_| {},
-                    );
-                }
+                // A graphics pass after each: the second compute submit is not the frame's
+                // last, which waits for the other queue's last submit.
+                let label = ["between", "after"][at];
+                decl.render_pass(&draws(label, &[colour(target, Load::Clear([0.0; 4]))]), |_| {});
             }
             let compiled = graph.compile(decl).expect("a plan");
-            assert_eq!(compiled.plan().submits(), if several { 3 } else { 1 });
+            assert_eq!(compiled.plan().submits(), if several { 4 } else { 1 });
             let recorded = graph.record(compiled, ctx).expect("a recorded frame");
             let point = graph.submit(recorded).expect("null accepts every use");
             graph.device().signal_timeline(gate).expect("the host's signal");
+            reached(&**graph.device(), point);
+        });
+    }
+}
+
+/// A frame's compute submit is held pending behind its import's `ready`, and its graphics
+/// submit, the last, shares nothing with it: the frame's point is not reached until the
+/// compute submit has completed, because the last submit waits for each other queue's last
+/// ("Submission").
+#[test]
+fn a_frames_point_waits_for_every_queue() {
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let out = buffer(&*device, "out", Sharing::Exclusive);
+        let target = image(&*device, "target", Sharing::Exclusive);
+        let gate = held(&*device);
+        in_job(move |ctx| {
+            let several = several(&*device);
+            let mut graph = graph(&device, 1, 1);
+            let mut decl = FrameDecl::new(1);
+            let out = decl.import_buffer(&BufferImport {
+                ready: Some(gate),
+                ..fresh_buffer("out", out, C, BufferState::ShaderWrite)
+            });
+            let target = decl.import_image(&image_import(
+                "target",
+                target,
+                on(ImageState::Undefined, G),
+                on(ImageState::ColourAttachment, G),
+            ));
+            decl.compute_pass(
+                &ComputePassDecl { label: "held", sampled: &[], buffers: &writes(out), slots: &[] },
+                |_| {},
+            );
+            decl.render_pass(&draws("apart", &[colour(target, Load::Clear([0.0; 4]))]), |_| {});
+            let compiled = graph.compile(decl).expect("a plan");
+            assert_eq!(compiled.plan().submits(), if several { 2 } else { 1 });
+            let recorded = graph.record(compiled, ctx).expect("a recorded frame");
+            let point = graph.submit(recorded).expect("null accepts the frame");
+            let value = graph.device().timeline_value(point.timeline).expect("a value");
+            assert!(value < point.value, "the frame's point waits for its held compute submit");
+            graph.device().signal_timeline(gate).expect("the host's signal");
+            reached(&**graph.device(), point);
+        });
+    }
+}
+
+/// After a frame held pending, a compute pass and a graphics pass read a `Concurrent` buffer
+/// in its initial state, independent of each other, and the buffer's change to its `last`
+/// follows the graphics read, in a submit that is not the frame's last: it waits for the
+/// compute submit that read it (`no-qfot` refuses a change under another queue's pending
+/// use), though that submit neither wrote nor changed it.
+#[test]
+fn a_change_after_another_queues_read_in_the_frame_waits_for_it() {
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let shared = buffer(&*device, "shared", Sharing::Concurrent);
+        let hold = buffer(&*device, "hold", Sharing::Exclusive);
+        let outs = [
+            buffer(&*device, "out", Sharing::Exclusive),
+            buffer(&*device, "out, again", Sharing::Exclusive),
+        ];
+        let target = image(&*device, "target", Sharing::Exclusive);
+        let gate = held(&*device);
+        define_buffer(&*device, shared, on(BufferState::ShaderRead, G));
+        in_job(move |ctx| {
+            let several = several(&*device);
+            let mut graph = graph(&device, 1, 2);
+            let mut decl = FrameDecl::new(1);
+            let hold = decl.import_buffer(&BufferImport {
+                ready: Some(gate),
+                ..fresh_buffer("hold", hold, C, BufferState::ShaderWrite)
+            });
+            decl.compute_pass(
+                &ComputePassDecl {
+                    label: "hold",
+                    sampled: &[],
+                    buffers: &writes(hold),
+                    slots: &[],
+                },
+                |_| {},
+            );
+            let holding = frame(&mut graph, ctx, decl).expect("the held frame");
+
+            let mut decl = FrameDecl::new(1);
+            let shared = decl.import_buffer(&BufferImport {
+                label: "shared",
+                buffer: shared,
+                sharing: Sharing::Concurrent,
+                initial: on(BufferState::ShaderRead, G),
+                last: on(BufferState::CopySource, G),
+                ready: None,
+            });
+            let outs = outs.map(|out| {
+                decl.import_buffer(&fresh_buffer("out", out, C, BufferState::ShaderWrite))
+            });
+            let target = decl.import_image(&image_import(
+                "target",
+                target,
+                on(ImageState::Undefined, G),
+                on(ImageState::ColourAttachment, G),
+            ));
+            let read = [
+                BufferUse { buffer: shared, access: BufferAccess::Read },
+                BufferUse { buffer: outs[0], access: BufferAccess::Write },
+            ];
+            decl.compute_pass(
+                &ComputePassDecl {
+                    label: "read on compute",
+                    sampled: &[],
+                    buffers: &read,
+                    slots: &[],
+                },
+                |_| {},
+            );
+            decl.render_pass(
+                &RenderPassDecl {
+                    buffers: &reads(shared),
+                    ..draws("read on graphics", &[colour(target, Load::Clear([0.0; 4]))])
+                },
+                |_| {},
+            );
+            decl.compute_pass(
+                &ComputePassDecl {
+                    label: "later",
+                    sampled: &[],
+                    buffers: &writes(outs[1]),
+                    slots: &[],
+                },
+                |_| {},
+            );
+            decl.render_pass(&draws("last", &[colour(target, Load::Clear([0.0; 4]))]), |_| {});
+            let compiled = graph.compile(decl).expect("a plan");
+            assert_eq!(compiled.plan().submits(), if several { 4 } else { 1 });
+            let recorded = graph.record(compiled, ctx).expect("a recorded frame");
+            let point = graph.submit(recorded).expect("null accepts the change");
+            graph.device().signal_timeline(gate).expect("the host's signal");
+            reached(&**graph.device(), holding);
             reached(&**graph.device(), point);
         });
     }
@@ -403,41 +555,43 @@ fn a_buffer_declared_on_graphics_and_written_on_compute_goes_out_and_back() {
 }
 
 /// A frame refused after its first submit is torn: the next `submit` first makes the torn
-/// frame's last submit in its place, so the torn frame's point is reached, and the next
-/// frame's point is above it. Under one queue the frame is one submit, and its refusal
-/// changes nothing.
+/// frame's last submit in its place, which waits for the torn frame's compute submit, held
+/// pending, and signals the torn frame's point; the next frame, graphics work alone, waits
+/// for that point, so it is not reached until the hold is let go, and its point is above
+/// the torn one. Under one queue the frame is one submit, and its refusal changes nothing.
 #[test]
 fn a_torn_frame_is_finished_by_the_next_submit() {
     for queues in LAYOUTS {
         let device = device(queues);
         let written = buffer(&*device, "written", Sharing::Exclusive);
         let target = image(&*device, "target", Sharing::Exclusive);
+        let gate = held(&*device);
         in_job(move |ctx| {
             let several = several(&*device);
-            let mut graph = graph(&device, 1, 2);
-            let declare = |torn: bool| {
+            let mut graph = graph(&device, 1, 3);
+            let declare = |torn: bool, compute: bool| {
                 let mut decl = FrameDecl::new(1);
-                let written = decl.import_buffer(&fresh_buffer(
-                    "written",
-                    written,
-                    C,
-                    BufferState::ShaderWrite,
-                ));
+                if compute {
+                    let written = decl.import_buffer(&BufferImport {
+                        ready: torn.then_some(gate),
+                        ..fresh_buffer("written", written, C, BufferState::ShaderWrite)
+                    });
+                    decl.compute_pass(
+                        &ComputePassDecl {
+                            label: "write",
+                            sampled: &[],
+                            buffers: &writes(written),
+                            slots: &[],
+                        },
+                        |_| {},
+                    );
+                }
                 let target = decl.import_image(&image_import(
                     "target",
                     target,
                     on(ImageState::Undefined, G),
                     on(ImageState::ColourAttachment, G),
                 ));
-                decl.compute_pass(
-                    &ComputePassDecl {
-                        label: "write",
-                        sampled: &[],
-                        buffers: &writes(written),
-                        slots: &[],
-                    },
-                    |_| {},
-                );
                 let scratch =
                     decl.transient_image(&TransientImage { label: "never written", ..SCRATCH });
                 // The breach that tears: a transient kept before any pass wrote it.
@@ -448,20 +602,24 @@ fn a_torn_frame_is_finished_by_the_next_submit() {
                 );
                 decl
             };
-            let before = frame(&mut graph, ctx, declare(false)).expect("a frame");
+            let before = frame(&mut graph, ctx, declare(false, true)).expect("a frame");
             reached(&**graph.device(), before);
-            let refused = frame(&mut graph, ctx, declare(true)).expect_err("null refuses the read");
+            let refused =
+                frame(&mut graph, ctx, declare(true, true)).expect_err("null refuses the read");
             assert_eq!(Rule::of(&refused), Some(Rule::UndefinedRead), "{refused}");
             assert_eq!(graph.last_frame(), Some(before));
-            let after = frame(&mut graph, ctx, declare(false)).expect("the frame after");
-            reached(&**graph.device(), after);
+            let after = frame(&mut graph, ctx, declare(false, false)).expect("the frame after");
             let torn = TimelinePoint { value: before.value + 1, ..before };
             if several {
                 assert!(after.value > torn.value, "{before:?} {after:?}");
-                reached(&**graph.device(), torn);
+                let value = graph.device().timeline_value(after.timeline).expect("a value");
+                assert!(value < torn.value, "the torn frame's held submit is waited for");
             } else {
                 assert_eq!(after.value, torn.value, "{before:?} {after:?}");
             }
+            graph.device().signal_timeline(gate).expect("the host's signal");
+            reached(&**graph.device(), after);
+            reached(&**graph.device(), torn);
         });
     }
 }

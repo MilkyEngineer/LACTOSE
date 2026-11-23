@@ -11,12 +11,12 @@ use lactose_render_graph::{
 };
 use lactose_rhi_api::{
     BufferState, Capabilities, Extent, Format, ImageDesc, ImageMemory, ImageState, ImageUsage,
-    Load, Rule, Sharing,
+    Load, QueueRole, Rule, Sharing,
 };
 
 use crate::common::{
-    G, LAYOUTS, Logged, SCRATCH, WHOLE, buffer, colour, count, device, device_of, draws, frame,
-    fresh_buffer, graph, held, image, image_import, in_job, lines, on, reached,
+    G, LAYOUTS, Logged, SCRATCH, WHOLE, buffer, colour, count, define_buffer, device, device_of,
+    draws, frame, fresh_buffer, graph, held, image, image_import, in_job, lines, on, reached,
 };
 
 /// A copy of `image` whole into `out`, a pass of its own.
@@ -154,6 +154,58 @@ fn aliasing_transients_are_aliased_every_frame_and_stored_where_read_later() {
     }
 }
 
+/// Two aliasing transients, the first drawn and read back, the second filled by a copy and
+/// read back, with no resource of the second's passes used by a graphics pass: every pass
+/// stays on the graphics queue, so the second's alias call and uses follow the first's on
+/// one queue (`no-qfot` refuses a use of a placement another queue's pending submit used).
+#[test]
+fn aliasing_transients_stay_on_one_queue() {
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let readbacks =
+            [buffer(&*device, "a", Sharing::Exclusive), buffer(&*device, "b", Sharing::Exclusive)];
+        let source = buffer(&*device, "source", Sharing::Exclusive);
+        define_buffer(&*device, source, on(BufferState::CopySource, G));
+        device.take_submitted();
+        in_job(move |ctx| {
+            let mut graph = graph(&device, 2, 1);
+            let mut decl = FrameDecl::new(1);
+            let a = decl.transient_image(&SCRATCH);
+            let b = decl.transient_image(&TransientImage { label: "b", ..SCRATCH });
+            let out_a =
+                decl.import_buffer(&fresh_buffer("a", readbacks[0], G, BufferState::HostRead));
+            let out_b =
+                decl.import_buffer(&fresh_buffer("b", readbacks[1], G, BufferState::HostRead));
+            let source = decl.import_buffer(&BufferImport {
+                initial: on(BufferState::CopySource, G),
+                ..fresh_buffer("source", source, G, BufferState::CopySource)
+            });
+            decl.render_pass(&draws("a", &[colour(a, Load::Clear([0.0; 4]))]), |_| {});
+            read_back(&mut decl, "read a", a, out_a);
+            decl.copy_pass(
+                &CopyPassDecl {
+                    label: "fill b",
+                    image_sources: &[],
+                    image_destinations: &[b],
+                    buffer_sources: &[source],
+                    buffer_destinations: &[],
+                },
+                move |copy| copy.copy_buffer_to_image(source, b, &[WHOLE]),
+            );
+            read_back(&mut decl, "read b", b, out_b);
+            let compiled = graph.compile(decl).expect("a plan");
+            let plan = compiled.plan();
+            assert_eq!(plan.transient(a), plan.transient(b));
+            let roles: Vec<QueueRole> = plan.passes().iter().map(|planned| planned.queue).collect();
+            let submits = plan.submits();
+            let recorded = graph.record(compiled, ctx).expect("a recorded frame");
+            let point = graph.submit(recorded).expect("null accepts the aliasing");
+            reached(&**graph.device(), point);
+            assert_eq!((roles, submits), (vec![G; 4], 1));
+        });
+    }
+}
+
 const DEPTH: TransientImage<'static> =
     TransientImage { label: "depth", format: Format::Depth32Float, ..SCRATCH };
 
@@ -163,7 +215,8 @@ fn depth(image: lactose_render_graph::ImageId, load: Load<f32>) -> Option<DepthU
 
 /// The memory one frame under `set` gives a depth transient used by one pass and a colour
 /// transient locally read in one, each frame submitted; and, in a second frame, a depth
-/// candidate loaded with `Keep`, given memory and refused its read.
+/// candidate loaded with `Keep`, given memory and refused its read; and, in a third, one two
+/// passes use, given memory.
 fn memoryless_frame(set: Capabilities) -> [Option<TransientMemory>; 2] {
     let device = device_of(set);
     let handle = image(&*device, "target", Sharing::Exclusive);
@@ -243,6 +296,35 @@ fn memoryless_frame(set: Capabilities) -> [Option<TransientMemory>; 2] {
         let recorded = graph.record(compiled, ctx).expect("a recorded frame");
         let refused = graph.submit(recorded).expect_err("null refuses the read of the kept depth");
         assert_eq!(Rule::of(&refused), Some(Rule::UndefinedRead), "{refused}");
+
+        // A candidate two passes use is given memory: the first stores what the second keeps.
+        let mut decl = FrameDecl::new(1);
+        let target = decl.import_image(&image_import(
+            "target",
+            handle,
+            on(ImageState::ColourAttachment, G),
+            on(ImageState::ColourAttachment, G),
+        ));
+        let twice = decl.transient_image(&TransientImage { label: "twice", ..DEPTH });
+        let colour_only = [colour(target, Load::Keep)];
+        for (label, load) in [("first depth", Load::Clear(1.0)), ("second depth", Load::Keep)] {
+            decl.render_pass(
+                &RenderPassDecl {
+                    label,
+                    colour: &colour_only,
+                    depth: depth(twice, load),
+                    sampled: &[],
+                    buffers: &[],
+                    slots: &[],
+                },
+                |_| {},
+            );
+        }
+        let compiled = graph.compile(decl).expect("a plan");
+        assert!(matches!(compiled.plan().transient(twice), Some(TransientMemory::Placed { .. })));
+        let recorded = graph.record(compiled, ctx).expect("a recorded frame");
+        let point = graph.submit(recorded).expect("null accepts the kept depth");
+        reached(&**graph.device(), point);
         memory
     })
 }
