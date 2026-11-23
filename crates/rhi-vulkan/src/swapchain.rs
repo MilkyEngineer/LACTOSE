@@ -835,6 +835,15 @@ mod tests {
     #[test]
     #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
     fn an_acquire_semaphore_reused_under_a_pending_wait_is_reported() {
+        // The check is core validation's, which the GPU-assisted run turns off.
+        if std::env::var("VK_KHRONOS_VALIDATION_VALIDATE_CORE").is_ok_and(|value| value == "false")
+        {
+            eprintln!(
+                "an_acquire_semaphore_reused_under_a_pending_wait_is_reported: skipped, core \
+                 validation is off"
+            );
+            return;
+        }
         let kept = Arc::new(Kept::default());
         let request = DeviceRequest {
             adapter: std::env::var("LACTOSE_GPU_ADAPTER").ok(),

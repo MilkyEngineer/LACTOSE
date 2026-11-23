@@ -267,7 +267,8 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   and a shutdown with three frames in flight, again with an image acquired and never
   presented. In `src/swapchain.rs`, a unit test since no safe call makes its misuse: an
   acquire semaphore taken again while a batch's wait for it is held, which the layer must
-  report (`VUID-vkAcquireNextImageKHR-semaphore-01779`), heard by a sink that prints nothing.
+  report (`VUID-vkAcquireNextImageKHR-semaphore-01779`), heard by a sink that prints nothing;
+  a core validation check, so the GPU-assisted run, which turns core validation off, skips it.
 - Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, no size,
   two sizes or the built-in state no workgroup, an entry declared by its name and its stage's
   execution model, a `Bool` widened to four bytes and `Int64Atomics` refused unless enabled.
