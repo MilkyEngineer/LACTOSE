@@ -534,7 +534,7 @@ fn run_vulkan(
                 .stdin(Stdio::null());
             let ended = vulkan::run_bounded(&mut command, vulkan::DEADLINE)
                 .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
-            let text = &ended.text;
+            let text = ended.text();
             let verdict = vulkan::judge_ended(test, &ended, expected, run.metal);
             if test.ends_with("device_reports_its_driver_and_sends_nothing_when_clean") {
                 lines.extend(
@@ -545,7 +545,6 @@ fn run_vulkan(
                         .map(|line| format!("{line}\n")),
                 );
             }
-            let word = verdict.word();
             if expected.is_some() && verdict.failure.is_none() {
                 answered.push(test.to_owned());
                 heard.push(match &verdict.said {
@@ -553,19 +552,12 @@ fn run_vulkan(
                     _ => format!("{test} heard {}", verdict.messages.len() + verdict.reports.len()),
                 });
             }
-            lines.push(format!("{package} {test}: {word}\n"));
-            lines.extend(
-                verdict
-                    .messages
-                    .iter()
-                    .chain(&verdict.reports)
-                    .chain(&verdict.driver)
-                    .map(|line| format!("  {line}\n")),
-            );
+            let entry = vulkan::entry(package, test, &verdict, &ended);
             if verdict.failure.is_some() {
-                eprintln!("gpu: {test}: {word}\n{text}");
+                eprint!("gpu: {entry}{}", vulkan::output(test, &ended));
                 failed.push(test.to_owned());
             }
+            lines.push(entry);
         }
     }
     // Decision 5.10's "one case for each validator" holds of the run, not of the test

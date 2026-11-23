@@ -9657,6 +9657,26 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   which it does not pass for its own defects; a storage binding in the contract so that a
   removed dispatch barrier shows under MoltenVK, whose serial compute encoder hides it, since
   KosmicKrisp's run shows it.
+- Addendum (lane `nightly-ga-heap`, 2026-11-24): the GPU-assisted form runs in the layer's
+  safe mode (`gpuav_safe_mode`), with the shader sanitizer, which safe mode also turns on,
+  held off, so the run checks what it checked before. Safe mode skips an access its
+  instrumentation finds invalid and still reports it; without it the access is made (the
+  layer's own negative tests turn it on "or they will crash", `tests/unit/gpu_av_positive.cpp`
+  at `vulkan-sdk-1.4.363.1`). The nightly of 23 November 2026 showed the heap canary's process
+  under lavapipe failing with nothing written after the test's start line, its exit status not
+  recorded. The likely cause, by the layer's source and Mesa 26.0.8's: lavapipe lays slot
+  `heap_slots` out as the sampler table's first descriptor, its sampling-function pointer null,
+  and the CPU's read through it ends the process before the layer reads its report back. The
+  evidence also fits the layer's error record written from a fragment shader under llvmpipe,
+  a path no other canary takes there, which safe mode would not cure. The next nightly
+  decides: the heap canary heard means safe mode was the cure; a failure again names its
+  signal in the run's `ended with` line, with the tail of its output. Under KosmicKrisp the
+  counts and the canaries' messages are unchanged. A device test that fails now has its exit
+  status, or the signal that killed it, and the last 40 lines of its output in the run's file;
+  the job's log has the same and the test's whole output. Rejected: the heap canary skipped
+  under lavapipe, which leaves lavapipe's run with no canary of the heap; safe mode under
+  lavapipe alone, since an invalid access made on any driver reads what it should not, and
+  the setting changes nothing the M1's run reports.
 
 ## 10. Review history
 
