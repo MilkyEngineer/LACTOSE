@@ -126,7 +126,8 @@ impl<R> Drop for Reply<R> {
 }
 
 /// The result of a lane call. Resolves to an error of kind `Cancelled` if the pump was
-/// dropped before the call ran. Dropping this does not cancel a call already queued.
+/// dropped before the call ran. Dropping this does not cancel a call already queued. Polling
+/// it again after it resolved panics, as polling a finished [`crate::JobRun`] does.
 #[must_use = "futures do nothing unless awaited"]
 pub struct LaneCall<R> {
     slot: Arc<Mutex<Slot<R>>>,
@@ -139,6 +140,7 @@ impl<R> Future for LaneCall<R> {
         let mut slot = lock(&self.slot);
         match slot.result.take() {
             Some(result) => Poll::Ready(result),
+            None if slot.settled => panic!("a lane call is not polled after it resolved"),
             None => {
                 slot.waker = Some(cx.waker().clone());
                 Poll::Pending

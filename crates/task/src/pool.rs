@@ -19,11 +19,13 @@ use crate::gate::{self, Gate, Look, Opener};
 use crate::graph::{self, RunState};
 use crate::guard::abort_on_unwind;
 use crate::job::{self, ChildHeader, ScopeCore};
+use crate::job_run::JobEntry;
 use crate::latch::Latch;
 use crate::platform::{Platform, ThreadHandle};
 use crate::sleep::Sleep;
 use crate::task::RawTask;
 use crate::time::Timers;
+use crate::width::{Place, Queued, Width};
 use crate::{WorkerClass, lock};
 
 /// How long a worker that found nothing keeps rescanning the queues before it parks.
@@ -61,6 +63,8 @@ pub(crate) enum Entry {
     Child { scope: NonNull<ScopeCore>, job: NonNull<ChildHeader>, units: Range<u32> },
     /// A stackless task that is ready to be polled.
     Task(Arc<dyn RawTask>),
+    /// A job of [`crate::Executor::run_job`], not started.
+    Job(JobEntry),
 }
 
 // SAFETY: the pointers of a `Child` entry refer to a scope and to job storage that stay alive
@@ -77,7 +81,7 @@ impl Entry {
                 Self::Range { run: run.clone(), node: *node, units, root: false }
             }
             Self::Child { scope, job, .. } => Self::Child { scope: *scope, job: *job, units },
-            Self::Task(_) => unreachable!("a task has no units"),
+            Self::Task(_) | Self::Job(_) => unreachable!("a task or a job has no units"),
         }
     }
 
@@ -87,6 +91,11 @@ impl Entry {
             Self::Range { run, node, root, .. } => Self::Range { run, node, units, root },
             Self::Child { scope, job, .. } => Self::Child { scope, job, units },
             Self::Task(_) => unreachable!("a task has no units"),
+            // One entry, never split: its one unit is the whole job.
+            job @ Self::Job(_) => {
+                debug_assert_eq!(units, 0..1, "a job is one unit");
+                job
+            }
         }
     }
 
@@ -102,18 +111,18 @@ impl Entry {
                 units.end = middle;
                 upper
             }
-            Self::Task(_) => return None,
+            Self::Task(_) | Self::Job(_) => return None,
         };
         Some(self.with_units(upper))
     }
 
-    /// Gives up on an entry that will never run. A task is cancelled; graph work is dropped,
-    /// which leaves its run unfinished for good. Never called on a child, whose opener
-    /// would wait forever.
+    /// Gives up on an entry that will never run. A task is cancelled and a job dropped
+    /// unrun, which resolves its future to `Cancelled`; graph work is dropped, which leaves
+    /// its run unfinished for good. Never called on a child, whose opener would wait forever.
     fn discard(self) {
         match self {
             Self::Task(task) => task.run(true),
-            Self::Range { .. } => {}
+            Self::Range { .. } | Self::Job(_) => {}
             Self::Child { .. } => unreachable!("scope children are always run"),
         }
     }
@@ -142,6 +151,9 @@ pub(crate) struct WorkerLocal {
     /// Whether this worker's job has a scope open. While it does, the worker's deque takes
     /// only that scope's children (see [`Shared::submit_range`]).
     pub(crate) scope_open: Cell<bool>,
+    /// Whether this worker is running a job of [`crate::Executor::run_job`]. While it is, the
+    /// children of the job's scopes wait on the pool's queue for such work ([`Wide`]).
+    pub(crate) wide_job: Cell<bool>,
     /// Set while this worker fires due timers ([`fire_timers`]) and none of the tasks they
     /// wake has been kept yet.
     keep_woken_task: Cell<bool>,
@@ -200,6 +212,10 @@ pub(crate) struct Pool {
     sleep: Sleep,
     /// Run permits and the `block_in_place` gate.
     gate: Gate,
+    /// How many openers are parked on their scope's latch, for the tests that need one to
+    /// be.
+    #[cfg(all(test, not(feature = "loom")))]
+    parked_openers: core::sync::atomic::AtomicU32,
 }
 
 impl Pool {
@@ -214,6 +230,8 @@ impl Pool {
             stealers: stealers.into(),
             threads: threads.into(),
             gate: Gate::new(workers),
+            #[cfg(all(test, not(feature = "loom")))]
+            parked_openers: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -226,6 +244,21 @@ impl Pool {
     #[cfg(all(test, not(feature = "loom")))]
     pub(crate) fn sleepers(&self) -> u32 {
         self.sleep.announced()
+    }
+
+    /// How many openers are parked on their scope's latch.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn parked_openers(&self) -> u32 {
+        self.parked_openers.load(Ordering::SeqCst)
+    }
+
+    /// Parks an opener on its scope's latch ([`Opener::park`]).
+    pub(crate) fn park_opener(&self, latch: &Latch) {
+        #[cfg(all(test, not(feature = "loom")))]
+        self.parked_openers.fetch_add(1, Ordering::SeqCst);
+        latch.park();
+        #[cfg(all(test, not(feature = "loom")))]
+        self.parked_openers.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Wakes one sleeping worker, if any. Call after making work visible.
@@ -396,6 +429,53 @@ pub(crate) fn time_steals(
     Ok(nanos)
 }
 
+/// The frame-critical pool's queues for the jobs of [`crate::Executor::run_job`] and for the
+/// children of their scopes, and the width that bounds the workers such work occupies
+/// (`width.rs`). Nothing else waits here, and nothing of such work waits anywhere else
+/// outside a replay.
+pub(crate) struct Wide {
+    pub(crate) width: Width,
+    jobs: Injector<Entry>,
+    /// Children of the one scope of such a job that is open, whole, as halves split off or
+    /// as the rest a worker put back.
+    children: Injector<Entry>,
+}
+
+impl Wide {
+    fn new(workers: usize) -> Self {
+        Self { width: Width::new(workers), jobs: Injector::new(), children: Injector::new() }
+    }
+
+    fn take(queue: &Injector<Entry>) -> Option<Entry> {
+        loop {
+            match queue.steal() {
+                Steal::Success(entry) => return Some(entry),
+                Steal::Empty => return None,
+                Steal::Retry => {}
+            }
+        }
+    }
+
+    /// Takes a child under the opener's place.
+    pub(crate) fn take_child(&self) -> Option<Entry> {
+        Self::take(&self.children)
+    }
+
+    pub(crate) fn has_children(&self) -> bool {
+        !self.children.is_empty()
+    }
+}
+
+impl Queued for Wide {
+    fn jobs(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
+    fn children(&self) -> bool {
+        !self.children.is_empty()
+    }
+}
+
 /// Everything the workers of one executor share.
 pub(crate) struct Shared {
     frame: Pool,
@@ -404,7 +484,10 @@ pub(crate) struct Shared {
     pub(crate) shutdown: AtomicBool,
     pub(crate) timers: Timers,
     pub(crate) chaos: Option<Chaos>,
-    /// Graph runs started so far; a run's ordinal identifies it in an execution log.
+    /// The jobs of `run_job` and their scopes' children.
+    pub(crate) wide: Wide,
+    /// Graph runs and `run_job` jobs started so far; a run's ordinal identifies it in an
+    /// execution log.
     runs: AtomicU64,
     /// Graph runs that have started and not finished, so shutdown can resolve their
     /// futures.
@@ -436,6 +519,7 @@ impl Shared {
         handles: Vec<ThreadHandle>,
     ) -> Self {
         Self {
+            wide: Wide::new(frame.0.len()),
             // Only the frame-critical pool keeps the timers (`idle`).
             frame: Pool::new(frame.0, frame.1, true),
             background: Pool::new(background.0, background.1, false),
@@ -468,9 +552,62 @@ impl Shared {
 
     /// Notes the start of a graph run and returns its ordinal.
     pub(crate) fn begin_run(&self, run: &Arc<RunState>) -> u64 {
-        let ordinal = self.runs.fetch_add(1, Ordering::Relaxed);
+        let ordinal = self.next_run_ordinal();
         lock(&self.live_runs).insert(ordinal, Arc::downgrade(run));
         ordinal
+    }
+
+    /// The ordinal of the next graph run or `run_job` job, in the order the program starts
+    /// them.
+    pub(crate) fn next_run_ordinal(&self) -> u64 {
+        self.runs.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Queues a job of `run_job`. One that finds the executor shut down is dropped here,
+    /// which resolves its future to `Cancelled`.
+    pub(crate) fn submit_job(&self, job: JobEntry) {
+        if self.is_shut_down() {
+            drop(job);
+            return;
+        }
+        let entry = Entry::Job(job);
+        if let Some(replay) = self.replay() {
+            self.replay_wake(replay.push(entry));
+        } else {
+            self.wide.jobs.push(entry);
+            self.wide.width.queued(Place::Job, None, &self.frame);
+        }
+        self.discard_if_shut_down();
+    }
+
+    /// Puts back a job a worker took while a `block_in_place` wanted it parked. The worker
+    /// gives its place up next, which wakes a worker that may take it.
+    fn requeue_job(&self, job: JobEntry) {
+        self.wide.jobs.push(Entry::Job(job));
+        self.discard_if_shut_down();
+    }
+
+    /// Queues a child of a scope of a `run_job` job. `opener` is the scope's opener when the
+    /// caller is another worker: it takes its children from this queue and is told.
+    pub(crate) fn submit_wide_child(&self, entry: Entry, opener: Option<usize>) {
+        self.wide.children.push(entry);
+        self.wide.width.queued(Place::Child, opener, &self.frame);
+    }
+
+    /// Takes a child or a job of `run_job` for a worker that holds no place, with the place
+    /// it took. Children come first: they belong to the one job that has started.
+    fn take_wide(&self) -> Option<(Entry, Place)> {
+        let wide = &self.wide;
+        for (queue, place) in [(&wide.children, Place::Child), (&wide.jobs, Place::Job)] {
+            if queue.is_empty() || !wide.width.try_enter(place) {
+                continue;
+            }
+            if let Some(entry) = Wide::take(queue) {
+                return Some((entry, place));
+            }
+            wide.width.leave(place, wide, &self.frame);
+        }
+        None
     }
 
     /// How many graph runs are registered as unfinished.
@@ -545,20 +682,16 @@ impl Shared {
         }
     }
 
-    /// Cancels every queued task and drops queued graph work. Safe while workers still
-    /// run: scope children are never touched.
+    /// Cancels every queued task and job and drops queued graph work. Safe while workers
+    /// still run: scope children are never touched.
     fn discard_queued(&self) {
         fence(Ordering::SeqCst);
         if let Some(chaos) = &self.chaos {
             chaos.discard_graph_work();
         }
-        for pool in [&self.frame, &self.background] {
-            loop {
-                match pool.injector.steal() {
-                    Steal::Success(entry) => entry.discard(),
-                    Steal::Empty => break,
-                    Steal::Retry => {}
-                }
+        for queue in [&self.frame.injector, &self.background.injector, &self.wide.jobs] {
+            while let Some(entry) = Wide::take(queue) {
+                entry.discard();
             }
         }
     }
@@ -695,6 +828,7 @@ pub(crate) fn worker_thread(seed: WorkerSeed) {
             index,
             deque,
             scope_open: Cell::new(false),
+            wide_job: Cell::new(false),
             keep_woken_task: Cell::new(false),
             chaos,
             next_victim: Cell::new(index + 1),
@@ -732,6 +866,9 @@ fn worker_loop(local: &WorkerLocal) {
                 scanning_since = None;
                 scans = 0;
                 execute(local, &mut arenas, found.entry, found.position);
+                if let Some(place) = found.place {
+                    shared.wide.width.leave(place, &shared.wide, pool);
+                }
                 if found.replayed
                     && let Some(replay) = shared.replay()
                 {
@@ -797,6 +934,9 @@ struct Found {
     position: u64,
     /// Whether the entry came from the replay pool, which wants to hear when it is done.
     replayed: bool,
+    /// The place in the width the worker took for the entry, which it gives up when the
+    /// entry is done.
+    place: Option<Place>,
 }
 
 /// The next entry for this worker.
@@ -804,13 +944,13 @@ fn find_work(local: &WorkerLocal) -> Option<Found> {
     let shared = &*local.shared;
     let pool = local.pool();
     let frame = local.class == WorkerClass::FrameCritical;
-    let found = |entry| Some(Found { entry, position: 0, replayed: false });
+    let found = |entry| Some(Found { entry, position: 0, replayed: false, place: None });
 
     if frame && let Some(replay) = shared.replay() {
         let (taken, wake) = replay.take(local.index, Filter::Any);
         shared.replay_wake(wake);
         if let Some((entry, position)) = taken {
-            return Some(Found { entry, position, replayed: true });
+            return Some(Found { entry, position, replayed: true, place: None });
         }
     }
     if let Some(entry) = local.deque.pop() {
@@ -821,6 +961,13 @@ fn find_work(local: &WorkerLocal) -> Option<Found> {
         && let Some(entry) = local.deque.pop()
     {
         return found(entry);
+    }
+    // In replay the log places such work like any other.
+    if frame
+        && shared.replay().is_none()
+        && let Some((entry, place)) = shared.take_wide()
+    {
+        return Some(Found { entry, position: 0, replayed: false, place: Some(place) });
     }
     perturb(local, |config| config.shuffle_steals, 8);
 
@@ -864,6 +1011,7 @@ fn find_work(local: &WorkerLocal) -> Option<Found> {
 
 /// Runs one entry under the abort-on-unwind guard.
 fn execute(local: &WorkerLocal, arenas: &mut Arenas, entry: Entry, position: u64) {
+    let shared = &*local.shared;
     abort_on_unwind(|| match entry {
         Entry::Range { run, node, units, root } => {
             graph::run_range(local, arenas, &run, node, units, root, position);
@@ -872,6 +1020,12 @@ fn execute(local: &WorkerLocal, arenas: &mut Arenas, entry: Entry, position: u64
             job::run_child(local, scope, job, units, &mut arenas.child);
         }
         Entry::Task(task) => task.run(false),
+        // A `block_in_place` wants this worker parked: the job goes back unstarted, as the
+        // rest of a range does. A replay runs what the log names.
+        Entry::Job(job) if shared.replay().is_none() && local.pool().over_limit() => {
+            shared.requeue_job(job);
+        }
+        Entry::Job(job) => job.run(local, arenas, position),
     });
 }
 
@@ -920,7 +1074,9 @@ fn idle(local: &WorkerLocal) {
             let limit = Instant::now() + REPLAY_STALL;
             deadline = Some(deadline.map_or(limit, |timer| timer.min(limit)));
         }
+        // Such work of `run_job` counts only while a worker without a place could take it.
         let work = pool.work_visible()
+            || frame && shared.wide.width.admits(&shared.wide)
             || frame && shared.replay().is_some_and(|replay| replay.ready(local.index));
         let seen = if shared.is_shut_down() {
             Look::Stop
@@ -966,16 +1122,20 @@ pub(crate) enum Rest {
 /// Peels `units` one at a time through `run` while keeping the rest stealable, and returns
 /// how many units it ran itself.
 ///
-/// Before each unit, if this worker's deque is empty and more than one unit is left, the
-/// upper half goes to `split`, which pushes it. A range that was just stolen arrives with an
-/// empty deque, so this is also the thief-side split-on-steal. With `force_split` (chaos)
-/// the range is halved down to single units regardless.
+/// Before each unit, if `dry` says the place a split half goes holds nothing and more than
+/// one unit is left, the upper half goes to `split`, which pushes it. For graph work and the
+/// children of other scopes that place is this worker's own deque: a range that was just
+/// stolen arrives with an empty deque, so this is also the thief-side split-on-steal. For
+/// the children of a `run_job` job's scope it is the pool's queue for such work, which every
+/// half and every worker's put-back goes to; the worker's own deque would say nothing about
+/// that work. With `force_split` (chaos) the range is halved down to single units regardless.
 ///
 /// `rest` is asked before every unit what to do with the units not yet started.
 pub(crate) fn drain_range(
     local: &WorkerLocal,
     mut units: Range<u32>,
     mut split: impl FnMut(Range<u32>),
+    dry: impl Fn() -> bool,
     mut run: impl FnMut(Range<u32>),
     rest: impl Fn() -> Rest,
 ) -> u32 {
@@ -990,7 +1150,7 @@ pub(crate) fn drain_range(
             }
             Rest::Abandon => break,
         }
-        while units.end - units.start > 1 && (force_split || local.deque.is_empty()) {
+        while units.end - units.start > 1 && (force_split || dry()) {
             let middle = units.start + (units.end - units.start) / 2;
             split(middle..units.end);
             units.end = middle;
@@ -1022,5 +1182,79 @@ pub(crate) fn spin_until(limit: Duration, done: impl Fn() -> bool) -> bool {
         if start.elapsed() >= limit {
             return done();
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use core::ops::Range;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::{Arenas, Entry, Wide, execute, with_local};
+    use crate::job_run::{self, JobRun};
+    use crate::{Executor, GraphBuilder, GraphNode, JobContext};
+
+    /// On the one frame-critical worker, while a `block_in_place` would want that worker
+    /// parked, takes the job it queues out of the pool's queue, as a worker does that found
+    /// the job just before the gate closed, and executes it.
+    struct TakeAtAClosedGate {
+        started: Arc<AtomicBool>,
+        run: Mutex<Option<JobRun<()>>>,
+        put_back: AtomicBool,
+    }
+
+    impl GraphNode for TakeAtAClosedGate {
+        fn name(&self) -> &'static str {
+            "pool::tests::take_at_a_closed_gate"
+        }
+
+        fn units(&self) -> u32 {
+            1
+        }
+
+        fn run(&self, _units: Range<u32>, _ctx: &mut JobContext<'_>) {
+            with_local(|local| {
+                let local = local.expect("a graph job runs on a worker");
+                let (shared, pool) = (&*local.shared, local.pool());
+                // The gate closes with no permit reserved, and this worker holds one all the
+                // same: it is over the limit.
+                pool.gate.close(0, pool);
+                pool.gate.retake();
+                assert!(pool.over_limit());
+                let started = self.started.clone();
+                let run = job_run::start(shared, move |_| started.store(true, Ordering::SeqCst));
+                let entry = Wide::take(&shared.wide.jobs).expect("the job is queued");
+                assert!(matches!(entry, Entry::Job(_)));
+                execute(local, &mut Arenas::default(), entry, 0);
+                // Back in the queue, unstarted.
+                let back = !self.started.load(Ordering::SeqCst) && !shared.wide.jobs.is_empty();
+                self.put_back.store(back, Ordering::SeqCst);
+                // What `block_in_place` does when its closure returns.
+                pool.gate.release(pool);
+                pool.gate.open(0, pool);
+                *self.run.lock().unwrap() = Some(run);
+            });
+        }
+    }
+
+    /// A worker that takes a job of `run_job` while a `block_in_place` wants it parked puts
+    /// it back unstarted, and the job runs once the gate opens.
+    #[test]
+    fn a_job_taken_at_a_closed_gate_is_put_back_unstarted() {
+        let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
+        let node = Arc::new(TakeAtAClosedGate {
+            started: Arc::new(AtomicBool::new(false)),
+            run: Mutex::new(None),
+            put_back: AtomicBool::new(false),
+        });
+        let mut builder = GraphBuilder::new();
+        builder.add_node(node.clone());
+        executor.block_on(executor.run_graph(builder.build().unwrap())).unwrap();
+        assert!(node.put_back.load(Ordering::SeqCst), "the job was not put back unstarted");
+        let run = node.run.lock().unwrap().take().unwrap();
+        executor.block_on(run).unwrap();
+        assert!(node.started.load(Ordering::SeqCst));
+        executor.shutdown();
     }
 }

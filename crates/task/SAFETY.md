@@ -25,8 +25,10 @@ raw pointers that carry no lifetime. One invariant makes that sound:
   down exactly the units it ran, after running them, and creates no entry afterwards.
 - `JobContext::scope` waits for the latch in every path, and runs its body and the wait under
   the abort-on-unwind guard, so a panic cannot unwind past borrowed data. A worker that
-  shuts down runs the children left on its deque instead of dropping them, and no other code
-  path drops a child entry (`Entry::discard` rejects one).
+  shuts down runs the children left on its deque instead of dropping them, an opener whose
+  children wait on the pool's queue for the work of `Executor::run_job` runs the ones left
+  there, and no other code path drops a child entry (`Entry::discard` rejects one, and the
+  shutdown sweep never reads that queue).
 - So for as long as any worker holds a child entry, or is inside `run_child` before its
   count-down, the `ScopeCore` in the opener's frame, the job storage in the opener's scope
   arena, and everything the closure borrowed are alive.
@@ -36,8 +38,13 @@ scope is open, the opening worker's deque receives only that scope's children
 (`Shared::submit_range` sends everything else to the injector, and `Shared::keep_woken_task`,
 which puts a task woken by a timer on the firing worker's own deque, refuses while the worker's
 `scope_open` is set, so that task goes to the injector too), so the opener can find every
-child that is still on its deque by popping. Breaking it would hang the opener; it could not
-free anything early, because the first invariant holds regardless.
+child that is still on its deque by popping. The scopes of a job of `Executor::run_job` are
+the exception: their children, the halves split off them and the rest a worker puts back go
+to the pool's queue for such work and never to a deque, and the opener takes them there
+(`WideChildren` in `job.rs`). That queue holds the children of one scope at a time, because
+such jobs run one after the other (`width.rs`) and a job opens its scopes one after another.
+Breaking either would hang the opener; it could not free anything early, because the first
+invariant holds regardless.
 
 What follows from the first:
 
@@ -58,7 +65,7 @@ What follows from the first:
   closure needs dropping, a `DropEntry` in the same arena records it, and the opener drops
   it in place after the wait, when no worker can still hold a reference.
 - **Reading the scope from another worker.** `run_child` and `chaos::child_identity` read
-  `opener`, `tag`, `position`, `call` and `ordinal` through the raw pointers. Those fields
+  `opener`, `tag`, `position`, `wide`, `call` and `ordinal` through the raw pointers. Those fields
   are written before the first entry exists and never change.
 - **The last count-down.** The decrement that brings the latch to zero lets the opener leave
   its frame at once, so it is the last access a child makes: `Latch::count_down` touches

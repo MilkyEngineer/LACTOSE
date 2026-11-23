@@ -484,6 +484,7 @@ pub(crate) fn run_range(
             |upper| {
                 local.push(Entry::Range { run: state.clone(), node, units: upper, root: false });
             },
+            || local.deque.is_empty(),
             |unit| {
                 let position = record(JobKind::Units, unit.clone());
                 let mut ctx = JobContext::new(local, arenas, position);
