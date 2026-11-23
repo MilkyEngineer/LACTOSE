@@ -30,6 +30,7 @@ mod models;
 mod platform;
 mod pool;
 mod quiesce;
+mod shutdown;
 mod sleep;
 mod span;
 mod sync;

@@ -142,7 +142,11 @@ impl<R> Future for LaneCall<R> {
             Some(result) => Poll::Ready(result),
             None if slot.settled => panic!("a lane call is not polled after it resolved"),
             None => {
-                slot.waker = Some(cx.waker().clone());
+                // The waker it replaces is dropped outside the lock, as the one it keeps is
+                // woken: a foreign waker's drop may run anything.
+                let old = slot.waker.replace(cx.waker().clone());
+                drop(slot);
+                drop(old);
                 Poll::Pending
             }
         }

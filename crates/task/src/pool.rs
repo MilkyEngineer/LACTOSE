@@ -4,7 +4,7 @@
 use core::cell::{Cell, OnceCell, RefCell};
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
@@ -22,6 +22,7 @@ use crate::job::{self, ChildHeader, ScopeCore};
 use crate::job_run::JobEntry;
 use crate::latch::Latch;
 use crate::platform::{Platform, ThreadHandle};
+use crate::shutdown::ShutdownFlag;
 use crate::sleep::Sleep;
 use crate::task::RawTask;
 use crate::time::Timers;
@@ -481,7 +482,7 @@ pub(crate) struct Shared {
     frame: Pool,
     background: Pool,
     pub(crate) platform: Arc<dyn Platform>,
-    pub(crate) shutdown: AtomicBool,
+    pub(crate) shutdown: ShutdownFlag,
     pub(crate) timers: Timers,
     pub(crate) chaos: Option<Chaos>,
     /// The jobs of `run_job` and their scopes' children.
@@ -524,7 +525,7 @@ impl Shared {
             frame: Pool::new(frame.0, frame.1, true),
             background: Pool::new(background.0, background.1, false),
             platform,
-            shutdown: AtomicBool::new(false),
+            shutdown: ShutdownFlag::new(),
             timers: Timers::new(),
             chaos,
             runs: AtomicU64::new(0),
@@ -547,7 +548,7 @@ impl Shared {
     }
 
     pub(crate) fn is_shut_down(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
+        self.shutdown.is_set()
     }
 
     /// Notes the start of a graph run and returns its ordinal.
@@ -566,18 +567,20 @@ impl Shared {
     /// Queues a job of `run_job`. One that finds the executor shut down is dropped here,
     /// which resolves its future to `Cancelled`.
     pub(crate) fn submit_job(&self, job: JobEntry) {
-        if self.is_shut_down() {
-            drop(job);
-            return;
-        }
-        let entry = Entry::Job(job);
-        if let Some(replay) = self.replay() {
-            self.replay_wake(replay.push(entry));
-        } else {
-            self.wide.jobs.push(entry);
-            self.wide.width.queued(Place::Job, None, &self.frame);
-        }
-        self.discard_if_shut_down();
+        self.shutdown.queue(
+            job,
+            drop,
+            |job| {
+                let entry = Entry::Job(job);
+                if let Some(replay) = self.replay() {
+                    self.replay_wake(replay.push(entry));
+                } else {
+                    self.wide.jobs.push(entry);
+                    self.wide.width.queued(Place::Job, None, &self.frame);
+                }
+            },
+            || self.discard_queued(),
+        );
     }
 
     /// Puts back a job a worker took while a `block_in_place` wanted it parked. The worker
@@ -645,12 +648,19 @@ impl Shared {
     /// nodes and will take one of them itself as its next entry. An entry that lands on its
     /// own deque then wakes nobody: a sleeper woken for it would find it gone.
     pub(crate) fn submit_range(&self, entry: Entry, keeps_one: bool) {
-        if self.is_shut_down() {
-            return;
-        }
+        self.shutdown.queue(
+            entry,
+            drop,
+            |entry| self.push_range(entry, keeps_one),
+            || {
+                self.discard_queued();
+            },
+        );
+    }
+
+    fn push_range(&self, entry: Entry, keeps_one: bool) {
         if let Some(replay) = self.replay() {
             self.replay_wake(replay.push(entry));
-            self.discard_if_shut_down();
             return;
         }
         let entry = with_local(|local| match local {
@@ -669,15 +679,13 @@ impl Shared {
             self.frame.injector.push(entry);
         }
         self.frame.announce_entry(keeps_one && on_own_deque);
-        self.discard_if_shut_down();
     }
 
-    /// Closes the race between a submission and shutdown. Call after the entry is queued.
-    /// The fence orders the queueing before the load: either shutdown's own sweep comes
-    /// after the entry and finds it, or this load sees the flag and sweeps.
+    /// Closes the race between a submission and shutdown for an entry queued without
+    /// [`ShutdownFlag::queue`]: either shutdown's own sweep comes after the entry and finds
+    /// it, or this sees the flag and sweeps.
     fn discard_if_shut_down(&self) {
-        fence(Ordering::SeqCst);
-        if self.shutdown.load(Ordering::SeqCst) {
+        if self.shutdown.seen_after_queueing() {
             self.discard_queued();
         }
     }
@@ -685,7 +693,7 @@ impl Shared {
     /// Cancels every queued task and job and drops queued graph work. Safe while workers
     /// still run: scope children are never touched.
     fn discard_queued(&self) {
-        fence(Ordering::SeqCst);
+        self.shutdown.before_sweep();
         if let Some(chaos) = &self.chaos {
             chaos.discard_graph_work();
         }
@@ -701,22 +709,24 @@ impl Shared {
     /// on its way to its next job ([`fire_timers`]) while nothing waits in the frame-critical
     /// queue: it goes onto that worker's own deque, to be its next job, and wakes nobody.
     pub(crate) fn submit_task(&self, class: WorkerClass, task: Arc<dyn RawTask>) {
-        if self.is_shut_down() {
-            task.run(true);
-            return;
-        }
-        let pool = self.pool(class);
-        let entry = Entry::Task(task);
-        let entry = match class {
-            WorkerClass::FrameCritical => self.keep_woken_task(entry),
-            WorkerClass::Background => Some(entry),
-        };
-        let kept = entry.is_none();
-        if let Some(entry) = entry {
-            pool.injector.push(entry);
-        }
-        pool.announce_entry(kept);
-        self.discard_if_shut_down();
+        self.shutdown.queue(
+            task,
+            |task| task.run(true),
+            |task| {
+                let pool = self.pool(class);
+                let entry = Entry::Task(task);
+                let entry = match class {
+                    WorkerClass::FrameCritical => self.keep_woken_task(entry),
+                    WorkerClass::Background => Some(entry),
+                };
+                let kept = entry.is_none();
+                if let Some(entry) = entry {
+                    pool.injector.push(entry);
+                }
+                pool.announce_entry(kept);
+            },
+            || self.discard_queued(),
+        );
     }
 
     /// Pushes a frame-critical task onto the calling worker's own deque if that worker is
@@ -761,7 +771,7 @@ impl Shared {
     /// With `join` it returns once every thread has exited. Without, for a caller that is
     /// itself a worker, it only tells them to exit.
     pub(crate) fn shut_down(&self, join: bool) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown.set();
         if let Some(replay) = self.replay() {
             replay.abandon();
         }
@@ -1236,6 +1246,34 @@ mod tests {
                 *self.run.lock().unwrap() = Some(run);
             });
         }
+    }
+
+    /// A worker that takes a job after shutdown began, before the sweep reached it, drops it
+    /// unstarted: inside a job on the one frame-critical worker, a job is queued, taken out
+    /// of the pool's queue and executed once the shutdown flag is set.
+    #[test]
+    fn a_job_taken_after_shutdown_began_never_starts() {
+        let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
+        let (started, run) = executor
+            .block_on(executor.run_job(|_ctx| {
+                with_local(|local| {
+                    let local = local.expect("a job runs on a worker");
+                    let shared = &*local.shared;
+                    let started = Arc::new(AtomicBool::new(false));
+                    let flag = started.clone();
+                    let run = job_run::start(shared, move |_| flag.store(true, Ordering::SeqCst));
+                    let entry = Wide::take(&shared.wide.jobs).expect("the job is queued");
+                    // Shutdown has begun; its sweep has not reached this entry.
+                    shared.shutdown.set();
+                    execute(local, &mut Arenas::default(), entry, 0);
+                    (started.load(Ordering::SeqCst), run)
+                })
+            }))
+            .unwrap();
+        assert!(!started, "a job taken after shutdown began was started");
+        let cancelled = executor.block_on(run).expect_err("the job never started");
+        assert_eq!(cancelled.kind(), lactose_core::ErrorKind::Cancelled);
+        executor.shutdown();
     }
 
     /// A worker that takes a job of `run_job` while a `block_in_place` wants it parked puts

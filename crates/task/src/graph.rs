@@ -382,7 +382,11 @@ impl Future for GraphRun {
                 ))
             });
         }
-        completion.waker = Some(cx.waker().clone());
+        // The waker it replaces is dropped outside the lock, as the one it keeps is woken: a
+        // foreign waker's drop may run anything.
+        let old = completion.waker.replace(cx.waker().clone());
+        drop(completion);
+        drop(old);
         Poll::Pending
     }
 }

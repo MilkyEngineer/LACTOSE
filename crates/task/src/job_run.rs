@@ -18,7 +18,7 @@ use crate::guard::abort_on_unwind;
 use crate::job::JobContext;
 use crate::pool::{Arenas, Shared, WorkerLocal};
 use crate::span::TARGET;
-use crate::sync::{Mutex, MutexGuard, Ordering};
+use crate::sync::{Mutex, MutexGuard};
 
 enum Stage<F, R> {
     /// In a queue, not started.
@@ -41,8 +41,8 @@ struct State<F, R> {
 /// Where a job's closure waits to be taken and its value waits to be read.
 ///
 /// Whoever holds the job's queue entry is the only caller of [`JobSlot::take`]; the future is
-/// the only caller of [`JobSlot::poll`] and [`JobSlot::abandon`]. Every closure and value is
-/// dropped outside the lock.
+/// the only caller of [`JobSlot::poll`] and [`JobSlot::abandon`]. Every closure, value and
+/// waker is dropped or woken outside the lock.
 pub(crate) struct JobSlot<F, R> {
     state: Mutex<State<F, R>>,
 }
@@ -126,9 +126,14 @@ impl<F, R> JobSlot<F, R> {
             ))),
             pending => {
                 state.stage = pending;
-                if !state.waker.as_ref().is_some_and(|waker| waker.will_wake(cx.waker())) {
-                    state.waker = Some(cx.waker().clone());
+                if state.waker.as_ref().is_some_and(|waker| waker.will_wake(cx.waker())) {
+                    return Poll::Pending;
                 }
+                // The waker it replaces is dropped outside the lock, as every waker here is
+                // woken: a foreign waker's drop may run anything, this slot's own calls too.
+                let old = state.waker.replace(cx.waker().clone());
+                drop(state);
+                drop(old);
                 Poll::Pending
             }
         }
@@ -197,7 +202,7 @@ where
         let shared = &*local.shared;
         // A job that started finishes, shutdown or not; one that has not, never starts once
         // shutdown has begun.
-        let Some(job) = self.slot.take(shared.shutdown.load(Ordering::SeqCst), discard) else {
+        let Some(job) = self.slot.take(shared.is_shut_down(), discard) else {
             return;
         };
         let position = match &shared.chaos {

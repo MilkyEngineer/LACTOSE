@@ -1,5 +1,6 @@
-//! Jobs of `Executor::run_job`: where they run, what the future says, shutdown, the gate,
-//! and who drops the value.
+//! Jobs of `Executor::run_job`: where they run, what the future says, shutdown, the gate's
+//! reservation, who drops the value, a job queued as the workers go idle, a child that
+//! crosses to another worker, and the figures.
 
 #![cfg(not(feature = "loom"))]
 
@@ -10,7 +11,7 @@ use core::pin::pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{LIMIT, Node, executor, graph, must_finish, wait_for};
 use lactose_core::ErrorKind;
@@ -159,10 +160,13 @@ fn shutdown_before_the_job_starts_cancels_it_and_drops_the_closure() {
     drop(holding);
 }
 
-/// Shutdown begins while the job runs: it finishes, and its future hands the value back.
+/// Shutdown begins while the job runs: it finishes, and its future hands the value back. The
+/// job is released only once shutdown has begun, which a job queued on a clone of the
+/// handle shows by resolving to `Cancelled` at once.
 #[test]
 fn a_started_job_hands_its_value_back_through_shutdown() {
     let executor = executor(2, 1);
+    let inert = executor.clone();
     let (started, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
     let run = {
         let (started, release) = (started.clone(), release.clone());
@@ -181,7 +185,11 @@ fn a_started_job_hands_its_value_back_through_shutdown() {
     };
     wait_for(&started);
     let stopper = std::thread::spawn(move || executor.shutdown());
-    std::thread::sleep(Duration::from_millis(5));
+    let begun = Instant::now();
+    while !matches!(poll_once(inert.run_job(|_| ())), Poll::Ready(Err(_))) {
+        assert!(begun.elapsed() < LIMIT, "shutdown never began");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     release.store(true, Ordering::Release);
     stopper.join().unwrap();
     match poll_once(run) {
@@ -191,41 +199,143 @@ fn a_started_job_hands_its_value_back_through_shutdown() {
     }
 }
 
-/// A job queued while a `block_in_place` keeps every other worker parked waits for the
-/// gate to open. A worker that takes it at the closed gate puts it back unstarted, which a
-/// unit test in `src/pool.rs` shows by handing it one.
+/// While a `block_in_place` holds the gate, a job starts on a worker its reservation leaves
+/// awake: on three frame-critical workers, a graph job holds the gate with one worker
+/// reserved and queues a `run_job` job inside its block, which waits until the job has
+/// begun. Whether a job waits at a closed gate with no reservation is the executor's unit
+/// test `a_job_waits_while_the_gate_holds_its_workers`.
 #[test]
-#[cfg_attr(miri, ignore = "waits for real time")]
-fn a_job_waits_while_the_gate_holds_its_workers() {
-    let executor = executor(2, 1);
-    let rounds = 20;
+fn a_job_starts_within_the_reservation() {
+    let executor = executor(3, 1);
+    let rounds = if cfg!(miri) { 2 } else { 20 };
     for _ in 0..rounds {
-        let (started, early) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let started = Arc::new(AtomicBool::new(false));
+        let inside = Arc::new(AtomicBool::new(false));
         let queued = Arc::new(Mutex::new(None));
         let node = {
-            let (caller, queued) = (executor.clone(), queued.clone());
-            let (started, early) = (started.clone(), early.clone());
-            Node::new("jobs::gate")
+            let (caller, queued, started, inside) =
+                (executor.clone(), queued.clone(), started.clone(), inside.clone());
+            Node::new("jobs::reservation")
                 .run(move |_, ctx| {
-                    ctx.block_in_place(0, || {
+                    ctx.block_in_place(1, || {
                         let starts = started.clone();
                         let run = caller.run_job(move |_| starts.store(true, Ordering::SeqCst));
-                        std::thread::sleep(Duration::from_millis(2));
+                        let begun = Instant::now();
+                        while !started.load(Ordering::SeqCst) && begun.elapsed() < LIMIT {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
                         // A panic here would abort; the test thread asserts instead.
-                        early.store(started.load(Ordering::SeqCst), Ordering::SeqCst);
+                        inside.store(started.load(Ordering::SeqCst), Ordering::SeqCst);
                         *queued.lock().unwrap() = Some(run);
                     });
                 })
                 .build()
         };
-        executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap();
-        assert!(!early.load(Ordering::SeqCst), "a job began at a closed gate");
-        let run = queued.lock().unwrap().take().unwrap();
         let blocking = executor.clone();
-        must_finish("the job after the gate opened", LIMIT, move || blocking.block_on(run))
-            .unwrap();
-        assert!(started.load(Ordering::SeqCst));
+        must_finish("the reserving graph", LIMIT * 2, move || {
+            blocking.block_on(blocking.run_graph(graph(vec![node], &[]))).unwrap();
+        });
+        assert!(inside.load(Ordering::SeqCst), "the job did not start within the reservation");
+        let run = queued.lock().unwrap().take().unwrap();
+        executor.block_on(run).unwrap();
     }
+    executor.shutdown();
+}
+
+/// A job queued while the one frame-critical worker is on its way to sleep is taken. The
+/// caller spins rather than parks, so it queues each job within microseconds of the last
+/// one's end, and the gaps sweep the window between the worker's last look for work, after
+/// its scan, and its announcement: only the look before it sleeps sees a job queued there,
+/// since a wake finds nobody to claim.
+#[test]
+#[cfg_attr(miri, ignore = "sweeps a window of real time")]
+fn a_job_queued_as_the_workers_go_idle_is_taken() {
+    let executor = executor(1, 1);
+    for job in 0..5_000u32 {
+        let taken = Arc::new(AtomicBool::new(false));
+        let run = {
+            let taken = taken.clone();
+            executor.run_job(move |_| taken.store(true, Ordering::Release))
+        };
+        let queued = Instant::now();
+        while !taken.load(Ordering::Acquire) {
+            assert!(queued.elapsed() < LIMIT, "job {job} was never taken: a lost wake-up");
+            core::hint::spin_loop();
+        }
+        drop(run);
+        // 40 to 80 µs in steps of 10 ns, about the scan of 50 µs.
+        let gap = Duration::from_nanos(40_000 + u64::from(job) * 7_919 % 4_000 * 10);
+        let ended = Instant::now();
+        while ended.elapsed() < gap {
+            core::hint::spin_loop();
+        }
+    }
+    executor.shutdown();
+}
+
+/// A child of a job's scope runs on another worker than its opener, through the pool's
+/// queue for such work, small enough for Miri. The opener writes the input before it forks
+/// and reads what the children wrote after the scope without atomics, so Miri checks that
+/// the entry's publication and the latch carry them. The opener's first child waits, a
+/// bounded while, until another worker has run one.
+#[test]
+fn a_child_crosses_to_another_worker() {
+    let executor = executor(3, 1);
+    assert_eq!(executor.run_job_width(), 2);
+    let rounds = if cfg!(miri) { 3 } else { 200 };
+    let mut crossed = 0;
+    for round in 0..rounds {
+        let run = executor.run_job(move |ctx| {
+            let own = ctx.slot();
+            let input: Vec<u64> = (0..4).map(|i| i * 3 + round).collect();
+            let mut out = [0u64; 4];
+            let mut rows = [0u64; 6];
+            let elsewhere = AtomicU32::new(0);
+            ctx.scope(|scope| {
+                let (input, elsewhere) = (&input, &elsewhere);
+                for (i, out) in out.iter_mut().enumerate() {
+                    scope.fork(move |child| {
+                        if child.slot() != own {
+                            elsewhere.fetch_add(1, Ordering::Relaxed);
+                        } else if i == 0 {
+                            for _ in 0..2_000 {
+                                if elsewhere.load(Ordering::Relaxed) > 0 {
+                                    break;
+                                }
+                                std::thread::yield_now();
+                            }
+                        }
+                        *out = input[i] * 2;
+                    });
+                }
+                for (i, row) in rows.iter_mut().enumerate() {
+                    scope.fork(move |child| {
+                        if child.slot() != own {
+                            elsewhere.fetch_add(1, Ordering::Relaxed);
+                        }
+                        *row = input[i % 4] + 1;
+                    });
+                }
+                scope.fork_range(0..6, move |range, child| {
+                    if child.slot() != own {
+                        elsewhere.fetch_add(1, Ordering::Relaxed);
+                    }
+                    for unit in range {
+                        assert!(input[unit as usize % 4] >= round);
+                    }
+                });
+            });
+            for (i, out) in out.iter().enumerate() {
+                assert_eq!(*out, input[i] * 2);
+            }
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(*row, input[i % 4] + 1);
+            }
+            elsewhere.into_inner()
+        });
+        crossed += executor.block_on(run).unwrap();
+    }
+    assert!(crossed > 0, "no child ran on another worker than its opener");
     executor.shutdown();
 }
 
@@ -387,6 +497,72 @@ fn timed_wake_inside_a_fan_out() {
                 late[late.len() - 1]
             );
         }
+    }
+    executor.shutdown();
+}
+
+/// How long the fan-out itself takes, from its scope's start to its end, `samples` times:
+/// inside a job of `run_job` when `in_job`, else inside a graph job.
+fn fan_out_time(executor: &Executor, fan_out: FanOut, in_job: bool, samples: usize) -> Vec<f64> {
+    let mut took = Vec::with_capacity(samples);
+    let timed = move |ctx: &mut lactose_task::JobContext<'_>| {
+        let begun = Instant::now();
+        fan_out.run(ctx, &AtomicBool::new(false));
+        begun.elapsed()
+    };
+    for _ in 0..samples {
+        let time = if in_job {
+            executor.block_on(executor.run_job(timed)).unwrap()
+        } else {
+            let cell = Arc::new(Mutex::new(Duration::ZERO));
+            let out = cell.clone();
+            let node = Node::new("jobs::fan_out")
+                .run(move |_, ctx| *out.lock().unwrap() = timed(ctx))
+                .build();
+            drop(executor.block_on(executor.run_graph(graph(vec![node], &[]))).unwrap());
+            *cell.lock().unwrap()
+        };
+        took.push(time.as_secs_f64() * 1e3);
+    }
+    took.sort_by(f64::total_cmp);
+    took
+}
+
+/// Figures with no threshold: how long a fan-out takes inside a job of `run_job`, whose
+/// width leaves one frame-critical worker out, beside the same fan-out in a graph job, in
+/// the shapes of D162's review. Where `timed_wake_inside_a_fan_out` times a timer, this
+/// times the fan-out's throughput under the width.
+/// `cargo test -p lactose-task --release --test integration -- --ignored --nocapture
+/// jobs::fan_out_time_under_the_width`, on a quiet machine.
+#[test]
+#[ignore = "figures, on a quiet machine"]
+fn fan_out_time_under_the_width() {
+    let executor = Executor::builder().build().unwrap();
+    let samples = 100;
+    let shapes = [
+        ("4 children of 10 ms", FanOut::Children { count: 4, each: Duration::from_millis(10) }),
+        ("3 children of 10 ms", FanOut::Children { count: 3, each: Duration::from_millis(10) }),
+        ("2000 units of 20 us", FanOut::Range { units: 2000, each: Duration::from_micros(20) }),
+        ("40 children of 1 ms", FanOut::Children { count: 40, each: Duration::from_millis(1) }),
+    ];
+    println!(
+        "{} frame-critical workers, width {}, {samples} samples a row, fan-out time in ms",
+        executor.frame_worker_count(),
+        executor.run_job_width()
+    );
+    for (name, fan_out) in shapes {
+        let job = fan_out_time(&executor, fan_out, true, samples);
+        let graph = fan_out_time(&executor, fan_out, false, samples);
+        let at = |took: &[f64], q: f64| took[((took.len() - 1) as f64 * q).round() as usize];
+        println!(
+            "{name}: run_job P50 {:.3}, P99 {:.3}; a graph job P50 {:.3}, P99 {:.3}; \
+             ratio of the P50s {:.3}",
+            at(&job, 0.5),
+            at(&job, 0.99),
+            at(&graph, 0.5),
+            at(&graph, 0.99),
+            at(&job, 0.5) / at(&graph, 0.5)
+        );
     }
     executor.shutdown();
 }

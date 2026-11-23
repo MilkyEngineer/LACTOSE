@@ -247,7 +247,11 @@ where
                 "the executor shut down before the task finished",
             ))),
             None => {
-                join.waker = Some(cx.waker().clone());
+                // The waker it replaces is dropped outside the lock, as the one it keeps is
+                // woken: a foreign waker's drop may run anything.
+                let old = join.waker.replace(cx.waker().clone());
+                drop(join);
+                drop(old);
                 Poll::Pending
             }
         }

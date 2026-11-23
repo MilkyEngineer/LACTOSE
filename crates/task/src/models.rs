@@ -1,14 +1,31 @@
 //! loom models of the scope latch, the sleep-and-wake protocol, the permit gate, run
-//! quiescence, and the completion slot and the width of `Executor::run_job`.
+//! quiescence, the shutdown flag, and the completion slot and the width of `Executor::run_job`.
 //!
 //! Run with `cargo test -p lactose-task --features loom --release`. Every model calls the
 //! functions the executor ships: `gate::wait_for_children` is the opener's wait,
 //! `Sleep::announce_entry` is what a worker does after queueing work, `Sleep::wake_worker`
 //! is how it wakes a worker, `Timers::fire_due`
 //! is how a deadline reaches its task, `Quiesce` is what holds a run's future back,
-//! `JobSlot` is where a job's value waits for its future, and `Width` is what bounds the
-//! workers such jobs occupy. What a model supplies is only what loom does not model: a
-//! deque is a counter, a worker is a loom thread, and a scope's children are a number.
+//! `ShutdownFlag::queue` is how work is queued against shutdown's sweep, `JobSlot` is where a
+//! job's value waits for its future, and `Width` is what bounds the workers such jobs occupy.
+//! What a model supplies is only what loom does not model: a deque is a counter, a worker is a
+//! loom thread, and a scope's children are a number.
+//!
+//! Four call sites of `run_job`'s are copies in the models, because loom cannot run the types
+//! they live in (`WorkerLocal`, `Shared`), and each is held by a native test instead:
+//! - `idle`'s look (`pool.rs`) counts the two queues only while `Width::admits` says so; the
+//!   model's `Pool::work` calls `Width::admits` itself
+//!   (`jobs::a_job_queued_as_the_workers_go_idle_is_taken` in `tests/jobs.rs`);
+//! - `WideChildren::look` (`job.rs`) asks whether the children's queue holds any; the model's
+//!   `ModelOpener::look` asks its own queue
+//!   (`executor::job_tests::an_opener_takes_a_half_queued_after_it_parked`; the split rule
+//!   that queues those halves in `a_range_in_a_job_splits_to_a_second_worker`);
+//! - `WideChildren::park` keeps the job's place while the opener sleeps; the model's opener
+//!   parks on its latch and never gives a place up
+//!   (`executor::job_tests::an_opener_parks_beside_a_full_width_and_the_next_job_waits`);
+//! - `JobCell::run` (`job_run.rs`) hands `JobSlot::take` the shutdown flag; the model hands it
+//!   `ShutdownFlag::is_set` itself
+//!   (`pool::tests::a_job_taken_after_shutdown_began_never_starts`).
 //!
 //! A lost wake-up shows as a deadlock, which loom reports. The models are exhaustive
 //! except where a preemption bound is named; `LOOM_MAX_PREEMPTIONS` overrides the bounds.
@@ -818,6 +835,7 @@ mod jobs {
     use crate::gate::{self, Gate, Look, Opener, Wake};
     use crate::job_run::JobSlot;
     use crate::latch::Latch;
+    use crate::shutdown::{self, ShutdownFlag};
     use crate::sleep::Sleep;
     use crate::width::{Place, Queued, Weakened, Width};
 
@@ -964,7 +982,7 @@ mod jobs {
     /// the closure is gone.
     fn a_take_against_shutdown(sweep: Sweep) {
         bounded(super::THREE_THREAD_BOUND, move || {
-            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(ShutdownFlag::new());
             let queued = Arc::new(AtomicBool::new(true));
             let record = Arc::new(Record::default());
             let slot = Arc::new(JobSlot::new(Closure { record: record.clone(), ran: false }));
@@ -973,7 +991,7 @@ mod jobs {
                 let (shutdown, queued, slot) = (shutdown.clone(), queued.clone(), slot.clone());
                 thread::spawn(move || {
                     if queued.swap(false, Ordering::AcqRel)
-                        && let Some(job) = slot.take(shutdown.load(Ordering::SeqCst), drop)
+                        && let Some(job) = slot.take(shutdown.is_set(), drop)
                     {
                         let _ = slot.finish(job.run());
                     }
@@ -982,7 +1000,8 @@ mod jobs {
             let stopper = {
                 let (shutdown, queued, slot) = (shutdown.clone(), queued.clone(), slot.clone());
                 thread::spawn(move || {
-                    shutdown.store(true, Ordering::SeqCst);
+                    shutdown.set();
+                    shutdown.before_sweep();
                     if queued.swap(false, Ordering::AcqRel) {
                         match sweep {
                             Sweep::Cancels => slot.cancel(drop),
@@ -1149,6 +1168,32 @@ mod jobs {
     }
 
     impl Pool {
+        fn new(
+            workers: usize,
+            jobs: &'static [Job],
+            weakened: Option<Weakened>,
+            opener_looks: bool,
+        ) -> Self {
+            let mut width = Width::new(workers);
+            width.weakened = weakened;
+            Self {
+                width,
+                queues: Queues { jobs: AtomicUsize::new(0), children: AtomicUsize::new(0) },
+                sleep: Sleep::new(workers),
+                gate: Gate::new(workers),
+                threads: (0..workers).map(|_| OnceLock::new()).collect(),
+                jobs,
+                latches: [Latch::new(), Latch::new()],
+                openers: [AtomicUsize::new(0), AtomicUsize::new(0)],
+                opener_looks,
+                inside: AtomicUsize::new(0),
+                done: AtomicUsize::new(0),
+                finished: AtomicBool::new(false),
+                held: AtomicUsize::new(0),
+                half_run: AtomicBool::new(false),
+            }
+        }
+
         fn enter(&self) {
             let inside = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
             let limit = self.width.limit();
@@ -1310,24 +1355,7 @@ mod jobs {
         bound: usize,
     ) {
         bounded(bound, move || {
-            let mut width = Width::new(workers);
-            width.weakened = weakened;
-            let pool = Arc::new(Pool {
-                width,
-                queues: Queues { jobs: AtomicUsize::new(0), children: AtomicUsize::new(0) },
-                sleep: Sleep::new(workers),
-                gate: Gate::new(workers),
-                threads: (0..workers).map(|_| OnceLock::new()).collect(),
-                jobs,
-                latches: [Latch::new(), Latch::new()],
-                openers: [AtomicUsize::new(0), AtomicUsize::new(0)],
-                opener_looks,
-                inside: AtomicUsize::new(0),
-                done: AtomicUsize::new(0),
-                finished: AtomicBool::new(false),
-                held: AtomicUsize::new(0),
-                half_run: AtomicBool::new(false),
-            });
+            let pool = Arc::new(Pool::new(workers, jobs, weakened, opener_looks));
             if !main_queues {
                 for job in 0..jobs.len() {
                     push(&pool.queues.jobs, job, job + 1);
@@ -1426,5 +1454,210 @@ mod jobs {
     #[should_panic(expected = "deadlock")]
     fn weakened_a_range_held_beside_an_opener_that_does_not_look() {
         the_width(3, RANGE_HELD, false, None, false, WIDTH_BOUND);
+    }
+
+    /// One job with no children, which is all a model of the count's wakes needs queued.
+    const ONE_JOB: &[Job] = &[Job { children: &[], half: 0 }];
+
+    /// A job queued while the count is at a width of two with the flag clear, because a
+    /// worker that took a place for a child it then found gone has not given it back yet,
+    /// against that worker's `leave`: a job arriving against a lowering at a width above one,
+    /// which the configurations above leave out. A straggling child's place is held
+    /// throughout; a third worker sleeps, and only a wake from the queueing or the lowering
+    /// reaches it.
+    fn the_transient_place(weakened: Option<Weakened>) {
+        bounded(TRANSIENT_BOUND, move || {
+            let pool = Arc::new(Pool::new(3, ONE_JOB, weakened, true));
+            assert!(pool.width.try_enter(Place::Child));
+            pool.inside.fetch_add(1, Ordering::SeqCst);
+            let transient = {
+                let pool = pool.clone();
+                thread::spawn(move || {
+                    // It goes on to other work without looking at the jobs.
+                    if pool.width.try_enter(Place::Child) {
+                        pool.width.leave(Place::Child, &pool.queues, &*pool);
+                    }
+                })
+            };
+            let sleeper = {
+                let pool = pool.clone();
+                thread::spawn(move || pool.work(2))
+            };
+            push(&pool.queues.jobs, 0, 1);
+            pool.width.queued(Place::Job, None, &*pool);
+            transient.join().unwrap();
+            sleeper.join().unwrap();
+            assert_eq!(pool.done.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// The preemption bound of the transient place's model.
+    const TRANSIENT_BOUND: usize = 2;
+
+    #[test]
+    fn a_job_against_a_transient_child_place() {
+        the_transient_place(None);
+    }
+
+    #[test]
+    #[should_panic(expected = "deadlock")]
+    fn weakened_a_transient_child_place_without_the_push_fence() {
+        the_transient_place(Some(Weakened::PushFence));
+    }
+
+    #[test]
+    #[should_panic(expected = "deadlock")]
+    fn weakened_a_transient_child_place_without_the_leave_fence() {
+        the_transient_place(Some(Weakened::LeaveFence));
+    }
+
+    #[test]
+    #[should_panic(expected = "deadlock")]
+    fn weakened_a_transient_child_place_with_acquire_release_fences() {
+        the_transient_place(Some(Weakened::AcqRelFences));
+    }
+
+    /// A child queued while a width of two is full, which only the wake of a holder's
+    /// `leave` can deliver. The main thread is the scope's opener: it holds the job's place,
+    /// waits on the latch and takes no child. A holder gives its child's place up; a third
+    /// worker, which holds no place, is the only one that can run the queued child.
+    fn the_leave(weakened: Option<Weakened>) {
+        bounded(LEAVE_BOUND, move || {
+            let pool = Arc::new(Pool::new(3, ONE_JOB, weakened, true));
+            // The main thread is worker 0, the opener of job 1.
+            pool.threads[0].set(thread::current()).unwrap();
+            assert!(pool.width.try_enter(Place::Job));
+            assert!(pool.width.try_enter(Place::Child));
+            pool.inside.fetch_add(2, Ordering::SeqCst);
+            pool.latches[0].add(1);
+            push(&pool.queues.children, 0, 1 << 2 | UNIT);
+            let holder = {
+                let pool = pool.clone();
+                thread::spawn(move || {
+                    pool.inside.fetch_sub(1, Ordering::SeqCst);
+                    pool.width.leave(Place::Child, &pool.queues, &*pool);
+                })
+            };
+            let sleeper = {
+                let pool = pool.clone();
+                thread::spawn(move || pool.work(2))
+            };
+            while !pool.latches[0].is_set() {
+                thread::park();
+            }
+            pool.finish();
+            holder.join().unwrap();
+            sleeper.join().unwrap();
+        });
+    }
+
+    /// The preemption bound of the leave's model.
+    const LEAVE_BOUND: usize = 1;
+
+    #[test]
+    fn a_child_delivered_by_a_leave() {
+        the_leave(None);
+    }
+
+    #[test]
+    #[should_panic(expected = "deadlock")]
+    fn weakened_a_leave_that_does_not_count_the_children() {
+        the_leave(Some(Weakened::ChildrenNotAdmitted));
+    }
+
+    // The shutdown flag.
+
+    /// A job's queue and a task's queue, and how many entries were refused or swept.
+    struct Submissions {
+        flag: ShutdownFlag,
+        jobs: AtomicUsize,
+        tasks: AtomicUsize,
+        refused: AtomicUsize,
+        swept: AtomicUsize,
+    }
+
+    impl Submissions {
+        /// What `Shared::submit_job` and `Shared::submit_task` do: `ShutdownFlag::queue`.
+        fn submit(&self, queue: &AtomicUsize) {
+            self.flag.queue(
+                1,
+                |_| {
+                    self.refused.fetch_add(1, Ordering::SeqCst);
+                },
+                |entry| push(queue, 0, entry),
+                || self.sweep(),
+            );
+        }
+
+        /// What `Shared::discard_queued` does, in its order: the tasks' queue, then the
+        /// jobs'. A queue that looks empty is not written, as a `crossbeam-deque` steal from
+        /// an empty injector writes nothing.
+        fn sweep(&self) {
+            self.flag.before_sweep();
+            for queue in [&self.tasks, &self.jobs] {
+                if queue.load(Ordering::Acquire) != 0 && queue.swap(0, Ordering::AcqRel) != 0 {
+                    self.swept.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// A job and a task queued against shutdown, whose thread sets the flag and sweeps both
+    /// queues: each entry is refused or swept, whichever side sees the other.
+    fn submissions_against_shutdown(weakened: Option<shutdown::Weakened>) {
+        bounded(SUBMISSIONS_BOUND, move || {
+            let mut flag = ShutdownFlag::new();
+            flag.weakened = weakened;
+            let state = Arc::new(Submissions {
+                flag,
+                jobs: AtomicUsize::new(0),
+                tasks: AtomicUsize::new(0),
+                refused: AtomicUsize::new(0),
+                swept: AtomicUsize::new(0),
+            });
+            let submitters: Vec<_> = [false, true]
+                .into_iter()
+                .map(|job| {
+                    let state = state.clone();
+                    thread::spawn(move || {
+                        state.submit(if job { &state.jobs } else { &state.tasks });
+                    })
+                })
+                .collect();
+            state.flag.set();
+            state.sweep();
+            for submitter in submitters {
+                submitter.join().unwrap();
+            }
+            let resolved =
+                state.refused.load(Ordering::SeqCst) + state.swept.load(Ordering::SeqCst);
+            assert_eq!(resolved, 2, "an entry stayed queued after shutdown's sweep");
+        });
+    }
+
+    /// The preemption bound of the submissions' model.
+    const SUBMISSIONS_BOUND: usize = 1;
+
+    #[test]
+    fn submissions_against_shutdown_are_refused_or_swept() {
+        submissions_against_shutdown(None);
+    }
+
+    #[test]
+    #[should_panic(expected = "an entry stayed queued after shutdown's sweep")]
+    fn weakened_a_submission_that_does_not_check_after_queueing() {
+        submissions_against_shutdown(Some(shutdown::Weakened::NoCheck));
+    }
+
+    #[test]
+    #[should_panic(expected = "an entry stayed queued after shutdown's sweep")]
+    fn weakened_a_submission_without_its_fence() {
+        submissions_against_shutdown(Some(shutdown::Weakened::QueueFence));
+    }
+
+    #[test]
+    #[should_panic(expected = "an entry stayed queued after shutdown's sweep")]
+    fn weakened_a_sweep_without_its_fence() {
+        submissions_against_shutdown(Some(shutdown::Weakened::SweepFence));
     }
 }

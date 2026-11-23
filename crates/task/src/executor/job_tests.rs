@@ -245,6 +245,10 @@ fn an_opener_parks_beside_a_full_width_and_the_next_job_waits() {
     let frame = executor.owner.shared.frame();
     wait_until("the opener is parked", || frame.parked_openers() == 1);
     assert!(parked.all_began_elsewhere.load(Ordering::SeqCst));
+    // The parked opener keeps its job's place: one given up while it sleeps would let a
+    // worker without a place into the job, and no worker would be left for the timers.
+    let occupied = executor.owner.shared.wide.width.occupied();
+    assert_eq!(occupied, width as usize, "the parked opener gave its job's place up");
     let second = {
         let parked = parked.clone();
         executor.run_job(move |_| {
@@ -290,5 +294,183 @@ fn one_worker_runs_a_job_and_its_children_itself() {
     let blocking = executor.clone();
     assert!(within("the job", move || blocking.block_on(run)).unwrap());
     a_free_worker_serves_a_timer_and_a_graph(&executor);
+    executor.shutdown();
+}
+
+/// The job flag alone: on four frame-critical workers a first job with no children holds
+/// one place of three, so the count leaves room, and a second job queued beside it has not
+/// begun once every other frame-critical worker is asleep again. Queueing it wakes nobody,
+/// since no worker without a place may take it; without the flag one would wake and run it.
+#[test]
+#[cfg_attr(miri, ignore = "holds workers for real time")]
+fn a_second_job_waits_with_room_in_the_width() {
+    let executor = executor(4);
+    let held = Arc::new(Held::default());
+    let _release = Release(held.clone());
+    let first = {
+        let held = held.clone();
+        executor.run_job(move |ctx| held.hold(ctx.slot()))
+    };
+    wait_until("the first job began", || held.running.load(Ordering::SeqCst) == 1);
+    let frame = executor.owner.shared.frame();
+    wait_until("the other workers sleep", || frame.sleepers() == 3);
+    assert_eq!(executor.owner.shared.wide.width.occupied(), 1);
+    let began = Arc::new(AtomicBool::new(false));
+    let second = {
+        let began = began.clone();
+        executor.run_job(move |_| began.store(true, Ordering::SeqCst))
+    };
+    wait_until("the other workers sleep again", || frame.sleepers() == 3);
+    assert!(!began.load(Ordering::SeqCst), "a job began beside another");
+    held.release.store(true, Ordering::SeqCst);
+    let blocking = executor.clone();
+    within("both jobs", move || {
+        blocking.block_on(first).unwrap();
+        blocking.block_on(second).unwrap();
+    });
+    assert!(began.load(Ordering::SeqCst));
+    executor.shutdown();
+}
+
+/// A graph job that holds the gate with no permit reserved and queues a `run_job` job
+/// inside its block.
+struct Gated {
+    executor: Executor,
+    started: Arc<AtomicBool>,
+    /// Whether the job had begun, and whether it was still queued, once the other worker
+    /// had been woken for it and was asleep again; and the job's future.
+    seen: Mutex<Option<(bool, bool, crate::JobRun<()>)>>,
+}
+
+impl GraphNode for Gated {
+    fn name(&self) -> &'static str {
+        "executor::job_tests::gated"
+    }
+
+    fn units(&self) -> u32 {
+        1
+    }
+
+    fn run(&self, _units: Range<u32>, ctx: &mut JobContext<'_>) {
+        ctx.block_in_place(0, || {
+            let shared = &self.executor.owner.shared;
+            let frame = shared.frame();
+            wait_until("the other worker sleeps", || frame.sleepers() == 1);
+            let started = self.started.clone();
+            let run = self.executor.run_job(move |_| started.store(true, Ordering::SeqCst));
+            // Queueing the job claimed the sleeper to wake it; it finds no permit and
+            // announces itself again.
+            wait_until("the other worker sleeps again", || frame.sleepers() == 1);
+            let began = self.started.load(Ordering::SeqCst);
+            let queued = crate::width::Queued::jobs(&shared.wide);
+            *self.seen.lock().unwrap() = Some((began, queued, run));
+        });
+    }
+}
+
+/// A job queued while a `block_in_place` keeps the other worker parked does not start
+/// while the gate is closed: that worker is woken for it, finds no permit and sleeps again,
+/// the job still queued. A worker that takes one at a closed gate puts it back unstarted,
+/// which `pool::tests` shows by handing it one.
+#[test]
+fn a_job_waits_while_the_gate_holds_its_workers() {
+    let executor = executor(2);
+    let rounds = if cfg!(miri) { 2 } else { 20 };
+    for _ in 0..rounds {
+        let node = Arc::new(Gated {
+            executor: executor.clone(),
+            started: Arc::new(AtomicBool::new(false)),
+            seen: Mutex::new(None),
+        });
+        let mut builder = GraphBuilder::new();
+        builder.add_node(node.clone());
+        let blocking = executor.clone();
+        let graph = builder.build().unwrap();
+        within("the gated graph", move || blocking.block_on(blocking.run_graph(graph))).unwrap();
+        let (began, queued, run) = node.seen.lock().unwrap().take().unwrap();
+        assert!(!began, "a job began at a closed gate");
+        assert!(queued, "a job left the queue at a closed gate");
+        let blocking = executor.clone();
+        within("the job after the gate opened", move || blocking.block_on(run)).unwrap();
+        assert!(node.started.load(Ordering::SeqCst));
+    }
+    executor.shutdown();
+}
+
+/// No unit of the range has run yet.
+const NOBODY: u32 = u32::MAX;
+
+/// A range in a job's scope reaches a second worker by the split rule: the first unit to
+/// run waits until a unit has run on another worker. A range that is never split runs all
+/// of its units on one worker, and the wait runs out.
+#[test]
+fn a_range_in_a_job_splits_to_a_second_worker() {
+    let executor = executor(3);
+    assert_eq!(executor.run_job_width(), 2);
+    let (rounds, units) = if cfg!(miri) { (2, 8) } else { (20, 64) };
+    for round in 0..rounds {
+        let run = executor.run_job(move |ctx| {
+            let first = AtomicU32::new(NOBODY);
+            let crossed = AtomicBool::new(false);
+            ctx.scope(|scope| {
+                let (first, crossed) = (&first, &crossed);
+                scope.fork_range(0..units, move |_range, child| {
+                    let slot = child.slot();
+                    match first.compare_exchange(NOBODY, slot, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => {
+                            let begun = Instant::now();
+                            while !crossed.load(Ordering::SeqCst) && begun.elapsed() < LIMIT {
+                                std::thread::yield_now();
+                            }
+                        }
+                        Err(owner) if owner != slot => crossed.store(true, Ordering::SeqCst),
+                        Err(_) => {}
+                    }
+                });
+            });
+            crossed.into_inner()
+        });
+        let blocking = executor.clone();
+        let crossed = within("the job", move || blocking.block_on(run)).unwrap();
+        assert!(crossed, "round {round}: the range ran on one worker");
+    }
+    executor.shutdown();
+}
+
+/// An opener that parked takes the halves a holder queues after it parked. Units on the
+/// opener take no time and units elsewhere 1 ms each, so the opener runs out of work and
+/// parks while a holder still runs its part; each half that holder splits off then reaches
+/// the opener only through its look after the wake. With that look the holder runs about as
+/// many units as the opener takes milliseconds to wake; without it, the opener stays parked
+/// and the holder runs at least the half it took.
+#[test]
+#[cfg_attr(miri, ignore = "times units in real time")]
+fn an_opener_takes_a_half_queued_after_it_parked() {
+    const UNITS: u32 = 256;
+    let executor = executor(3);
+    assert_eq!(executor.run_job_width(), 2);
+    let mut most = 0;
+    for _ in 0..20 {
+        let run = executor.run_job(move |ctx| {
+            let own = ctx.slot();
+            let elsewhere = AtomicU32::new(0);
+            ctx.scope(|scope| {
+                let elsewhere = &elsewhere;
+                scope.fork_range(0..UNITS, move |range, child| {
+                    if child.slot() != own {
+                        elsewhere.fetch_add(range.len() as u32, Ordering::SeqCst);
+                        let begun = Instant::now();
+                        while begun.elapsed() < Duration::from_millis(1) {
+                            core::hint::spin_loop();
+                        }
+                    }
+                });
+            });
+            elsewhere.into_inner()
+        });
+        let blocking = executor.clone();
+        most = most.max(within("the job", move || blocking.block_on(run)).unwrap());
+    }
+    assert!(most < UNITS / 4, "{most} of {UNITS} units ran off the opener: it stayed parked");
     executor.shutdown();
 }

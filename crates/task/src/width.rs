@@ -22,6 +22,10 @@
 //! of their own, which is why these fences do not lean on them; the sleeper's side is the
 //! idle protocol's (`sleep.rs`), whose look counts these queues only while [`Width::admits`]
 //! says a worker without a place could take from them.
+//!
+//! Nothing is published through the word, which is a count and a flag, and both pairs are
+//! carried by the fences, so the word's own operations need only be atomic. They are `SeqCst`
+//! as a margin, not because a pair leans on them.
 
 use crate::gate::Wake;
 use crate::sync::{AtomicUsize, Ordering, fence};
@@ -68,6 +72,8 @@ pub(crate) enum Weakened {
     SplitRaise,
     /// A job raises the count as a child does and ignores [`JOB`].
     NoJobFlag,
+    /// [`Width::admits`] never counts the children's queue.
+    ChildrenNotAdmitted,
 }
 
 /// Which of the two fences [`Width::fence`] issues.
@@ -165,6 +171,10 @@ impl Width {
     /// worker's last look counts the queues only when this says so.
     pub(crate) fn admits(&self, queued: &impl Queued) -> bool {
         let state = self.state.load(Ordering::SeqCst);
+        #[cfg(all(test, feature = "loom"))]
+        if self.weakened == Some(Weakened::ChildrenNotAdmitted) {
+            return self.free(state, Place::Job) && queued.jobs();
+        }
         (self.free(state, Place::Child) && queued.children())
             || (self.free(state, Place::Job) && queued.jobs())
     }
