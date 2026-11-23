@@ -59,7 +59,7 @@ pub struct Case {
     pub refuses: Option<Rule>,
     /// Whether a device backend runs the case. `false` for a case that provokes a check
     /// the null backend alone makes, whose breach on a device gives a wrong image and
-    /// proves nothing, and for one that holds null's own meaning of a pending submit, one
+    /// proves nothing, and for those that hold null's own meaning of a pending submit, one
     /// whose completion the caller has not yet seen (`README.md`, "Queues by role").
     pub devices: bool,
 }
@@ -359,6 +359,7 @@ pub const CASES: &[Case] = cases! {
     contract "submit_signalling_no_more_than_it_waits_for_is_refused" => Timeline everywhere;
     contract "timeline_value_beyond_the_difference_limit_is_refused" => Timeline everywhere;
     contract "timeline_signalled_from_two_queues_without_a_wait_is_refused" => Timeline everywhere;
+    contract "timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused" => Timeline;
     contract "signal_after_a_wait_for_another_signal_of_its_submit_is_refused" => Timeline everywhere;
     contract "wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline";
     contract "wait_for_a_signal_orders_the_earlier_submits_of_its_queue";

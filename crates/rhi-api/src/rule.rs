@@ -103,11 +103,12 @@ pub enum Rule {
     /// has reached, been given by a host signal or been promised, or than a value the same
     /// submit waits for on it, or while another queue's signal of it is pending with no
     /// wait that orders it, a wait ordering the signal it waits for and the earlier submits
-    /// of that signal's queue but not the other signals of its submit; a host signal not between the timeline's value and every pending
-    /// promise, or one a pending promise or another host signal could pass; or a value
-    /// 2^31 or more from the timeline's, from a host signal's in progress, or from a value
-    /// a pending submit waits for or signals on it. The timeline's value is the greatest
-    /// the device knows it has reached (`README.md`, "Timelines").
+    /// of that signal's queue but not the other signals of its submit; a host signal not
+    /// between the timeline's value and every pending promise, or one a pending promise or
+    /// another host signal could pass; or a value 2^31 or more from the timeline's, from a
+    /// host signal's in progress, or from a value a pending submit waits for or signals on
+    /// it. The timeline's value is the greatest the device knows it has reached
+    /// (`README.md`, "Timelines").
     Timeline,
     /// `encoding`: a command outside the scope it belongs to, a render pass, graphics bind,
     /// draw or depth image copy on a `Compute` encoder, a draw or dispatch with nothing bound

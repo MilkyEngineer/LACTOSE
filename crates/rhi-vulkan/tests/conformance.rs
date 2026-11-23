@@ -253,6 +253,7 @@ cases! {
     submit_signalling_no_more_than_it_waits_for_is_refused
     timeline_value_beyond_the_difference_limit_is_refused
     timeline_signalled_from_two_queues_without_a_wait_is_refused
+    timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused
     signal_after_a_wait_for_another_signal_of_its_submit_is_refused
     wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline
     wait_for_a_signal_orders_the_earlier_submits_of_its_queue

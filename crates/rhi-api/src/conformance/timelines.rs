@@ -55,6 +55,10 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         timeline_signalled_from_two_queues_without_a_wait_is_refused,
     ),
     (
+        "timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused",
+        timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused,
+    ),
+    (
         "signal_after_a_wait_for_another_signal_of_its_submit_is_refused",
         signal_after_a_wait_for_another_signal_of_its_submit_is_refused,
     ),
@@ -398,9 +402,37 @@ fn timeline_signalled_from_two_queues_without_a_wait_is_refused(ctx: &Ctx<'_>) -
     Ok(())
 }
 
+/// A promise is pending until the caller has seen its submit, not until the submit runs:
+/// a compute submit with no gate signals `f`, and a graphics signal of `f` with no wait,
+/// and a host signal above it, are refused although null runs the compute submit at once.
+/// On a device either could land first (VUID-VkSubmitInfo2-semaphore-03882). A device
+/// refuses them only while the compute submit is in flight, which a case cannot hold it
+/// to; `lactose-rhi-vulkan`'s device tests hold it with a dispatch that lags.
+fn timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused(
+    ctx: &Ctx<'_>,
+) -> Applies {
+    if ctx.set.queues.compute != QueuePath::Own {
+        return Err("compute shares the graphics queue");
+    }
+    let device = ctx.device();
+    let f = ctx.timeline(&*device, 0);
+    ctx.submit(&*device, C, &mut [], &[], &[at(f, 1)]);
+    ctx.refused(
+        submit(&*device, G, &mut [], &[], &[at(f, 2)]),
+        "a signal from another queue before the first is seen",
+    );
+    ctx.refused(device.signal_timeline(at(f, 2)), "a host signal before the promise is seen");
+    ctx.reached(&*device, at(f, 1));
+    ctx.submit(&*device, G, &mut [], &[], &[at(f, 2)]);
+    ctx.reached(&*device, at(f, 2));
+    Ok(())
+}
+
 /// A wait orders the one signal it waits for: the other signals of its submit are unordered
 /// with it (Vulkan, "Implicit Synchronization Guarantees"), so a signal of `f` after a wait
-/// for `c` could land below the pending `f` (VUID-VkSubmitInfo2-semaphore-03882).
+/// for `c` could land below the pending `f` (VUID-VkSubmitInfo2-semaphore-03882). A wait
+/// for a value of `f` below the pending one, here one the host has signalled, orders it no
+/// more.
 fn signal_after_a_wait_for_another_signal_of_its_submit_is_refused(ctx: &Ctx<'_>) -> Applies {
     if ctx.set.queues.compute != QueuePath::Own {
         return Err("compute shares the graphics queue");
@@ -416,6 +448,17 @@ fn signal_after_a_wait_for_another_signal_of_its_submit_is_refused(ctx: &Ctx<'_>
     ctx.ok(device.signal_timeline(gate), "the gate's host signal");
     ctx.reached(&*device, at(f, 1));
     ctx.submit(&*device, G, &mut [], &[at(c, 1)], &[at(f, 2)]);
+    ctx.reached(&*device, at(f, 2));
+
+    let (c, f) = (ctx.timeline(&*device, 0), ctx.timeline(&*device, 0));
+    let gate = ctx.point(&*device, 1);
+    ctx.ok(device.signal_timeline(at(f, 1)), "the host signal of f = 1");
+    ctx.submit(&*device, C, &mut [], &[gate], &[at(c, 1), at(f, 2)]);
+    ctx.refused(
+        submit(&*device, G, &mut [], &[at(c, 1), at(f, 1)], &[at(f, 3)]),
+        "a signal ordered by a wait below the pending signal",
+    );
+    ctx.ok(device.signal_timeline(gate), "the gate's host signal");
     ctx.reached(&*device, at(f, 2));
     Ok(())
 }

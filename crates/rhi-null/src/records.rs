@@ -563,8 +563,9 @@ impl Records {
     /// each wait's and signal's timeline lives; no value is 2^31 or more from those it is
     /// compared with; each signal grows past the timeline's value, its host signal in
     /// progress, every pending promise and the submit's own waits and earlier signals on
-    /// it; every pending promise of it is ordered before the signal; and
-    /// while a host signal of it is in progress, the submit waits for that signal's value.
+    /// it; every pending promise of it is ordered before the signal, a promise pending
+    /// until the caller has seen its submit, not until it runs; and while a host signal of
+    /// it is in progress, the submit waits for that signal's value.
     pub(crate) fn check_points(
         &self,
         queue: usize,
@@ -605,7 +606,7 @@ impl Records {
                 }
             }
             for (other, rec) in self.queues.iter().enumerate() {
-                for submit in rec.unrun() {
+                for submit in rec.after(rec.observed) {
                     let promises = submit.signals.iter().filter(|p| p.timeline == signal.timeline);
                     for promise in promises {
                         if promise.value >= signal.value {
@@ -668,7 +669,7 @@ impl Records {
         }
         self.within_limit(point)?;
         let known = timeline.value;
-        for submit in self.queues.iter().flat_map(QueueRec::unrun) {
+        for submit in self.queues.iter().flat_map(|rec| rec.after(rec.observed)) {
             for promise in submit.signals.iter().filter(|p| p.timeline == point.timeline) {
                 if promise.value <= point.value {
                     return Err(refuse("not below a pending promise"));
