@@ -10,18 +10,19 @@
 //!
 //! Usage: `lactose-app-headless [TICKS] [SLOT]`: `TICKS` (600 by default) ticks, then a save
 //! to the file `SLOT` if one is named, its directory created at start. Exits 1 with the
-//! error when the policy stops the run, 2 after the report when the save failed.
+//! error when the policy stops the run, 2 after the report when the save failed. A panic
+//! writes a crash report to stderr and to a file in the directory `LACTOSE_CRASH_DIR` names,
+//! `crash` in the working directory when it is unset or empty, and aborts.
 
 #![forbid(unsafe_code)]
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use lactose_app::{
     Cooked, CrateRegistration, Game, Headless, HeadlessConfig, RunReport, Start, Workers,
-    WorldConfig,
+    WorldConfig, install_crash_hook,
 };
 use lactose_asset_api::{
     Asset, AssetId, AssetKind, AssetSet, AssetVersion, LoadPriority, PinnedTable, PublishedAssets,
@@ -161,23 +162,20 @@ impl Args {
     }
 }
 
-/// Architecture section 5.1: a panic writes a crash dump and aborts. At milestone 1 the
-/// dump is a text report on stderr (the thread, the panic and a forced backtrace); the
-/// hook moves to `lactose-app`, and minidumps are milestone 5's (D155).
-fn install_crash_hook() {
-    std::panic::set_hook(Box::new(|info| {
-        let thread = std::thread::current();
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        let mut stderr = std::io::stderr().lock();
-        // Nothing is left to report a failed write to: the process aborts either way.
-        let _ = writeln!(
-            stderr,
-            "lactose-app-headless crashed\nthread: {}\n{info}\nbacktrace:\n{backtrace}",
-            thread.name().unwrap_or("<unnamed>"),
-        );
-        let _ = stderr.flush();
-        std::process::abort();
-    }));
+/// The variable that names the directory of crash report files. Unset or empty, it is
+/// `crash` in the working directory.
+const CRASH_DIR: &str = "LACTOSE_CRASH_DIR";
+
+/// The test hook (README, "Rules a caller should know"): set, the first frame's callback
+/// panics, on the frame worker that runs the timer root, so that a test sees the crash
+/// hook's report and the abort. Unset, the run is unchanged.
+const TEST_PANIC: &str = "LACTOSE_TEST_PANIC";
+
+/// Where a crash report's file goes: [`CRASH_DIR`]'s value, or `crash`.
+fn crash_dir() -> PathBuf {
+    std::env::var_os(CRASH_DIR)
+        .filter(|dir| !dir.is_empty())
+        .map_or_else(|| PathBuf::from("crash"), PathBuf::from)
 }
 
 /// Architecture section 3: every event at `info` and above, the assembly's at target `app`
@@ -195,7 +193,7 @@ fn install_subscriber() {
 /// policy says, the run still reports and shuts down, and the exit status is 2, so a
 /// script sees it.
 fn main() -> Result<ExitCode> {
-    install_crash_hook();
+    install_crash_hook("lactose-app-headless", Some(crash_dir()));
     install_subscriber();
     let Args { ticks, save_to } = Args::parse()?;
     let cooked = Arc::new(InMemory::new(RegionId(1))?);
@@ -206,7 +204,11 @@ fn main() -> Result<ExitCode> {
         saves: save_to.as_deref().and_then(Path::parent).map(Path::to_path_buf),
     };
     let mut app = Headless::start(&GAME, config, Arc::clone(&cooked) as Arc<dyn Cooked>)?;
-    let report: RunReport = app.run(ticks, frames(cooked)?)?;
+    let mut frames = frames(cooked)?;
+    if std::env::var_os(TEST_PANIC).is_some() {
+        frames = Box::new(|_| panic!("{TEST_PANIC} is set: the first frame panics"));
+    }
+    let report: RunReport = app.run(ticks, frames)?;
     println!(
         "{} ticks in {} frames ({} behind), hash {:#018x}",
         report.ticks, report.frames, report.behind, report.hash

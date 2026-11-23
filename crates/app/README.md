@@ -73,6 +73,7 @@ signature change to list.
 | `ErrorPolicy`, `Source`, `Response`, `LOG_TARGET` | The policy as a table from where an error came from to what the assembly does with it; the `tracing` target everything here logs at, `app` |
 | `Cooked`, `SavedRegion`, `SavedWorld`, `load` | Where cooked content comes from until the asset store exists; one region's saved state between loads; every region's saved state at one tick, which is what a container decodes to and what a save point yields; the load path from the slot's bytes to a `Start::Loaded` |
 | `SaveEncode` | A save being encoded on background tasks; the bytes then go to `lactose_io::Io::replace`, which nothing here wraps |
+| `install_crash_hook` | The panic hook every engine binary installs first in `main`: a text report to stderr, then to a file in the directory the binary names, then the abort ("The crash hook" below) |
 | `HeadlessConfig`, `Headless`, `RunReport` | The headless app: the executor, the IO pool and one server world, stepped from a test or run at tick rate by a tool, saved to a slot, shut down in order |
 | `WorldConfig::shown`, `RECORD_RESERVATION` (facade) | The configuration of a world that is shown, and the physics reservation a frame's record is left with while the step blocks: one, until `record-stall` reports |
 | `JOIN_MARGIN`, `SHED_DEPTH` (facade) | How long before the next tick's deadline a paced frame stops waiting for the frame before it, 2 ms; and the count of finished pictures still on their way to the display, taken as a present call begins, at which the frame after that call is shed: three, as `reviewer-gpu` measured it on the M1. `frame-pace` reads both |
@@ -99,6 +100,7 @@ table it is.
 |---|---|---|
 | `app-headless` (milestone 1) | Start an executor, an IO pool and a server world from the game's registrations, run N ticks at tick rate, report the hash, save, shut down in order; `main` returns the first fatal error | `Headless::{start, run, hash, save, shutdown}`, `RunReport`; the policy's `Stop` is `main`'s `Err` |
 | | The same from a save, losing no saved region | `load` before any world exists, `Start::Loaded`, the store ("Saves and loads" below) |
+| Every engine binary | A panic reported as text to stderr and to a file, and the process aborted, in every profile | `install_crash_hook`, first in `main` ("The crash hook" below) |
 | A SOUR test of the assembly | Build from the session's workers, layout and chaos; one unpaced tick at a time with the hash after each and every refusal visible; the chaos log at the end | `Workers::{frame_workers, chaos}`, `WorldConfig::layout`, `Headless::{step, hash, shutdown}`, `StepOutput::failures`; the glue is `tests/headless.rs`, section 4 |
 | The milestone 1 netcode spike, server side | Step the server once per frame with the sessions and inputs its jitter buffer released; take the gathered frame for its packer; the player's entity after a join; a full frame for the join over the table the server simulates with | `Server::frame` with a frame callback, `FrameOutput::gathered`, `Server::simulation` with `lactose_input::player_entity`, `Server::relevance` and `Server::time_scale` into a `StagedFrame::resync` |
 | The spike, client side | Build the prediction world on `JoinAccepted`; queue staged frames; one frame with a scripted sample; the last eight samples to send; a resync to request; the rollback cost and correction count to record | `build_client`, `Client::{push, frame, history}`, `ClientOutput::{reconciled, rollback, resync}` |
@@ -2685,6 +2687,41 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
   `run` and `save` fail with `Cancelled`.
 - A `Headless` is built on the thread that owns it and every method is called from that
   thread; none is called from a worker (`block_on` on a worker is a debug assertion).
+
+## The crash hook
+
+`install_crash_hook(binary, dir)` installs the process's panic hook (architecture section
+5.1, D155). Every engine binary calls it first in `main`, before its subscriber and before
+anything that can panic; RICOTTA keeps a hook of its own, since a tool does not link the
+assembly. It is safe code over `std` alone: no signal handler, no minidump, no second
+process. On a panic, on any thread, the hook:
+
+1. takes a lock it never releases, so that a panic on another thread waits for the abort
+   and the report is the process's first panic's;
+2. formats the report once, as text: `<binary> crashed`, `thread: <name>` (`<unnamed>` for
+   a thread without one), the panic's location and message as `std` prints them,
+   `backtrace:`, and a backtrace captured with `Backtrace::force_capture`, whatever
+   `RUST_BACKTRACE` says;
+3. writes it to stderr and flushes, before any file system call, so that a file system
+   that hangs or fails cannot cost it;
+4. when `dir` is `Some`, creates the directory with its parents and writes the same text to
+   a new file in it, `<binary>-<YYYYMMDD>T<HHMMSS>.<mmm>Z-<process id>.txt`, in UTC, so
+   that two crashes in one directory never share a name and the files sort by time; the
+   file is opened with `create_new`, so no report replaces another;
+5. writes one line to stderr: `<binary>: the crash report is in <path>`, or `<binary>: no
+   crash report file at <path>: <error>` naming the directory or the file that failed;
+6. calls `std::process::abort`, in every profile.
+
+A directory that cannot be created or written, or a file that cannot be written, costs the
+file alone: the failure is that one line, never a second panic, and the abort follows
+(`docs/verification.md`, the writable disk). `None` writes stderr alone. The directory is
+the binary's to choose (`crates/app-headless/README.md` gives the headless binary's), and
+the hook does not resolve it: a relative path is taken against the working directory at the
+panic. `binary` names the file, so it holds no path separator. A hardware fault, a signal
+and a stack overflow never reach a panic hook; they are read from the operating system's
+own report (D155). Tests never install the hook (D16), so `#[should_panic]` and a property
+test's shrinking keep unwinding; a test that expects an abort runs a binary in a subprocess,
+as `crates/app-headless/tests/crash.rs` does.
 
 ## The saved-type record
 

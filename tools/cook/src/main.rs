@@ -90,8 +90,9 @@ fn run(arguments: &Arguments) -> Result<()> {
     Ok(())
 }
 
-/// Architecture section 5.1: a panic writes a crash dump and aborts. At milestone 1 the
-/// dump is a text report on stderr, as `lactose-app-headless` writes it.
+/// Architecture section 5.1: a panic writes a crash report and aborts. The report is the
+/// text `lactose_app::install_crash_hook` writes, on stderr alone: a tool does not link the
+/// assembly, so it keeps a hook of its own (D155).
 fn install_crash_hook() {
     std::panic::set_hook(Box::new(|info| {
         let thread = std::thread::current();
