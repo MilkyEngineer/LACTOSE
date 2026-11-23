@@ -127,6 +127,7 @@ separate = [
   "lactose-net-host::interpolation_alloc",
   "lactose-persist::container",
   "lactose-physics-rapier::memory",
+  "lactose-task::job_alloc",
   # Tests of one binary share a process under `cargo test` and `cargo miri test`, and each
   # of these installs the process's one tracing subscriber and reads back what it saw.
   "lactose-app::proof",

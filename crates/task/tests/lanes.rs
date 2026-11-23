@@ -132,3 +132,19 @@ fn dropping_the_pump_cancels_pending_and_later_calls() {
     assert_eq!(Arc::strong_count(&token), 1, "a cancelled call is dropped, not kept");
     executor.shutdown();
 }
+
+/// A call's future polled again after it resolved panics: its result was handed over, and
+/// a `Pending` would wait for ever.
+#[test]
+#[should_panic(expected = "a lane call is not polled after it resolved")]
+fn a_lane_call_polled_after_it_resolved_panics() {
+    use core::pin::pin;
+    use core::task::{Context, Waker};
+
+    let (lane, mut pump) = lane::<u32>("polled-lane", || {});
+    let mut call = pin!(lane.run(|state| *state));
+    assert_eq!(pump.drain(&mut 7), 1);
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(call.as_mut().poll(&mut context).is_ready());
+    let _ = call.as_mut().poll(&mut context);
+}

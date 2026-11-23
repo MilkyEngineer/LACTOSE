@@ -232,3 +232,63 @@ fn a_replay_waits_for_a_run_the_program_has_not_started_yet() {
     program(&replaying, std::time::Duration::from_millis(2600));
     replaying.shutdown();
 }
+
+/// A job of `run_job` between two graph runs, its scope forking a child and a range: the
+/// log records the job and its children, and a replay starts them in the same order on the
+/// same workers, every child once.
+#[test]
+fn a_run_job_between_graph_runs_replays_in_the_recorded_order() {
+    let units = sized(16, 4);
+    let program = |executor: Executor| {
+        let placement = Placement::default();
+        let graph = executor.block_on(executor.run_graph(workload(&placement))).unwrap();
+        let job = {
+            let ran = placement.clone();
+            executor.run_job(move |ctx| {
+                ran.lock().unwrap().push((100, 0, "job", ctx.slot()));
+                let ran = &ran;
+                ctx.scope(|scope| {
+                    scope.fork(move |ctx| ran.lock().unwrap().push((100, 1, "fork", ctx.slot())));
+                    scope.fork_range(0..units, move |range, ctx| {
+                        for unit in range {
+                            ran.lock().unwrap().push((100, 10 + unit, "range", ctx.slot()));
+                        }
+                    });
+                });
+                7
+            })
+        };
+        assert_eq!(executor.block_on(job).unwrap(), 7);
+        drop(executor.block_on(executor.run_graph(graph)).unwrap());
+        let log = executor.execution_log().expect("recording was requested");
+        executor.shutdown();
+        let mut placement = core::mem::take(&mut *placement.lock().unwrap());
+        placement.sort_unstable();
+        (placement, log)
+    };
+    for seed in 0..u64::from(sized(4, 1)) {
+        let chaos = ChaosConfig {
+            seed,
+            shuffle_steals: true,
+            inject_yields: true,
+            force_split: seed % 2 == 0,
+            record: true,
+        };
+        let (recorded_placement, log) = program(builder().chaos(chaos).build().unwrap());
+        let ran: Vec<u32> =
+            recorded_placement.iter().filter(|entry| entry.0 == 100).map(|entry| entry.1).collect();
+        let expected: Vec<u32> =
+            [0, 1].into_iter().chain((0..units).map(|unit| 10 + unit)).collect();
+        assert_eq!(ran, expected, "seed {seed}: the job and each of its children ran once");
+
+        let log = ExecutionLog::from_bytes(log.as_bytes().to_vec());
+        let replaying = builder()
+            .replay(log.clone())
+            .chaos(ChaosConfig { record: true, ..ChaosConfig::default() })
+            .build()
+            .unwrap();
+        let (replayed_placement, replayed_log) = program(replaying);
+        assert_eq!(replayed_log, log, "seed {seed}");
+        assert_eq!(replayed_placement, recorded_placement, "seed {seed}");
+    }
+}

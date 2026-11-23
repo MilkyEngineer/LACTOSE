@@ -44,7 +44,8 @@ pub struct ChaosConfig {
 /// A recorded job execution order. Opaque; it round-trips through bytes so a failing CI run
 /// can attach it as an artifact.
 ///
-/// It covers graph jobs (each call of `GraphNode::run` and `finalize`) and scope children.
+/// It covers graph jobs (each call of `GraphNode::run` and `finalize`), the jobs of
+/// [`crate::Executor::run_job`] and scope children.
 /// Stackless tasks are not recorded: what wakes them (timers, IO, other threads) is outside
 /// anything a log could replay.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -80,6 +81,8 @@ pub(crate) enum JobKind {
     Finalize = 1,
     /// One call of a scope child.
     Child = 2,
+    /// One job of `Executor::run_job`.
+    Job = 3,
 }
 
 /// One job start.
@@ -87,10 +90,11 @@ pub(crate) enum JobKind {
 pub(crate) struct LogRecord {
     pub(crate) worker: u32,
     pub(crate) kind: JobKind,
-    /// The ordinal of the graph run for graph jobs; for a child, the log position of the
-    /// job that opened its scope.
+    /// The ordinal of the graph run for graph jobs, and of the job for a `run_job` job; for
+    /// a child, the log position of the job that opened its scope.
     pub(crate) key: u64,
-    /// The node for graph jobs; for a child, its fork ordinal within the opening job.
+    /// The node for graph jobs; for a child, its fork ordinal within the opening job; zero
+    /// for a `run_job` job, whose units are `0..1`.
     pub(crate) index: u32,
     pub(crate) units: Range<u32>,
 }
@@ -138,6 +142,7 @@ fn decode(log: &ExecutionLog, workers: u32) -> Result<Vec<LogRecord>> {
                 0 => JobKind::Units,
                 1 => JobKind::Finalize,
                 2 => JobKind::Child,
+                3 => JobKind::Job,
                 _ => return Err(invalid("execution log names an unknown job kind")),
             };
             let record = LogRecord {
@@ -439,6 +444,7 @@ fn find(pool: &[Entry], record: &LogRecord) -> Option<usize> {
                 && units.start <= wanted.start
                 && wanted.end <= units.end
         }
+        (Entry::Job(job), JobKind::Job) => job.ordinal() == record.key,
         _ => false,
     })
 }
@@ -465,6 +471,9 @@ fn describe_whole(entry: &Entry, worker: u32) -> LogRecord {
             let (key, index) = child_identity(*scope, *job);
             LogRecord { worker, kind: JobKind::Child, key, index, units: first(units) }
         }
+        Entry::Job(job) => {
+            LogRecord { worker, kind: JobKind::Job, key: job.ordinal(), index: 0, units: 0..1 }
+        }
         Entry::Task(_) => unreachable!("tasks never enter the replay pool"),
     }
 }
@@ -475,6 +484,7 @@ fn carve(pool: &mut Vec<Entry>, at: usize, units: Range<u32>) -> Entry {
     let entry = pool.swap_remove(at);
     let whole = match &entry {
         Entry::Range { units, .. } | Entry::Child { units, .. } => units.clone(),
+        Entry::Job(_) => 0..1,
         Entry::Task(_) => unreachable!("tasks never enter the replay pool"),
     };
     for rest in [whole.start..units.start, units.end..whole.end] {
@@ -499,6 +509,7 @@ mod tests {
             record(0, JobKind::Units, 0..4),
             record(3, JobKind::Finalize, 0..0),
             record(1, JobKind::Child, 2..3),
+            record(2, JobKind::Job, 0..1),
         ];
         let log = encode(4, &records);
         let copy = ExecutionLog::from_bytes(log.as_bytes().to_vec());

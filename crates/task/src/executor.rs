@@ -15,6 +15,8 @@ use lactose_core::{AllocTag, Error, ErrorKind, Result, ThreadClass};
 use crate::WorkerClass;
 use crate::chaos::{Chaos, ChaosConfig, ExecutionLog};
 use crate::graph::{self, Graph, GraphRun};
+use crate::job::JobContext;
+use crate::job_run::{self, JobRun};
 use crate::platform::{Platform, StdPlatform, ThreadHandle, ThreadSpec};
 use crate::platform::{default_background_workers, default_frame_workers};
 use crate::pool::{Shared, WorkerSeed, on_worker_of, on_worker_thread, worker_thread};
@@ -84,6 +86,40 @@ impl Executor {
     /// and the graph is then dropped.
     pub fn run_graph(&self, graph: Graph) -> GraphRun {
         graph::start(&self.owner.shared, graph)
+    }
+
+    /// Runs `job` once, as one job on a frame-critical worker, and resolves to what it
+    /// returned.
+    ///
+    /// The job is queued at the call, as a graph run starts at the call, and never runs
+    /// inside it: a frame-critical worker takes it, never a background worker or a thread
+    /// that is no worker. It is one job as one call of [`crate::GraphNode::run`] with one unit
+    /// is, with that job's [`JobContext`], one abort-on-unwind guard and no `finalize`; it may
+    /// open scopes one after another. A worker takes it only with a run permit, and one that
+    /// takes it while a `block_in_place` wants that worker parked puts it back unstarted.
+    ///
+    /// Such jobs, and the children their scopes fork, occupy at most
+    /// [`Executor::run_job_width`] frame-critical workers at any moment, so with two
+    /// frame-critical workers or more one of them is always free for graph jobs, tasks and
+    /// timers. They run one after the other. The opener of such a scope runs its children
+    /// itself while one is waiting, under the place its job holds.
+    ///
+    /// See [`JobRun`] for what the future says. The closure may wait for nothing but its own
+    /// scopes.
+    pub fn run_job<F, R>(&self, job: F) -> JobRun<R>
+    where
+        F: FnOnce(&mut JobContext<'_>) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        job_run::start(&self.owner.shared, job)
+    }
+
+    /// How many frame-critical workers the jobs [`Executor::run_job`] starts, and the children
+    /// their scopes fork, occupy at most at any moment: [`Executor::frame_worker_count`] less
+    /// one, and one where that is one. A constant of the executor.
+    #[must_use]
+    pub fn run_job_width(&self) -> u32 {
+        self.owner.shared.wide.width.limit() as u32
     }
 
     /// The number of frame-critical workers.
@@ -178,8 +214,10 @@ impl Executor {
     /// Stops accepting work, lets running jobs finish, cancels unfinished tasks and joins
     /// every worker. Returns once all threads have exited.
     ///
-    /// Queued graph work is dropped. A [`GraphRun`], [`Task`] or [`Sleep`] that was cut off
-    /// resolves to an error of kind `Cancelled`. Other clones of the handle stay valid and
+    /// Queued graph work is dropped, and a queued job of [`Executor::run_job`] is dropped
+    /// unrun. A [`GraphRun`], [`JobRun`], [`Task`] or [`Sleep`] that was cut off resolves to
+    /// an error of kind `Cancelled`; a job that has started finishes and hands its value
+    /// back. Other clones of the handle stay valid and
     /// inert: what they start is cancelled at once.
     ///
     /// Called on one of this executor's own workers, from a task or a job, it cannot wait
@@ -336,6 +374,9 @@ impl ExecutorBuilder {
         Ok(Executor { owner: Arc::new(Owner { shared }) })
     }
 }
+
+#[cfg(all(test, not(feature = "loom")))]
+mod job_tests;
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {

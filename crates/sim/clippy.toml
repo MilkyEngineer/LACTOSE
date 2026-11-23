@@ -215,7 +215,7 @@ disallowed-methods = [
   { path = "lactose_task::Executor::slot_count", reason = "the worker count is not a semantic key; key by StableKey", allow-invalid = true },
   { path = "lactose_task::Executor::spawn", reason = "a boundary crate runs schedules, not arbitrary tasks", allow-invalid = true },
   { path = "lactose_task::Executor::run_graph", reason = "a boundary crate runs schedules through lactose_ecs::Schedule, not graphs", allow-invalid = true },
-  { path = "lactose_task::Executor::run_job", reason = "a boundary crate runs schedules through lactose_ecs::Schedule, not jobs", allow-invalid = true },
+  { path = "lactose_task::Executor::run_job", reason = "a boundary crate runs schedules through lactose_ecs::Schedule, not jobs" },
   { path = "lactose_task::Executor::platform", reason = "a boundary crate creates no thread", allow-invalid = true },
   { path = "lactose_task::Executor::sleep_until", reason = "no wall-clock time inside the boundary", allow-invalid = true },
   { path = "lactose_task::Executor::execution_log", reason = "scheduling history is not simulation input", allow-invalid = true },

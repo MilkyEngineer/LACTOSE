@@ -9159,6 +9159,146 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   finished", which is so for the span of a call, in a command, its heap slot holding the last
   target's image between calls. No sentence of the architecture is replaced, and nothing of D153 or
   of D157 to D161.
+- Addendum (lane task-job, 2026-11-23): built. `Executor::run_job`, `JobRun` and
+  `Executor::run_job_width` in `lactose-task`, with the signatures of `crates/app/README.md`'s
+  ask, and a `LaneCall` polled after it resolved panics ("a lane call is not polled after it
+  resolved"), as a `JobRun` does ("a job run is not polled after it resolved"). What D162 left to
+  the lane, and how each was settled:
+  - *No name.* `run_job` takes none. Its span is target `whisk`, named `run_job`: the frame is its
+    one caller, and a name passed by the caller would tell nothing apart.
+  - *Its place in an execution log* is a record of a new kind, `Job` (3), whose key is the job's
+    ordinal, drawn from the counter that numbers graph runs, so that runs and jobs are numbered in
+    the order the program starts them; its index is 0 and its units `0..1`. The log's version
+    stays 1: the kind is new, no record changed, and a log is read by the build that wrote it. A
+    replay hands the job to the worker the log names, as it does a graph run's job.
+  - *The completion slot reuses nothing.* `JobSlot` (`src/job_run.rs`) is one mutex over the
+    job's stage (the closure, then the value, then taken), the future's waker and whether the
+    future was dropped. The worker takes the closure out under it, runs it unlocked, and stores the
+    value under it; the future takes the value under it; whichever of the two comes second drops
+    the value. A queued job that shutdown sweeps is dropped under the abort guard on the sweeping
+    thread, its closure first and its `Cancelled` stored after, so the future never resolves
+    `Cancelled` before the closure is gone. Its locks are the slot's alone: at the call (below),
+    at the take, at the store, at each poll, when the future is dropped unresolved, and once or
+    twice in a cancel at shutdown. Every closure, value and waker is dropped or woken outside
+    it, a waker that a poll replaces too: a foreign waker's drop may run anything, the slot's
+    own calls included. A job does not enter the run registry.
+  - *Queued against shutdown.* A submission and shutdown's sweep are a store-buffering pair: a
+    submitter queues its entry, issues a `fence(SeqCst)` and reads the flag, and sweeps the
+    queues itself if the flag is up; shutdown raises the flag, issues a `fence(SeqCst)` and
+    sweeps. `ShutdownFlag` (`src/shutdown.rs`) holds both halves, and `submit_job`,
+    `submit_task` and `submit_range` queue through its `queue`, which the model calls; what
+    they hand it, the push and the sweep, the model copies. What holds each submission's own
+    sweep is a pool test of its own, for a job, a task and a graph's range: a hook that only
+    the crate's native tests compile, and not the loom build, sets the flag between the push
+    and the read, on the test's own executor, whose one frame-critical worker a job holds, and
+    the entry is gone by the time the call that queued it returns, a job's and a task's future
+    resolved `Cancelled` by then. Against `crossbeam-deque`'s injector, whose push is a
+    `SeqCst` compare-exchange and whose empty steal issues its own `fence(SeqCst)`, and against
+    the stand-in deque's lock, the two fences are margin; against the model's queue they carry
+    the pair.
+  - *How the pool keeps the width* is the README's way, with two queues of the frame-critical
+    pool's that hold such work alone (`crossbeam-deque` injectors, one for jobs and one for
+    children), and one atomic word that is the count of occupied places and a flag a job holds. A
+    worker with no place raises the word by a compare-exchange only while the count is below the
+    width and, for a job, the flag is down; it lowers it with a `fetch_sub`, then a `fence(SeqCst)`,
+    then reads the queues and wakes an idle worker if one could take from them now. A worker that
+    queues such work tells the scope's opener when it is not the opener, then issues a
+    `fence(SeqCst)`, then reads the word and wakes an idle worker if a place is free: the
+    store-buffering pair of D162's note, each side's write before its read of the other's word,
+    with a `SeqCst` fence between them. The opener takes its scope's children from the children's
+    queue under its job's place, and the scope wait asks it, after every wake that leaves the scope
+    unfinished, whether that queue holds any before it parks again (`Opener::look` in
+    `src/gate.rs`; a deque's opener answers no, since only it pushes there). A worker running such
+    a child splits what is left of it while the children's queue is empty, the rule a deque's
+    range follows with its deque, and pushes the half there. A worker that takes a job while
+    `block_in_place` wants it parked puts it back unstarted and gives its place up, which wakes a
+    worker for it. The pool's look for visible work counts the two queues only while the word
+    admits a worker with no place; a replay places such work by the log and leaves the word alone.
+  - *Two such jobs in flight run one after the other.* The flag a job raises keeps a second job
+    queued until the first's closure has returned, whatever places are free. So every queued child
+    is a child of the one scope that is open, no worker that holds no place has to check an entry's
+    scope, and a worker inside one such job never meets another scope's entry or another job; the
+    opener asserts it of every child it takes. The frame never has two.
+  - *One allocation a call*, as the target: the `Arc` cell that holds the slot, under
+    `AllocTag::Task`, on the calling thread. Where std's mutex allocates at its first lock, as on
+    Apple targets, the cell's mutex is a second; the call locks it once at once, so that that
+    allocation is the task tag's too and is made there. Beside those, a job costs a share of a block
+    of the jobs' queue, and a child a share of a block of the children's queue, one block per 63
+    entries (`tests/job_alloc.rs`: on the M1, 2,540 allocations for 1,260 calls beside
+    `block_on`'s, 2,520 of them the task tag's, and 320 for 20,160 children). The closure runs
+    untagged, as a graph job does.
+  - *The ban's entry drops `allow-invalid`.* clippy refuses a boundary crate's call, shown once
+    with a call added to `lactose-sim` and taken out again: "use of a disallowed method
+    `lactose_task::Executor::run_job`", with the entry's reason. With the method in place the entry
+    needs no `allow-invalid`: without it clippy says nothing in a boundary crate that links
+    `lactose-task` (`lactose-sim`, `lactose-ecs`) or in one that does not (`lactose-math`), and an
+    entry whose path does not exist, tried as `run_jobx`, makes clippy print "does not refer to a
+    reachable function" in a crate that links it, which `allow-invalid` would have hidden. That
+    print is a warning that `-D warnings` does not deny, so it is a sign and not a gate; `cargo
+    xtask boundary` still pins the entry by name. Dropped in `crates/core/clippy.toml` and its
+    fourteen copies alike; no other entry of the file changed.
+  - *loom 0.7.2, as the lane found it.* A plain store on one thread and a read-modify-write of the
+    same atomic on another are ordered only in part: a later load, on the storing thread too, may
+    read the value the read-modify-write wrote, which no modification order allows, and the width's
+    models reported deadlocks that cannot happen. The models' queues push by a `fetch_or`
+    into a word of slots, a read-modify-write, and a take is one compare-exchange. Dropping a loom `Arc`
+    while a deadlock's panic unwinds panics again inside loom and aborts the test binary, so the
+    models that are meant to deadlock share their state through `std::sync::Arc`. An unpark of a
+    loom thread that is blocked on a mutex or a join makes it runnable and saves no token.
+  - *The proof.* The loom models, each beside the weakened variants that fail it at its bound,
+    in `src/models.rs`, module `jobs`: the completion slot against a dropped `JobRun`, exhaustive
+    (a worker that keeps the value of a dropped future, and a dropper that leaves it in the slot,
+    fail it); a worker taking the job against shutdown, at five preemptions (a cancel that
+    resolves before the closure is dropped, and a sweep that forgets the job, fail it); the width
+    at two preemptions in three configurations: a width of one on two workers, the main thread
+    queueing two jobs while the workers run, failed by the push fence or the leave fence
+    dropped, by acquire-release fences and by a count read and raised in two steps; a width of
+    two with two jobs on three workers, failed by a job that raises the count as a child does
+    and ignores the flag; and a width of two with one job on three workers whose range's half is
+    held, failed by the opener's loop as it was, which does not look after a wake; a job queued
+    at a width of two while a worker gives back a child's place it took for nothing, at two
+    preemptions, failed by the push fence or the leave fence dropped and by acquire-release
+    fences; a child that only the wake of a holder's `leave` can deliver, at one, failed by a
+    `leave` that leaves the children out of what it checks; and a job and a task queued through
+    `ShutdownFlag::queue` against shutdown's flag and sweep, at one, failed by a submission that
+    does not read the flag after queueing, by its fence dropped and by the sweep's fence dropped.
+    The model's sweep reads a queue before it empties it, as a steal from an empty
+    `crossbeam-deque` injector writes nothing; a sweep that always wrote would hide the missing
+    fence. Each bound is the smallest that fails every variant of its model, found with
+    `LOOM_MAX_PREEMPTIONS` from one. In the two configurations of three workers the jobs are
+    queued before the workers start, which keeps their searches within minutes; there, the
+    leave fence dropped fails nothing, since a worker that lowers the count always finds what
+    was queued long before, and the count raised in two steps needs three preemptions, past
+    the bound. Five terms are copies in the models, since loom cannot run `WorkerLocal` or
+    `Shared`; the module's doc names each with the native test that holds it: `idle`'s look, by
+    a job queued as the one frame-critical worker goes idle, 5,000 times with the gaps swept
+    across the window before it sleeps; `WideChildren::look`, by an opener that parked taking
+    the halves queued after it parked, over rounds until five sent a part off the opener, and
+    the split rule, by a range that reaches a second worker; `WideChildren::park`, by the
+    width's occupancy with the opener parked; `JobCell::run`'s flag, by a job taken after
+    shutdown began; and the submissions' push and sweep, by the three pool tests above. By
+    order, in `src/executor/job_tests.rs`: a job's scope forking `frame_worker_count()` children and one
+    more, held, beside a task's `sleep_until` and a graph run that complete meanwhile, on four
+    workers and on two, where every child runs on the job's own worker; the opener parked
+    beside a full width, its place kept, with a second job held back; a second job waiting
+    beside a first that leaves room in the width, by the flag alone; a job queued while the gate
+    holds the other worker, still queued once that worker, woken for it, sleeps again; one
+    worker. In `tests/jobs.rs`: where the job runs and never inside the call, shutdown before
+    and after the start (the job released once a job queued on a clone resolves `Cancelled`),
+    the reservation, who drops the value, the job queued as the worker goes idle, and a child
+    that crosses to another worker, which the nightly Miri entry runs. A job taken at a closed
+    gate is put back, one taken after shutdown began never starts, and a job, a task and a
+    range queued as shutdown begins are swept by their own submission, in `src/pool.rs`; a
+    record and a replay under chaos with a `run_job` between two graph runs, in
+    `tests/chaos.rs`. Each test that review rounds 1 and 2 asked for fails against the mutant
+    it was asked for. The suite, its 39 models and variants with the 25 of `jobs`, took 390 s of
+    wall time on the M1 in release (`cargo test -p lactose-task --features loom --release`, load
+    averages 17.51 before and 14.74 after), against 303 s at 3.7 before the three models of
+    review round 1, which with their variants take under a second of it at their bounds (0.97 s,
+    at a load of 6.2, for them and three older variants together): the rest is the load of
+    other agents' builds. Its longest models are the two width configurations of three workers;
+    the nightly job's runner has fewer cores, and its sixty minutes also hold
+    `lactose-input-host`'s and `lactose-net-host`'s models.
 
 **D163. `lactose-rhi-vulkan` without a window, and the Vulkan step of `cargo xtask gpu`** (§12.1, §20, §21, `lactose-rhi-vulkan`, `lactose-rhi-api`, `tools/xtask`, `crate-tiers.toml`)
 - Why: the milestone 2 plan's lane `vulkan`, under its decisions 5.7, 5.10, 5.12 and D158.

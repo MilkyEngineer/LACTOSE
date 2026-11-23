@@ -66,6 +66,7 @@ impl<'job> JobContext<'job> {
                     opener: self.local.index,
                     tag: AllocTag::current(),
                     position: self.position,
+                    wide: self.local.wide_job.get(),
                 },
                 local: self.local,
                 jobs: &*self.scope_jobs,
@@ -145,6 +146,9 @@ pub(crate) struct ScopeCore {
     pub(crate) tag: AllocTag,
     /// The opening job's position in the execution log.
     pub(crate) position: u64,
+    /// Whether the opening job is one of `Executor::run_job`'s, whose children wait on the
+    /// pool's queue for such work and not on the opener's deque.
+    pub(crate) wide: bool,
 }
 
 /// The type-erased head of a child job in scope job storage.
@@ -292,8 +296,10 @@ impl<'scope> Scope<'scope, '_> {
     fn submit(&self, job: NonNull<ChildHeader>, units: Range<u32>) {
         self.core.latch.add(units.len());
         let entry = Entry::Child { scope: NonNull::from(&self.core), job, units };
-        match self.local.shared.replay() {
-            Some(replay) => self.local.shared.replay_wake(replay.push(entry)),
+        let shared = &*self.local.shared;
+        match shared.replay() {
+            Some(replay) => shared.replay_wake(replay.push(entry)),
+            None if self.core.wide => shared.submit_wide_child(entry, None),
             None => self.local.push(entry),
         }
     }
@@ -365,10 +371,67 @@ impl<'scope> Scope<'scope, '_> {
             fn spin(&mut self, latch: &Latch) -> bool {
                 spin_until(LATCH_SPIN, || latch.is_set())
             }
+
+            fn look(&mut self) -> bool {
+                false
+            }
+
+            fn park(&mut self, latch: &Latch) {
+                self.local.pool().park_opener(latch);
+            }
         }
 
-        let mut children = Children { local, own, scratch: child_scratch };
-        pool.wait_for_children(latch, local.index, &mut children);
+        /// The same for a scope of a `run_job` job, whose children wait on the pool's queue
+        /// for such work. The opener takes them there under its job's place. Every child
+        /// queued is this scope's: such jobs run one after the other and open their scopes
+        /// one after another, and a scope closes only once none of its units is left.
+        struct WideChildren<'a> {
+            local: &'a WorkerLocal,
+            own: NonNull<ScopeCore>,
+            scratch: &'a mut Arena,
+        }
+
+        impl Opener for WideChildren<'_> {
+            fn run_children(&mut self) -> bool {
+                let (local, pool) = (self.local, self.local.pool());
+                let wide = &local.shared.wide;
+                while !pool.over_limit() || self.shutting_down() {
+                    match wide.take_child() {
+                        Some(Entry::Child { scope, job, units }) => {
+                            assert!(scope == self.own, "a child of another scope waits for a job");
+                            run_child(local, scope, job, units, self.scratch);
+                        }
+                        Some(_) => unreachable!("the queue holds children alone"),
+                        None => return false,
+                    }
+                }
+                wide.has_children()
+            }
+
+            fn shutting_down(&self) -> bool {
+                self.local.shared.is_shut_down()
+            }
+
+            fn spin(&mut self, latch: &Latch) -> bool {
+                spin_until(LATCH_SPIN, || latch.is_set())
+            }
+
+            fn look(&mut self) -> bool {
+                self.local.shared.wide.has_children()
+            }
+
+            fn park(&mut self, latch: &Latch) {
+                self.local.pool().park_opener(latch);
+            }
+        }
+
+        if self.core.wide {
+            let mut children = WideChildren { local, own, scratch: child_scratch };
+            pool.wait_for_children(latch, local.index, &mut children);
+        } else {
+            let mut children = Children { local, own, scratch: child_scratch };
+            pool.wait_for_children(latch, local.index, &mut children);
+        }
     }
 
     /// Drops the closures of this scope's range jobs. Every child has finished.
@@ -399,12 +462,13 @@ pub(crate) fn run_child(
     // SAFETY: the entry carrying these pointers exists, so the latch still counts `units`
     // and the opener has not returned from `JobContext::scope`: the scope and the job
     // storage are alive. These fields are written before any entry exists and never change.
-    let (opener, tag, position, call, ordinal) = unsafe {
+    let (opener, tag, position, wide, call, ordinal) = unsafe {
         let core = scope.as_ptr();
         (
             (*core).opener,
             (*core).tag,
             (*core).position,
+            (*core).wide,
             (*job.as_ptr()).call,
             (*job.as_ptr()).ordinal,
         )
@@ -427,10 +491,19 @@ pub(crate) fn run_child(
         done
     } else {
         let recorder = shared.chaos.as_ref().filter(|chaos| chaos.recording());
+        // The half split off a child of a `run_job` job goes to the pool's queue for such
+        // work, where its opener and the workers the width admits take it, and wakes the
+        // opener. It is split while that queue is empty, as a deque's range is while the
+        // deque is.
+        let other = (opener != local.index).then_some(opener);
         drain_range(
             local,
             units,
-            |upper| local.push(Entry::Child { scope, job, units: upper }),
+            |upper| {
+                let entry = Entry::Child { scope, job, units: upper };
+                if wide { shared.submit_wide_child(entry, other) } else { local.push(entry) }
+            },
+            || if wide { !shared.wide.has_children() } else { local.deque.is_empty() },
             |units| {
                 if let Some(chaos) = recorder {
                     chaos.record(LogRecord {
