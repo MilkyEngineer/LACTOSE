@@ -252,3 +252,38 @@ pub(crate) fn compute(
 ) -> Result<(ComputeObj, Vec<u64>)> {
     Ok((ComputeObj, vec![stage(caps, &desc.stage, ShaderStage::Compute)?]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lactose_rhi_api::PipelineStats;
+
+    fn state(bytes: &[u8]) -> PipelineState {
+        let (cache, stages) = open(bytes);
+        let stats = PipelineStats {
+            cache,
+            pipelines: 0,
+            stage_hits: 0,
+            stage_misses: 0,
+            creation: core::time::Duration::ZERO,
+        };
+        PipelineState { stats, stages }
+    }
+
+    /// Null reports every stage, as the suite holds a driver that reports to: a stage its
+    /// cache lacks is a miss and one it holds a hit, on a device started from the cache too.
+    #[test]
+    fn every_stage_is_counted_a_hit_or_a_miss() {
+        let mut cold = state(&[]);
+        count(&mut cold, &[1], Instant::now());
+        count(&mut cold, &[1, 2], Instant::now());
+        let counts = |state: &PipelineState| {
+            (state.stats.pipelines, state.stats.stage_hits, state.stats.stage_misses)
+        };
+        assert_eq!(counts(&cold), (2, 1, 2));
+        let mut warm = state(&seal(&cold.stages).expect("the cache's bytes"));
+        assert_eq!(warm.stats.cache, CacheStart::Loaded);
+        count(&mut warm, &[2, 1, 3], Instant::now());
+        assert_eq!(counts(&warm), (1, 2, 1));
+    }
+}

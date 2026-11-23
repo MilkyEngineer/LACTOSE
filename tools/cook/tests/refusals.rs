@@ -413,6 +413,6 @@ fn the_binary_exits_one_with_the_refusal_and_two_with_the_usage() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "usage: ricotta [--slangc SLANGC] [--code DIR] SOURCES PACK\n"
+        "usage: ricotta [--slangc SLANGC] [--code DIR] [--shaders DIR] SOURCES PACK\n"
     );
 }

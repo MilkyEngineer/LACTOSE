@@ -34,11 +34,12 @@ the cooker writes, is `lactose-asset`'s ("The cooked pack set" below).
 
 ## The command line
 
-`ricotta [--slangc SLANGC] [--code DIR] SOURCES PACK`, the two paths required and each
-option at most once, before them; nothing else is accepted (exit 2 and the usage otherwise).
-`--slangc` names the pinned `slangc`, which a tree with a shader source needs
-(`NotFound` without it), and `--code` a directory that also receives each cooked shader's
-code ("The shader kind"); `--code` without `--slangc` is refused (`InvalidData`).
+`ricotta [--slangc SLANGC] [--code DIR] [--shaders DIR] SOURCES PACK`, the two paths required
+and each option at most once, before them; nothing else is accepted (exit 2 and the usage
+otherwise). `--slangc` names the pinned `slangc`, which a tree with a shader source needs
+(`NotFound` without it), `--code` a directory that also receives each cooked shader's code,
+and `--shaders` one that receives each cooked shader whole ("The shader kind"); either
+without `--slangc` is refused (`InvalidData`).
 
 - **Sources.** Every regular file under the directory `SOURCES`, at any depth, whose name
   ends in `.gltf` is a source, hidden files included (a `._knight.gltf` a copy left behind
@@ -115,6 +116,10 @@ dependency.
   metallib, is also written to `DIR/<asset name>` once every source has cooked, before the
   pack, each file replaced by rename. It is what `cargo xtask gpu` and the `shaders` CI job
   load through Metal.
+- **`--shaders DIR`.** Each cooked shader whole, the bytes of `CookedShader::encode` that
+  `CookedShader::decode` reads, is written to `DIR/<asset name>` in the same way: what a
+  device test reads with no pack reader, which a backend crate may not depend on
+  (`cargo xtask gpu`, `lactose-rhi-vulkan`).
 
 ## The checks
 
@@ -409,7 +414,7 @@ The tests that run Slang are ignored, and run once `cargo xtask slang` has insta
 | A `slangc` of another version, the SDK's among them, and a missing one, are refused; a shader source with no `slangc`, a link module alone and `--code` without `--slangc` are refused | `tests/shader.rs`, `a_slangc_of_another_version_is_refused`, `a_shader_without_slangc_and_a_lone_link_module_are_refused`, `the_binary_refuses_code_without_slangc` |
 | Two checkouts at different paths cook the same SPIR-V and MSL, no cooked file names a path of either checkout or of the temporary directory, and the metallibs' equality is printed | `tests/shader.rs`, `two_checkouts_at_different_paths_cook_the_same_spirv_and_msl_and_name_no_path` |
 | The link-time constant folds into both targets: `discard_fragment` and `OpKill` with it true, neither with it false, and no specialisation constant for it | `tests/shader.rs`, `the_link_time_constant_folds_into_both_targets` |
-| The engine shader cooks to what its code declares, loaded back from the pack through a store: the heap's two arrays and capacities, the constant and its type, the push bytes, the input attachment, each output and each varying | `tests/shader.rs`, `the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack` |
+| `shaders/` cooks to every entry of its sources by name, the conformance suite's of `shaders/conformance/` beside the surface's, each of its stage; the engine shader cooks to what its code declares, loaded back from the pack through a store: the heap's two arrays and capacities, the constant and its type, the push bytes, the input attachment, each output and each varying | `tests/shader.rs`, `the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack` |
 | A compute entry's workgroup, a constant of each type and a varying of each component type cook to the format, each target alike, the fragment entry's varyings the ones it reads; a workgroup above the invocation limit is refused | `tests/shader.rs`, `a_compute_entrys_workgroup_and_each_constant_and_varying_type_cook`, `a_workgroup_out_of_bounds_is_refused` |
 | The varying components with the built-ins, on the gpu review's probes: sixteen `float4` and `Position` (v14), the same read with `FragCoord` (v23), and fifteen read with `FragCoord` and `FrontFacing` (v25) are refused, each naming its count; fifteen read with `FragCoord` (v24) cook | `tests/shader.rs`, `varyings_and_built_ins_past_64_components_are_refused` |
 | A `half`, an `int16_t` and a `double` varying and constant, and a `centroid` and a `sample` varying, are refused by name | `tests/shader.rs`, `a_varying_or_constant_of_16_or_64_bits_or_centroid_or_sample_is_refused_by_name` |

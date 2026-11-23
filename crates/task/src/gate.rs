@@ -225,10 +225,24 @@ pub(crate) trait Opener {
     fn shutting_down(&self) -> bool;
     /// Spins briefly on the latch before the first park. Returns whether it is set.
     fn spin(&mut self, latch: &Latch) -> bool;
+    /// Whether, after a wake, a child of this scope may be waiting where this opener takes
+    /// its children from. Asked after every wake that leaves the scope unfinished, when
+    /// [`Opener::run_children`] last found none left. An opener whose children wait on its
+    /// own deque answers `false`: only it pushes there, so none can have come. One whose
+    /// children wait on the pool's queue for such work answers whether that queue holds
+    /// any, since the half another worker splits off or puts back lands there and wakes it.
+    fn look(&mut self) -> bool;
+    /// Parks the opener on `latch`.
+    fn park(&mut self, latch: &Latch) {
+        latch.park();
+    }
 }
 
-/// The wait of a scope's opener: run the children that are on this worker's deque, then
-/// park on `latch` until the ones other workers took are done.
+/// The wait of a scope's opener: run the children that wait for this worker, then park on
+/// `latch` until the ones other workers took are done. A scope's children wait on its
+/// opener's deque, or for a scope of a job of `Executor::run_job` on the pool's queue for
+/// such work, where one can be queued after the opener parked; such an opener looks there
+/// again after every wake before it parks again ([`Opener::look`]).
 ///
 /// The opener parks without its permit, so a worker that runs nothing never uses up a
 /// `block_in_place` reservation. If the gate stopped it with children still on its deque, it
@@ -246,7 +260,7 @@ pub(crate) fn wait_for_children(
 ) {
     let mut spun = false;
     loop {
-        let children_here = opener.run_children();
+        let mut children_here = opener.run_children();
         if latch.is_set() {
             return;
         }
@@ -273,7 +287,7 @@ pub(crate) fn wait_for_children(
             } else if children_here && gate.try_acquire() {
                 Some(true)
             } else {
-                latch.park();
+                opener.park(latch);
                 None
             };
             if children_here {
@@ -291,11 +305,15 @@ pub(crate) fn wait_for_children(
                 gate.retake();
                 return;
             }
-            // Woken with the scope unfinished: by a gate opening, a freed permit, shutdown
-            // or a stale token. Only children on this deque are a reason to go round
-            // again; without any, park until the last child's count-down.
+            // Woken with the scope unfinished: by a gate opening, a freed permit, shutdown,
+            // a child queued where this opener takes them from, or a stale token. Only
+            // children waiting for this opener are a reason to go round again; without
+            // any, park until the last child's count-down or the next wake.
             if !children_here {
-                continue;
+                children_here = opener.look();
+                if !children_here {
+                    continue;
+                }
             }
             if opener.shutting_down() {
                 gate.retake();

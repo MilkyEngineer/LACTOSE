@@ -99,17 +99,23 @@ pub trait Device: Send + Sync {
         read: &mut dyn FnMut(&[u8]),
     ) -> Result<()>;
 
-    /// Makes the host's writes to a range visible to the device. Called after every
-    /// write and before the submit that reads it; it does nothing where
-    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported.
+    /// Makes the host's writes to a range of an `Upload` buffer visible to the device.
+    /// Called after every write and before the submit that reads it; it does nothing where
+    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported. A buffer
+    /// of another class is refused ([`Rule::Usage`](crate::Rule::Usage)), and so is a range
+    /// that overlaps a host access in progress
+    /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)), on every backend: a device
+    /// backend's flush is rounded out to the driver's atom.
     fn flush_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()>;
 
-    /// Makes the device's writes to a range visible to the host. Called after the submit
-    /// that wrote it completes and before the read; it does nothing where
-    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported. A call
-    /// while a pending submit writes the buffer or changes its state is refused on every
-    /// backend ([`Rule::Pending`](crate::Rule::Pending)): it would be taken for the
-    /// invalidate after the write.
+    /// Makes the device's writes to a range of a `Readback` buffer visible to the host.
+    /// Called after the submit that wrote it completes and before the read; it does nothing
+    /// where [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported. A
+    /// call while a pending submit writes the buffer or changes its state is refused on
+    /// every backend ([`Rule::Pending`](crate::Rule::Pending)): it would be taken for the
+    /// invalidate after the write. Class and overlap are as
+    /// [`flush_buffer`](Self::flush_buffer)'s: an invalidate of memory the host writes
+    /// would discard what it has not flushed.
     fn invalidate_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()>;
 
     /// Makes an image, every subresource
@@ -278,7 +284,10 @@ pub trait Device: Send + Sync {
     /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)); its signals are refused by the
     /// rules of `README.md`, "Timelines" ([`Rule::Timeline`](crate::Rule::Timeline)),
     /// among them a signal not greater than a value the same submit waits for on the
-    /// timeline. Both on every backend.
+    /// timeline, and one of a timeline another queue's submit has a pending signal of,
+    /// where no wait orders that signal first: a wait for one signal of a submit orders
+    /// the earlier submits of its queue and not the submit's other signals. Both on every
+    /// backend.
     ///
     /// # Errors
     ///

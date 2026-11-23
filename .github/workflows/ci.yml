@@ -272,7 +272,7 @@ jobs:
       # failure of either cook still lets the tests and the hashes below run and report.
       - name: Cook and load the engine shaders
         if: runner.os == 'macOS'
-        run: cargo xtask gpu --driver system
+        run: cargo xtask gpu --driver system --only metal
       - name: Cook the engine shaders
         if: runner.os != 'macOS'
         env:
@@ -305,6 +305,42 @@ jobs:
             target/gpu/hashes.txt
             target/gpu/facts.txt
             target/gpu/system-metal.txt
+          if-no-files-found: ignore
+
+  # Decision 5.10 of the milestone 2 plan: every device test under lavapipe, the pinned Khronos
+  # validation layer and its canaries (`cargo xtask gpu`, tools/xtask/README.md, "GPU runs").
+  # The image is pinned, since a runner image change is a driver change. On ubuntu-26.04 the
+  # nightly `gpu-probe` recorded (22 November 2026): Ubuntu's `mesa-vulkan-drivers` is Mesa
+  # 26.0.8, whose lavapipe offers Vulkan 1.4.335 with `VK_KHR_dynamic_rendering_local_read`,
+  # synchronization2, timeline semaphores and buffer device addresses (`bufferDeviceAddress`),
+  # and installs one manifest, `lvp_icd.json` in /usr/share/vulkan/icd.d/; it has one queue
+  # family of one queue, so compute shares the graphics queue. `mesa-vulkan-drivers` itself is
+  # not pinned: the step installs the archive's current one, and the run's file names the Mesa
+  # that ran (`DeviceInfo`'s driver). The loader and the layer are the pinned SDK's, whose
+  # archive is cached by the pin.
+  gpu-lavapipe:
+    name: gpu (lavapipe)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends mesa-vulkan-drivers
+      - uses: actions/cache@v4
+        with:
+          path: target/vulkan-sdk/download
+          key: vulkan-sdk-${{ hashFiles('tools/xtask/vulkan-layer.toml') }}
+      - name: The device tests under lavapipe
+        run: cargo xtask gpu --driver lavapipe --only vulkan
+      - uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: gpu-lavapipe
+          path: target/gpu/lavapipe-vulkan.txt
           if-no-files-found: ignore
 
   shaders-compare:
@@ -347,7 +383,7 @@ jobs:
         shell: bash
         run: bash tools/xtask/runner-facts.sh --metal-optional target/gpu/facts.txt
       - name: Load each metallib and MSL
-        run: cargo xtask gpu --driver system --cooked cooked/code
+        run: cargo xtask gpu --driver system --only metal --cooked cooked/code
       - uses: actions/upload-artifact@v4
         if: success() || failure()
         with:

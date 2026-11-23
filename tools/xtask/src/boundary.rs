@@ -57,7 +57,7 @@ const PIN_FLAGS: [&str; 2] = ["-C", "target-cpu=x86-64-v3"];
 /// reference and every copy is reported, and so is one moved to another table, where clippy
 /// no longer applies it, or one added without being pinned here. `allow-invalid` keeps clippy
 /// quiet about an entry whatever happens to it, and no test uses most of them.
-const REQUIRED_LINT_PATHS: [&str; 278] = [
+const REQUIRED_LINT_PATHS: [&str; 279] = [
     "f32::min",
     "f32::max",
     "f32::clamp",
@@ -236,6 +236,7 @@ const REQUIRED_LINT_PATHS: [&str; 278] = [
     "lactose_task::Executor::slot_count",
     "lactose_task::Executor::spawn",
     "lactose_task::Executor::run_graph",
+    "lactose_task::Executor::run_job",
     "lactose_task::Executor::sleep_until",
     "lactose_task::Executor::execution_log",
     "lactose_task::Executor::chaos_config",
@@ -2588,6 +2589,34 @@ mod tests {
                 unnamed("rayon"),
                 unnamed("serde"),
                 unnamed("tracing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_boundary_crates_test_may_not_run_on_a_device() {
+        // Decision 5.12 of the milestone 2 plan, against the real tier file: the Vulkan
+        // backend is on [test_support] for the render crates' tests, and a boundary crate's
+        // test that names it is still refused, by the interface the backend compiles.
+        let tiers = TierFile::parse(include_str!("../../../crate-tiers.toml")).unwrap();
+        assert!(tiers.test_support.iter().any(|c| c == "lactose-rhi-vulkan"));
+        let sim = package("lactose-sim", &[("lactose-core", Normal), ("lactose-rhi-vulkan", Dev)]);
+        let ws = workspace(vec![
+            package("lactose-core", &[("bytemuck", Normal)]),
+            sim.clone(),
+            package(
+                "lactose-rhi-vulkan",
+                &[("ash", Normal), ("lactose-core", Normal), ("lactose-rhi-api", Normal)],
+            ),
+            package("lactose-rhi-api", &[("lactose-core", Normal)]),
+        ]);
+        let mut findings = Vec::new();
+        dependency_allowlist(&tiers, &ws, &sim, &mut findings);
+        let found: Vec<String> = findings.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            found,
+            [
+                "crates/sim/Cargo.toml: boundary crate `lactose-sim` reaches non-boundary crate `lactose-rhi-api` in its tests (lactose-sim -> lactose-rhi-vulkan -> lactose-rhi-api), which [boundary_internal] in crate-tiers.toml does not allow at any depth"
             ]
         );
     }

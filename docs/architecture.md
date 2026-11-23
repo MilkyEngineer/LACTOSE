@@ -220,15 +220,25 @@ never runs background work while waiting. A job may open scopes in sequence but 
 allocated from a per-worker bump arena reset when the scope closes. Every deque entry carries
 the tag of the scope that forked it, and while a worker has a scope open, work pushed to it that
 is not a child of that scope is routed to the frame injector, so the opener's deque holds only
-its own children and it never runs older or unrelated work.
+its own children and it never runs older or unrelated work. Under the width of the jobs
+`Executor::run_job` starts (D162), a worker that has a scope of such a job open runs that
+scope's children itself, in the place it already holds: it takes no other scope's entry and no
+other such job, and it parks on the latch only when none of its scope's children is still to be
+started. Such children, and the halves split off them, wait on the frame-critical pool's queue
+for such work and not on the opener's deque: the opener takes them from there, looks there again
+after every wake before it parks again, and one that another worker queues after it parked
+wakes it.
 The physics step is the one sanctioned blocking wait on a worker (section 16):
 `block_in_place` lowers the number of run permits by its reservation, a worker holds a permit
 while it takes jobs, an opener parked on its latch holds none, and a permit that comes free
 while the count is lowered reaches both idle workers and openers waiting beside their own
 children.
 
-**Resolution means quiescent.** `GraphRun`, `Task` and `Sleep` resolve to a `Result`, and the
-error `Cancelled` means the executor shut down first. A graph run resolves, with the graph or
+**Resolution means quiescent.** `GraphRun`, `JobRun`, `Task` and `Sleep` resolve to a `Result`,
+and the error `Cancelled` means the executor shut down first. A job run resolves with its
+closure's value once the closure and every scope it opened have returned, shutdown or not, and
+with `Cancelled` only when shutdown began before the job started, its closure dropped unrun;
+dropping it cancels nothing. A graph run resolves, with the graph or
 with `Cancelled`, only when no unit, scope child or finalize of that run is executing or can
 start, and their writes happen before the resolution; this holds when the last handle is
 dropped on a worker and nothing is joined. After `Cancelled` the run is torn and the graph is
@@ -262,7 +272,14 @@ owns its data and may be cancelled by drop. Waiting is an `.await`.
 
 - Each worker owns a `crossbeam-deque`. Work stealing uses thief-side split-on-steal: a
   stolen chunk-range job is split in half and the thief pushes one half to its own deque.
-  There is no fixed task-duration target.
+  There is no fixed task-duration target. The jobs `Executor::run_job` starts, and the
+  children their scopes fork, occupy all the frame-critical workers but one at most at any
+  moment, and one where there is one, so that a worker is left to fire the timers and run
+  the timer root while a record fills the others (D162); such jobs run one after the other.
+  Such work waits on two queues of the frame-critical pool's, for its jobs and for its
+  children, and never on a worker's deque. A worker that holds no place takes from them only
+  within that width, and one running such a child splits what is left of its range while the
+  children's queue is empty and pushes the half there.
 - Idle workers spin for 50 microseconds, then `std::thread::park`. The worker keeping the
   timers steps its timed park (0.6 of the time left, repeated) and spins the last 50
   microseconds, because macOS lengthens a timed wait by a leeway proportional to the timeout

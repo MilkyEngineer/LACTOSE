@@ -90,6 +90,13 @@ jobs:
           - name: rhi-null, doc
             key: rhi-null-doc
             args: -p lactose-rhi-null --doc
+          # The Vulkan backend's unit tests: its records' fixed interleavings and their race, its
+          # holders' count, its handle table and its shader module reads. Nothing here reaches a
+          # driver, which Miri cannot load; the device's own paths run in `cargo xtask gpu`.
+          - name: rhi-vulkan, unit tests
+            key: rhi-vulkan-lib
+            args: -p lactose-rhi-vulkan --lib
+            miriflags: -Zmiri-many-seeds=0..4
     steps:
       - uses: actions/checkout@v4
       # Miri is the one sanctioned use of a nightly toolchain (architecture section 8.3).
@@ -109,7 +116,7 @@ jobs:
   # slot sequence lock (architecture section 5.3), each switched on by a Cargo feature of its
   # crate and never by a `--cfg` flag in the environment, which would replace the x86-64 pin.
   # Release, because the models' searches are long: every interleaving, or those loom reaches
-  # within a preemption bound where a model names one (three of task's, and input-host's and
+  # within a preemption bound where a model names one (ten of task's, and input-host's and
   # net-host's).
   loom:
     name: loom
@@ -289,13 +296,44 @@ jobs:
               print(f"- `io_uring_setup`: failed with {name}, io_uring is not usable here")
           PROBE
 
+  # The nightly form of the pull request's `gpu (lavapipe)` job (decision 5.10 of the milestone
+  # 2 plan): every device test under GPU-assisted validation, with its own canary
+  # (tools/xtask/README.md, "GPU runs"). Assumed from the layer's documentation until the
+  # `gpu-probe` below records it: GPU-assisted validation loads on lavapipe, whose features
+  # cover what its instrumentation needs, as it does under KosmicKrisp on the M1. On the image
+  # the pull request's job pins.
+  gpu-assisted:
+    name: gpu (lavapipe, GPU-assisted)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends mesa-vulkan-drivers
+      - uses: actions/cache@v4
+        with:
+          path: target/vulkan-sdk/download
+          key: vulkan-sdk-${{ hashFiles('tools/xtask/vulkan-layer.toml') }}
+      - name: The device tests under GPU-assisted validation
+        run: cargo xtask gpu --driver lavapipe --only vulkan --gpu-assisted
+      - uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: gpu-lavapipe-gpu-assisted
+          path: target/gpu/lavapipe-vulkan-gpu-assisted.txt
+          if-no-files-found: ignore
+
   # docs/plans/milestone-2.md section 3, `gpu-probe`: what lavapipe on the Linux runner offers,
   # for lane `vulkan` (docs/verification.md, the row on lavapipe). It records and never fails.
   # The macOS runners' facts, the oldest image's included, are the `shaders` jobs' own
-  # (tools/xtask/runner-facts.sh).
+  # (tools/xtask/runner-facts.sh). On the image `gpu (lavapipe)` pins.
   gpu-probe:
     name: gpu probe (lavapipe)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     continue-on-error: true
     steps:

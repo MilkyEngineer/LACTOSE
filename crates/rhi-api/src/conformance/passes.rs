@@ -233,7 +233,16 @@ fn viewport_outside_its_rules_is_refused(ctx: &Ctx<'_>) -> Applies {
         after(ctx, &*device, &|encoder| encoder.set_viewport(past)),
         "a viewport past the attachments",
     );
-    let widest = Viewport { x: 0.0, y: 0.0, width, height, near: 0.0, far: 1.0 };
+    // The widest viewport the bounds also allow: an Apple GPU's are narrower than twice
+    // its extent, which Vulkan's least assumes.
+    let widest = Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: width.min(high),
+        height: height.min(high),
+        near: 0.0,
+        far: 1.0,
+    };
     ctx.ok(
         after(ctx, &*device, &|encoder| encoder.set_viewport(widest)),
         "a viewport at the limit",
@@ -406,9 +415,15 @@ fn dispatch_beyond_the_group_limit_is_refused(ctx: &Ctx<'_>) -> Applies {
         encoder.end_pass();
         ctx.refused(submit(&*device, &mut [encoder]), "a dispatch one group past the limit");
     }
+    // At the limit on one axis at a time: on all three at once a device would run the
+    // product, 2^90 groups where MoltenVK reports 2^30.
     let mut encoder = ctx.encoder(&*device, G);
     compute_pass(&mut *encoder, pipeline, PassReach::NOTHING);
-    encoder.dispatch(limit);
+    for axis in 0..3 {
+        let mut groups = [1; 3];
+        groups[axis] = limit[axis];
+        encoder.dispatch(groups);
+    }
     encoder.end_pass();
     run(ctx, &*device, &mut [encoder]);
     Ok(())

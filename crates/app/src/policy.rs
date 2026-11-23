@@ -37,6 +37,10 @@ pub enum Source {
     /// A cooked baseline or asset table a client's fold could not have for a region a
     /// frame made relevant: the client-only asset failure of architecture section 14.
     Cooked,
+    /// The render side of a shown world: a method of its `RenderSide`, or a present call
+    /// on the present thread (`README.md`, "The shown frame"). A device loss arrives here
+    /// as an error of kind `DeviceLost` (architecture section 19).
+    Render,
 }
 
 /// What the policy does with an error.
@@ -64,7 +68,8 @@ pub enum Response {
 /// (architecture section 19).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ErrorPolicy {
-    _private: (),
+    /// Whether the table is milestone 2's: the default is milestone 1's.
+    shown: bool,
 }
 
 impl ErrorPolicy {
@@ -73,7 +78,18 @@ impl ErrorPolicy {
     /// save unless `Io::replace` failed after its rename), and a cooked-content failure in
     /// a client's fold resyncs at the world's own tick, so the full frame that follows
     /// retries the region (architecture section 14).
-    pub const MILESTONE_1: Self = Self { _private: () };
+    ///
+    /// It reads no error kind, so `Source::Render`, which no milestone 1 run produces, is
+    /// `Stop` under it.
+    pub const MILESTONE_1: Self = Self { shown: false };
+
+    /// Milestone 2: milestone 1's table, and for `Source::Render` the first response that
+    /// reads an error's kind. `DeviceLost` is `Stop`: recovery (architecture section 19)
+    /// is not in this crate yet, and until it is a lost device ends the run with the world
+    /// kept. Every other kind is `Log`: the frame is torn or the present skipped, every
+    /// world shown gets a full pass, and the next frame runs. What a shown world is built
+    /// with (`build_shown`).
+    pub const MILESTONE_2: Self = Self { shown: true };
 
     /// The response to `error` from `source`: the table is the contract.
     #[must_use]
@@ -85,6 +101,10 @@ impl ErrorPolicy {
             Source::Prediction { kept: true } | Source::Cooked => Response::Resync,
             Source::Prediction { kept: false } => Response::Stop,
             Source::Save => Response::Log,
+            Source::Render if self.shown => {
+                todo!("frame-impl: `DeviceLost` is `Stop`, every other kind `Log`")
+            }
+            Source::Render => Response::Stop,
         }
     }
 }

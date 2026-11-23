@@ -19,7 +19,9 @@ use lactose_core::{Error, ErrorKind};
 pub enum Rule {
     /// `state`: a transition's `from` is not the state the subresource is in, a use needs
     /// a state the subresource is not in, or a resource an earlier pass or copy wrote is
-    /// used with no transition since, in submission order.
+    /// used with no transition since, in submission order; or one transition call names
+    /// an image's subresource, or a buffer, in two of its elements, which take effect
+    /// together and in no order. Every backend checks the last, at the call.
     State,
     /// `no-qfot`: a use on a queue other than the owning one with no release and acquire
     /// between, an acquire with no release submitted, a change of a resource's state or
@@ -100,15 +102,18 @@ pub enum Rule {
     /// `timeline`: a submit's signal of a value not greater than every value the timeline
     /// has reached, been given by a host signal or been promised, or than a value the same
     /// submit waits for on it, or while another queue's signal of it is pending with no
-    /// wait for it; a host signal not between the timeline's value and every pending
-    /// promise, or one a pending promise or another host signal could pass; or a value
-    /// 2^31 or more from the timeline's, from a host signal's in progress, or from a value
-    /// a pending submit waits for or signals on it. The timeline's value is the greatest
-    /// the device knows it has reached (`README.md`, "Timelines").
+    /// wait that orders it, a wait ordering the signal it waits for and the earlier submits
+    /// of that signal's queue but not the other signals of its submit; a host signal not
+    /// between the timeline's value and every pending promise, or one a pending promise or
+    /// another host signal could pass; or a value 2^31 or more from the timeline's, from a
+    /// host signal's in progress, or from a value a pending submit waits for or signals on
+    /// it. The timeline's value is the greatest the device knows it has reached
+    /// (`README.md`, "Timelines").
     Timeline,
-    /// `encoding`: a command outside the scope it belongs to, a draw or dispatch with
-    /// nothing bound to it, a pass left open, an encoder of another device or role, or an
-    /// encoder submitted again with no reset.
+    /// `encoding`: a command outside the scope it belongs to, a render pass, graphics bind,
+    /// draw or depth image copy on a `Compute` encoder, a draw or dispatch with nothing bound
+    /// to it, a pass left open, an encoder of another device or role, or an encoder
+    /// submitted again with no reset.
     Encoding,
 }
 

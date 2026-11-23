@@ -126,7 +126,7 @@ fn copy(from: &Path, to: &Path) {
 /// Cooks `sources` with the pinned Slang, writing each shader's code below `code`.
 fn cook_shaders(env: &Env, sources: &Path, code: Option<&Path>) -> Result<Vec<String>> {
     let slang = slang();
-    let shaders = Shaders { slang: &slang, code };
+    let shaders = Shaders { slang: &slang, code, cooked: None };
     let pack = env.dir.join(format!("{}.pack", sources.file_name().unwrap().to_string_lossy()));
     let published = env.wait(cook(&env.io, sources, &pack, Some(shaders)))?;
     Ok(published.into_iter().map(|asset| asset.name).collect())
@@ -554,6 +554,14 @@ fn the_binary_refuses_code_without_slangc() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(stderr, "ricotta: InvalidData: --code is given without --slangc\n");
     let output = Command::new(env!("CARGO_BIN_EXE_ricotta"))
+        .args(["--shaders", "out", "sources", "x.pack"])
+        .current_dir(&env.dir)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr, "ricotta: InvalidData: --shaders is given without --slangc\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_ricotta"))
         .args(["--code", "a", "--code", "b", "sources", "x.pack"])
         .output()
         .unwrap();
@@ -576,6 +584,27 @@ fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {
     }
     found.sort();
     found
+}
+
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn shaders_directory_holds_each_cooked_shader_whole() {
+    let env = Env::new("shaders-whole");
+    let sources = env.dir.join("sources");
+    copy(&root().join("shaders"), &sources);
+    let (code, whole) = (env.dir.join("code"), env.dir.join("whole"));
+    let slang = slang();
+    let shaders = Shaders { slang: &slang, code: Some(&code), cooked: Some(&whole) };
+    let published =
+        env.wait(cook(&env.io, &sources, &env.dir.join("x.pack"), Some(shaders))).unwrap();
+    let (code_files, whole_files) = (files(&code), files(&whole));
+    assert_eq!(whole_files.len(), published.len());
+    for ((name, bytes), (code_name, code_bytes)) in whole_files.iter().zip(&code_files) {
+        assert_eq!(name, code_name);
+        let shader = CookedShader::decode(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(&shader.code, code_bytes, "{name}: the code beside it");
+        assert!(name.contains(&format!(".{}.", shader.entry)), "{name}: {}", shader.entry);
+    }
 }
 
 #[test]
@@ -673,7 +702,7 @@ impl Loader for ShaderLoader {
 fn cook_and_load(env: &Env, sources: &Path) -> (Vec<lactose_cook::Published>, Vec<CookedShader>) {
     let pack = env.dir.join("shaders.pack");
     let slang = slang();
-    let shaders = Shaders { slang: &slang, code: None };
+    let shaders = Shaders { slang: &slang, code: None, cooked: None };
     let published = env.wait(cook(&env.io, sources, &pack, Some(shaders))).unwrap();
     let loaders = vec![ErasedLoader::new(ShaderLoader)];
     let store = Store::new(env.executor.clone(), env.io.clone(), loaders).unwrap();
@@ -700,9 +729,36 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
     let (published, loaded) = cook_and_load(&env, &root().join("shaders"));
     let targets: &[&str] =
         if cfg!(target_os = "macos") { &["metallib", "msl", "spirv"] } else { &["msl", "spirv"] };
+    // `shaders/conformance/`'s entries, which the RHI suites run, cook into the pack beside
+    // the surface's, in name order.
+    let entries = [
+        "conformance/address.fs_main",
+        "conformance/address.vs_main",
+        "conformance/constant.fs_main",
+        "conformance/constant.vs_main",
+        "conformance/copy.cs_main",
+        "conformance/fill.fs_main",
+        "conformance/fill.vs_main",
+        "conformance/gbuffer.fs_light",
+        "conformance/gbuffer.fs_write",
+        "conformance/gbuffer.vs_main",
+        "conformance/groups.cs_main",
+        "conformance/ids.fs_main",
+        "conformance/ids.vs_main",
+        "conformance/sample.fs_main",
+        "conformance/sample.vs_main",
+        "conformance/specialised.cs_main",
+        "conformance/store.cs_main",
+        "conformance/triangles.fs_main",
+        "conformance/triangles.vs_main",
+        "conformance/workgroup.cs_main",
+        "surface.fs_main",
+        "surface.fs_resolve",
+        "surface.vs_main",
+    ];
     let mut expected = Vec::new();
-    for entry in ["fs_main", "fs_resolve", "vs_main"] {
-        expected.extend(targets.iter().map(|target| format!("surface.{entry}.{target}")));
+    for entry in entries {
+        expected.extend(targets.iter().map(|target| format!("{entry}.{target}")));
     }
     let names: Vec<&str> = published.iter().map(|asset| asset.name.as_str()).collect();
     assert_eq!(names, expected);
@@ -727,6 +783,16 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
         assert_eq!(shader.target, target, "{}", asset.name);
         let entry = asset.name.split('.').nth(1).unwrap();
         assert_eq!(shader.entry, entry);
+        if !asset.name.starts_with("surface.") {
+            // The suites hold a conformance shader's reflection to what they run.
+            let stage = match &entry[..3] {
+                "cs_" => ShaderStage::Compute,
+                "vs_" => ShaderStage::Vertex,
+                _ => ShaderStage::Fragment,
+            };
+            assert_eq!(shader.stage, stage, "{}", asset.name);
+            continue;
+        }
         let uv = Varying { location: 0, component: ComponentType::Float, count: 2 };
         // `fs_resolve` never reads `uv`, which its SPIR-V leaves out.
         let (stage, heap, constants, push, inputs, outputs, varyings) = match entry {

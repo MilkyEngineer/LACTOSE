@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use common::*;
 use lactose_asset_api::AssetSet;
-use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, Overlay, Record};
+use lactose_bundle::{Baseline, BaselineRow, ComponentData, ComponentSchema, Record};
 use lactose_core::{
     ComponentKey, EntityRef, ErrorKind, NetId, PlayerId, PredictionKey, Result, StableKey, Tick,
 };
@@ -23,9 +23,7 @@ use lactose_ecs::{
 };
 use lactose_math::Scalar;
 use lactose_net_api::OverlayPayload;
-use lactose_persist::{
-    FieldValues, Loader, Migration, Migrations, RegionRecords, SchemaTable, diff,
-};
+use lactose_persist::{Loader, Migrations, RegionRecords, SchemaTable, diff};
 use lactose_reflect::{Reflect, Registry, component, resource};
 use lactose_sim::RegionExport;
 use lactose_sim::harness::{ChunkCapacity, layout_mode};
@@ -435,6 +433,14 @@ fn a_debug_build_asserts_on_a_nan_in_a_persistent_resource() {
 #[test]
 #[cfg(debug_assertions)]
 fn a_debug_build_asserts_nothing_on_a_transient_column_or_a_decoded_value() {
+    use lactose_bundle::Overlay;
+    use lactose_persist::{FieldValues, Migration};
+
+    /// A step that changes nothing.
+    fn unchanged(_: &mut FieldValues) -> Result<()> {
+        Ok(())
+    }
+
     let (mut world, table) = spin_world();
     world.insert(net(c(A, 3)), Spin(Scalar::NAN)).unwrap();
     let export = RegionExport { region: A, rows: world.export_region(A).unwrap() };
@@ -488,11 +494,6 @@ fn a_debug_build_asserts_nothing_on_a_transient_column_or_a_decoded_value() {
         _ => None,
     });
     assert_eq!(mass, Some(canonical));
-}
-
-/// A step that changes nothing.
-fn unchanged(_: &mut FieldValues) -> Result<()> {
-    Ok(())
 }
 
 /// `cooked_schemas()` with `component`'s version moved on: a cook another build made.

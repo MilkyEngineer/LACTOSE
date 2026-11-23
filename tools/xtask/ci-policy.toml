@@ -127,6 +127,7 @@ separate = [
   "lactose-net-host::interpolation_alloc",
   "lactose-persist::container",
   "lactose-physics-rapier::memory",
+  "lactose-task::job_alloc",
   # Tests of one binary share a process under `cargo test` and `cargo miri test`, and each
   # of these installs the process's one tracing subscriber and reads back what it saw.
   "lactose-app::proof",
@@ -175,7 +176,7 @@ base = [
   "lactose-ecs-macros", "lactose-ecs", "lactose-bundle", "lactose-asset-api", "lactose-io",
   "lactose-asset", "lactose-input", "lactose-input-host", "lactose-sim", "lactose-net-api",
   "lactose-net-host", "lactose-persist", "lactose-xtask", "game-sim", "lactose-rhi-api",
-  "lactose-platform", "lactose-render-graph", "lactose-rhi-null",
+  "lactose-platform", "lactose-render-graph", "lactose-rhi-null", "lactose-rhi-vulkan",
 ]
 physics = [
   "lactose-physics-api", "lactose-physics-rapier", "lactose-anim", "lactose-predict",

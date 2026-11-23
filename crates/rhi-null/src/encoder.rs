@@ -154,6 +154,19 @@ impl NullEncoder {
         }
     }
 
+    /// Whether the encoder may record `what`, which the graphics role alone takes: the
+    /// compute role's queue may be of a family that does not draw, so a `Compute` encoder
+    /// records none on any layout (`lactose-rhi-api`, "Queues by role"). A render pass and a
+    /// depth image's copy ask; a graphics bind and a draw need a render pass, which none
+    /// begins on a `Compute` encoder, so the scope rule refuses them there.
+    fn draws(&mut self, what: &str) -> bool {
+        if self.role == QueueRole::Compute {
+            self.fail(Rule::Encoding, format!("{what} on a compute encoder"));
+            return false;
+        }
+        true
+    }
+
     fn outside(&mut self, what: &str) -> bool {
         if self.open() {
             self.fail(Rule::Encoding, format!("{what} inside a pass"));
@@ -396,7 +409,7 @@ impl Encoder for NullEncoder {
         if !self.recording() || !self.outside("a transition") {
             return;
         }
-        for transition in transitions {
+        for (at, transition) in transitions.iter().enumerate() {
             let Some(object) = self.image(transition.image) else { return };
             let range = transition.range;
             let inside = range.mips > 0
@@ -418,6 +431,13 @@ impl Encoder for NullEncoder {
                 );
                 return;
             }
+            let repeats = transitions[..at]
+                .iter()
+                .any(|earlier| earlier.image == transition.image && earlier.range.overlaps(range));
+            if repeats {
+                self.fail(Rule::State, "a transition call that names a subresource twice");
+                return;
+            }
         }
         self.commands.push(Cmd::Images(transitions.to_vec()));
     }
@@ -426,8 +446,12 @@ impl Encoder for NullEncoder {
         if !self.recording() || !self.outside("a transition") {
             return;
         }
-        for transition in transitions {
+        for (at, transition) in transitions.iter().enumerate() {
             if self.buffer(transition.buffer).is_none() {
+                return;
+            }
+            if transitions[..at].iter().any(|earlier| earlier.buffer == transition.buffer) {
+                self.fail(Rule::State, "a transition call that names a buffer twice");
                 return;
             }
         }
@@ -503,6 +527,9 @@ impl Encoder for NullEncoder {
         }
         let Some(buffer) = self.buffer_for(source, BufferUsage::COPY_SOURCE) else { return };
         let Some(image) = self.image_for(destination, ImageUsage::COPY_DESTINATION) else { return };
+        if image.format.is_depth() && !self.draws("a depth image's copy") {
+            return;
+        }
         let Some((subresources, _)) = self.image_regions(&buffer, &image, regions) else { return };
         let shared = regions.iter().enumerate().any(|(at, one)| {
             regions[at + 1..].iter().any(|other| {
@@ -526,6 +553,9 @@ impl Encoder for NullEncoder {
             return;
         }
         let Some(image) = self.image_for(source, ImageUsage::COPY_SOURCE) else { return };
+        if image.format.is_depth() && !self.draws("a depth image's copy") {
+            return;
+        }
         let Some(buffer) = self.buffer_for(destination, BufferUsage::COPY_DESTINATION) else {
             return;
         };
@@ -540,7 +570,7 @@ impl Encoder for NullEncoder {
     }
 
     fn begin_render_pass(&mut self, pass: &RenderPass<'_>) {
-        if !self.recording() || !self.outside("a pass begun") {
+        if !self.recording() || !self.outside("a pass begun") || !self.draws("a render pass") {
             return;
         }
         let limit = self.shared.caps.colour_attachments;

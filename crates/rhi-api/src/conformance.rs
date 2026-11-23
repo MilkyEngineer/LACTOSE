@@ -9,16 +9,17 @@
 //! and compares it with a reference computed on the CPU, never with a stored image. Only
 //! a device can pass it, and [`run`] skips it for a harness that does not render.
 //!
-//! The contract cases' bodies are here, one function for each, by group, written with
-//! `lactose-rhi-null`; the output cases' and their shader sources arrive with
-//! `lactose-rhi-vulkan` (milestone 2 plan, section 3). `README.md`, "The conformance
-//! suite", says what each case holds.
+//! Every case's body is here, one function for each, by group: the contract cases' written
+//! with `lactose-rhi-null`, the output cases' with `lactose-rhi-vulkan`. The output cases'
+//! shader sources are `shaders/conformance/`'s, cooked before a run and given by
+//! [`Harness::shader`]. `README.md`, "The conformance suite", says what each case holds.
 
 mod buffers;
 mod encoders;
 mod heap;
 mod images;
 mod kit;
+mod outputs;
 mod passes;
 mod queues;
 mod shaders;
@@ -58,7 +59,7 @@ pub struct Case {
     pub refuses: Option<Rule>,
     /// Whether a device backend runs the case. `false` for a case that provokes a check
     /// the null backend alone makes, whose breach on a device gives a wrong image and
-    /// proves nothing, and for one that holds null's own meaning of a pending submit, one
+    /// proves nothing, and for those that hold null's own meaning of a pending submit, one
     /// whose completion the caller has not yet seen (`README.md`, "Queues by role").
     pub devices: bool,
 }
@@ -146,17 +147,13 @@ pub trait Harness {
 ///
 /// When the case fails, with the case's name and what did not hold.
 pub fn run(harness: &dyn Harness, case: &Case) -> Outcome {
-    if case.kind == CaseKind::Output {
-        return Outcome::Skipped(if harness.renders() {
-            "an output case, whose body arrives with lactose-rhi-vulkan"
-        } else {
-            "an output case, on a harness that does not render"
-        });
+    if case.kind == CaseKind::Output && !harness.renders() {
+        return Outcome::Skipped("an output case, on a harness that does not render");
     }
     if harness.renders() && !case.devices {
         return Outcome::Skipped("a case of a check the null backend alone makes");
     }
-    let Some(body) = body(case.name) else { panic!("{}: a contract case with no body", case.name) };
+    let Some(body) = body(case.name) else { panic!("{}: a case with no body", case.name) };
     let mut ran = false;
     let mut skipped = "no capability set of the harness";
     for set in harness.sets() {
@@ -175,7 +172,7 @@ pub fn run(harness: &dyn Harness, case: &Case) -> Outcome {
     if ran { Outcome::Passed } else { Outcome::Skipped(skipped) }
 }
 
-/// Every contract case's body, by the case's name.
+/// Every case's body, by the case's name.
 fn bodies() -> impl Iterator<Item = (&'static str, kit::Body)> {
     [
         queues::BODIES,
@@ -188,6 +185,7 @@ fn bodies() -> impl Iterator<Item = (&'static str, kit::Body)> {
         timelines::BODIES,
         passes::BODIES,
         swapchain::BODIES,
+        outputs::BODIES,
     ]
     .into_iter()
     .flatten()
@@ -264,8 +262,12 @@ pub const CASES: &[Case] = cases! {
     contract "transition_from_another_state_is_refused" => State;
     contract "use_in_another_state_is_refused" => State;
     contract "use_after_a_write_without_a_transition_is_refused" => State;
-    contract "state_is_kept_for_each_mip_and_layer";
-    contract "state_follows_submission_order_not_recording_order";
+    contract "state_is_kept_for_each_mip_and_layer" => State;
+    contract "state_follows_submission_order_not_recording_order" => State;
+    contract "transition_naming_a_subresource_twice_is_refused" => State everywhere;
+    contract "transition_of_overlapping_ranges_is_refused" => State everywhere;
+    contract "transition_naming_a_buffer_twice_is_refused" => State everywhere;
+    contract "transitions_of_disjoint_mips_in_one_call_pass";
     contract "cross_queue_use_without_a_transfer_is_refused" => Queue;
     contract "acquire_without_a_release_is_refused" => Queue;
     contract "release_and_acquire_cross_a_resource";
@@ -334,6 +336,7 @@ pub const CASES: &[Case] = cases! {
     contract "recording_while_pending_records_nothing";
     contract "encoder_of_another_role_or_device_is_refused" => Encoding everywhere;
     contract "command_outside_its_scope_is_refused" => Encoding everywhere;
+    contract "graphics_on_a_compute_encoder_is_refused" => Encoding everywhere;
     contract "draw_with_nothing_bound_is_refused" => Encoding everywhere;
     contract "pass_left_open_is_refused" => Encoding everywhere;
     contract "push_outside_the_block_is_refused" => Bounds everywhere;
@@ -356,6 +359,10 @@ pub const CASES: &[Case] = cases! {
     contract "submit_signalling_no_more_than_it_waits_for_is_refused" => Timeline everywhere;
     contract "timeline_value_beyond_the_difference_limit_is_refused" => Timeline everywhere;
     contract "timeline_signalled_from_two_queues_without_a_wait_is_refused" => Timeline everywhere;
+    contract "timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused" => Timeline;
+    contract "signal_after_a_wait_for_another_signal_of_its_submit_is_refused" => Timeline everywhere;
+    contract "wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline";
+    contract "wait_for_a_signal_orders_the_earlier_submits_of_its_queue";
     contract "destroy_under_a_pending_submit_is_refused" => Pending everywhere;
     contract "concurrent_resource_destroyed_while_another_queue_uses_it_is_refused" => Pending everywhere;
     contract "destroy_after_an_unobserved_submit_is_refused" => Pending;
@@ -415,17 +422,25 @@ mod tests {
     use super::{CASES, CaseKind, bodies};
 
     #[test]
-    fn every_contract_case_has_one_body_and_every_body_one_case() {
+    fn every_case_has_one_body_and_every_body_one_case() {
         let mut named = HashSet::new();
         for (name, _) in bodies() {
             assert!(named.insert(name), "{name}: two bodies");
-            assert!(
-                CASES.iter().any(|case| case.name == name && case.kind == CaseKind::Contract),
-                "{name}: a body for no contract case"
-            );
+            assert!(CASES.iter().any(|case| case.name == name), "{name}: a body for no case");
         }
-        for case in CASES.iter().filter(|case| case.kind == CaseKind::Contract) {
-            assert!(named.contains(case.name), "{}: a contract case with no body", case.name);
+        for case in CASES {
+            assert!(named.contains(case.name), "{}: a case with no body", case.name);
+        }
+    }
+
+    #[test]
+    fn output_cases_run_on_devices_alone() {
+        for case in CASES.iter().filter(|case| case.kind == CaseKind::Output) {
+            assert!(
+                case.devices && case.refuses.is_none(),
+                "{}: an output case is a device's",
+                case.name
+            );
         }
     }
 }

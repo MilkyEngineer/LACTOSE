@@ -4,7 +4,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::kit::{Body, Ctx, HEAD, LONG, PATIENCE, WOKEN, buffer_to, clear, image_desc, woken};
+use super::kit::{
+    Body, Ctx, HEAD, LONG, Lead, Orders, PATIENCE, WOKEN, buffer_to, clear, image_desc, race, woken,
+};
 use crate::{
     BufferCopy, BufferHandle, BufferState, BufferUsage, Device, Encoder, Format, ImageUsage,
     MemoryClass, QueuePath, QueueRole, Rule, Sharing, Submit, TimelineHandle, TimelinePoint,
@@ -51,6 +53,22 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     (
         "timeline_signalled_from_two_queues_without_a_wait_is_refused",
         timeline_signalled_from_two_queues_without_a_wait_is_refused,
+    ),
+    (
+        "timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused",
+        timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused,
+    ),
+    (
+        "signal_after_a_wait_for_another_signal_of_its_submit_is_refused",
+        signal_after_a_wait_for_another_signal_of_its_submit_is_refused,
+    ),
+    (
+        "wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline",
+        wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline,
+    ),
+    (
+        "wait_for_a_signal_orders_the_earlier_submits_of_its_queue",
+        wait_for_a_signal_orders_the_earlier_submits_of_its_queue,
     ),
     ("destroy_under_a_pending_submit_is_refused", destroy_under_a_pending_submit_is_refused),
     (
@@ -384,6 +402,99 @@ fn timeline_signalled_from_two_queues_without_a_wait_is_refused(ctx: &Ctx<'_>) -
     Ok(())
 }
 
+/// A promise is pending until the caller has seen its submit, not until the submit runs:
+/// a compute submit with no gate signals `f`, and a graphics signal of `f` with no wait,
+/// and a host signal above it, are refused although null runs the compute submit at once.
+/// On a device either could land first (VUID-VkSubmitInfo2-semaphore-03882). A device
+/// refuses them only while the compute submit is in flight, which a case cannot hold it
+/// to; `lactose-rhi-vulkan`'s device tests hold it with a dispatch that lags.
+fn timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused(
+    ctx: &Ctx<'_>,
+) -> Applies {
+    if ctx.set.queues.compute != QueuePath::Own {
+        return Err("compute shares the graphics queue");
+    }
+    let device = ctx.device();
+    let f = ctx.timeline(&*device, 0);
+    ctx.submit(&*device, C, &mut [], &[], &[at(f, 1)]);
+    ctx.refused(
+        submit(&*device, G, &mut [], &[], &[at(f, 2)]),
+        "a signal from another queue before the first is seen",
+    );
+    ctx.refused(device.signal_timeline(at(f, 2)), "a host signal before the promise is seen");
+    ctx.reached(&*device, at(f, 1));
+    ctx.submit(&*device, G, &mut [], &[], &[at(f, 2)]);
+    ctx.reached(&*device, at(f, 2));
+    Ok(())
+}
+
+/// A wait orders the one signal it waits for: the other signals of its submit are unordered
+/// with it (Vulkan, "Implicit Synchronization Guarantees"), so a signal of `f` after a wait
+/// for `c` could land below the pending `f` (VUID-VkSubmitInfo2-semaphore-03882). A wait
+/// for a value of `f` below the pending one, here one the host has signalled, orders it no
+/// more.
+fn signal_after_a_wait_for_another_signal_of_its_submit_is_refused(ctx: &Ctx<'_>) -> Applies {
+    if ctx.set.queues.compute != QueuePath::Own {
+        return Err("compute shares the graphics queue");
+    }
+    let device = ctx.device();
+    let (c, f) = (ctx.timeline(&*device, 0), ctx.timeline(&*device, 0));
+    let gate = ctx.point(&*device, 1);
+    ctx.submit(&*device, C, &mut [], &[gate], &[at(c, 1), at(f, 1)]);
+    ctx.refused(
+        submit(&*device, G, &mut [], &[at(c, 1)], &[at(f, 2)]),
+        "a signal ordered by a wait for another timeline of the pending signal's submit",
+    );
+    ctx.ok(device.signal_timeline(gate), "the gate's host signal");
+    ctx.reached(&*device, at(f, 1));
+    ctx.submit(&*device, G, &mut [], &[at(c, 1)], &[at(f, 2)]);
+    ctx.reached(&*device, at(f, 2));
+
+    let (c, f) = (ctx.timeline(&*device, 0), ctx.timeline(&*device, 0));
+    let gate = ctx.point(&*device, 1);
+    ctx.ok(device.signal_timeline(at(f, 1)), "the host signal of f = 1");
+    ctx.submit(&*device, C, &mut [], &[gate], &[at(c, 1), at(f, 2)]);
+    ctx.refused(
+        submit(&*device, G, &mut [], &[at(c, 1), at(f, 1)], &[at(f, 3)]),
+        "a signal ordered by a wait below the pending signal",
+    );
+    ctx.ok(device.signal_timeline(gate), "the gate's host signal");
+    ctx.reached(&*device, at(f, 2));
+    Ok(())
+}
+
+fn wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline(ctx: &Ctx<'_>) -> Applies {
+    if ctx.set.queues.compute != QueuePath::Own {
+        return Err("compute shares the graphics queue");
+    }
+    let device = ctx.device();
+    let (c, f) = (ctx.timeline(&*device, 0), ctx.timeline(&*device, 0));
+    let gate = ctx.point(&*device, 1);
+    ctx.submit(&*device, C, &mut [], &[gate], &[at(c, 1), at(f, 1)]);
+    ctx.submit(&*device, G, &mut [], &[at(f, 1)], &[at(f, 2)]);
+    ctx.ok(device.signal_timeline(gate), "the gate's host signal");
+    ctx.reached(&*device, at(c, 1));
+    ctx.reached(&*device, at(f, 2));
+    Ok(())
+}
+
+/// A signal's first scope holds every signal of an earlier batch of its queue, so a wait
+/// for `c` orders the earlier compute submit's `f`.
+fn wait_for_a_signal_orders_the_earlier_submits_of_its_queue(ctx: &Ctx<'_>) -> Applies {
+    if ctx.set.queues.compute != QueuePath::Own {
+        return Err("compute shares the graphics queue");
+    }
+    let device = ctx.device();
+    let (c, f) = (ctx.timeline(&*device, 0), ctx.timeline(&*device, 0));
+    let gate = ctx.point(&*device, 1);
+    ctx.submit(&*device, C, &mut [], &[gate], &[at(f, 1)]);
+    ctx.submit(&*device, C, &mut [], &[], &[at(c, 1)]);
+    ctx.submit(&*device, G, &mut [], &[at(c, 1)], &[at(f, 2)]);
+    ctx.ok(device.signal_timeline(gate), "the gate's host signal");
+    ctx.reached(&*device, at(f, 2));
+    Ok(())
+}
+
 fn destroy_under_a_pending_submit_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let (mut encoder, source, destination) = copier(ctx, &*device, G);
@@ -538,32 +649,33 @@ fn rule<T>(result: &lactose_core::Result<T>) -> Option<Rule> {
 
 fn destroy_racing_a_submit_refuses_one(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
-    for _ in 0..ROUNDS {
+    let mut orders = Orders::new(["the destroy first", "the submit first"]);
+    for lead in Lead::rounds(ROUNDS) {
         let (encoder, source, _) = copier(ctx, &*device, G);
         let gate = ctx.gate(&*device);
         let mut encoders = [encoder];
         let racer: &dyn Device = &*device;
-        let (destroy, submitted) = thread::scope(|scope| {
-            let destroy = scope.spawn(move || racer.destroy_buffer(source));
-            let encoders = &mut encoders;
-            let submitted =
-                scope.spawn(move || submit(racer, G, encoders, &[gate.wait], &[gate.done]));
-            (
-                destroy.join().unwrap_or_else(|_| ctx.fail("the destroyer panicked")),
-                submitted.join().unwrap_or_else(|_| ctx.fail("the submitter panicked")),
-            )
-        });
-        match (rule(&destroy), rule(&submitted)) {
+        let encoders = &mut encoders;
+        let (destroy, submitted) = race(
+            ctx,
+            lead,
+            move || racer.destroy_buffer(source),
+            move || submit(racer, G, encoders, &[gate.wait], &[gate.done]),
+        );
+        let order = match (rule(&destroy), rule(&submitted)) {
             (Some(Rule::Pending), None) if submitted.is_ok() => {
                 gate.open(ctx, &*device);
                 ctx.ok(device.destroy_buffer(source), "the destroy once the submit is seen");
+                1
             }
-            (None, Some(Rule::Destroyed)) if destroy.is_ok() => {}
+            (None, Some(Rule::Destroyed)) if destroy.is_ok() => 0,
             _ => ctx.fail(format_args!(
                 "not exactly one refused: the destroy {destroy:?}, the submit {submitted:?}"
             )),
-        }
+        };
+        orders.reached(ctx, lead, order);
     }
+    orders.report(ctx);
     Ok(())
 }
 
@@ -656,18 +768,18 @@ fn wait_is_woken_by_a_host_signal(ctx: &Ctx<'_>) -> Applies {
 /// backend's driver call widens that window, and its own unit tests fix it ("Threads").
 fn host_signals_racing_on_one_timeline_keep_it_growing(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
-    for round in 0..ROUNDS as u64 {
+    let mut orders =
+        Orders::new(["both accepted", "the low refused", "the high refused, during the low"]);
+    for (round, lead) in (0..).zip(Lead::rounds(ROUNDS)) {
         let timeline = ctx.timeline(&*device, round);
         let (low, high) = (at(timeline, round + 3), at(timeline, round + 5));
         let racer: &dyn Device = &*device;
-        let (low_signal, high_signal) = thread::scope(|scope| {
-            let low_signal = scope.spawn(move || racer.signal_timeline(low));
-            let high_signal = scope.spawn(move || racer.signal_timeline(high));
-            (
-                low_signal.join().unwrap_or_else(|_| ctx.fail("a signaller panicked")),
-                high_signal.join().unwrap_or_else(|_| ctx.fail("a signaller panicked")),
-            )
-        });
+        let (low_signal, high_signal) = race(
+            ctx,
+            lead,
+            move || racer.signal_timeline(low),
+            move || racer.signal_timeline(high),
+        );
         for result in [&low_signal, &high_signal] {
             if result.is_err() && rule(result) != Some(Rule::Timeline) {
                 ctx.fail(format_args!(
@@ -675,17 +787,20 @@ fn host_signals_racing_on_one_timeline_keep_it_growing(ctx: &Ctx<'_>) -> Applies
                 ));
             }
         }
-        let expected = match (low_signal.is_ok(), high_signal.is_ok()) {
-            (_, true) => high.value,
-            (true, false) => low.value,
+        let (expected, order) = match (low_signal.is_ok(), high_signal.is_ok()) {
+            (true, true) => (high.value, 0),
+            (false, true) => (high.value, 1),
+            (true, false) => (low.value, 2),
             (false, false) => ctx.fail("both racing host signals were refused"),
         };
+        orders.reached(ctx, lead, order);
         ctx.check(
             ctx.ok(device.timeline_value(timeline), "a read") == expected,
             "the timeline ends at the greater accepted value",
         );
         ctx.ok(device.destroy_timeline(timeline), "a destroy");
     }
+    orders.report(ctx);
     Ok(())
 }
 

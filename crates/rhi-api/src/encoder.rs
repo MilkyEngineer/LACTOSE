@@ -237,9 +237,22 @@ pub trait Encoder: Any + Send {
     fn reset(&mut self) -> Result<()>;
 
     /// Changes the state of images' subresources ([`ImageTransition`]).
+    ///
+    /// The elements take effect together, not in order: Vulkan records the call as one
+    /// barrier command, whose elements are separate dependencies none of which is ordered
+    /// with another. Each subresource is named by at most one element, and each element's
+    /// `from` is its state before the call. Two elements whose ranges of one image overlap
+    /// ([`ImageRange::overlaps`](crate::ImageRange::overlaps)) are refused at the submit
+    /// ([`Rule::State`](crate::Rule::State), every backend), a transition from or to
+    /// `Undefined` among them; elements over disjoint ranges of one image, such as one for
+    /// each mip, are one call. A change of two steps is two calls.
     fn transition_images(&mut self, transitions: &[ImageTransition]);
 
     /// Changes the state of buffers ([`BufferTransition`]).
+    ///
+    /// The elements take effect together, not in order, as
+    /// [`transition_images`](Self::transition_images)'s do: two that name one buffer are
+    /// refused at the submit ([`Rule::State`](crate::Rule::State), every backend).
     fn transition_buffers(&mut self, transitions: &[BufferTransition]);
 
     /// The alias call: `image`, placed in a memory block, now begins, and every image
@@ -290,7 +303,9 @@ pub trait Encoder: Any + Send {
 
     /// Begins a render pass. The viewport and the scissor are the attachments' extent
     /// until set. Nothing is bound: a pass starts with no pipeline, no index buffer and a
-    /// push-constant block of zeros.
+    /// push-constant block of zeros. A `Compute` encoder begins none on any layout, and
+    /// copies no depth image ([`Rule::Encoding`](crate::Rule::Encoding), every backend):
+    /// the compute role's queue may be of a family that does not draw.
     fn begin_render_pass(&mut self, pass: &RenderPass<'_>);
 
     /// Begins a compute pass, with no pipeline and a push-constant block of zeros.

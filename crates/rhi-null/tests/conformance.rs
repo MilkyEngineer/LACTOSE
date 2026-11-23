@@ -220,6 +220,10 @@ cases! {
     use_after_a_write_without_a_transition_is_refused
     state_is_kept_for_each_mip_and_layer
     state_follows_submission_order_not_recording_order
+    transition_naming_a_subresource_twice_is_refused
+    transition_of_overlapping_ranges_is_refused
+    transition_naming_a_buffer_twice_is_refused
+    transitions_of_disjoint_mips_in_one_call_pass
     cross_queue_use_without_a_transfer_is_refused
     acquire_without_a_release_is_refused
     release_and_acquire_cross_a_resource
@@ -269,6 +273,7 @@ cases! {
     recording_while_pending_records_nothing
     encoder_of_another_role_or_device_is_refused
     command_outside_its_scope_is_refused
+    graphics_on_a_compute_encoder_is_refused
     draw_with_nothing_bound_is_refused
     pass_left_open_is_refused
     push_outside_the_block_is_refused
@@ -289,6 +294,10 @@ cases! {
     submit_signalling_no_more_than_it_waits_for_is_refused
     timeline_value_beyond_the_difference_limit_is_refused
     timeline_signalled_from_two_queues_without_a_wait_is_refused
+    timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused
+    signal_after_a_wait_for_another_signal_of_its_submit_is_refused
+    wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline
+    wait_for_a_signal_orders_the_earlier_submits_of_its_queue
     destroy_under_a_pending_submit_is_refused
     concurrent_resource_destroyed_while_another_queue_uses_it_is_refused
     destroy_after_an_unobserved_submit_is_refused

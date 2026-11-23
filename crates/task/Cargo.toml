@@ -61,6 +61,12 @@ path = "tests/integration.rs"
 name = "idle_cpu"
 path = "tests/idle_cpu.rs"
 
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): its `#[global_allocator]`
+# would count every other test's allocations too in the package's one binary.
+[[test]]
+name = "job_alloc"
+path = "tests/job_alloc.rs"
+
 # A binary of its own ([test_targets] in tools/xtask/ci-policy.toml): it installs the
 # process's tracing subscriber, which every test of one binary shares under `cargo test`
 # and `cargo miri test`.
