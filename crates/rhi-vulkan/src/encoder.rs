@@ -436,7 +436,10 @@ impl VulkanEncoder {
         Ok(set)
     }
 
-    /// Records a barrier for each change, in one call.
+    /// Records a barrier for each change, in one call. Its elements are separate
+    /// dependencies, none ordered with another, so a call that names one subresource or
+    /// one buffer twice leaves their order undefined. That breach gives a wrong image, as a
+    /// wrong `from` does, and is null's to refuse (`lactose-rhi-api`, "States").
     fn barriers(
         &self,
         images: &[vk::ImageMemoryBarrier2<'_>],

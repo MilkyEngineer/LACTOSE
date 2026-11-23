@@ -179,6 +179,10 @@ cases! {
     use_after_a_write_without_a_transition_is_refused
     state_is_kept_for_each_mip_and_layer
     state_follows_submission_order_not_recording_order
+    transition_naming_a_subresource_twice_is_refused
+    transition_of_overlapping_ranges_is_refused
+    transition_naming_a_buffer_twice_is_refused
+    transitions_of_disjoint_mips_in_one_call_pass
     cross_queue_use_without_a_transfer_is_refused
     acquire_without_a_release_is_refused
     release_and_acquire_cross_a_resource

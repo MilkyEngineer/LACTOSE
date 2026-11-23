@@ -19,7 +19,9 @@ use lactose_core::{Error, ErrorKind};
 pub enum Rule {
     /// `state`: a transition's `from` is not the state the subresource is in, a use needs
     /// a state the subresource is not in, or a resource an earlier pass or copy wrote is
-    /// used with no transition since, in submission order.
+    /// used with no transition since, in submission order; or one transition call names
+    /// an image's subresource, or a buffer, in two of its elements, which take effect
+    /// together and in no order.
     State,
     /// `no-qfot`: a use on a queue other than the owning one with no release and acquire
     /// between, an acquire with no release submitted, a change of a resource's state or

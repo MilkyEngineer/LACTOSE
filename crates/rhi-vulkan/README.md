@@ -108,6 +108,8 @@ contract leaves to the backend.
   can be refused by while recording; the first breach stops the recording, and its submit is
   refused with the breach's rule. A transition is recorded as one `vkCmdPipelineBarrier2` on
   the recording queue, its scopes from the two states (`lactose-rhi-api`'s README, "States");
+  its elements are unordered, and a call that names one subresource or one buffer twice is
+  rhi-null's to refuse (`state`), which this crate leaves to it as it does a wrong `from`;
   a family without `GRAPHICS` gets no graphics stage. A re-take from `Undefined` carries
   `ALL_COMMANDS` and `MEMORY_WRITE` as its source scope. Two roles on two queues of one family
   are one layout change on the releasing queue and a semaphore (D160). A local read is a
@@ -162,7 +164,12 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   which the run reports and goes past; and the drops while a thread unwinds: a last holder
   with a submit pending leaks the device and keeps its messengers' sink, one with nothing
   pending destroys everything, and an encoder dropped with its submit pending hands its pools
-  to the last holder.
+  to the last holder; and a transition call that names one subresource or one buffer twice,
+  sent and heard by no validator: a take and then a change of a new image, and, where compute
+  has its own queue, a change or a take and then a release of an image and of a buffer.
+  Synchronisation validation hears a change and then another of an image a copy wrote (one
+  `SYNC-HAZARD-WRITE-AFTER-WRITE`, on the second element, under MoltenVK and KosmicKrisp),
+  which the test leaves out.
 - Each validator's canary, a misuse whose message alone the run must hear. In
   `tests/device.rs`: core, an image declared in a state it is not in; synchronisation, two
   copies into one range; its load-after-store check, a target stored by one render pass and
@@ -206,15 +213,15 @@ MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choos
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2, under Metal API and shader validation | 150 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363) | 143 | 50: 30 null alone, 8 no window, 4 no loss, 5 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
-| KosmicKrisp under GPU-assisted validation | 138 | 50: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
+| MoltenVK 1.4.2, under Metal API and shader validation | 152 | 47: 33 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363) | 145 | 53: 33 null alone, 8 no window, 4 no loss, 5 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
+| KosmicKrisp under GPU-assisted validation | 140 | 53: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
 
-The counts are of the device tests: the suite's 175 cases, 147 contract and 28 output, and the
+The counts are of the device tests: the suite's 179 cases, 151 contract and 28 output, and the
 device's own; the Metal canary runs under MoltenVK alone. Each driver passes 27 of the 28
 output cases: MoltenVK skips the count draw, and KosmicKrisp the ownership transfer, since
 compute shares its one queue. Under Metal's validation every case that does not skip prints
-both banners; a skipped case is exempt, 14 of MoltenVK's 44 having made a device first.
+both banners; a skipped case is exempt, 14 of MoltenVK's 47 having made a device first.
 
 GPU-assisted validation does not run under MoltenVK 1.4.2: its instrumented shaders fail in
 SPIRV-Cross (a `uint` to `ulong` `reinterpret_cast`). On an Apple GPU the device reports

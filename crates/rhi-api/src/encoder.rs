@@ -237,9 +237,21 @@ pub trait Encoder: Any + Send {
     fn reset(&mut self) -> Result<()>;
 
     /// Changes the state of images' subresources ([`ImageTransition`]).
+    ///
+    /// The elements take effect together, not in order: Vulkan records the call as one
+    /// barrier command, whose elements are separate dependencies none of which is ordered
+    /// with another. Each subresource is named by at most one element, and each element's
+    /// `from` is its state before the call. Two elements whose ranges of one image overlap
+    /// are refused at the submit ([`Rule::State`](crate::Rule::State), null), a transition
+    /// from or to `Undefined` among them; elements over disjoint ranges of one image, such
+    /// as one for each mip, are one call. A change of two steps is two calls.
     fn transition_images(&mut self, transitions: &[ImageTransition]);
 
     /// Changes the state of buffers ([`BufferTransition`]).
+    ///
+    /// The elements take effect together, not in order, as
+    /// [`transition_images`](Self::transition_images)'s do: two that name one buffer are
+    /// refused at the submit ([`Rule::State`](crate::Rule::State), null).
     fn transition_buffers(&mut self, transitions: &[BufferTransition]);
 
     /// The alias call: `image`, placed in a memory block, now begins, and every image

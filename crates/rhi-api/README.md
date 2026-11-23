@@ -480,6 +480,24 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   into one buffer, and two compute passes that write one buffer each have one between
   them. Null keeps, for each resource, whether a pass or a copy has written it since its
   last transition, beside the writes it keeps for `undefined-read`.
+- One call's transitions take effect together, not in order. Vulkan records a
+  `transition_images` or `transition_buffers` call as one `vkCmdPipelineBarrier2`, and
+  "each member of `pMemoryBarriers`, `pBufferMemoryBarriers`, and `pImageMemoryBarriers`
+  defines a separate memory dependency" (`VkDependencyInfo`), whose scopes are the
+  operations "earlier" and "later in submission order" than the command
+  (`vkCmdPipelineBarrier2`, in the specification's "Pipeline Barriers"). No element is in
+  another's scope, so two elements over one subresource run in no fixed order: a layout
+  change after another, or a release after the change it depends on, may run first, and
+  each element's `oldLayout` must be the current layout
+  (`VUID-VkImageMemoryBarrier2-oldLayout-01197`). A call therefore names each subresource of
+  an image in at most one element, and each buffer in at most one; a call that names one
+  twice, by one image's ranges that overlap or by one buffer, is refused (`state`, null), a
+  transition from or to `Undefined` counted as any other: null finds it at the call, before
+  it records any of it, and refuses the encoder's submit. Each element's
+  `from` is the state before the call. Two elements over disjoint ranges of one image are
+  not a repeat: a mip chain's transitions, one for each level, stay one call. A change of
+  two steps, such as a change of state and then a release, or a take from `Undefined` and
+  then a release, is two calls, which their stages order.
 - A transition of an image into a state its usage does not allow is refused (`usage`, every
   backend): `ColourAttachment` needs `COLOUR`, `LocalRead` `COLOUR` and `INPUT`,
   `DepthAttachment` `DEPTH`, `SampledRead` `SAMPLED`, and `CopySource` and
@@ -1026,7 +1044,7 @@ stale number into a wrong image ("The heap and the sampler table").
 
 | Rule | Name | Every backend | Null alone |
 |---|---|---|---|
-| `State` | `state` | a buffer a pass declares in two states | a transition's `from`, a use's state, by subresource; a use after a write in a writing state with no transition since |
+| `State` | `state` | a buffer a pass declares in two states | a transition's `from`, a use's state, by subresource; a use after a write in a writing state with no transition since; a subresource or a buffer named twice in one transition call |
 | `Queue` | `no-qfot` | | a use off the owning queue; an acquire with no release, or of a release a transition from `Undefined` ended; a change of state or owner under another queue's pending submit, or a use under another queue's pending write or change of state or owner, with no wait for it, direct or through the submits it waits for; an alias call across queues |
 | `Destroyed` | `destroyed` | a stale handle, at the `Device` call it is given to, or at the submit of the encoder it was recorded into, a resource destroyed since the recording included | a handle another device issued that resolves to a live resource |
 | `Pending` | `pending` | `Encoder::reset` while pending; `resize` with a present pending past its wait; `present` behind a wait that no signal made or submitted meets, past `acquire`'s bound; a destroy under a pending submit of any queue; of an image a slot holds; of a block an image is placed in; of a sampler while any submit made before it is pending; `write_buffer` of a buffer a pending submit writes; `read_buffer` and `invalidate_buffer` of one a pending submit writes or changes the state of | a submit counted pending until the caller has seen its point ("Queues by role") |
@@ -1111,7 +1129,7 @@ and `conformance::run` runs one against a `Harness`. The contract cases' bodies 
 with `rhi-null` and the output cases' with `vulkan`; the output cases' Slang sources are the
 repository's `shaders/conformance/`, cooked before a run by `ricotta --shaders` and read
 through `Harness::shader` by the name `<source>.<entry>`. A backend's tests carry one test for
-each case, named after it. There are 175: 147 contract cases and 28 output cases.
+each case, named after it. There are 179: 151 contract cases and 28 output cases.
 
 - A **contract** case asserts what the contract says of calls and results. It needs no
   shader to run and no pixel, so null passes it as a device does. A case that names a rule
@@ -1213,6 +1231,19 @@ column, one or more for each of its clauses, 64 in all: `unreported_capability_i
   Each asserts after every hold that the value known of each caller's timeline is at most
   the driver's; a queue's own value may be known ahead of its semaphore, from a caller's
   point its submit signals.
+- `transition_naming_a_subresource_twice_is_refused` sends four calls that each name one
+  subresource twice, each element valid alone: a change and then another, a change and then
+  a release to the compute role, a take from `Undefined` and then a release, and a change to
+  the state the image is in and then a change; under a set whose compute role shares the
+  graphics queue the release is an ordinary change, refused all the same.
+  `transition_of_overlapping_ranges_is_refused` sends a range with one inside it, and a mip
+  of every layer with a layer of every mip; `transition_naming_a_buffer_twice_is_refused` a
+  take and then a change, and a take and then a release. A device runs none of the three,
+  since `rhi-vulkan` leaves a repeat to null ("States").
+  `transitions_of_disjoint_mips_in_one_call_pass` runs on every backend: one call of an
+  element for each mip, then one for each mip but the last and each layer of the last, each
+  from its own state, then one back, and a whole-image transition from the state the calls
+  left, which is accepted only where each took effect; one call of two buffers beside them.
 - `destroy_at_once_after_the_wait_is_accepted` holds a device to "Queues by role": a lagging
   submit, a wait for its point, then at once a destroy and a reset, repeated, each accepted.
 - `dispatch_beyond_the_group_limit_is_refused` and `viewport_outside_its_rules_is_refused`

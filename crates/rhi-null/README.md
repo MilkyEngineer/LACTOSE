@@ -108,7 +108,9 @@ walk refuse it `destroyed`, with nothing submitted.
 - `src/tests.rs`: fixed interleavings, a call made in full between another call's two holds
   through a test-only hook (a host signal, a heap write, a host lend, a present's wait),
   among them a second heap write started inside a first, which the heap's lock holds back,
-  and host signals landed inside each other's holds in both orders; the present's walk
+  and host signals landed inside each other's holds in both orders; a hook cleared while it
+  runs, which stays cleared, so a hook run on another thread cannot outlive its test's clear
+  and keep the device alive through its twin; the present's walk
   against queues held from running; the drops that wait, of the swapchain with a present
   pending and of the device's last handle; a drop that is not the last, which returns at
   once; and the drops made while a thread unwinds, none of which waits.
@@ -133,6 +135,9 @@ a row for each place and a third that removes both.
 | `state` | a second write with no transition | `conformance::use_after_a_write_without_a_transition_is_refused` |
 | `state` | a second write through a `ShaderWrite` reach | `conformance::use_after_a_write_without_a_transition_is_refused`, `submit_writing_under_a_host_access_is_refused` |
 | `state` | a buffer a pass declares in two states | `conformance::buffer_declared_in_two_states_is_refused` |
+| `state` | a subresource named twice in one `transition_images` call | `conformance::transition_naming_a_subresource_twice_is_refused`, `transition_of_overlapping_ranges_is_refused` |
+| `state` | two ranges of one image in one call compared as equal, not as sharing a subresource | `conformance::transition_of_overlapping_ranges_is_refused` |
+| `state` | a buffer named twice in one `transition_buffers` call | `conformance::transition_naming_a_buffer_twice_is_refused` |
 | `state` | a present of an image not in `Present` | `conformance::present_of_an_image_not_in_present_is_refused` |
 | `no-qfot` | a use on a queue that does not own the resource | `conformance::cross_queue_use_without_a_transfer_is_refused` |
 | `no-qfot` | an acquire with no release | `conformance::acquire_without_a_release_is_refused`, `acquire_of_a_release_a_retake_ended_is_refused` |
@@ -279,6 +284,7 @@ The threads' rules, each removed alone in the same way:
 | the wake after a stall ends | `wakes::an_unstall_wakes_an_acquire` |
 | the wake after a present | `wakes::a_present_wakes_a_wait` |
 | the heap's lock over a slot's write | `tests::a_heap_write_started_inside_another_waits_for_it` |
+| a hook put back after it ran, over a test's clear (the test hook alone) | `tests::a_hook_cleared_while_it_runs_stays_cleared` |
 | a present's wait seeing a loss | `wakes::a_loss_during_a_present_wait_returns_lost` |
 | a pending encoder's drop waiting for its submit | `conformance::pending_encoder_drop_waits_for_its_submit` |
 | a swapchain's drop waiting for its present's submit | `tests::a_swapchain_drop_with_its_present_pending_waits_for_its_submit` |

@@ -9,9 +9,9 @@ use std::sync::Arc;
 use lactose_rhi_api::{
     BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferTransition,
     BufferUsage, ComputePass, ComputePipelineHandle, Encoder, Extent, Format,
-    GraphicsPipelineHandle, HeapSlot, ImageHandle, ImageState, ImageTransition, ImageUsage,
-    IndexedIndirectArgs, Load, PUSH_BYTES_MAX, PassReach, QueueRole, Rect, RenderPass, Rule, Store,
-    Target, Viewport,
+    GraphicsPipelineHandle, HeapSlot, ImageHandle, ImageRange, ImageState, ImageTransition,
+    ImageUsage, IndexedIndirectArgs, Load, PUSH_BYTES_MAX, PassReach, QueueRole, Rect, RenderPass,
+    Rule, Store, Target, Viewport,
 };
 
 use crate::device::{BufferObj, ComputeObj, GraphicsObj, ImageObj, Shared, range};
@@ -409,7 +409,7 @@ impl Encoder for NullEncoder {
         if !self.recording() || !self.outside("a transition") {
             return;
         }
-        for transition in transitions {
+        for (at, transition) in transitions.iter().enumerate() {
             let Some(object) = self.image(transition.image) else { return };
             let range = transition.range;
             let inside = range.mips > 0
@@ -431,6 +431,13 @@ impl Encoder for NullEncoder {
                 );
                 return;
             }
+            let repeats = transitions[..at]
+                .iter()
+                .any(|earlier| earlier.image == transition.image && share(earlier.range, range));
+            if repeats {
+                self.fail(Rule::State, "a transition call that names a subresource twice");
+                return;
+            }
         }
         self.commands.push(Cmd::Images(transitions.to_vec()));
     }
@@ -439,8 +446,12 @@ impl Encoder for NullEncoder {
         if !self.recording() || !self.outside("a transition") {
             return;
         }
-        for transition in transitions {
+        for (at, transition) in transitions.iter().enumerate() {
             if self.buffer(transition.buffer).is_none() {
+                return;
+            }
+            if transitions[..at].iter().any(|earlier| earlier.buffer == transition.buffer) {
+                self.fail(Rule::State, "a transition call that names a buffer twice");
                 return;
             }
         }
@@ -1053,6 +1064,15 @@ const fn state_usage(state: ImageState) -> ImageUsage {
         ImageState::CopySource => ImageUsage::COPY_SOURCE,
         ImageState::CopyDestination => ImageUsage::COPY_DESTINATION,
     }
+}
+
+/// Whether two ranges of one image share a subresource. Both are inside the image, so
+/// neither end overflows.
+const fn share(one: ImageRange, other: ImageRange) -> bool {
+    one.mip < other.mip + other.mips
+        && other.mip < one.mip + one.mips
+        && one.layer < other.layer + other.layers
+        && other.layer < one.layer + one.layers
 }
 
 /// Whether two of `ranges`, each a start and an end past it, share a byte.
