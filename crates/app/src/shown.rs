@@ -54,22 +54,28 @@ pub const RECORD_RESERVATION: u32 = 1;
 /// this, and is [busy](Rendered::Busy) if neither has resolved by then. It is what the
 /// frame may still have to do before that deadline: its passes, which criterion 4 of the
 /// milestone 2 plan holds to a millisecond for 50,000 dirty rows, behind a timed wake
-/// that D144 holds to a millisecond on Windows. Two milliseconds until `frame-pace`
-/// reports the lateness of the ticks that follow such a wait; a follow-up commit changes
-/// this constant and nothing else if the file shows it wrong (`README.md`, "The shown
-/// frame", step 2).
+/// that D144 holds to a millisecond on Windows where a worker is idle to keep it. It does
+/// not cover a wake kept behind the record's jobs: the frame's job leaves one
+/// frame-critical worker out for that (`Executor::run_job_width`, which `lactose-task` is
+/// asked for). Two milliseconds until `frame-pace` reports the lateness of the ticks that
+/// follow such a wait; a follow-up commit changes this constant and nothing else if the
+/// file shows it wrong (`README.md`, "The shown frame", step 2).
 pub const JOIN_MARGIN: Duration = Duration::from_millis(2);
 
 /// The count of finished pictures still on their way to the display, taken as a present
 /// call begins, at which the frame after that call is shed: submitted, and not queued for
-/// a present ([`PresentReport::waiting`], [`Rendered::Drew::shed`]). A frame is shed where
-/// the count rose to this: the last report reads it or more, and the one before read
-/// less. Three: by the ages `reviewer-gpu` measured on the M1 under MoltenVK, the count
-/// should read one at most at the swapchain's floor, two with one image waiting behind
-/// another, and three where a swapchain of three images makes the next acquire wait for
-/// the display. Proposed with D162, to be measured by its review and by `frame-pace` on
-/// each device that reports display times; a follow-up commit changes this constant and
-/// nothing else (`README.md`, "Pacing", *The shedding rule*).
+/// a present ([`PresentReport::waiting`], [`Rendered::Drew::shed`]). A frame is shed
+/// where the count rose to this: the last report reads it or more, and the one before
+/// read less; the reports of the next `SHED_DEPTH` calls after a shed are then passed
+/// over, since they count the shed frame's gap. Three. `reviewer-gpu` measured the count
+/// on the M1, under MoltenVK and native Metal at 60 Hz with three images, in the review
+/// of D162's fourth draft: it reads one at the swapchain's floor, two in the floor's top
+/// band, about 9% of a sweep of the frames' phase against the refresh, and never none;
+/// two with one image waiting behind another; and three where the next acquire waits for
+/// the display. So three sheds what a drift owes and nothing at the floor, and its steady
+/// state is one image waiting. `frame-pace` reads each other device that reports display
+/// times; a follow-up commit changes this constant and nothing else (`README.md`,
+/// "Pacing", *The shedding rule*).
 pub const SHED_DEPTH: u32 = 3;
 
 /// One of the frame's offscreen targets, by its index below [`TARGETS`]. The render side
@@ -112,9 +118,11 @@ pub struct FrameTime {
     pub now: Instant,
     /// How far `now` is past the deadline of the newest tick, as a share of the tick
     /// period at the world's time scale, in `[0, 1]`: zero at the deadline, one a period
-    /// later and from then on, and one while the world is paused. How far that is between
-    /// the two ticks of a pair that spans several is presentation's to compute from the
-    /// snapshots' ticks (`crates/present-api/README.md`, "The snapshot").
+    /// later and from then on, and one while the world is paused. It is the weight of the
+    /// pair's newer state over the whole pair, whatever ticks the pair's two snapshots
+    /// are: `lactose-renderer` draws `p + (c - p) * fraction` (`InstanceRecord::drawn`),
+    /// and nothing rescales it for a pair that spans several ticks, whose picture then
+    /// covers them in one period.
     pub fraction: f32,
 }
 
@@ -236,13 +244,16 @@ pub trait RenderSide: Any + Send {
 
     /// The frame's draw up to its recorded passes: the remote batch, `prepare`, the
     /// declaration into the image of `draw.target` at `draw.extent`, compile and record,
-    /// at the fraction of the [`present`](Self::present) that preceded it in the same job.
-    /// The image is declared left as a colour attachment on the graphics role and handed
-    /// off to the present role for a sampled read. A region is open when this is called,
-    /// and no pass of extract runs from before it until the frame's
-    /// [`submit`](Self::submit) or a later [`open`](Self::open) has answered `Ready`. It
-    /// makes no submit. [`submit`](Self::submit) follows every `draw` that returned `Ok`,
-    /// unless the executor shut down between the two.
+    /// at the fraction of the [`present`](Self::present) that preceded it in the same
+    /// job. The image is declared left as a colour attachment on the graphics role and
+    /// handed off to the present role for a sampled read. A region is open when this is
+    /// called, and no pass of extract runs from before it until the frame's
+    /// [`submit`](Self::submit) or a later [`open`](Self::open) has answered `Ready`.
+    /// What it forks from `ctx` runs on `Executor::run_job_width` frame-critical workers
+    /// at most, the job's own among them, so an object over `lactose-render-graph` is
+    /// made with `GraphDesc::jobs` no greater than that. It makes no submit.
+    /// [`submit`](Self::submit) follows every `draw` that returned `Ok`, unless the
+    /// executor shut down between the two.
     fn draw(&mut self, ctx: &mut JobContext<'_>, draw: Draw) -> Result<FrameCounts>;
 
     /// The latch and the submit of the frame [`draw`](Self::draw) recorded, as late as
@@ -383,8 +394,9 @@ pub enum Rendered {
         /// Whether the frame was shed: no earlier call was in flight at its decision, and
         /// the count of the last call's report had risen to [`SHED_DEPTH`]
         /// ([`PresentReport::waiting`]): that report read [`SHED_DEPTH`] or more, and the
-        /// one before it read less. A rise sheds one frame, and a frame that was held is
-        /// not counted here. `false` wherever the swapchain reports no display time.
+        /// one before it read less. A rise sheds one frame, the reports of the next
+        /// [`SHED_DEPTH`] calls are passed over, and a frame that was held is not counted
+        /// here. `false` wherever the swapchain reports no display time.
         shed: bool,
     },
     /// The window had no area, or the frame was starved: no region was open and the
@@ -402,14 +414,15 @@ pub enum Rendered {
     /// waits does, unless it was starved, when it is [`Hidden`](Self::Hidden).
     Torn,
     /// The frame before was still on the render side at this frame's limit, the next
-    /// tick's deadline less [`JOIN_MARGIN`]: its render task had not resolved by then, or,
-    /// where the present role shares the graphics queue, a present call was still in
+    /// tick's deadline less [`JOIN_MARGIN`]: its render task had not resolved by then,
+    /// or, where the present role shares the graphics queue, a present call was still in
     /// flight and this frame had to ask for a region. The frame ran its ticks, waited
-    /// until its limit, deferred its passes and published nothing, as one that waits for a
-    /// region does, and started no render task. So a record that outlasts the tick period,
-    /// or a submit held for a present call, delays no tick. A paced frame alone reports
-    /// it, in [`ShownOutput::deferred`]: [`Shown::step`] and [`Shown::flush`] await with
-    /// no limit where [`Shown::frame`] awaits up to its own.
+    /// until its limit, deferred its passes and published nothing, as one that waits for
+    /// a region does, and started no render task. So the frame waits for a record that
+    /// outlasts the tick period, or for a submit held for a present call, no later than
+    /// its limit. A paced frame alone reports it, in [`ShownOutput::deferred`]:
+    /// [`Shown::step`] and [`Shown::flush`] await with no limit where [`Shown::frame`]
+    /// awaits up to its own.
     Busy,
 }
 
@@ -509,13 +522,21 @@ struct Side {
     /// Whether the last report taken read below [`SHED_DEPTH`]
     /// ([`PresentReport::waiting`]): `false` before the first report, and after a call
     /// that returned an error or was cancelled, which brings no report. A report whose
-    /// `waiting` is `None` leaves it as it was.
+    /// `waiting` is `None` leaves it as it was, and so does a report that is passed over
+    /// after a shed (`pass_over`).
     below: bool,
     /// Whether the report taken since the last decision rose to [`SHED_DEPTH`]: it read
     /// that or more, and the one before it read below. The next decision reads it and
     /// clears it, so a rise sheds one frame. The report of a call that a frame was
-    /// dropped for never sets it.
+    /// dropped for never sets it, and nor does a report that is passed over after a shed.
     rose: bool,
+    /// How many of the reports after the last shed are still to be passed over: set to
+    /// [`SHED_DEPTH`] where a frame is shed, and counted down by each report taken that
+    /// carries a count, which then changes neither `below` nor `rose`. A shed frame
+    /// presented nothing, so those reports count one present fewer, and would read as
+    /// the count falling and then rising again. A report whose `waiting` is `None`, and
+    /// a call that brought no report, leave it as it was.
+    pass_over: u32,
     /// Whether a region is open, as the render side last said; `None` before the first
     /// frame and after a torn one, when the frame asks.
     region: Option<Region>,
@@ -608,19 +629,28 @@ impl Shown {
     /// next deadline less [`JOIN_MARGIN`], through `executor`'s timer; then, unless no
     /// region is open, the passes, the publication and a render task started and left in
     /// flight, which a later call takes back. Where the render task in flight has not
-    /// resolved by the limit, the frame defers its passes and reports
-    /// [`Rendered::Busy`]: no tick waits for the render side, short of the bound
+    /// resolved by the limit, the frame defers its passes and reports [`Rendered::Busy`]:
+    /// the frame waits for the render side no later than its limit, short of the bound
     /// `README.md` gives a frame that defers, past which the frame awaits with no limit.
-    /// A frame whose limit has passed when its ticks are done, as that of a frame that is
-    /// behind has, looks once and waits for nothing. The call reads no clock of its own:
-    /// the limit is the pacer's, and the executor's timer keeps it. An executor shut down
-    /// during the wait resolves the frame `Cancelled` with [`ShownKept::Nothing`],
-    /// whether the render task's join or the timer reports it. `window` is the window's
-    /// extent in pixels, or `None` while it has no area; an extent with a zero dimension
-    /// is read as `None`. `README.md`, "The shown frame", states each step. The caller
-    /// sleeps until `world.next_deadline` and calls again: the timer root paces the frame
-    /// and nothing else does. Resolves with the world and the output, or with
-    /// [`ShownError`].
+    /// That the wake at the limit comes on time is the executor's: the frame's job leaves
+    /// one frame-critical worker out to keep it (`Executor::run_job_width`, which
+    /// `lactose-task` is asked for). An executor of one frame-critical worker has none to
+    /// leave, and there every frame looks once and does not wait for the task, as a frame
+    /// does whose limit has passed when its ticks are done, which that of a frame that is
+    /// behind has. `now` is `executor`'s clock, `Instant::now()` read just before the
+    /// call: the limit is the pacer's, in the time base of `now`, and the executor's
+    /// timer compares it with that clock, so a `now` that runs behind the clock makes
+    /// every frame look, and one that runs ahead waits past the next deadline. The call
+    /// reads no clock of its own. A frame suspended in its wait when the executor shuts
+    /// down is dropped with its `Server`, unpolled, on the thread that called
+    /// `Executor::shutdown`, and resolves nothing. Only a frame polled after the shutdown
+    /// began, as one driven through `Executor::block_on` is, resolves `Cancelled` with
+    /// [`ShownKept::Nothing`], whether the render task's join or the timer reports it.
+    /// `window` is the window's extent in pixels, or `None` while it has no area; an
+    /// extent with a zero dimension is read as `None`. `README.md`, "The shown frame",
+    /// states each step. The caller sleeps until `world.next_deadline` and calls again:
+    /// the timer root paces the frame and nothing else does. Resolves with the world and
+    /// the output, or with [`ShownError`].
     pub fn frame<'a>(
         self,
         executor: &'a Executor,

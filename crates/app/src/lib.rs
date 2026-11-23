@@ -115,7 +115,7 @@ const _: () = {
     assert!(TargetIndex::new(TARGETS - 1).is_some() && TargetIndex::new(TARGETS).is_none());
     assert!(RECORD_RESERVATION >= 1);
     // A frame's limit falls inside its own period: after its start, so a frame on time
-    // waits at all, and before the next deadline, so the wait delays no tick.
+    // waits at all, and before the next deadline, so the wait ends before a tick is due.
     assert!(!JOIN_MARGIN.is_zero() && JOIN_MARGIN.as_nanos() < TICK_PERIOD.as_nanos());
     // The picture presented a frame ago is on its way at any swapchain's floor.
     assert!(SHED_DEPTH >= 2);
