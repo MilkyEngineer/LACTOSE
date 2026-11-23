@@ -695,9 +695,10 @@ writes its report.
    counted.
 4. The Vulkan step runs every device test: each ignored test of the test targets
    `DEVICE_TESTS` in `src/main.rs` lists, which are `lactose-rhi-vulkan`'s library's unit
-   tests, of its `canary` module alone, so that no other ignored unit test runs as a device
-   test, and its `integration` binary, each in a process of its own, built with `cargo test
-   --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
+   tests, of its `canary` and `swapchain` modules alone, so that no other ignored unit test
+   runs as a device test, its `integration` binary, and the `device` module of
+   `lactose-render-graph`'s `integration` binary, each in a process of its own, built with
+   `cargo test --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
    - the layer is the Khronos validation layer of the Vulkan SDK that
      `tools/xtask/vulkan-layer.toml` pins, refused unless its library's SHA-256 and its
      manifest's version are the pin's. On Linux the SDK's archive is fetched into

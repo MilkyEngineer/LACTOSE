@@ -258,6 +258,23 @@ fn masked(stages: S, access: A, graphics: bool, everything: A) -> (S, A) {
     (kept, access & !GRAPHICS_ACCESS)
 }
 
+/// The families of an ownership transfer between two families that `change` is, if it is
+/// one.
+fn families(change: &Change) -> Option<(u32, u32)> {
+    let (from, to) = (change.from_queue, change.to_queue);
+    let crossing = change.exclusive && !change.from_undefined && from.queue != to.queue;
+    (crossing && from.family != to.family).then_some((from.family, to.family))
+}
+
+/// `stages` and `access` with the host's stage and accesses taken out, `instead` put in the
+/// host stage's place.
+fn off_host(stages: S, access: A, instead: S) -> (S, A) {
+    if !stages.contains(S::HOST) {
+        return (stages, access);
+    }
+    ((stages & !S::HOST) | instead, access & !(A::HOST_READ | A::HOST_WRITE))
+}
+
 /// The barrier `change` records on the queue `recording`, if any.
 ///
 /// A change from `Undefined` takes every earlier command and write as its source and
@@ -266,7 +283,11 @@ fn masked(stages: S, access: A, graphics: bool, everything: A) -> (S, A) {
 /// queues of one family is the full change on the releasing queue and nothing on the
 /// acquiring one, which the semaphore between them orders (D160, row 213); between two
 /// families it is a release and an acquire of equal layouts and families, each holding its
-/// own half of the scope.
+/// own half of the scope. Neither half names the host, which a barrier between two families
+/// may not (`VUID-VkBufferMemoryBarrier2-srcStageMask-03851`): a release out of `HostRead`
+/// takes no source stage for it, since the submit orders the host's earlier reads, and an
+/// acquire into `HostRead` takes every command as its destination, the host's half being
+/// [`host_after`]'s barrier.
 pub(crate) fn barrier(change: &Change, recording: Side) -> Option<Barrier> {
     let src = if change.from_undefined {
         (S::ALL_COMMANDS, A::MEMORY_WRITE)
@@ -297,19 +318,56 @@ pub(crate) fn barrier(change: &Change, recording: Side) -> Option<Barrier> {
     if !crossing {
         return Some(full(recording));
     }
-    if from.family == to.family {
+    let Some(pair) = families(change) else {
         return if recording.queue == to.queue { None } else { Some(full(recording)) };
-    }
-    let families = Some((from.family, to.family));
+    };
+    let families = Some(pair);
     if recording.queue == from.queue {
         let release = full(from);
-        Some(Barrier { dst_stages: S::NONE, dst_access: A::NONE, families, ..release })
+        let (src_stages, src_access) = off_host(release.src_stages, release.src_access, S::NONE);
+        Some(Barrier {
+            src_stages,
+            src_access,
+            dst_stages: S::NONE,
+            dst_access: A::NONE,
+            families,
+            ..release
+        })
     } else if recording.queue == to.queue {
         let acquire = full(to);
-        Some(Barrier { src_stages: S::NONE, src_access: A::NONE, families, ..acquire })
+        let (dst_stages, dst_access) =
+            off_host(acquire.dst_stages, acquire.dst_access, S::ALL_COMMANDS);
+        Some(Barrier {
+            src_stages: S::NONE,
+            src_access: A::NONE,
+            dst_stages,
+            dst_access,
+            families,
+            ..acquire
+        })
     } else {
         Some(full(recording))
     }
+}
+
+/// The barrier the queue `recording` records after `change`'s acquire, in a later call, when
+/// the acquire is one between two families into a scope of the host's: on the acquiring
+/// family alone, it makes every earlier write visible to the host, the acquired ones
+/// included.
+pub(crate) fn host_after(change: &Change, recording: Side) -> Option<Barrier> {
+    let into_host = change.to.stages.contains(S::HOST);
+    if !into_host || recording.queue != change.to_queue.queue || families(change).is_none() {
+        return None;
+    }
+    Some(Barrier {
+        src_stages: S::ALL_COMMANDS,
+        src_access: A::MEMORY_WRITE,
+        dst_stages: S::HOST,
+        dst_access: change.to.access & (A::HOST_READ | A::HOST_WRITE),
+        old_layout: change.to.layout,
+        new_layout: change.to.layout,
+        families: None,
+    })
 }
 
 #[cfg(test)]
@@ -317,7 +375,7 @@ mod tests {
     use ash::vk;
     use lactose_rhi_api::{BufferState, ImageState};
 
-    use super::{Barrier, Change, Side, barrier, buffer_scope, image_scope};
+    use super::{Barrier, Change, Side, barrier, buffer_scope, host_after, image_scope};
 
     const GRAPHICS: Side = Side { queue: 0, family: 0, graphics: true };
     /// A second queue of the graphics queue's family.
@@ -384,6 +442,71 @@ mod tests {
             (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
         );
         assert_eq!(release.src_access, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
+    }
+
+    fn buffer_change(
+        from: BufferState,
+        to: BufferState,
+        from_queue: Side,
+        to_queue: Side,
+    ) -> Change {
+        Change {
+            from: buffer_scope(from),
+            to: buffer_scope(to),
+            from_undefined: false,
+            from_queue,
+            to_queue,
+            exclusive: true,
+        }
+    }
+
+    #[test]
+    fn no_barrier_between_families_names_the_host() {
+        let host = vk::PipelineStageFlags2::HOST;
+        let host_access = vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE;
+        let named = |b: Barrier| {
+            b.src_stages.intersects(host)
+                || b.dst_stages.intersects(host)
+                || b.src_access.intersects(host_access)
+                || b.dst_access.intersects(host_access)
+        };
+        // Into `HostRead`: the acquire takes every command, and the host's barrier after it,
+        // on the acquiring family alone, takes the writes to the host.
+        let into =
+            buffer_change(BufferState::ShaderWrite, BufferState::HostRead, COMPUTE, GRAPHICS);
+        let release = barrier(&into, COMPUTE).unwrap();
+        let acquire = barrier(&into, GRAPHICS).unwrap();
+        assert!(!named(release) && !named(acquire));
+        assert_eq!(acquire.families, Some((2, 0)));
+        assert_eq!(acquire.dst_stages, vk::PipelineStageFlags2::ALL_COMMANDS);
+        assert_eq!(host_after(&into, COMPUTE), None);
+        let after = host_after(&into, GRAPHICS).unwrap();
+        assert_eq!(after.families, None);
+        assert_eq!(
+            (after.src_stages, after.src_access, after.dst_stages, after.dst_access),
+            (
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_WRITE,
+                host,
+                vk::AccessFlags2::HOST_READ
+            )
+        );
+        // Out of `HostRead`: the release takes no source stage, the submit ordering the
+        // host's earlier read, and the acquire is the use's.
+        let out = buffer_change(BufferState::HostRead, BufferState::CopySource, COMPUTE, GRAPHICS);
+        let release = barrier(&out, COMPUTE).unwrap();
+        assert!(!named(release) && !named(barrier(&out, GRAPHICS).unwrap()));
+        assert_eq!(release.src_stages, vk::PipelineStageFlags2::NONE);
+        assert_eq!(host_after(&out, GRAPHICS), None);
+        // Within one queue, or between two queues of one family, the host is named as before.
+        let one =
+            buffer_change(BufferState::CopyDestination, BufferState::HostRead, GRAPHICS, GRAPHICS);
+        assert_eq!(barrier(&one, GRAPHICS).unwrap().dst_stages, host);
+        assert_eq!(host_after(&one, GRAPHICS), None);
+        let sibling =
+            buffer_change(BufferState::CopyDestination, BufferState::HostRead, GRAPHICS, SIBLING);
+        assert_eq!(barrier(&sibling, GRAPHICS).unwrap().dst_stages, host);
+        assert_eq!(host_after(&sibling, SIBLING), None);
     }
 
     #[test]
