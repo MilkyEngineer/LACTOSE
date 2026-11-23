@@ -73,6 +73,7 @@ signature change to list.
 | `ErrorPolicy`, `Source`, `Response`, `LOG_TARGET` | The policy as a table from where an error came from to what the assembly does with it; the `tracing` target everything here logs at, `app` |
 | `Cooked`, `SavedRegion`, `SavedWorld`, `load` | Where cooked content comes from until the asset store exists; one region's saved state between loads; every region's saved state at one tick, which is what a container decodes to and what a save point yields; the load path from the slot's bytes to a `Start::Loaded` |
 | `SaveEncode` | A save being encoded on background tasks; the bytes then go to `lactose_io::Io::replace`, which nothing here wraps |
+| `install_crash_hook` | The panic hook every engine binary installs first in `main`: a text report to stderr, then to a file in the directory the binary names, then the abort ("The crash hook" below) |
 | `HeadlessConfig`, `Headless`, `RunReport` | The headless app: the executor, the IO pool and one server world, stepped from a test or run at tick rate by a tool, saved to a slot, shut down in order |
 | `WorldConfig::shown`, `RECORD_RESERVATION` (facade) | The configuration of a world that is shown, and the physics reservation a frame's record is left with while the step blocks: one, until `record-stall` reports |
 | `JOIN_MARGIN`, `SHED_DEPTH` (facade) | How long before the next tick's deadline a paced frame stops waiting for the frame before it, 2 ms; and the count of finished pictures still on their way to the display, taken as a present call begins, at which the frame after that call is shed: three, as `reviewer-gpu` measured it on the M1. `frame-pace` reads both |
@@ -99,6 +100,7 @@ table it is.
 |---|---|---|
 | `app-headless` (milestone 1) | Start an executor, an IO pool and a server world from the game's registrations, run N ticks at tick rate, report the hash, save, shut down in order; `main` returns the first fatal error | `Headless::{start, run, hash, save, shutdown}`, `RunReport`; the policy's `Stop` is `main`'s `Err` |
 | | The same from a save, losing no saved region | `load` before any world exists, `Start::Loaded`, the store ("Saves and loads" below) |
+| Every engine binary | A panic reported as text to stderr and to a file, and the process aborted, in every profile | `install_crash_hook`, first in `main` ("The crash hook" below) |
 | A SOUR test of the assembly | Build from the session's workers, layout and chaos; one unpaced tick at a time with the hash after each and every refusal visible; the chaos log at the end | `Workers::{frame_workers, chaos}`, `WorldConfig::layout`, `Headless::{step, hash, shutdown}`, `StepOutput::failures`; the glue is `tests/headless.rs`, section 4 |
 | The milestone 1 netcode spike, server side | Step the server once per frame with the sessions and inputs its jitter buffer released; take the gathered frame for its packer; the player's entity after a join; a full frame for the join over the table the server simulates with | `Server::frame` with a frame callback, `FrameOutput::gathered`, `Server::simulation` with `lactose_input::player_entity`, `Server::relevance` and `Server::time_scale` into a `StagedFrame::resync` |
 | The spike, client side | Build the prediction world on `JoinAccepted`; queue staged frames; one frame with a scripted sample; the last eight samples to send; a resync to request; the rollback cost and correction count to record | `build_client`, `Client::{push, frame, history}`, `ClientOutput::{reconciled, rollback, resync}` |
@@ -2685,6 +2687,68 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
   `run` and `save` fail with `Cancelled`.
 - A `Headless` is built on the thread that owns it and every method is called from that
   thread; none is called from a worker (`block_on` on a worker is a debug assertion).
+
+## The crash hook
+
+`install_crash_hook(binary, dir)` installs the process's panic hook (architecture section
+5.1, D155). Every engine binary calls it first in `main`, before its subscriber and before
+anything that can panic; RICOTTA keeps a hook of its own, since a tool does not link the
+assembly, and takes its lock and writes stderr the same way. It is safe code over `std`
+alone: no signal handler, no minidump, no second process. `binary` names the report's file,
+so the call asserts, at startup, that it is one non-empty path component: no separator, no
+root, not `.` or `..`. On a panic, on any thread, the hook:
+
+1. takes a lock it never releases, so that a panic on another thread waits for the abort
+   and the report is the process's first panic's. While it holds this one it takes `std`'s
+   backtrace lock alone, inside `std`'s capture and symbol lookup, where no user code runs
+   and the engine's allocator takes no lock, so no thread that waits on the hook's lock or
+   holds one the panicking thread waits on can hold it. A panic inside the hook makes `std`
+   abort before the hook runs again;
+2. captures a backtrace with `Backtrace::force_capture`, whatever `RUST_BACKTRACE` says;
+3. writes to stderr `<binary> crashed`, `thread: <name>` (`<unnamed>` for a thread without
+   one) and the panic's location and message as `std` prints them, before anything else
+   that can stall: formatting the backtrace reads its symbols from the executable's files;
+4. writes to stderr `backtrace:` and the backtrace;
+5. when `dir` is `Some`, creates the directory with its parents and writes the whole report,
+   the same bytes as steps 3 and 4, to a new file in it,
+   `<binary>-<YYYYMMDD>T<HHMMSS>.<mmm>Z-<process id>.txt`, in UTC, so that two crashes in
+   one directory never share a name and the files sort by time; the file is opened with
+   `create_new`, so no report replaces another, and a file whose write failed is removed;
+6. writes one line to stderr: `<binary>: the crash report is in <path>`, or `<binary>: no
+   crash report file at <path>: <error>` naming the directory or the file that failed;
+7. calls `std::process::abort`, in every profile.
+
+Stderr is written through a duplicate of its handle, never through `std`'s stderr lock: a
+thread that panics inside `eprintln!` holds that lock while its own hook waits for the
+first, and a thread waiting inside `eprintln!` on a lock the panicking thread holds would
+hold it until the abort, so a hook that took it would hang. The hook duplicates the handle
+at the panic, so that a stderr redirected since install is followed, and keeps a second
+duplicate made at install for a panic whose own duplicate fails: a full descriptor table
+(EMFILE), itself a common cause of a panic, or on Windows a full handle quota. With neither,
+the hook writes no stderr and goes on to the file. The reserve costs one descriptor or
+handle for the life of the process. On Windows a process with no console has a null stderr,
+which `std` copies without duplicating; a write to it fails and writes nothing, as `std`'s
+stderr does there, so such a process's report is its file. The cost: what other threads
+write to stderr while the hook runs can interleave with the report on the terminal, and on
+a Windows console that is not UTF-8 non-ASCII text (a message, a path) prints in the
+console's code page, since a raw handle bypasses `std`'s conversion for the console; the
+file is written whole and in UTF-8. A directory that cannot be created or written, or a
+file that cannot be written, costs the file alone: the failure is that one line, never a
+second panic, and the abort follows (`docs/verification.md`, the writable disk). `None`
+writes stderr alone. The directory is the binary's to choose (`crates/app-headless/README.md`
+gives the headless binary's), and the hook does not resolve it: a relative path is taken
+against the working directory at the panic, so a binary that changes its working directory
+passes an absolute one.
+
+Limits. A hardware fault, a signal and a stack overflow never reach a panic hook; they are
+read from the operating system's own report (D155). A panic whose payload's `Display`
+panics aborts in `std` before the hook runs. The hook names the thread through
+`std::thread::current`; on Linux, a panic in a foreign library's thread-exit destructor
+after `std`'s thread cleanup may make that call panic inside the hook, which `std` then
+aborts with no report: unverified, and not built around. Tests never install the hook
+(D16), so `#[should_panic]` and a property test's shrinking keep unwinding; a test that
+expects an abort runs a binary in a subprocess, as `crates/app-headless/tests/crash.rs`
+does.
 
 ## The saved-type record
 

@@ -6837,6 +6837,89 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   moves to milestone 5; sections 3 and 5.1's "crash dump", which revision 3.5 states as
   the text report; the row's and the headless README's "`lactose-platform` ... whose hook
   replaces this one".
+- Addendum (lane crash-hook, 2026-11-23; review rounds 1 and 2): built.
+  `lactose_app::install_crash_hook(binary: &'static str, dir: Option<PathBuf>)` installs the panic
+  hook, and every engine binary calls it first in `main` (`crates/app/README.md`, "The crash
+  hook"). It asserts at startup that `binary`, which names the file, is one non-empty path
+  component. On a panic on any thread it takes a lock it never releases, so that a second thread's
+  panic waits for the abort and the report is the first panic's. While it holds that lock it takes
+  `std`'s backtrace lock alone, inside `std`'s capture and symbol lookup, where no user code runs
+  and the engine's allocator takes no lock, so no thread that waits on the hook or holds a lock the
+  panicking thread waits on can hold it; a panic inside the hook makes `std` abort before the hook
+  runs again. It captures a backtrace with `Backtrace::force_capture`; writes to stderr `<binary>
+  crashed`, `thread: <name>` and the panic's location and message, before anything else that can
+  stall, since formatting the backtrace reads its symbols from the executable's files; then
+  `backtrace:` and the backtrace; then, when `dir` is `Some`, creates the directory with its
+  parents and writes the whole report, the same bytes, to a new file in it,
+  `<binary>-<YYYYMMDD>T<HHMMSS>.<mmm>Z-<process id>.txt` in UTC, opened with `create_new`, so that
+  two crashes in one directory never share a name, no report replaces another, and the files sort
+  by time; a file whose write failed is removed; then one line on stderr, naming the file, or the
+  path that failed with its error; then `std::process::abort`, in every profile. A directory or a
+  file that cannot be created or written costs the file alone, and is never a second panic. `None`
+  writes stderr alone (`docs/verification.md`, section 3, the writable disk). It is `std` alone: no
+  `unsafe`, no signal handler, no dependency added.
+  - *Stderr is written through a duplicate of its handle* (`AsFd` or `AsHandle`, then
+    `try_clone_to_owned`), never through `std`'s stderr lock. Review round 1 found that the lock
+    deadlocks the hook: a thread that panics inside `eprintln!` holds the stderr lock while its hook
+    waits for the first panic's, and a thread waiting inside `eprintln!` on a lock the panicking
+    thread holds keeps the stderr lock until the abort, which hung the milestone 1 hook and
+    RICOTTA's too. Review round 2 found the same hang where the duplicate fails and the hook fell
+    back to the locked stderr: a full descriptor table (EMFILE), itself a common cause of a panic.
+    So the hook duplicates the handle at the panic, which follows a stderr redirected since
+    install, and keeps a second duplicate made at install for a panic whose own duplicate fails;
+    with neither it writes no stderr and goes on to the file. The reserve costs one descriptor or
+    handle for the life of the process. On Windows a process with no console has a null stderr,
+    which `std` copies without duplicating; a write to it fails and writes nothing, as `std`'s
+    stderr does there, so the report of such a process is its file. The costs: what other threads
+    write to stderr meanwhile can interleave with the report on the terminal, and on a Windows
+    console that is not UTF-8 non-ASCII text prints in the console's code page, since a raw handle
+    bypasses `std`'s conversion for the console; the file is written whole and in UTF-8.
+  - *RICOTTA keeps a hook of its own*, since a tool does not link the assembly: the same report on
+    stderr alone, the same never-released lock, so that two threads that panic at once print one
+    report, and the same two duplicates.
+  - *The headless binary's directory* is the environment variable `LACTOSE_CRASH_DIR`, or `crash`
+    in the working directory when it is unset or empty, created only when a panic needs it: a run
+    that does not panic leaves nothing. The rule is the binary's, not `lactose-app`'s, since a
+    binary that runs on a player's machine will name a per-user directory.
+  - *The test-only panic path is an environment variable, `LACTOSE_TEST_PANIC`* (the binary's
+    `src/test_hook.rs`). Set and not empty, it replaces the run's frame callback with one that
+    panics on its first call, on the frame worker that runs the timer root, before any tick:
+    plainly; or, with `stderr-held`, while another thread is inside `eprintln!` and panics there a
+    second later; or, with `stderr-blocked`, holding a lock another thread waits on inside
+    `eprintln!`; or, on unix, with `stderr-blocked-emfile`, the same with the descriptor table
+    filled first. Unset or empty, the binary's paths are the ones it had. An environment variable
+    leaves the argument grammar untouched and needs no build of its own, which a cargo feature on a
+    feature root (`[feature_roots]`) would; the binary itself carries the lock cases, not an
+    example or a second binary, so that the test runs the headless binary's own wiring, the call
+    first in `main` and the directory rule; and the panic is where an engine panic happens, inside
+    a job under the abort-on-unwind guard, so the test shows the hook reporting before the guard
+    and the report naming a worker (`whisk-frame-<n>`). It makes no state reachable that a panic
+    would not: it is the process's own abort.
+  - *The proof* is `crates/app-headless/tests/crash.rs`, which runs the binary in a subprocess and
+    kills a run that has not exited in 30 s: the exit is SIGABRT on unix and
+    `STATUS_STACK_BUFFER_OVERRUN` (0xC0000409) on Windows; the report is on stderr, with the
+    thread, the message and a backtrace with frames, naming the timer root on unix; the file holds
+    the same bytes and carries the child's process ID; the default directory is `crash` under the
+    working directory; a directory below a regular file and, on unix and for a user other than
+    root, a read-only directory cost the file alone; both lock cases report and abort, and each
+    hung until killed on the hook before review round 1; on unix, with the descriptor limit
+    lowered to 256 and the table full, the lock case still reports on stderr, the line names the
+    file that could not be created, and the run aborts, where the hook before review round 2 hung
+    until killed; a run with the variable unset or empty exits 0 and creates no directory.
+    `lactose-app`'s unit tests hold the name's UTC date, the refusal to replace a file, the
+    removal of a file whose write failed, and the binary name's check. Tests install no hook
+    (D16).
+  - *Not covered*: on Linux, a panic in a foreign library's thread-exit destructor after `std`'s
+    thread cleanup may make `std::thread::current` panic inside the hook, which `std` aborts with no
+    report. It is unverified and not built around. A stderr closed at startup and opened later has
+    no reserve; `std` reopens a closed descriptor 2 at startup on unix.
+  - *The M1 keeps a system report of a Rust abort.* On macOS 27.2.1, ReportCrash wrote one `.ips`
+    (`EXC_CRASH`, `SIGABRT`) under the user's DiagnosticReports for each abort of the test's
+    subprocess. The laptop's and the desktop's `LocalDumps` setting is the owner's to record
+    (verification row 190).
+  - *The crossing*: `crates/persist/tests/diff.rs`'s two imports and the migration step that only
+    its `cfg(debug_assertions)` test uses moved into that test, and a release build of
+    `lactose-persist`'s tests prints no warning.
 
 **D156. On macOS tick start is held to 50 µs at P99** (§22, `lactose-task`, `docs/results`)
 - Why: the development Mac moved to macOS 27.2.1 on 17 November 2026 (D154), and the M1's re-run
