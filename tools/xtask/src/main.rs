@@ -79,14 +79,16 @@ cargo xtask <command>
                              docs/results/README.md
   slang                      install the pinned Slang release under the target directory,
                              from tools/cook/slang.toml, and print its slangc's path
-  gpu --driver <name> [--adapter <name>] [--only <metal|vulkan>] [--gpu-assisted]
+  gpu [--driver <name>] [--adapter <name>] [--only <metal|vulkan>] [--gpu-assisted]
       [--cooked <dir>]       cook the engine shaders, or with --cooked take the code
                              `ricotta --code` wrote to <dir> (Metal step alone); on macOS
                              make a Metal pipeline state from each under Metal's
                              validation; then run every device test under the pinned
                              Vulkan validation layer and the named driver (lavapipe,
                              moltenvk, kosmickrisp or system, whose device --adapter
-                             names), with GPU-assisted validation for --gpu-assisted
+                             names), with GPU-assisted validation for --gpu-assisted;
+                             with no --driver, on macOS, under moltenvk then kosmickrisp,
+                             or kosmickrisp alone with --gpu-assisted
   help                       print this text
 
 Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 could not run.";
@@ -285,15 +287,18 @@ fn install_slang() -> Result<PathBuf, String> {
 const SHADERS: &str = "shaders";
 /// The Swift script of the Metal step.
 const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
-/// The device tests the Vulkan step runs: each package and its test target, `None` for its
-/// library's unit tests, whose ignored tests are the ones that need a device. The library's
-/// is the thread-safety canary, whose unlocked driver call no safe call can make.
-const DEVICE_TESTS: [(&str, Option<&str>); 2] =
-    [("lactose-rhi-vulkan", None), ("lactose-rhi-vulkan", Some("integration"))];
+/// The device tests the Vulkan step runs: each package, its test target (`None` for its
+/// library's unit tests) and the prefix of the names taken, whose ignored tests are the ones
+/// that need a device. The library's are its `canary` module's alone: the thread-safety
+/// canary, whose unlocked driver call no safe call can make.
+const DEVICE_TESTS: [(&str, Option<&str>, &str); 2] =
+    [("lactose-rhi-vulkan", None, "canary::"), ("lactose-rhi-vulkan", Some("integration"), "")];
 
 /// What `gpu` was asked to run.
 struct GpuArgs<'a> {
-    driver: vulkan::Driver,
+    /// The drivers of the Vulkan step, one after the other; the Metal step's report is named
+    /// for the first.
+    drivers: Vec<vulkan::Driver>,
     adapter: Option<&'a str>,
     cooked: Option<&'a str>,
     metal: bool,
@@ -304,24 +309,26 @@ struct GpuArgs<'a> {
 impl<'a> GpuArgs<'a> {
     fn parse(args: &[&'a str]) -> Result<Self, String> {
         let usage = || {
-            "expected `--driver <lavapipe|moltenvk|kosmickrisp|system> [--adapter <name>] \
+            "expected `[--driver <lavapipe|moltenvk|kosmickrisp|system>] [--adapter <name>] \
              [--only <metal|vulkan>] [--gpu-assisted] [--cooked <dir>]`"
                 .to_owned()
         };
-        let ["--driver", name, ref rest @ ..] = *args else { return Err(usage()) };
-        let driver = vulkan::Driver::of(name).ok_or_else(usage)?;
         let mut parsed = Self {
-            driver,
+            drivers: Vec::new(),
             adapter: None,
             cooked: None,
             metal: cfg!(target_os = "macos"),
             vulkan: true,
             validators: vulkan::Validators::Plain,
         };
-        let mut rest = rest;
+        let mut rest = args;
         while let [flag, ref tail @ ..] = *rest {
             rest = match (flag, tail) {
-                ("--adapter", [name, tail @ ..]) if driver == vulkan::Driver::System => {
+                ("--driver", [name, tail @ ..]) if parsed.drivers.is_empty() => {
+                    parsed.drivers.push(vulkan::Driver::of(name).ok_or_else(usage)?);
+                    tail
+                }
+                ("--adapter", [name, tail @ ..]) => {
                     parsed.adapter = Some(name);
                     tail
                 }
@@ -344,6 +351,21 @@ impl<'a> GpuArgs<'a> {
                 _ => return Err(usage()),
             };
         }
+        if parsed.drivers.is_empty() {
+            // The M1's gate: both drivers, MoltenVK's run under Metal's validation and
+            // KosmicKrisp's without. GPU-assisted validation fails in MoltenVK's SPIRV-Cross,
+            // so its form runs under KosmicKrisp alone.
+            if !cfg!(target_os = "macos") {
+                return Err(format!("{}: on this host, name the driver", usage()));
+            }
+            parsed.drivers = match parsed.validators {
+                vulkan::Validators::Plain => vulkan::MACOS_GATE.to_vec(),
+                vulkan::Validators::GpuAssisted => vec![vulkan::Driver::KosmicKrisp],
+            };
+        }
+        if parsed.adapter.is_some() && parsed.drivers != [vulkan::Driver::System] {
+            return Err("`--adapter` selects a device under `--driver system` alone".to_owned());
+        }
         if parsed.cooked.is_some() && parsed.vulkan {
             // The code another runner cooked is MSL and metallibs; the Vulkan step takes the
             // whole cooked shaders this host's cook writes.
@@ -359,11 +381,12 @@ impl<'a> GpuArgs<'a> {
     }
 }
 
-/// `gpu --driver <name> [--adapter <name>] [--only <metal|vulkan>] [--gpu-assisted]
+/// `gpu [--driver <name>] [--adapter <name>] [--only <metal|vulkan>] [--gpu-assisted]
 /// [--cooked <dir>]`: cooks the engine's shaders with the pinned Slang, or takes the code
 /// another runner cooked to `<dir>`, then runs the Metal step on macOS and the Vulkan step
-/// under the named driver (`README.md`, "GPU runs"). Each step writes its report to
-/// `target/gpu/` and to standard error.
+/// under the named driver, or under each of the M1's gate with none (`README.md`, "GPU
+/// runs"). Each step writes its report to `target/gpu/` and to standard error, and every
+/// step runs before a failure of any fails the run.
 fn run_gpu(args: &[&str]) -> Checked {
     let args = GpuArgs::parse(args)?;
     let context = Context::load()?;
@@ -374,13 +397,20 @@ fn run_gpu(args: &[&str]) -> Checked {
         Some(dir) => (PathBuf::from(dir), format!("cooked elsewhere, in {dir}")),
         None => (cook_engine_shaders(&context, &pin, &out)?, format!("Slang {}", pin.version)),
     };
+    let mut failures = Vec::new();
     if args.metal {
-        run_metal(args.driver.name(), &code, &cooked_by, &out)?;
+        failures.extend(run_metal(args.drivers[0].name(), &code, &cooked_by, &out).err());
     }
     if args.vulkan {
-        run_vulkan(&context, &args, &cooked_by, &out)?;
+        for &driver in &args.drivers {
+            failures.extend(
+                run_vulkan(&context, &args, driver, &cooked_by, &out)
+                    .err()
+                    .map(|failure| format!("under {}: {failure}", driver.name())),
+            );
+        }
     }
-    Ok(Vec::new())
+    if failures.is_empty() { Ok(Vec::new()) } else { Err(failures.join("\n")) }
 }
 
 /// The Metal step: makes a Metal pipeline state from each cooked MSL and metallib, through
@@ -415,7 +445,7 @@ fn run_metal(driver: &str, code: &Path, cooked_by: &str, out: &Path) -> Result<(
     let counted: Vec<&str> = step
         .stderr
         .lines()
-        .filter(|line| !VALIDATION_ON.iter().any(|on| line.ends_with(on)))
+        .filter(|line| !vulkan::METAL_BANNERS.iter().any(|on| line.ends_with(on)))
         .collect();
     let file = out.join(format!("{driver}-metal.txt"));
     let written = format!(
@@ -440,16 +470,16 @@ fn run_metal(driver: &str, code: &Path, cooked_by: &str, out: &Path) -> Result<(
 }
 
 /// The Vulkan step: every device test of [`DEVICE_TESTS`] in a process of its own, under the
-/// pinned layer and the named driver, each judged by decision 5.10's rule; the run's
-/// validators' canaries first. Its report is `<out>/<driver>-vulkan[-gpu-assisted].txt`. A
-/// failure fails the run under every driver but KosmicKrisp, whose report is its record.
+/// pinned layer and `driver`, each judged by decision 5.10's rule; the run's validators'
+/// canaries first. Its report is `<out>/<driver>-vulkan[-gpu-assisted].txt`, and a failed
+/// test fails the run.
 fn run_vulkan(
     context: &Context,
     args: &GpuArgs<'_>,
+    driver: vulkan::Driver,
     cooked_by: &str,
     out: &Path,
 ) -> Result<(), String> {
-    let driver = args.driver;
     let pin = vulkan::Pin::parse(&read(vulkan::PIN_FILE)?)?;
     let sdk = vulkan::sdk(&pin, &context.target_dir)?;
     let layers = out.join("layers");
@@ -475,17 +505,19 @@ fn run_vulkan(
         vulkan::Validators::GpuAssisted => "-gpu-assisted",
     };
     eprintln!(
-        "gpu: the Vulkan step, under driver {}{form}, with the layer {}",
+        "gpu: the Vulkan step, under driver {}{form}, with the layer {}{}",
         driver.name(),
-        pin.version
+        pin.version,
+        if run.metal { " and Metal's validation" } else { "" }
     );
     let mut lines = Vec::new();
     let mut failed = Vec::new();
     let mut heard = Vec::new();
     let mut answered = Vec::new();
-    for (package, target) in DEVICE_TESTS {
+    for (package, target, prefix) in DEVICE_TESTS {
         let binary = test_binary(context, package, target)?;
-        let tests = ignored_tests(&binary)?;
+        let mut tests = ignored_tests(&binary)?;
+        tests.retain(|test| test.starts_with(prefix));
         // The run's canaries first: a layer that did not load reports nothing, and every
         // verdict after would pass for clean.
         let canaries = args.validators.canaries();
@@ -507,7 +539,7 @@ fn run_vulkan(
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            let verdict = vulkan::judge(test, output.status.success(), &text, expected);
+            let verdict = vulkan::judge(test, output.status.success(), &text, expected, run.metal);
             if test.ends_with("device_reports_its_driver_and_sends_nothing_when_clean") {
                 lines.extend(
                     text.lines()
@@ -567,7 +599,7 @@ fn run_vulkan(
     );
     fs::write(&file, written).map_err(|e| format!("{}: {e}", file.display()))?;
     eprintln!("gpu: the report is {}", file.display());
-    if !failed.is_empty() && driver.gates() {
+    if !failed.is_empty() {
         return Err(format!(
             "{} device test(s) failed decision 5.10's rule: {}",
             failed.len(),
@@ -685,8 +717,6 @@ fn said<'a>(phrasings: &[&str], stderr: &'a str) -> Option<&'a str> {
         Some(&stderr[at..at + phrasing.len()])
     })
 }
-/// The lines the two layers write when they load.
-const VALIDATION_ON: [&str; 2] = ["Metal API Validation Enabled", "Metal GPU Validation Enabled"];
 
 /// What one run of the Metal script printed.
 struct StepOutput {
@@ -695,17 +725,13 @@ struct StepOutput {
     stderr: String,
 }
 
-/// Runs the Metal script under Metal API and shader validation, set as the Metal spike set
-/// them: API validation's assertions abort, its warnings and shader validation's reports go to
-/// standard error.
+/// Runs the Metal script under Metal API and shader validation
+/// ([`vulkan::METAL_VALIDATION`]).
 fn metal_step(args: &[&str]) -> Result<StepOutput, String> {
     let output = Command::new("swift")
         .arg(METAL_SCRIPT)
         .args(args)
-        .env("MTL_DEBUG_LAYER", "1")
-        .env("MTL_DEBUG_LAYER_WARNING_MODE", "nslog")
-        .env("MTL_SHADER_VALIDATION", "1")
-        .env("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1")
+        .envs(vulkan::METAL_VALIDATION)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("cannot run swift: {e}"))?;
@@ -1001,7 +1027,42 @@ fn heavy(args: &[&str]) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CANARIES, said};
+    use super::{CANARIES, DEVICE_TESTS, GpuArgs, said, vulkan};
+
+    #[test]
+    fn with_no_driver_the_mac_gates_on_both_and_gpu_assisted_on_kosmickrisp() {
+        use vulkan::Driver::{KosmicKrisp, MoltenVk, System};
+        let drivers = |args: &[&str]| GpuArgs::parse(args).map(|parsed| parsed.drivers);
+        if cfg!(target_os = "macos") {
+            assert_eq!(drivers(&[]).unwrap(), [MoltenVk, KosmicKrisp]);
+            assert_eq!(drivers(&["--only", "vulkan"]).unwrap(), [MoltenVk, KosmicKrisp]);
+            assert_eq!(drivers(&["--gpu-assisted"]).unwrap(), [KosmicKrisp]);
+        } else {
+            assert!(drivers(&["--only", "vulkan"]).unwrap_err().contains("name the driver"));
+        }
+        let only = ["--only", "vulkan"];
+        assert_eq!(drivers(&[&["--driver", "moltenvk"], &only[..]].concat()).unwrap(), [MoltenVk]);
+        assert_eq!(
+            drivers(&["--only", "vulkan", "--driver", "system", "--adapter", "M1"]).unwrap(),
+            [System]
+        );
+        assert!(drivers(&["--driver", "moltenvk", "--driver", "kosmickrisp"]).is_err());
+        assert!(drivers(&["--driver", "metal"]).is_err());
+        let adapter = drivers(&["--only", "vulkan", "--adapter", "M1"]);
+        if cfg!(target_os = "macos") {
+            assert!(adapter.unwrap_err().contains("--driver system"));
+        }
+    }
+
+    #[test]
+    fn the_librarys_unit_tests_run_as_device_tests_by_the_canary_module_alone() {
+        let library: Vec<&str> = DEVICE_TESTS
+            .iter()
+            .filter(|(_, target, _)| target.is_none())
+            .map(|(_, _, prefix)| *prefix)
+            .collect();
+        assert_eq!(library, ["canary::"]);
+    }
 
     #[test]
     fn a_canary_is_heard_in_each_phrasing_seen_and_no_other_misuse_is() {

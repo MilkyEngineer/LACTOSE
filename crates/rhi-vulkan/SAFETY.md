@@ -32,7 +32,9 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
    indirect record's contents or a dispatch's counts may fault the GPU or race a host access.
    GPU-assisted validation reports such an access in tests (`cargo xtask gpu
    --gpu-assisted`, whose canaries are a read past a buffer through its address and a sample
-   of slot `heap_slots`, one past the heap, by an index in push bytes).
+   of slot `heap_slots`, one past the heap, by an index in push bytes), and on the M1 Metal
+   shader validation reports one past a buffer in every run under MoltenVK (`cargo xtask
+   gpu`, whose Metal step's canary is a store past a buffer).
 
 ## The sites, by kind
 

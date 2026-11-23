@@ -26,7 +26,7 @@ of a manifest it writes under the target directory.
 | `heavy` | nothing: it bounds how many heavy commands run at once on one machine (below) |
 | `measure` | nothing: it runs the milestone measurements and writes their result files (below) |
 | `slang` | nothing: it installs the pinned Slang release under the target directory and prints its `slangc` (below) |
-| `gpu --driver <name> [--adapter <name>] [--only <metal\|vulkan>] [--gpu-assisted] [--cooked <dir>]` | the GPU run's rule of decision 5.10 of the milestone 2 plan: the Metal step on macOS and the Vulkan step (below) |
+| `gpu [--driver <name>] [--adapter <name>] [--only <metal\|vulkan>] [--gpu-assisted] [--cooked <dir>]` | the GPU run's rule of decision 5.10 of the milestone 2 plan: the Metal step on macOS and the Vulkan step (below); with no `--driver`, the M1's gate, under MoltenVK and KosmicKrisp |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
 is printed there. The exit status is 0 for none, 1 for findings and 2 when a check could not
@@ -636,12 +636,25 @@ another version, the SDK's among them, is refused by the cook too.
 
 ## GPU runs
 
-`cargo xtask gpu --driver <lavapipe|moltenvk|kosmickrisp|system> [--adapter <name>] [--only
+`cargo xtask gpu [--driver <lavapipe|moltenvk|kosmickrisp|system>] [--adapter <name>] [--only
 <metal|vulkan>] [--gpu-assisted] [--cooked <dir>]` is the command decision 5.10 of the
 milestone 2 plan names. It cooks, then runs the Metal step on macOS and the Vulkan step on
 every host the layer's pin names; `--only` runs one of them, and the Metal step asked for on
 another host than macOS exits 2. The Metal step is the same under each driver name, since the
 driver selects a Vulkan loader's environment and the Metal step uses none.
+
+With no `--driver`, on macOS, it is the M1's gate (the owner's ruling of 19 November 2026):
+the Metal step once, then the Vulkan step under MoltenVK, with Metal API and shader
+validation, and under KosmicKrisp, without them, one after the other, and a failure under
+either fails the run. Each catches a missing barrier the other misses: MoltenVK the local
+read's, by its pixels, and KosmicKrisp the one between two dispatches, which Metal's serial
+compute encoder hides under MoltenVK. KosmicKrisp runs without Metal's validation because
+its queue aborts under API validation and its heap's textures are not resident under shader
+validation, defects of that driver. `gpu --gpu-assisted` with no `--driver` runs KosmicKrisp
+alone, since the layer's instrumented shaders fail in MoltenVK's SPIRV-Cross. On another host
+a run names its driver. `--driver <name>` runs one driver, for development, and `--adapter`
+goes with `--driver system` alone. Every step runs before a failure fails the run, so each
+writes its report.
 
 1. It installs the pinned Slang as `slang` does, and cooks `shaders/` with `ricotta --slangc
    <it> --code target/gpu/code --shaders target/gpu/shaders` into
@@ -682,7 +695,8 @@ driver selects a Vulkan loader's environment and the Metal step uses none.
    counted.
 4. The Vulkan step runs every device test: each ignored test of the test targets
    `DEVICE_TESTS` in `src/main.rs` lists, which are `lactose-rhi-vulkan`'s library's unit
-   tests and its `integration` binary, each in a process of its own, built with `cargo test
+   tests, of its `canary` module alone, so that no other ignored unit test runs as a device
+   test, and its `integration` binary, each in a process of its own, built with `cargo test
    --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
    - the layer is the Khronos validation layer of the Vulkan SDK that
      `tools/xtask/vulkan-layer.toml` pins, refused unless its library's SHA-256 and its
@@ -702,9 +716,9 @@ driver selects a Vulkan loader's environment and the Metal step uses none.
      `CLEARED_PREFIXES` in `src/vulkan.rs`): `VK_KHRONOS_VALIDATION_*`, `VK_LOADER_*`,
      `VK_INSTANCE_LAYERS`, `VK_ICD_FILENAMES`, `VK_DRIVER_FILES`, `VK_ADD_DRIVER_FILES`,
      `VK_LAYER_PATH`, `VK_ADD_LAYER_PATH`, `VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_SETTINGS_PATH`,
-     `DYLD_LIBRARY_PATH`, `LACTOSE_VALIDATION_OFF`, `LACTOSE_GPU_ADAPTER` and
-     `LACTOSE_GPU_SHADERS`, and names each it removed in its file; what a run needs of them it
-     takes as an argument;
+     `DYLD_LIBRARY_PATH`, `LACTOSE_VALIDATION_OFF`, `LACTOSE_GPU_ADAPTER`,
+     `LACTOSE_GPU_SHADERS` and Metal's `MTL_*`, and names each it removed in its file; what a
+     run needs of them it takes as an argument;
    - the driver is `VK_DRIVER_FILES`: lavapipe's manifest in `/usr/share/vulkan/icd.d/`,
      MoltenVK's or KosmicKrisp's in the SDK's `share/vulkan/icd.d/`; under `system` the
      loader's own search, and `--adapter <name>` selects the device by a part of its name
@@ -716,7 +730,9 @@ driver selects a Vulkan loader's environment and the Metal step uses none.
      filtered (`WARNING-Setting-Limit-Adjusted`);
    - MoltenVK writes its warnings and errors (`MVK_CONFIG_LOG_LEVEL=2`), and Mesa's banner for
      a driver that is not conformant is off (`MESA_VK_IGNORE_CONFORMANCE_WARNING=1`): it is
-     no message about a call.
+     no message about a call;
+   - under MoltenVK, Metal API and shader validation, set as the Metal step sets them
+     (`METAL_VALIDATION` in `src/vulkan.rs`); under any other driver, none.
 5. Each binary's canaries go first. The canaries (`Validators::canaries` in `src/vulkan.rs`) are
    thread-safety validation's (the graphics queue waited idle through `ash` with no lock under
    a lagging dispatch while another thread submits to it,
@@ -738,20 +754,27 @@ driver selects a Vulkan loader's environment and the Metal step uses none.
    test, a listed canary that no binary holds fails the run. Every other test passes when it
    passes, its sinks printed no message and the driver wrote no line of its errors or
    warnings: MoltenVK's `[mvk-error]` and `[mvk-warn]`, Mesa's `MESA: error`, `MESA:
-   warning` and any `WARNING: ` line.
+   warning` and any `WARNING: ` line. Under Metal's validation Metal must also write no
+   report of shader validation's (`Invalid Metal usage`), no assertion of API validation's
+   (`failed assertion`) and no other line of the system log, which is where API validation's
+   warnings go; and every test, canaries included, must print both validators' banners to
+   the system log (`Metal API Validation Enabled`, `Metal GPU Validation Enabled`), which
+   shows them loaded in its process, unless it says it skipped: a case of the null backend's
+   alone skips before it makes a device, so Metal never loads. The Metal step's canaries
+   show what the two report.
 6. It writes `target/gpu/<driver>-vulkan.txt`, or `<driver>-vulkan-gpu-assisted.txt`: the
    driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
    cleared:`, or `none`), every variable it set, the canaries heard or skipped, the
    device's `DeviceInfo` and `Capabilities`, and each test with `passed`, the suite's
    `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed. A failed
-   test fails the run, except under `kosmickrisp`, whose file is that driver's record
-   (decision 5.7).
+   test fails the run, under every driver.
 
 The `shaders` CI job runs `gpu --driver system --only metal` on the macOS runner that cooks,
 and the `shaders-oldest` job runs `gpu --driver system --only metal --cooked` on the oldest
 macOS image, on the code the first cooked: the same canaries and count on both. The `gpu
 (lavapipe)` job runs `gpu --driver lavapipe --only vulkan` on every pull request, and the
-nightly runs `gpu --driver lavapipe --only vulkan --gpu-assisted`.
+nightly runs `gpu --driver lavapipe --only vulkan --gpu-assisted`. On the M1, `gpu` and
+`gpu --driver kosmickrisp --gpu-assisted` are run by hand: no runner has the M1's drivers.
 
 Before either, `bash tools/xtask/runner-facts.sh [--metal-optional] <file>` records the
 runner's facts in `<file>` and in the job's summary: its system, and on macOS its Xcode, its

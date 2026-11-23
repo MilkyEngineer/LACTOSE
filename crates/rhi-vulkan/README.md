@@ -139,9 +139,10 @@ anything under the GPU's use; with nothing pending it tears down as any last hol
 ## Tests
 
 Every test that makes a device is ignored by a plain run, which may have no driver;
-`cargo xtask gpu --driver <name>` runs each ignored test of the library's unit tests and of
-the `integration` binary in a process of its own, under the pinned Khronos validation layer,
-by decision 5.10's rule (`tools/xtask/README.md`, "GPU runs").
+`cargo xtask gpu` runs each ignored test of the library's `canary` module and of the
+`integration` binary in a process of its own, under the pinned Khronos validation layer, by
+decision 5.10's rule (`tools/xtask/README.md`, "GPU runs"). On the M1 the gate is both
+drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp without.
 
 - `tests/conformance.rs`: every case of `lactose-rhi-api`'s suite, one test each, on the
   driver the loader finds. A case of a check null alone makes, a case that needs a device
@@ -190,14 +191,14 @@ by decision 5.10's rule (`tools/xtask/README.md`, "GPU runs").
 ## Records
 
 The runs on the M1 (macOS 27.2.1, Vulkan SDK 1.4.363.1), each by `cargo xtask gpu` with every
-message counted. Under `system` the loader's first device is MoltenVK's, and the run is
+message counted; the first two are the gate, which fails on a failure of either. Under `system` the loader's first device is MoltenVK's, and the run is
 MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choose between them.
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2 | 148 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363), a record (decision 5.7) | 142 | 50: 30 null alone, 8 no window, 4 no loss, 5 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
-| KosmicKrisp under GPU-assisted validation, a record | 138 | 50: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
+| MoltenVK 1.4.2, under Metal API and shader validation | 148 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363) | 142 | 50: 30 null alone, 8 no window, 4 no loss, 5 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
+| KosmicKrisp under GPU-assisted validation | 138 | 50: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
 
 The counts are of the device tests: the suite's 175 cases, 147 contract and 28 output, and the
 device's own. Each driver passes 27 of the 28 output cases: MoltenVK skips the count draw, and

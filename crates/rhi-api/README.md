@@ -1304,9 +1304,9 @@ Some output cases count as evidence only in the shape, or on the device, named h
   submit before the next is made, silences it.
 - `sampler_filters_as_described` picks among two or more samplers by a non-uniform index
   past zero, in the draw that indexes the image array past slot zero, and compares exactly
-  where filtering is exact; a linear sample is within 80 / 2^(4 + 1) + 1 of the reference,
-  the weight's error at Vulkan's least `subTexelPrecisionBits` over a step of 80, and one
-  more for rounding.
+  where filtering is exact. A linear sample falls where each weight is a multiple of 1/16,
+  which a device with Vulkan's least `subTexelPrecisionBits`, 4, computes exactly, over
+  texels 32 apart, and is within 1.5 of the reference: a weight 1/16 off is 2 away.
 - `dispatch_indirect_reads_its_counts` has a dispatch write the counts, at an offset that
   is not zero and all three different, through a `ShaderWrite` to `Indirect` transition,
   with a lagging writer; a mutation that drops the transition shows on a discrete GPU
@@ -1314,9 +1314,10 @@ Some output cases count as evidence only in the shape, or on the device, named h
   synchronisation validation does not track indirect buffers and Metal's tracking hides the
   miss on the M1.
 - `dispatches_of_one_pass_see_each_others_writes` has a lagging first dispatch; a mutation
-  that drops Vulkan's barrier between the two shows on a discrete GPU alone, since lavapipe
-  runs each dispatch to completion before the next command, and on the M1 Metal's serial
-  compute encoder orders the two, so the case cannot fail there.
+  that drops Vulkan's barrier between the two fails it under KosmicKrisp on the M1, and so
+  fails the M1's gate. It passes under MoltenVK, whose serial Metal compute encoder orders
+  the two, and under lavapipe, which runs each dispatch to completion before the next
+  command.
 - `viewport_and_scissor_place_the_triangles` draws with a viewport off the centre and a
   scissor strictly inside the attachment, triangles of both windings under `Cull::Back`,
   compared exactly; `clear_and_keep_load_as_described` also orders two passes into one

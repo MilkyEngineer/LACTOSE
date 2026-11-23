@@ -976,17 +976,17 @@ fn heap_is_sampled_past_slot_zero(ctx: &Ctx<'_>) -> Applies {
     Ok(())
 }
 
-/// The least `subTexelPrecisionBits` Vulkan allows a device.
-const SUB_TEXEL_BITS: u32 = 4;
-
 fn sampler_filters_as_described(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
-    // Four texels in a row, red rising by 80 from zero; the rest of each texel fixed.
-    let reds = [0u8, 80, 160, 240];
+    // Eight texels in a row, red rising by 32 from zero; the rest of each texel fixed. Over
+    // eight texels the centre of the target's pixel x falls at texel coordinate
+    // (2x - 7) / 16: every filter weight is a multiple of 1/16, which the least sub-texel
+    // precision Vulkan allows, 4 bits, holds exactly, and every filtered red is whole.
+    let reds = [0u8, 32, 64, 96, 128, 160, 192, 224];
     let texels: Vec<u8> = reds.iter().flat_map(|&red| [red, 7, 9, 255]).collect();
-    let extent = Extent { width: 4, height: 1 };
+    let extent = Extent { width: 8, height: 1 };
     let image = sampled_image(ctx, &*device, extent, &texels);
-    let other = sampled_image(ctx, &*device, extent, &[0; 16]);
+    let other = sampled_image(ctx, &*device, extent, &[0; 32]);
     ctx.ok(device.write_heap_slot(HeapSlot(0), other), "a heap write");
     ctx.ok(device.write_heap_slot(HeapSlot(3), image), "a heap write");
     let linear = SamplerDesc { magnify: Filter::Linear, minify: Filter::Linear, ..NEAREST };
@@ -999,19 +999,15 @@ fn sampler_filters_as_described(ctx: &Ctx<'_>) -> Applies {
     for (x, texel) in got.iter().take(W as usize).enumerate() {
         let u = (x as f32 + 0.5) / W as f32;
         let red = if u < 0.5 {
-            reds[(u * 4.0) as usize]
+            reds[(u * 8.0) as usize]
         } else {
-            let t = (u * 4.0 - 0.5).clamp(0.0, 3.0);
+            let t = (u * 8.0 - 0.5).clamp(0.0, 7.0);
             let (low, frac) = (t.floor() as usize, t.fract());
-            let high = (low + 1).min(3);
+            let high = (low + 1).min(7);
             let value = f32::from(reds[low]) * (1.0 - frac) + f32::from(reds[high]) * frac;
-            // A filter weight is exact to 2^-bits of `subTexelPrecisionBits`, so a step of
-            // 80 lands up to 80 / 2^(bits + 1) off, and one more for the format's rounding.
-            // No capability reports the bits: the tolerance is of the least a device may
-            // have, 4, which every device meets.
-            let tolerance = 80.0 / f32::from(1u16 << (SUB_TEXEL_BITS + 1)) + 1.0;
+            // The format's rounding, with room: a weight 1/16 off lands 2 away.
             let have = f32::from(texel[0]);
-            if (have - value).abs() > tolerance {
+            if (have - value).abs() > 1.5 {
                 ctx.fail(format_args!("pixel {x} filtered to {have}, {value} expected"));
             }
             texel[0]

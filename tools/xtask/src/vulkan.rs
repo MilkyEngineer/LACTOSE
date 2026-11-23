@@ -99,7 +99,7 @@ pub enum Driver {
     Lavapipe,
     /// MoltenVK, from the SDK.
     MoltenVk,
-    /// Mesa's KosmicKrisp, from the SDK: a record, never a gate (decision 5.7).
+    /// Mesa's KosmicKrisp, from the SDK.
     KosmicKrisp,
     /// Whatever drivers the system's loader finds, the device selected by name.
     System,
@@ -129,13 +129,32 @@ impl Driver {
         }
     }
 
-    /// Whether a failed case fails the run: under every driver but KosmicKrisp, whose run
-    /// is that driver's record (decision 5.7).
+    /// Whether its runs are under Metal API and shader validation: MoltenVK's are. Not
+    /// KosmicKrisp's, whose queue aborts under API validation and whose heap's textures are
+    /// not resident under shader validation, defects of that driver.
     #[must_use]
-    pub fn gates(self) -> bool {
-        self != Self::KosmicKrisp
+    pub fn metal_validation(self) -> bool {
+        self == Self::MoltenVk
     }
 }
+
+/// The drivers `gpu` gates on with no `--driver`, on macOS, one after the other: each
+/// catches a missing barrier the other misses (the owner's ruling of 19 November 2026).
+pub const MACOS_GATE: [Driver; 2] = [Driver::MoltenVk, Driver::KosmicKrisp];
+
+/// Metal API and shader validation, set as the Metal spike set them: API validation's
+/// assertions abort, its warnings and shader validation's reports go to standard error.
+pub const METAL_VALIDATION: [(&str, &str); 4] = [
+    ("MTL_DEBUG_LAYER", "1"),
+    ("MTL_DEBUG_LAYER_WARNING_MODE", "nslog"),
+    ("MTL_SHADER_VALIDATION", "1"),
+    ("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1"),
+];
+
+/// What Metal's validators each write once on loading into a process, API validation's and
+/// shader validation's, at the end of a line of the system's log.
+pub const METAL_BANNERS: [&str; 2] =
+    ["Metal API Validation Enabled", "Metal GPU Validation Enabled"];
 
 /// Which validators a run turns on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -391,6 +410,8 @@ pub struct Run {
     pub set: Vec<(String, String)>,
     /// Every inherited variable the run removes (`cleared`), by name, for the result file.
     pub cleared: Vec<String>,
+    /// Whether the run sets Metal's validation, whose banners each test must then print.
+    pub metal: bool,
 }
 
 /// Variables a run removes from the environment it inherits, before it sets its own: each
@@ -410,8 +431,9 @@ const CLEARED: [&str; 12] = [
     "LACTOSE_GPU_SHADERS",
 ];
 
-/// Every family of variables a run removes: the layer's settings and the loader's own.
-const CLEARED_PREFIXES: [&str; 2] = ["VK_KHRONOS_VALIDATION_", "VK_LOADER_"];
+/// Every family of variables a run removes: the layer's settings, the loader's own and
+/// Metal's, which a run under MoltenVK sets and any other runs without.
+const CLEARED_PREFIXES: [&str; 3] = ["VK_KHRONOS_VALIDATION_", "VK_LOADER_", "MTL_"];
 
 /// The names among `inherited` a run removes, sorted.
 #[must_use]
@@ -430,8 +452,9 @@ pub fn cleared(inherited: impl IntoIterator<Item = String>) -> Vec<String> {
 
 impl Run {
     /// The environment of a run of `driver` on `sdk`, with the layer's implicit manifest in
-    /// `layers`, an empty directory at `no_layers`, `validators` on, the suite's shaders in
-    /// `shaders` and, under `system`, the device `adapter` names.
+    /// `layers`, an empty directory at `no_layers`, `validators` on, Metal's validation
+    /// where the driver runs under it, the suite's shaders in `shaders` and, under `system`,
+    /// the device `adapter` names.
     ///
     /// # Errors
     /// When the driver's manifest is not where this host keeps it.
@@ -471,6 +494,10 @@ impl Run {
         for (name, value) in validators.settings() {
             set.push(((*name).to_owned(), (*value).to_owned()));
         }
+        let metal = driver.metal_validation();
+        if metal {
+            set.extend(METAL_VALIDATION.map(|(name, value)| (name.to_owned(), value.to_owned())));
+        }
         // MoltenVK's warnings and errors on standard error, which count. Mesa's drivers print
         // a banner for a driver that is not conformant, which is no message about a call.
         set.push(("MVK_CONFIG_LOG_LEVEL".to_owned(), "2".to_owned()));
@@ -480,7 +507,7 @@ impl Run {
             set.push(("LACTOSE_GPU_ADAPTER".to_owned(), adapter.to_owned()));
         }
         let names = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok());
-        Ok(Self { set, cleared: cleared(names) })
+        Ok(Self { set, cleared: cleared(names), metal })
     }
 
     /// Applies the run's environment to `command`: the inherited variables it clears
@@ -523,7 +550,8 @@ pub struct Verdict {
     pub said: Option<String>,
     /// Every message the test's sinks printed, each a line.
     pub messages: Vec<String>,
-    /// Every line in which the driver reported an error or a warning.
+    /// Every line in which the driver, or Metal's validation under it, reported an error or
+    /// a warning.
     pub driver: Vec<String>,
     /// Why the test fails the rule, or `None` where it passes.
     pub failure: Option<String>,
@@ -533,19 +561,48 @@ pub struct Verdict {
 const DRIVER_LINES: [&str; 5] =
     ["[mvk-error]", "[mvk-warn]", "MESA: error", "MESA: warning", "WARNING: "];
 
+/// The lines Metal's validation writes for what it finds: shader validation's reports, API
+/// validation's assertions; its warnings are the system log's lines (`logged`).
+const METAL_LINES: [&str; 2] = ["Invalid Metal usage", "failed assertion"];
+
+/// Whether `line` is one of the system log's, as `NSLog` writes it to standard error: the
+/// date, the time to the millisecond, then the process's name and `[pid:thread]`.
+fn logged(line: &str) -> bool {
+    let shape = b"dddd-dd-dd dd:dd:dd.ddd ";
+    line.len() > shape.len()
+        && line.bytes().zip(shape).all(|(byte, &want)| match want {
+            b'd' => byte.is_ascii_digit(),
+            want => byte == want,
+        })
+        && line[shape.len()..].split(' ').next().is_some_and(|name| name.ends_with(']'))
+}
+
 /// Reads the output of the device test `test`, run alone, and judges it by decision 5.10's
 /// rule: the process succeeded; the driver wrote no error or warning line; and its sinks
 /// printed no message, or, for a canary, at least one of each of `expected` and nothing
-/// else.
+/// else. Under Metal's validation (`metal`), it wrote no report, assertion or other line of
+/// the log, and each of its validators printed its banner, unless the case says it skipped:
+/// a case of the null backend's alone skips before it makes a device, and Metal never loads.
 #[must_use]
-pub fn judge(test: &str, succeeded: bool, output: &str, expected: Option<&[&str]>) -> Verdict {
+pub fn judge(
+    test: &str,
+    succeeded: bool,
+    output: &str,
+    expected: Option<&[&str]>,
+    metal: bool,
+) -> Verdict {
     let messages: Vec<String> = output
         .lines()
         .filter_map(|line| line.find("message: Message {").map(|at| line[at..].to_owned()))
         .collect();
+    let metal_line = |line: &str| {
+        metal
+            && (METAL_LINES.iter().any(|mark| line.contains(mark))
+                || logged(line) && !METAL_BANNERS.iter().any(|banner| line.ends_with(banner)))
+    };
     let driver: Vec<String> = output
         .lines()
-        .filter(|line| DRIVER_LINES.iter().any(|mark| line.contains(mark)))
+        .filter(|line| DRIVER_LINES.iter().any(|mark| line.contains(mark)) || metal_line(line))
         .map(str::to_owned)
         .collect();
     let name = test.rsplit("::").next().unwrap_or(test);
@@ -555,10 +612,15 @@ pub fn judge(test: &str, succeeded: bool, output: &str, expected: Option<&[&str]
         (word == "passed" || word.starts_with("skipped, ")).then(|| word.to_owned())
     });
     let skipped = said.as_deref().is_some_and(|word| word.starts_with("skipped, "));
+    let unloaded = METAL_BANNERS.iter().find(|banner| {
+        metal && !skipped && !output.lines().any(|line| logged(line) && line.ends_with(*banner))
+    });
     let failure = if !succeeded {
         Some("the test failed".to_owned())
     } else if !driver.is_empty() {
-        Some(format!("{} line(s) of the driver's errors or warnings", driver.len()))
+        Some(format!("{} line(s) of the driver's or Metal's errors or warnings", driver.len()))
+    } else if let Some(banner) = unloaded {
+        Some(format!("Metal's validation did not print `{banner}`: is it loaded?"))
     } else {
         match expected {
             None | Some(_) if skipped && !messages.is_empty() => {
@@ -665,12 +727,12 @@ mod tests {
 
     #[test]
     fn a_clean_case_passes_and_its_word_is_kept() {
-        let verdict = judge("conformance::a_case", true, CLEAN, None);
+        let verdict = judge("conformance::a_case", true, CLEAN, None, false);
         assert_eq!(verdict.failure, None);
         assert_eq!(verdict.said.as_deref(), Some("passed"));
         let skipped = "test conformance::b ... b: skipped, no window\nok\n";
         assert_eq!(
-            judge("conformance::b", true, skipped, None).said.as_deref(),
+            judge("conformance::b", true, skipped, None, false).said.as_deref(),
             Some("skipped, no window")
         );
     }
@@ -679,44 +741,110 @@ mod tests {
     fn a_message_or_a_driver_line_fails_a_case_that_passed() {
         let sent = format!("{CLEAN}{}", message("VUID-x"));
         assert!(
-            judge("conformance::a_case", true, &sent, None).failure.unwrap().contains("1 message")
+            judge("conformance::a_case", true, &sent, None, false)
+                .failure
+                .unwrap()
+                .contains("1 message")
         );
         let warned = format!("{CLEAN}[mvk-warn] something\n");
         assert!(
-            judge("conformance::a_case", true, &warned, None).failure.unwrap().contains("driver")
+            judge("conformance::a_case", true, &warned, None, false)
+                .failure
+                .unwrap()
+                .contains("driver")
         );
-        assert!(judge("conformance::a_case", false, CLEAN, None).failure.is_some());
+        assert!(judge("conformance::a_case", false, CLEAN, None, false).failure.is_some());
     }
 
     #[test]
     fn a_canary_passes_on_its_messages_alone_and_fails_silent_or_with_another() {
         let ids: &[&str] = &["A", "B"];
         let both = format!("{}{}{}", message("A"), message("B"), message("A"));
-        assert_eq!(judge("device::canary", true, &both, Some(ids)).failure, None);
-        let silent = judge("device::canary", true, &message("A"), Some(ids)).failure.unwrap();
+        assert_eq!(judge("device::canary", true, &both, Some(ids), false).failure, None);
+        let silent =
+            judge("device::canary", true, &message("A"), Some(ids), false).failure.unwrap();
         assert!(silent.contains("B was not heard"), "{silent}");
         let other = format!("{both}{}", message("C"));
         assert!(
-            judge("device::canary", true, &other, Some(ids))
+            judge("device::canary", true, &other, Some(ids), false)
                 .failure
                 .unwrap()
                 .contains("not the canary's")
         );
         // An identifier that merely begins with the canary's is another message.
         let longer = format!("{both}{}", message("A-and-more"));
-        assert!(judge("device::canary", true, &longer, Some(ids)).failure.is_some());
+        assert!(judge("device::canary", true, &longer, Some(ids), false).failure.is_some());
     }
 
     #[test]
     fn a_canary_may_skip_for_a_reason_and_send_nothing() {
         let ids: &[&str] = &["A"];
         let skipped = "test device::canary ... canary: skipped, one queue\nok\n";
-        let verdict = judge("device::canary", true, skipped, Some(ids));
+        let verdict = judge("device::canary", true, skipped, Some(ids), false);
         assert_eq!(verdict.failure, None);
         assert_eq!(verdict.said.as_deref(), Some("skipped, one queue"));
         let loud = format!("{skipped}{}", message("A"));
-        assert!(judge("device::canary", true, &loud, Some(ids)).failure.is_some());
-        assert!(judge("conformance::b", true, &loud, None).failure.is_some());
+        assert!(judge("device::canary", true, &loud, Some(ids), false).failure.is_some());
+        assert!(judge("conformance::b", true, &loud, None, false).failure.is_some());
+    }
+
+    /// What a process under Metal's validation writes on loading it, through the system log.
+    const BANNERS: &str = "2026-11-19 04:55:04.377 integration-0392d6b825cbf81d[22328:15687764] \
+                           Metal API Validation Enabled\n2026-11-19 04:55:04.377 \
+                           integration-0392d6b825cbf81d[22328:15687764] Metal GPU Validation \
+                           Enabled\n";
+
+    #[test]
+    fn under_metal_validation_a_case_passes_with_both_banners_and_nothing_else() {
+        let clean = format!("{BANNERS}{CLEAN}");
+        assert_eq!(judge("conformance::a_case", true, &clean, None, true).failure, None);
+        // Not loaded: a run that set the variables and heard no banner proves nothing.
+        let silent = judge("conformance::a_case", true, CLEAN, None, true).failure.unwrap();
+        assert!(silent.contains("Metal API Validation Enabled"), "{silent}");
+        let half = format!("{}\n{CLEAN}", BANNERS.lines().next().unwrap());
+        let half = judge("conformance::a_case", true, &half, None, true).failure.unwrap();
+        assert!(half.contains("Metal GPU Validation Enabled"), "{half}");
+        // A report of shader validation's, as it wrote one for a read past a buffer.
+        let report = format!(
+            "{clean}Invalid Metal usage: Invalid load in 'device' or 'constant' address space at \
+             offset 256, executing compute function: \"cs_main\" \n"
+        );
+        let verdict = judge("conformance::a_case", true, &report, None, true);
+        assert_eq!(verdict.driver.len(), 1);
+        assert!(verdict.failure.unwrap().contains("Metal's errors or warnings"));
+        // Any other line of the log is a warning of API validation's.
+        let warned = format!(
+            "{clean}2026-11-19 04:55:04.390 integration-0392d6b825cbf81d[22328:15687764] a \
+             warning\n"
+        );
+        assert!(judge("conformance::a_case", true, &warned, None, true).failure.is_some());
+        // A case that skips may make no device, and Metal never loads; it still writes
+        // nothing.
+        let skipped = "test conformance::b ... b: skipped, null alone\nok\n";
+        assert_eq!(judge("conformance::b", true, skipped, None, true).failure, None);
+        let skipped_warned = format!("{skipped}{}", warned.lines().last().unwrap());
+        assert!(judge("conformance::b", true, &skipped_warned, None, true).failure.is_some());
+        // Without Metal's validation neither is looked for.
+        assert_eq!(judge("conformance::a_case", true, &warned, None, false).failure, None);
+    }
+
+    #[test]
+    fn a_log_line_is_known_by_its_shape() {
+        assert!(logged(BANNERS.lines().next().unwrap()));
+        assert!(!logged("2026-11-19 04:55:04.377 no process"));
+        assert!(!logged("test conformance::a_case ... a_case: passed"));
+        assert!(!logged("2026-11-19"));
+    }
+
+    #[test]
+    fn metal_validation_is_moltenvks_alone() {
+        let under: Vec<Driver> =
+            [Driver::Lavapipe, Driver::MoltenVk, Driver::KosmicKrisp, Driver::System]
+                .into_iter()
+                .filter(|driver| driver.metal_validation())
+                .collect();
+        assert_eq!(under, [Driver::MoltenVk]);
+        assert_eq!(MACOS_GATE, [Driver::MoltenVk, Driver::KosmicKrisp]);
     }
 
     #[test]
@@ -730,11 +858,13 @@ mod tests {
             "VK_DRIVER_FILES",
             "MVK_CONFIG_LOG_LEVEL",
             "VK_KHRONOS_VALIDATION_ENABLES",
+            "MTL_DEBUG_LAYER",
         ];
         assert_eq!(
             cleared(inherited.map(str::to_owned)),
             [
                 "LACTOSE_VALIDATION_OFF",
+                "MTL_DEBUG_LAYER",
                 "VK_ADD_LAYER_PATH",
                 "VK_DRIVER_FILES",
                 "VK_KHRONOS_VALIDATION_ENABLES",
