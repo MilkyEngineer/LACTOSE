@@ -12,7 +12,7 @@ and never name it.
 |---|---|
 | Tier | backend; on `[server_denylist]`, so no server binary links it |
 | Determinism boundary | outside |
-| Unsafe | none, `#![forbid(unsafe_code)]`; architecture section 21 lists the crate, and `SAFETY.md` says why none is needed and where the window tests' is |
+| Unsafe | none, `#![forbid(unsafe_code)]`; architecture section 21 lists the crate, and `SAFETY.md` says why none is needed and where the tests' is |
 
 **Status: implemented** over winit 0.30 on macOS and Windows (`platform-impl`). On Linux it
 builds over X11 and is not run, save the check that `event_pump` panics off the main thread.
@@ -203,14 +203,16 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
   window to the end of the process, as an error does, so a surface another thread holds
   stays valid and the test fails with its panic's message.
 - When `run` returns, with a value or an error, `Window::close_requested` turns `true`,
-  and every call still queued and every call queued later resolves to `Cancelled`. A
-  frame that loops until a close therefore ends after a failed `run` too. `run` turns
-  `close_requested` true before it closes the lane, so a task whose main-lane call came
-  back `Cancelled` reads the close. The lane's wake ignores an event loop that has ended
-  (winit's `EventLoopClosed`), even after the lane is closed, since `Lane::run` wakes
-  after it releases the queue: `exit` is queued from destructors, unwinding included,
-  where a panic in the wake would abort. An `EventPump` dropped before `run` has opened
-  no window, and its lane's calls resolve to `Cancelled`.
+  and every call still queued and every call queued later resolves to `Cancelled`. A frame
+  that loops until a close therefore ends after a failed `run` too. `run` turns
+  `close_requested` true before it drops its pump, which closes the lane: a call the close
+  cancels has its reply dropped as the pump drops, which releases the call's slot lock,
+  and the `LaneCall`'s poll acquires that lock, so a task whose main-lane call came back
+  `Cancelled` reads the close, and so does the waker the cancel wakes. The lane's wake
+  ignores an event loop that has ended (winit's `EventLoopClosed`), even after the lane is
+  closed, since `Lane::run` wakes after it releases the queue: `exit` is queued from
+  destructors, unwinding included, where a panic in the wake would abort. An `EventPump`
+  dropped before `run` has opened no window, and its lane's calls resolve to `Cancelled`.
 - An error from `run` is `Platform`: the window was refused, or the operating system's
   event loop failed. `lactose-app`'s policy for it is the binary's to choose; nothing can
   be shown after it.
@@ -320,10 +322,11 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
   state, with no check here.
 - The thread runs the lane's calls one at a time, in the order `lactose-task`'s lanes
   give, and parks between them. It has no clock, it runs nothing but the calls, and it
-  skips, merges and reorders none. The lane is named `present`. Its wake sets a flag
-  before it unparks the thread, and the thread parks until it takes the flag: a call that
-  parks inside its own body, on a channel or a fence's wait, can take the unpark of a call
-  queued meanwhile, and the flag keeps that call from waiting for the next wake.
+  skips, merges and reorders none. The lane is named `present`, and is `lactose-task`'s
+  `parking_lane`: the thread parks in the lane's own wait, which a call that parks inside
+  its body, on a channel or a fence's wait, cannot rob of the wake of a call queued
+  meanwhile. That wait is `lactose-task`'s, with its loom model, and this crate keeps no
+  flag or park for it.
 - A call may block for as long as an acquire or a present does. It holds the calls queued
   behind it and nothing else: not the main thread, not a worker, and not its caller, which
   holds a future. Every wait inside a present call is bounded, by the caller, save the
@@ -507,7 +510,8 @@ type-checks a client's `main`.
 
 The rest is a named test each, in three places. `tests/integration.rs` (`present`, `threads`,
 `values`) and the unit tests of `src/window.rs` need no window and run everywhere CI does,
-and nightly Miri runs them. `tests/window.rs` is the tests that open a window, a binary of
+and nightly Miri runs them, save the present thread's CPU test, which reads a clock
+through the operating system. `tests/window.rs` is the tests that open a window, a binary of
 its own with its own `main`: a test harness's thread is not the main thread, so each case is
 that binary run again as a subprocess whose `main` is the case, and the binary speaks enough
 of the harness's arguments for `cargo nextest` to list and run it. Every case is ignored, so
@@ -519,23 +523,27 @@ cargo nextest run -p lactose-platform --test window --run-ignored only
 ```
 
 Every wait in a test is bounded, and each test shows the interleaving it names, by a barrier
-or a count and never by a sleep's length alone. Each window subprocess runs under a deadline
-its parent keeps, as `tests/consumers.rs`, `under_a_deadline`, sketches it: the parent reads
-the child's output while it waits, and past the deadline it kills the child and fails,
-naming the last stage the child printed. It takes the output within a bound too, and fails
-with "stdout held open" past it, since a process the child started may keep the pipe. The
-subprocess's driver holds the `exit` guard of "Shutdown" from its start, so a check that
-fails ends the pump too. `ThreadHandle::join` discards a panic, so the driver sends its
-result on a channel as its last act and the subprocess's exit status carries it; the parent
-checks the status and that the last stage printed is the final one, or, for a case that
-must fail or abort, the stage and the text it must end with.
+or a count and never by a sleep's length alone. The two CPU tests idle for a set length and
+bound the CPU the idle thread spent in it, read from that thread's own clock, which a loaded
+machine does not raise. Each window subprocess runs under a deadline its parent keeps, as
+`tests/consumers.rs`, `under_a_deadline`, sketches it: the parent reads the child's output
+while it waits, and past the deadline it kills the child and fails, naming the last stage
+the child printed. It takes the output within a bound too, and fails with "stdout held open"
+past it, since a process the child started may keep the pipe. The subprocess's driver holds
+the `exit` guard of "Shutdown" from its start, so a check that fails ends the pump too.
+`ThreadHandle::join` discards a panic, so the driver sends its result on a channel as its
+last act and the subprocess's exit status carries it; the parent checks the status and that
+the last stage printed is the final one, or, for a case that must fail or abort, the stage
+and the text it must end with.
 
 - A window opens, events are pumped, one call runs on the main thread and one on the
   present thread, and the process closes: `run` returns and the exit status is zero.
   (`window`: `opens_pumps_and_closes`, which also reads the present thread's scheduling
   back from the operating system.)
 - A call queued before `run` runs after the window opens; a call queued after `run`
-  returned is `Cancelled`; a dropped pump cancels its calls and opens nothing. (`window`:
+  returned is `Cancelled`; a dropped pump cancels its calls. A dropped pump opens no
+  window, which no case checks: the window is made in winit's `resumed` alone, which only
+  `run_app` reaches, and a dropped pump never calls it. (`window`:
   `a_call_queued_before_run_runs_and_one_after_is_cancelled`,
   `a_dropped_pump_cancels_its_calls_and_a_second_pump_is_unsupported`.)
 - `event_pump` on a second thread panics; a second `event_pump` is `Unsupported`.
@@ -550,14 +558,20 @@ must fail or abort, the stage and the text it must end with.
   (`window`: `a_requested_size_and_a_minimise_are_reported`; `src/window.rs`:
   `a_read_never_sees_a_torn_size`.)
 - `close_requested` turns `true` on a close the test sends the window, and the window
-  stays open; it turns `true` when `run` returns, by value and by error, and a task whose
-  main-lane call came back `Cancelled` then reads it `true`. (`window`:
+  stays open; it turns `true` when `run` returns, by value and by error; and it is `true`
+  before the lane is closed: the waker of a main-lane call that the close cancels reads it
+  `true` when the cancel wakes it, on the main thread, as the pump drops. (`window`:
   `a_close_sent_to_the_window_is_reported_and_the_window_stays_open`, and the case of the
-  call queued before `run` for the task; by error, the case after an error from `run`.)
+  call queued before `run` for the waker; by error, the case after an error from `run`.)
 - `run` does not return after `exit` while an `Arc<Window>` is held: it has not returned
   a set time after `exit`, and has warned on `pail`; it returns within a bound of the last
-  drop, made on another thread. A `WindowReports` held past `exit` does not keep it.
-  (`window`: `run_waits_for_the_last_window_and_warns`.)
+  drop, made on another thread, of 500 ms, which a pump that looked once a second or
+  waited for the second's fallback overshoots. A `WindowReports` held past `exit` does not
+  keep it. (`window`: `run_waits_for_the_last_window_and_warns`.)
+- The pump spends under 200 ms of the main thread's CPU in each of two 2 s spells: idle
+  with the window open, and after `exit` while an `Arc<Window>` is held. The main thread
+  reads its own CPU clock in a main-lane call at each end. (`window`:
+  `the_pump_idles_open_and_while_a_window_is_held`.)
 - A driver that panics before its last step still lets the pump return: its `exit` guard
   queues `exit` while it unwinds, and the subprocess's exit status is not zero. (`window`:
   `a_driver_that_panics_still_lets_the_pump_return`.)
@@ -566,29 +580,38 @@ must fail or abort, the stage and the text it must end with.
   runs, and no worker is held. (`window`:
   `a_last_device_whose_drop_blocks_holds_its_own_thread_alone`.)
 - After an error from `run`, with a root whose last step blocks, `main` returns `run`'s
-  error within its bound, having logged on `pail`, and the root is not dropped on the
-  main thread. (`window`: `after_an_error_from_run_main_returns_within_its_bound`, on macOS
-  alone: the error is the event loop ended by the application's own stop, and winit's loop
-  on Windows ends through its `exit` alone.)
+  error within its bound, having logged on `pail`, and the root is not dropped on the main
+  thread. The close is reported after the error, and the window, held by the pump's `Arc`
+  alone and by the test's `Weak`, is still alive. (`window`:
+  `after_an_error_from_run_main_returns_within_its_bound`, on macOS alone: the error is
+  the event loop ended by the application's own stop, and winit's loop on Windows ends
+  through its `exit` alone.)
 - A worker that waits on the main thread fails: `Executor::block_on` of a main-lane call
-  on a worker is `lactose-task`'s debug assertion, and the subprocess aborts. (`window`:
-  `a_worker_that_waits_on_the_main_thread_aborts`.)
+  on a worker is `lactose-task`'s debug assertion, and the subprocess aborts. In a release
+  build there is no assertion, the main thread runs the call and the wait resolves, which
+  the case expects and prints. (`window`: `a_worker_that_waits_on_the_main_thread_aborts`.)
 - The present thread has the spec above, through a spy `Platform`. A call that blocks
-  holds the calls behind it and no other thread: a barrier shows the blocking call in
-  progress while a main-lane call and a worker's task complete, and the call behind it
-  not yet run. `stop` runs every call queued before it and hands the state back: in each
-  round a task queues calls in a loop while `stop` is called, every call queued before
-  `stop` runs, each later one runs in the last drain or is `Cancelled`, none runs after
-  the hand-back, the hand-back gives the state in every round, and across the rounds both
-  outcomes occur; so a stop queued before the take fails it. A call queued after the
-  hand-back is `Cancelled`. A platform that runs every body on one thread makes a second
-  present thread after the first stopped, and the second runs its calls. A dropped
-  `PresentThread` drops the state on the present thread, which the test sees by polling a
-  flag the state's drop sets, under a deadline. A platform that drops the body unrun
-  makes `present_thread` return `Cancelled`. A call queued while a call that parks the
-  present thread is in progress runs after it, its wake not lost to the park, and a call
-  that panics ends the thread with the stop `Cancelled`. (`integration`: each of
-  `present::`; `window`: `a_present_call_that_blocks_holds_only_the_calls_behind_it`.)
+  holds the calls behind it and no other thread: a bounded handshake shows the blocking
+  call in progress while a main-lane call and a worker's task complete, and the call
+  behind it not yet run. `stop` runs every call queued before it and hands the state back,
+  and a drop runs them and drops the state on the present thread: in 300 rounds that
+  alternate the two, three threads queue calls in a loop while the stop or the drop is
+  made; every call queued before it runs, in order, each later one runs in the last drain
+  or is `Cancelled`, none runs after the hand-back, and across the rounds both outcomes
+  occur; so a stop queued before the take fails it. The lane is closed before the state is
+  handed back: a call that the close cancels is in its drop while the stop's future is
+  polled pending. An idle present thread spends under 50 ms of its CPU in each of three
+  500 ms spells: after plain calls, after a call that parked with one behind it, and after
+  a call that unparked its own thread; it reads its own CPU clock in a call at each end. A
+  call queued after the hand-back is `Cancelled`. A platform that runs every body on one
+  thread makes a second present thread after the first stopped, and the second runs its
+  calls. A dropped `PresentThread` drops the state on the present thread, which the test
+  sees by polling a flag the state's drop sets, under a deadline. A platform that drops
+  the body unrun makes `present_thread` return `Cancelled`. A call queued while a call
+  that parks the present thread is in progress runs after it, its wake not lost to the
+  park, and a call that panics ends the thread with the stop `Cancelled`. (`integration`:
+  each of `present::`; `window`:
+  `a_present_call_that_blocks_holds_only_the_calls_behind_it`.)
 - `ClientPlatform` reports `StdPlatform`'s topology and hardware threads, and enters the
   class of each thread it makes. (`integration`: `threads::`; the present class read back,
   in `opens_pumps_and_closes`.)

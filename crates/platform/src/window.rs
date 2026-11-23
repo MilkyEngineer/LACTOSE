@@ -157,6 +157,13 @@ impl WindowReports {
 ///
 /// `Relaxed` is enough for every access: each atomic is the whole of what it reports and
 /// publishes nothing, since no reader reads other memory on the strength of a value it saw.
+/// The one order a reader relies on, the close before a main-lane call's `Cancelled`, the
+/// lane gives: the pump sets the close before it drops its pump, each cancelled reply's drop
+/// then releases its slot's lock, and the call's poll acquires it (`README.md`, "The main
+/// thread and its pump").
+/// A main-lane call that panics breaks that order for the rest of its batch, whose calls
+/// its unwinding drops before the close is set; a binary aborts first, so only a test can
+/// see it.
 pub(crate) struct Reports {
     /// The newest size the operating system delivered, as one value so that a read is
     /// never the width of one resize and the height of another: the width in the high 32

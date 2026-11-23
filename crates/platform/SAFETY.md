@@ -39,14 +39,18 @@ The invariants the contract in `README.md` fixes, and what holds each without `u
 ## In the tests
 
 `tests/window.rs` does to a window what a user does, and reads back what the operating
-system gave a thread, through one module, `os`: the binary is `#![deny(unsafe_code)]` and
-that module alone allows it. Every block carries a `// SAFETY:` comment, and each relies on
-the window's handle being lent, which is on the main thread inside a main-lane call, for
-the borrow of a `Window` the call holds:
+system gave a thread, through one module, `os`; both test binaries read a thread's CPU clock
+through a second, `tests/thread_cpu.rs`. Each binary is `#![deny(unsafe_code)]` and those
+modules alone allow it. Every block carries a `// SAFETY:` comment, and what each relies on
+is one of three things:
 
-- macOS: the content view of winit's handle as an `NSView`, its window's `performClose:`,
-  which a close button sends; `NSApplication`'s `stop:` and the application-defined event
-  that makes it take effect, as winit's own stop posts; `pthread_get_qos_class_np` of the
-  calling thread into two locals.
-- Windows: `PostMessageW` of `WM_CLOSE` to the window's handle, `IsWindowVisible` of it,
-  and `GetThreadPriority` of the calling thread's pseudo-handle.
+- The window's handle being lent, which is on the main thread inside a main-lane call, for
+  the borrow of a `Window` the call holds: on macOS, the content view of winit's handle as
+  an `NSView` and its window's `performClose:`, which a close button sends; on Windows,
+  `PostMessageW` of `WM_CLOSE` to the window's handle and `IsWindowVisible` of it.
+- The main thread, on which a main-lane call runs: on macOS, `NSApplication`'s `stop:` and
+  the application-defined event that makes it take effect, as winit's own stop posts.
+- The calling thread, and locals the call writes: `pthread_get_qos_class_np` on macOS and
+  `GetThreadPriority` of the thread's pseudo-handle on Windows, which read its scheduling
+  back; `clock_gettime` of `CLOCK_THREAD_CPUTIME_ID` on Unix and `GetThreadTimes` of the
+  pseudo-handle on Windows, which read its CPU time.
