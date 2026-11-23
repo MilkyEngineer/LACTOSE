@@ -2693,10 +2693,10 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
 `install_crash_hook(binary, dir)` installs the process's panic hook (architecture section
 5.1, D155). Every engine binary calls it first in `main`, before its subscriber and before
 anything that can panic; RICOTTA keeps a hook of its own, since a tool does not link the
-assembly, and takes its lock and writes stderr the same way. It is safe code over `std` alone: no signal
-handler, no minidump, no second process. `binary` names the report's file, so the call
-asserts, at startup, that it is one non-empty path component: no separator, no root, not
-`.` or `..`. On a panic, on any thread, the hook:
+assembly, and takes its lock and writes stderr the same way. It is safe code over `std`
+alone: no signal handler, no minidump, no second process. `binary` names the report's file,
+so the call asserts, at startup, that it is one non-empty path component: no separator, no
+root, not `.` or `..`. On a panic, on any thread, the hook:
 
 1. takes a lock it never releases, so that a panic on another thread waits for the abort
    and the report is the process's first panic's. While it holds this one it takes `std`'s
