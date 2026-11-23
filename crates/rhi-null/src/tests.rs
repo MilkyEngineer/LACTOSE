@@ -57,11 +57,11 @@ fn between<T: Send + 'static>(
     let out = Arc::new(Mutex::new(None));
     let kept = Arc::clone(&out);
     let done = AtomicBool::new(false);
-    *lock(&device.shared().between) = Some(Box::new(move |reached| {
+    *lock(&device.shared().between) = Some(Arc::new(Mutex::new(move |reached| {
         if reached == at && !done.swap(true, Ordering::Relaxed) {
             *lock(&kept) = Some(call(&twin));
         }
-    }));
+    })));
     out
 }
 
@@ -492,6 +492,21 @@ fn a_heap_write_started_inside_another_waits_for_it() {
     let racer = lock(&keep).take().expect("the second write was started");
     racer.join().expect("the second writer").expect("the second write");
     assert!(!landed, "a second heap write ran to its end inside the first's holds");
+}
+
+/// A hook cleared while it runs stays cleared, as `taken` needs of a call that runs it on
+/// another thread: a hook put back after it ran would keep its twin of the device, and so
+/// the device, alive (Miri's leak check under one seed of the test above).
+#[test]
+fn a_hook_cleared_while_it_runs_stays_cleared() {
+    let device = device(QueueLayout::ONE, false);
+    let image = sampled(&device);
+    let out = between(&device, Between::HeapWrite, |twin| {
+        *lock(&twin.shared().between) = None;
+    });
+    device.write_heap_slot(HeapSlot(3), image).expect("the write");
+    assert!(lock(&device.shared().between).is_none(), "a cleared hook was put back");
+    assert!(lock(&out).is_some(), "the hook ran");
 }
 
 /// With the queues running nothing, a present is shown with its submit pending: the

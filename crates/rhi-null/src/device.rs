@@ -109,9 +109,12 @@ pub(crate) struct GraphicsObj {
 /// A heap slot's entry: the image written to it, if any.
 pub(crate) type SlotEntry = Option<(ImageHandle, Arc<ImageObj>)>;
 
-/// What a unit test runs between a call's two holds.
+/// What a unit test runs between a call's two holds. Shared, not taken out of its slot while
+/// it runs, so that a test's clear is final: a call that put a hook back after running it
+/// could restore one a test had cleared, and the hook's twin of the device would then keep
+/// the device alive.
 #[cfg(test)]
-type Hook = Box<dyn FnMut(Between) + Send>;
+type Hook = Arc<Mutex<dyn FnMut(Between) + Send>>;
 
 /// A compute pipeline as its handle resolves: nothing recording checks.
 pub(crate) struct ComputeObj;
@@ -225,10 +228,11 @@ impl Shared {
 
     #[cfg(test)]
     pub(crate) fn between(&self, at: Between) {
-        let taken = lock(&self.between).take();
-        if let Some(mut hook) = taken {
-            hook(at);
-            *lock(&self.between) = Some(hook);
+        let hook = lock(&self.between).clone();
+        // `try_lock`: a call the hook makes, or one on another thread while it runs, passes
+        // the point without running it.
+        if let Some(Ok(mut hook)) = hook.as_ref().map(|hook| hook.try_lock()) {
+            (*hook)(at);
         }
     }
 }
