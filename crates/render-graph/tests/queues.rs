@@ -3,7 +3,8 @@
 //! queue's pending write or change, its `ready` point's among them, a `sampled` read's
 //! included; a frame's change under an earlier frame's pending use, and its use under an
 //! earlier frame's pending write, wherever its submit sits; that a frame on one queue makes
-//! no wait of its own; the queue rule's clauses; and a torn frame, ended on either queue.
+//! no wait of its own; the waits for a frame point signalled from the other queue; the queue
+//! rule's clauses; and a torn frame, ended on either queue.
 //!
 //! A test holds a submit pending by a point the host owes, given as an import's `ready`, or
 //! as its own submit's wait; null judges each submit against what is pending when it is
@@ -607,16 +608,20 @@ enum Reader {
     First,
     /// Between two compute submits: the first frame ends on the graphics queue.
     Middle,
+    /// The graphics queue's second submit, behind a draw of its own frame, depending on
+    /// nothing of the frame's compute work: the first frame ends on the compute queue.
+    Behind,
 }
 
 /// The second frame's reader of a `Concurrent` buffer that the first frame's compute pass
 /// wrote while held pending waits for that write in its own submit, wherever that submit
 /// sits in its frame: first, where the graphics queue's last submit before the frame does not
-/// cover the write, or between two submits of the compute queue (`no-qfot`).
+/// cover the write; between two submits of the compute queue; or behind an earlier graphics
+/// submit of its frame, whose wait orders no later one (`no-qfot`).
 #[test]
 fn a_frames_reader_waits_for_an_earlier_frames_pending_write_wherever_it_sits() {
     for queues in LAYOUTS {
-        for reader in [Reader::First, Reader::Middle] {
+        for reader in [Reader::First, Reader::Middle, Reader::Behind] {
             let device = device(queues);
             let shared = buffer(&*device, "shared", Sharing::Concurrent);
             let others = [
@@ -693,7 +698,7 @@ fn a_frames_reader_waits_for_an_earlier_frames_pending_write_wherever_it_sits() 
                     );
                 };
                 match reader {
-                    Reader::First => {
+                    Reader::First | Reader::Behind => {
                         draw(&mut decl);
                         write(&mut decl);
                     }
@@ -735,6 +740,17 @@ fn a_frames_reader_waits_for_an_earlier_frames_pending_write_wherever_it_sits() 
                         read(&mut decl);
                         compute(&mut decl, "b", 2);
                         vec![C, G, C]
+                    }
+                    Reader::Behind => {
+                        let ahead = target(&mut decl, 0);
+                        decl.render_pass(
+                            &draws("ahead", &[colour(ahead, Load::Clear([0.0; 4]))]),
+                            |_| {},
+                        );
+                        compute(&mut decl, "a", 1);
+                        read(&mut decl);
+                        compute(&mut decl, "b", 2);
+                        vec![G, C, G, C]
                     }
                 };
                 let second = frame(&mut graph, ctx, decl);
@@ -907,6 +923,113 @@ fn a_torn_frame_that_ends_on_the_compute_queue_is_finished_by_the_next_submit() 
             }
         });
     }
+}
+
+/// A frame of one compute submit, whose batch signals the compute queue's point and the
+/// frame point together, then a frame of one graphics submit: that submit waits for the
+/// frame point itself, not only the compute point. The signals of one submit are unordered
+/// with one another on Vulkan, so the wait for the compute point does not order the new
+/// frame point after the old (VUID-VkSubmitInfo2-semaphore-03882); null credits that wait
+/// with the whole batch and refuses neither, so the test reads the waits made.
+#[test]
+fn a_frame_after_one_that_ended_on_the_compute_queue_waits_for_its_frame_point_itself() {
+    let device = device(lactose_rhi_api::QueueLayout::SEVERAL);
+    let out = buffer(&*device, "out", Sharing::Exclusive);
+    let target = image(&*device, "target", Sharing::Exclusive);
+    let logged = std::sync::Arc::clone(&device);
+    in_job(move |ctx| {
+        let mut graph = graph(&device, 1, 2);
+        let mut decl = FrameDecl::new(1);
+        let id = decl.import_buffer(&fresh_buffer("out", out, C, BufferState::ShaderWrite));
+        decl.compute_pass(
+            &ComputePassDecl { label: "write", sampled: &[], buffers: &writes(id), slots: &[] },
+            |_| {},
+        );
+        let first = frame(&mut graph, ctx, decl).expect("the compute frame");
+        assert_eq!(logged.take_waits(), vec![(C, vec![])], "a first frame waits for nothing");
+
+        let mut decl = FrameDecl::new(1);
+        let target = decl.import_image(&image_import(
+            "target",
+            target,
+            on(ImageState::Undefined, G),
+            on(ImageState::ColourAttachment, G),
+        ));
+        decl.render_pass(&draws("draw", &[colour(target, Load::Clear([0.0; 4]))]), |_| {});
+        let second = frame(&mut graph, ctx, decl).expect("the graphics frame");
+        let waits = logged.take_waits();
+        assert_eq!(waits.len(), 1, "{waits:?}");
+        let (queue, waits) = &waits[0];
+        assert_eq!(*queue, G);
+        assert!(waits.contains(&first), "the frame point before itself: {waits:?}");
+        assert_eq!(waits.len(), 2, "and the compute queue's point: {waits:?}");
+        reached(&**graph.device(), second);
+    });
+}
+
+/// A frame of one compute submit, as above, then a frame `[draw, compute, draw]` whose
+/// compute submit is refused for a slot its pass did not declare (`undeclared`): it is torn
+/// with only its graphics work made, and the next call makes its last submit in its place,
+/// on the graphics queue. That replacement waits for the frame point before itself, not
+/// only the compute queue's point its batch signalled, for the reason above.
+#[test]
+fn a_torn_frames_replacement_waits_for_the_frame_point_before_itself() {
+    let device = device(lactose_rhi_api::QueueLayout::SEVERAL);
+    let out = buffer(&*device, "out", Sharing::Exclusive);
+    let targets =
+        [image(&*device, "a", Sharing::Exclusive), image(&*device, "b", Sharing::Exclusive)];
+    let pipeline = compute_pipeline(&*device);
+    let logged = std::sync::Arc::clone(&device);
+    in_job(move |ctx| {
+        let mut graph = graph(&device, 1, 3);
+        let compute = |decl: &mut FrameDecl<'_>, breach: bool| {
+            let id = decl.import_buffer(&fresh_buffer("out", out, C, BufferState::ShaderWrite));
+            decl.compute_pass(
+                &ComputePassDecl { label: "write", sampled: &[], buffers: &writes(id), slots: &[] },
+                move |pass| {
+                    pass.bind_pipeline(pipeline);
+                    if breach {
+                        pass.push_slot(0, HeapSlot(7));
+                    }
+                    pass.dispatch([1, 1, 1]);
+                },
+            );
+        };
+        let mut decl = FrameDecl::new(1);
+        compute(&mut decl, false);
+        let first = frame(&mut graph, ctx, decl).expect("the compute frame");
+        reached(&**graph.device(), first);
+        logged.take_waits();
+
+        let declare = |breach: bool| {
+            let mut decl = FrameDecl::new(1);
+            let draw = |decl: &mut FrameDecl<'_>, label: &'static str, at: usize| {
+                let target = decl.import_image(&image_import(
+                    label,
+                    targets[at],
+                    on(ImageState::Undefined, G),
+                    on(ImageState::ColourAttachment, G),
+                ));
+                decl.render_pass(&draws(label, &[colour(target, Load::Clear([0.0; 4]))]), |_| {});
+            };
+            draw(&mut decl, "a", 0);
+            compute(&mut decl, breach);
+            draw(&mut decl, "b", 1);
+            decl
+        };
+        let refused = frame(&mut graph, ctx, declare(true)).expect_err("null refuses the slot");
+        assert_eq!(Rule::of(&refused), Some(Rule::Undeclared), "{refused}");
+        let made: Vec<QueueRole> = logged.take_waits().iter().map(|(queue, _)| *queue).collect();
+        assert_eq!(made, vec![G], "the torn frame's graphics submit alone is made");
+
+        let third = frame(&mut graph, ctx, declare(false)).expect("the frame after");
+        reached(&**graph.device(), third);
+        let waits = logged.take_waits();
+        let (queue, replacement) = &waits[0];
+        assert_eq!(*queue, G, "the replacement is on the planned last queue: {waits:?}");
+        assert!(replacement.contains(&first), "the frame point before itself: {waits:?}");
+        assert_eq!(waits.len(), 4, "the replacement, then the frame's three submits: {waits:?}");
+    });
 }
 
 /// The queue that `pass` of `plan` runs on.

@@ -590,6 +590,11 @@ impl RenderGraph {
             if let Some(before) = before {
                 let at = role_index(submit.queue);
                 waits.extend(Some(before[1 - at]).filter(|other| other.value > 0));
+                // Not implied by the wait above, though one submit signalled both points:
+                // the signals of one submit are unordered with one another on Vulkan, so
+                // only a wait for the frame point itself orders this frame's after it
+                // (VUID-VkSubmitInfo2-semaphore-03882). Null credits a wait for one signal
+                // of a submit with all of them, so only the logged waits show its loss.
                 if number == last
                     && let Some((previous, queue)) = self.previous
                     && role_index(queue) != at
@@ -652,7 +657,8 @@ impl RenderGraph {
     }
 
     /// What a frame's last submit to `queue` waits for beside its frame's own submits:
-    /// the last submit made to the other queue and the frame point before.
+    /// the last submit made to the other queue and the frame point before, the second for
+    /// the reason `submit` gives at its own wait for it.
     fn replacement_waits(&self, queue: QueueRole) -> Vec<TimelinePoint> {
         let Some(queues) = &self.timelines.queues else { return Vec::new() };
         let other = &queues[1 - role_index(queue)];

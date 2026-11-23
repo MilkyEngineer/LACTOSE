@@ -503,14 +503,19 @@ Three things these consumers must know that no signature shows:
   every earlier frame's use, write and change there, and is how the graph makes the
   cross-frame waits of "Imports" (null credits a submit with its own waits alone). The
   frame's last submit also waits for the frame point before where that was signalled from
-  the other queue.
+  the other queue. The wait for the other queue's point does not imply it, though one
+  submit signalled both: the signals of one submit are unordered with one another on
+  Vulkan, so only a wait for the frame point itself keeps the frame timeline's values
+  growing (`VUID-VkSubmitInfo2-semaphore-03882`).
 - The two cost the frame's ends. The last submit waits for the frame's work on the other
   queue before any of its own passes run, so the other queue's work overlaps only the
-  submits made before the last one; and a frame's first submit on a queue starts after
-  the other queue's last submit of the frame before, so no work overlaps across the
-  frame's end at milestone 2. A frame all of whose work is on one queue, on a graph that
-  has used no other, makes neither wait. A trailing submit with no encoder that signals
-  the point is for a later milestone ("Not in this crate yet").
+  submits made before the last one; and where a graph has used both queues, a frame's
+  first submit on a queue starts after the other queue's last submit of the frame before,
+  so no work of one queue overlaps the other's across the frame's end. A frame all of
+  whose work is on one queue, on a graph that has used no other, makes neither wait, which
+  is every frame of milestone 2: its work overlaps the frame before's on that queue as the
+  device allows. A trailing submit with no encoder that signals the point is for a later
+  milestone ("Not in this crate yet").
 - `submit` waits for nothing and returns an error from `Device::submit` unchanged. A
   refusal of the frame's first submit changes nothing (rhi-api, "Timelines"): every import
   is as the declaration found it, and the frame's encoders are reset and free. An error
@@ -525,14 +530,15 @@ Three things these consumers must know that no signature shows:
   that submit in the torn frame's place, with no encoders, to the queue the torn frame's
   last submit was planned for (rhi-api, "Recording and submitting": a submit with no
   encoders waits and signals alone). It waits and signals as that last submit would have,
-  by the rule above: for a point of each submit the torn frame made to another queue, and
-  for the last frame point where that was signalled from another queue, and it signals the
-  torn frame's point. Then the new frame is submitted. The torn frame's point is reached
-  like any other frame's, the next frame's point is above it, and every later submit waits
-  for it by the rules above. The torn frame's submitted encoders and its plan are held, as
-  a pending frame's are, until its point is seen reached, so nothing is reset or destroyed
-  under a submit it made; the encoders of the submits it never made are reset and free at
-  once.
+  by the rule above, except that it waits for the frame point before wherever that was
+  signalled: for the last submit made to the other queue, where there is one, which covers
+  each submit the torn frame made there, and for the frame point before, and it signals
+  the torn frame's point. Then the new frame is submitted. The torn frame's point is
+  reached like any other frame's and the next frame's point is above it: the next frame's
+  last submit waits for it where that submit goes to the other queue, and submission order
+  covers the rest. The torn frame's submitted encoders and its plan are held, as a pending
+  frame's are, until its point is seen reached, so nothing is reset or destroyed under a
+  submit it made; the encoders of the submits it never made are reset and free at once.
 - If that submit is refused, the new frame is not submitted: its encoders are reset and
   free, the graph is as it was before the call, still owing that submit, and `submit`
   returns the error unchanged, which the caller takes as a torn frame like any other. The
@@ -671,9 +677,11 @@ A copy pass's second call into one destination fails `record`. Two transients al
 honour is not refused, it is given memory). No submit waits for a point that only a later
 submit to its own queue signals: null does not refuse that, neither submit completes, so
 the proof is every frame's point reached within a bounded wait under both capability sets.
-Null applies one transition call's elements in order, so it cannot refuse a call that names
-a resource twice; the tests' logging device does, over the five chains of two transitions a
-frame can give one resource at its end. Each queue rule's clause holds by the queue a pass
+The tests' logging device refuses a submit whose encoder had a transition call that named
+one resource twice, whatever the device under it checks, over the five chains of two
+transitions a frame can give one resource at its end. The waits for the frame point before
+hold by the waits that device records, since null credits a wait for one signal of a
+submit with all of them. Each queue rule's clause holds by the queue a pass
 is given (`PlannedPass::queue`), and a wait inside the graph, such as a pending encoder's
 drop, fails its test at a bound, with a message, rather than at nextest's kill.
 
