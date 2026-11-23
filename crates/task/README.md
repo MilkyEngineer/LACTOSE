@@ -207,8 +207,9 @@ and list what changed, because `lactose-ecs` is written against this surface.
   the lane's thread, so a call that parks inside its own body, on a channel or a lock, and so
   takes the unpark of a call queued meanwhile, does not lose that call's wake; an unpark from
   elsewhere does not end the wait. The flag publishes nothing: the queue's lock orders the
-  call. `wait` runs no call, and the thread drains after it. This is the present thread's
-  pump (`lactose-platform`), whose loop drains, checks its own stop and waits; the wake is
+  calls, and the flag's Release and Acquire are deliberate but relied on by nothing. `wait`
+  runs no call, and the thread drains after it. This is the present thread's pump
+  (`lactose-platform`), whose loop drains, checks its own stop and waits; the wake is
   `lactose-task`'s so that it is modelled, since no other crate names loom.
 
 **Chaos**
@@ -296,7 +297,8 @@ Correctness:
   Eleven models are explored exhaustively. The three with three threads are bounded at five
   preemptions, the idle-release one at four, the parking lane's at three
   (`LOOM_MAX_PREEMPTIONS` overrides the bounds). The parking lane's model fails, as a
-  deadlock, with the unpark alone and with the flag alone.
+  deadlock, with the unpark alone and with the flag alone; both run beside it, at its bound,
+  as `weakened_*` models over a copy of its wake and wait.
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it
   would run on loom primitives, which panic outside a loom model.

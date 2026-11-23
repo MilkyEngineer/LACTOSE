@@ -45,8 +45,9 @@ impl<S: 'static> ParkingPump<S> {
     pub fn wait(&self) {
         // Both sides swap: loom 0.7.2 lets a read-modify-write read past a plain store that
         // nothing orders after it, which no read-modify-write may do at any ordering, and
-        // against a swap it cannot (`sync`, `TimedPark`). The queue's mutex orders the call
-        // itself, so the flag publishes nothing.
+        // against a swap it cannot (`sync`, `TimedPark`). The Release and Acquire here and in
+        // `wake` are deliberate, and nothing relies on them: the queue's lock orders the
+        // calls, so the flag publishes nothing.
         while !self.signal.queued.swap(false, Ordering::Acquire) {
             park();
         }

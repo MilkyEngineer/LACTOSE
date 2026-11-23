@@ -503,11 +503,23 @@ fn a_call_queued_before_run_runs_and_one_after_is_cancelled() -> Result<()> {
             println!("stage: the call queued before run ran");
             // No `Arc<Window>` is held, so `exit` lets the window go in the turn that runs
             // it, and the pump drains nothing more: the next call is cancelled by its end.
-            wait(main.run(MainThread::exit))?;
+            // That call is queued and polled while the main thread is still inside the call
+            // that runs `exit`, so the lane cannot have closed yet, however late this thread
+            // runs; a drain runs only what was queued before it began.
+            let (entered, inside) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let exiting = main.run(move |main| {
+                entered.send(()).expect("the driver waits for the call");
+                main.exit();
+                let _ = released.recv_timeout(BOUND);
+            });
+            inside.recv_timeout(BOUND).map_err(|_| failed("the exit call never ran"))?;
             let mut call = pin!(main.run(|_| ()));
             let waker = Waker::from(Arc::new(ReadsTheClose(reports, read)));
             let mut context = Context::from_waker(&waker);
             assert!(call.as_mut().poll(&mut context).is_pending(), "the call resolved at once");
+            release.send(()).expect("the exit call waits for the release");
+            wait(exiting)?;
             // Polled again only once `run` has returned, so the waker stays the one above.
             poll_until(BOUND, "run's return", || returned.load(Ordering::SeqCst));
             let Poll::Ready(cancelled) = call.as_mut().poll(&mut context) else {

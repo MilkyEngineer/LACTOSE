@@ -279,10 +279,12 @@ fn stop_under_queuing_threads(before: usize, by_drop: bool) -> Round {
 /// `stop` runs every call queued before it and hands the state back, and a dropped
 /// `PresentThread` runs them and drops the state on the present thread. Three threads queue
 /// while the rounds alternate the two, so that a stop that could outrun its take, as one
-/// queued before the take would, meets an idle present thread in many rounds.
+/// queued before the take would, meets an idle present thread in many rounds. Such a stop
+/// is caught in about one stop round in a hundred, so the 1,500 stop rounds of a native run
+/// miss it in fewer than one run in 10^8; Miri's four rounds check the order, not that catch.
 #[test]
 fn stop_runs_every_call_queued_before_it_and_hands_the_state_back() {
-    let rounds = if cfg!(miri) { 4 } else { 300 };
+    let rounds = if cfg!(miri) { 4 } else { 3000 };
     let (mut ran_after, mut cancelled) = (0, 0);
     for round in 0..rounds {
         let seen = stop_under_queuing_threads(1 + round % 7, round % 2 == 1);

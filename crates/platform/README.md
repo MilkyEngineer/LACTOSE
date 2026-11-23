@@ -205,14 +205,19 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
 - When `run` returns, with a value or an error, `Window::close_requested` turns `true`,
   and every call still queued and every call queued later resolves to `Cancelled`. A frame
   that loops until a close therefore ends after a failed `run` too. `run` turns
-  `close_requested` true before it drops its pump, which closes the lane: a call the close
+  `close_requested` true before it drops its pump, which closes the lane. A call the close
   cancels has its reply dropped as the pump drops, which releases the call's slot lock,
-  and the `LaneCall`'s poll acquires that lock, so a task whose main-lane call came back
-  `Cancelled` reads the close, and so does the waker the cancel wakes. The lane's wake
-  ignores an event loop that has ended (winit's `EventLoopClosed`), even after the lane is
-  closed, since `Lane::run` wakes after it releases the queue: `exit` is queued from
-  destructors, unwinding included, where a panic in the wake would abort. An `EventPump`
-  dropped before `run` has opened no window, and its lane's calls resolve to `Cancelled`.
+  and the `LaneCall`'s poll acquires that lock. A call queued after the close finds the
+  lane closed under the queue's lock, which the pump's drop released after it marked the
+  lane closed, and is cancelled on the thread that queued it. So in a binary, a task whose
+  main-lane call came back `Cancelled` reads the close, and so does the waker the cancel
+  wakes. In a test, a main-lane call that panics drops the rest of its batch as it
+  unwinds, before the close is set, so those calls' tasks may read it `false`. The lane's
+  wake ignores an event loop that has ended (winit's `EventLoopClosed`), even after the
+  lane is closed, since `Lane::run` wakes after it releases the queue: `exit` is queued
+  from destructors, unwinding included, where a panic in the wake would abort. An
+  `EventPump` dropped before `run` has opened no window, and its lane's calls resolve to
+  `Cancelled`.
 - An error from `run` is `Platform`: the window was refused, or the operating system's
   event loop failed. `lactose-app`'s policy for it is the binary's to choose; nothing can
   be shown after it.
@@ -560,7 +565,9 @@ and the text it must end with.
 - `close_requested` turns `true` on a close the test sends the window, and the window
   stays open; it turns `true` when `run` returns, by value and by error; and it is `true`
   before the lane is closed: the waker of a main-lane call that the close cancels reads it
-  `true` when the cancel wakes it, on the main thread, as the pump drops. (`window`:
+  `true` when the cancel wakes it, on the main thread, as the pump drops. That call is
+  queued and polled while the main thread is still inside the call that runs `exit`, so
+  the lane is open then however late the test's thread runs. (`window`:
   `a_close_sent_to_the_window_is_reported_and_the_window_stays_open`, and the case of the
   call queued before `run` for the waker; by error, the case after an error from `run`.)
 - `run` does not return after `exit` while an `Arc<Window>` is held: it has not returned
@@ -594,16 +601,18 @@ and the text it must end with.
   holds the calls behind it and no other thread: a bounded handshake shows the blocking
   call in progress while a main-lane call and a worker's task complete, and the call
   behind it not yet run. `stop` runs every call queued before it and hands the state back,
-  and a drop runs them and drops the state on the present thread: in 300 rounds that
+  and a drop runs them and drops the state on the present thread: in 3,000 rounds that
   alternate the two, three threads queue calls in a loop while the stop or the drop is
   made; every call queued before it runs, in order, each later one runs in the last drain
   or is `Cancelled`, none runs after the hand-back, and across the rounds both outcomes
-  occur; so a stop queued before the take fails it. The lane is closed before the state is
-  handed back: a call that the close cancels is in its drop while the stop's future is
-  polled pending. An idle present thread spends under 50 ms of its CPU in each of three
-  500 ms spells: after plain calls, after a call that parked with one behind it, and after
-  a call that unparked its own thread; it reads its own CPU clock in a call at each end. A
-  call queued after the hand-back is `Cancelled`. A platform that runs every body on one
+  occur; so a stop queued before the take fails it, in about one stop round in a hundred,
+  and so in all but about one run in 10^8 (Miri runs four rounds, which check the order
+  but do not catch that stop). The lane is closed before the state is handed back: a call
+  that the close cancels is in its drop while the stop's future is polled pending. An idle
+  present thread spends under 50 ms of its CPU in each of three 500 ms spells: after plain
+  calls, after a call that parked with one behind it, and after a call that unparked its
+  own thread; it reads its own CPU clock in a call at each end. A call queued after the
+  hand-back is `Cancelled`. A platform that runs every body on one
   thread makes a second present thread after the first stopped, and the second runs its
   calls. A dropped `PresentThread` drops the state on the present thread, which the test
   sees by polling a flag the state's drop sets, under a deadline. A platform that drops
