@@ -2006,34 +2006,35 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
     start to the closure's return. A worker with a scope of such work open takes that
     scope's children from the queue under the place it holds, with no raise of the count,
     before it parks: never another scope's entry and never a job, and it parks on the
-    latch only when none of its scope's children is queued. Without that an opener would
-    look for its children on its own deque, as it does today, find none and park: on two
-    frame-critical workers, where its place is the whole width, no worker could take them
-    and the job would never return, and on four the fan-out would have the two other
-    places alone. The pool's look for visible work counts that queue only while the count
-    is below the width; and a worker that lowers the count with the queue not empty wakes
-    a sleeper, the one side's push before its read of the count meeting the other's
-    lowering before its read of the queue. That pair is a store-buffering pattern: each
-    side writes one word and then reads the other, so each needs a `SeqCst` fence between
-    its write and its read, or `SeqCst` operations on both words, and release with acquire
-    loses the wake-up. And a range needs a split rule of its own: `drain_range` splits
-    what is left of a range when its worker's own deque is empty, which is always so once
-    the halves go to a queue of the pool's. The lane holds four things in loom models
-    through the shipped functions, at a width of one and at a width of two with two such
-    jobs in flight: the count never exceeds the width; an entry queued while the count is
-    below the width is taken, and one queued while the count is at the width is taken once
-    it is lowered, with no wake-up lost in either; no child stays queued while its opener
-    is parked on the latch; and no worker inside one such job runs another scope's entry
-    or another such job. Under loom 0.7.2 a model whose reader is the main thread, its
-    writer spawned, may explore one execution, so a model counts only beside weakened
-    variants of the shipped orderings that fail it. Architecture section 5.1 gains the
-    width with that lane's merge, as an amendment of its own. It is owed in two places,
-    whatever way the lane takes: the split bullet of "Scheduling mechanics", for the width
-    and for where the halves of such a job's range go, and "Fork-join inside a job only",
-    for how the opener of such a job finds its children. The way sketched here departs
-    from both, for such work alone: from "the thief pushes one half to its own deque", and
-    from an opener's deque that "holds only its own children", which then holds none of
-    them.
+    latch only when none of its scope's children is queued. An entry of its scope that is
+    queued after it parked, the half of a range or what a worker put back, wakes it.
+    Without that an opener would look for its children on its own deque, as it does today,
+    find none and park: on two frame-critical workers, where its place is the whole width,
+    no worker could take them and the job would never return, and on four the fan-out
+    would have the two other places alone. The pool's look for visible work counts that
+    queue only while the count is below the width; and a worker that lowers the count with
+    the queue not empty wakes a sleeper, the one side's push before its read of the count
+    meeting the other's lowering before its read of the queue. That pair is a
+    store-buffering pattern: each side writes one word and then reads the other, so each
+    needs a `SeqCst` fence between its write and its read, or `SeqCst` operations on both
+    words, and release with acquire loses the wake-up. And a range needs a split rule of
+    its own: `drain_range` splits what is left of a range when its worker's own deque is
+    empty, which is always so once the halves go to a queue of the pool's. The lane holds
+    four things in loom models through the shipped functions, at a width of one and at a
+    width of two with two such jobs in flight: the count never exceeds the width; an entry
+    queued while the count is below the width is taken, and one queued while the count is
+    at the width is taken once it is lowered, with no wake-up lost in either; no child
+    stays queued while its opener is parked on the latch, the gate being open; and no
+    worker inside one such job runs another scope's entry or another such job. Under loom
+    0.7.2 a model whose reader is the main thread, its writer spawned, may explore one
+    execution, so a model counts only beside weakened variants of the shipped orderings
+    that fail it. Architecture section 5.1 gains the width with that lane's merge, as an
+    amendment of its own. It is owed in two places, whatever way the lane takes: the split
+    bullet of "Scheduling mechanics", for the width and for where the halves of such a
+    job's range go, and "Fork-join inside a job only", for how the opener of such a job
+    finds its children. The way sketched here departs from both, for such work alone: from
+    "the thief pushes one half to its own deque", and from an opener's deque that "holds
+    only its own children", which then holds none of them.
   - *What was weighed for it, and what the lane shows.* Timers fired inside a long job: a
     root woken between a range's units would go onto the firing worker's own deque behind
     its share (`keep_woken_task`), and running it inline would nest a scope. A width the
@@ -2178,25 +2179,32 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
     source only where the swapchain's README shows, from a run, that the wait's completion
     follows the display. The run is a floor run as `frame-pace` makes it, on a display of
     fixed rate: the frames a thousandth slower than half the display's rate, so that their
-    phase against the refresh sweeps, for a minute or more. The test is the grid: with the
-    refresh period fitted to the reported times, 99 in 100 of them lie within a tenth of a
-    period of one phase. Times that follow the display do, an image reaching the glass at
-    a refresh and at no other time: MoltenVK's display times kept one phase within 0.07 ms
-    over the 1,789 presents of such a run of `reviewer-gpu`'s, in the review of D162's
-    fifth draft, and within 0.012 ms in a run under drift. Completions that follow the
-    frames do not: `VK_KHR_present_wait`'s lay up to 8.3 ms either side in the same runs,
-    the whole period. On a display whose rate varies the grid tells nothing, and the pair
-    is no source there. The extension promises no such thing ("There is no requirement for
-    any precise timing relationship between the presentation of the image to the user and
-    the update of the presentId value"). MoltenVK completes the wait when the present's
-    command buffer completes, 31.7 to 48.5 ms before the display in `reviewer-gpu`'s run
-    and 38.75 ms at the median: a count made from it read none at all 1,800 calls where
-    the count from display times read two at 1,751, so no frame would be shed and
-    `frame-pace`'s first row would leave out the swapchain's queue. Where it is a source,
-    "never waits" is a poll with a timeout of zero for each outstanding id, on the thread
-    that presents, and the time is the poll's: late by up to the gap between polls, which
-    is a frame period where it is polled only as a call begins. A device with none of
-    these answers `None`.
+    phase against the refresh sweeps, for a minute or more. The test is the grid. Its
+    period is the display's refresh as the system reports it, refined by a fit to the
+    reported times that moves it by five parts in ten thousand at most; and 99 in 100 of
+    the reported times lie within a tenth of that period of one phase. The bound on the
+    fit is what makes it a test: half the frames' own period is a thousandth longer than
+    the refresh, and a period fitted freely to times that follow the frames lands there
+    and finds them on one phase. Times that follow the display do, an image reaching the
+    glass at a refresh and at no other time: MoltenVK's display times kept one phase
+    within 0.07 ms over the 1,789 presents of such a run of `reviewer-gpu`'s, in the
+    review of D162's fifth draft, and within 0.012 ms in a run under drift. Completions
+    that follow the frames do not: `VK_KHR_present_wait`'s lay up to 8.3 ms either side in
+    the same runs, the whole period. The review took its period from the display times,
+    16.6668 ms in the floor run, which a device whose one source is the pair does not
+    have; so the period here is the reported refresh, and no run has made the test in that
+    form. Where the bounded fit finds no phase, as on a display whose rate varies or is
+    not the rate reported, the pair is no source. The extension promises no such thing
+    ("There is no requirement for any precise timing relationship between the presentation
+    of the image to the user and the update of the presentId value"). MoltenVK completes
+    the wait when the present's command buffer completes, 31.7 to 48.5 ms before the
+    display in `reviewer-gpu`'s run and 38.75 ms at the median: a count made from it read
+    none at all 1,800 calls where the count from display times read two at 1,751, so no
+    frame would be shed and `frame-pace`'s first row would leave out the swapchain's
+    queue. Where it is a source, "never waits" is a poll with a timeout of zero for each
+    outstanding id, on the thread that presents, and the time is the poll's: late by up to
+    the gap between polls, which is a frame period where it is polled only as a call
+    begins. A device with none of these answers `None`.
   - *What its README states.* Which instant the time is: the refresh at which the image is
     on the glass, as the first two sources give it, or which stage of the third, since
     what the count reads at a device's floor differs by a refresh between an early stage
