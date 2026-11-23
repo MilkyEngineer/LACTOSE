@@ -1,12 +1,13 @@
 //! The primitives the scope latch, the sleep-and-wake protocol and a parking lane's wake are
 //! built from.
 //!
-//! With the `loom` feature these are loom's model-checked versions, so `latch` and `sleep`,
-//! the modules built on them (`gate`, `quiesce`), and `parking` compile unchanged against
-//! either. Nothing else in the crate goes through this module: the rest of the executor is
-//! not modelled, and with the feature on it must not be run, because a loom object panics
-//! outside `loom::model`. A parking lane's queue is `lane`'s, behind std's mutex, which a
-//! model runs as one step since nothing under it is loom's.
+//! With the `loom` feature these are loom's model-checked versions, so `latch` and `sleep`
+//! and the modules built on them (`gate`, `quiesce`), the width and the completion slot of
+//! `Executor::run_job` (`width`, `job_run`), the shutdown flag (`shutdown`), and `parking`
+//! compile unchanged against either. Nothing else in the crate goes through this module: the
+//! rest of the executor is not modelled, and with the feature on it must not be run, because a
+//! loom object panics outside `loom::model`. A parking lane's queue is `lane`'s, behind std's
+//! mutex, which a model runs as one step since nothing under it is loom's.
 //!
 //! [`TimedPark`] is one worker's timed wait, the step of the keeper's wait for a deadline
 //! (`Sleep::park`). It has three forms: on Windows a high-resolution waitable timer beside an

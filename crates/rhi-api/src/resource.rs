@@ -281,6 +281,22 @@ pub struct ImageRange {
 impl ImageRange {
     /// Mip 0 of layer 0: the whole of an image with one mip and one layer.
     pub const FIRST: Self = Self { mip: 0, mips: 1, layer: 0, layers: 1 };
+
+    /// Whether the two ranges share a subresource: a mip in both and a layer in both. A
+    /// range of no mips or no layers shares none. One transition call names a subresource
+    /// at most once ([`Rule::State`](crate::Rule::State)), and every backend judges a
+    /// repeat by this.
+    #[must_use]
+    pub const fn overlaps(self, other: Self) -> bool {
+        const fn meet(start: u32, count: u32, other_start: u32, other_count: u32) -> bool {
+            let (start, other_start) = (start as u64, other_start as u64);
+            let end = start + count as u64;
+            let other_end = other_start + other_count as u64;
+            start < other_end && other_start < end && start < end && other_start < other_end
+        }
+        meet(self.mip, self.mips, other.mip, other.mips)
+            && meet(self.layer, self.layers, other.layer, other.layers)
+    }
 }
 
 /// How a sampler picks between texels.

@@ -22,6 +22,7 @@ mod gate;
 mod graph;
 mod guard;
 mod job;
+mod job_run;
 mod lane;
 mod latch;
 #[cfg(all(test, feature = "loom"))]
@@ -30,16 +31,19 @@ mod parking;
 mod platform;
 mod pool;
 mod quiesce;
+mod shutdown;
 mod sleep;
 mod span;
 mod sync;
 mod task;
 mod time;
+mod width;
 
 pub use chaos::{ChaosConfig, ExecutionLog};
 pub use executor::{Executor, ExecutorBuilder};
 pub use graph::{Graph, GraphBuilder, GraphError, GraphNode, GraphRun, NodeId};
 pub use job::{ChildContext, JobContext, Scope};
+pub use job_run::JobRun;
 pub use lane::{Lane, LaneCall, LanePump, lane};
 pub use parking::{ParkingPump, parking_lane};
 pub use platform::{CoreTopology, Platform, StdPlatform, ThreadHandle, ThreadSpec};

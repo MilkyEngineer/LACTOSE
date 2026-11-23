@@ -66,6 +66,9 @@ impl Timers {
     }
 
     /// Adds or re-arms the timer `id` (allocated on first use) with `waker`.
+    ///
+    /// A waker this replaces is dropped outside the lock, as `fire_due` wakes one: a foreign
+    /// waker's drop may run anything, these timers' own calls too.
     pub(crate) fn register(&self, deadline: Instant, id: &mut Option<u64>, waker: &Waker) -> Rearm {
         let mut state = self.lock();
         let id = *id.get_or_insert_with(|| {
@@ -73,19 +76,27 @@ impl Timers {
             state.next_id
         });
         let was_earliest = state.pending.keys().next().copied();
-        state.pending.insert((deadline, id), waker.clone());
+        let replaced = state.pending.insert((deadline, id), waker.clone());
         self.publish_earliest(&state);
-        if was_earliest.is_some_and(|earliest| earliest <= (deadline, id)) {
+        let rearm = if was_earliest.is_some_and(|earliest| earliest <= (deadline, id)) {
             Rearm::Nobody
         } else {
             state.keeper.map_or(Rearm::AnySleeper, Rearm::Keeper)
-        }
+        };
+        drop(state);
+        drop(replaced);
+        rearm
     }
 
+    /// Removes the timer, dropping its waker outside the lock.
     fn remove(&self, deadline: Instant, id: u64) {
-        let mut state = self.lock();
-        state.pending.remove(&(deadline, id));
-        self.publish_earliest(&state);
+        let removed = {
+            let mut state = self.lock();
+            let removed = state.pending.remove(&(deadline, id));
+            self.publish_earliest(&state);
+            removed
+        };
+        drop(removed);
     }
 
     /// Wakes every timer whose deadline had passed when it was called.

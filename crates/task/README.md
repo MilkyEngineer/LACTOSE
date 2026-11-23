@@ -24,12 +24,13 @@ and list what changed, because `lactose-ecs` is written against this surface.
 | `Graph`, `GraphBuilder`, `GraphNode`, `GraphRun` | Continuation-counted dependency graphs |
 | `JobContext`, `Scope`, `ChildContext` | Fork-join inside a job, per-job scratch memory, partial-storage slots, `block_in_place` |
 | `Executor::spawn`, `Task`, `yield_now` | `'static` stackless tasks |
+| `Executor::run_job`, `JobRun`, `Executor::run_job_width` | One job on a frame-critical worker for a task that is in none, and the width such jobs and their children occupy |
 | `Executor::sleep_until`, `Sleep`, `TickPacer`, `TickBudget` | Timers and tick pacing for the timer root |
 | `lane`, `Lane`, `LanePump`, `LaneCall` | Calls onto one particular thread, returned as futures |
 | `parking_lane`, `ParkingPump` | A lane whose thread parks while nothing is queued, for a thread that runs nothing but its calls |
 | `ChaosConfig`, `ExecutionLog`, `Executor::execution_log`, `Executor::chaos_config` | Seeded schedule perturbation and exact replay for SOUR, and the configuration a run reports it applied |
 
-`GraphRun`, `Task` and `Sleep` resolve to a `lactose_core::Result`. The error is of kind
+`GraphRun`, `Task`, `JobRun` and `Sleep` resolve to a `lactose_core::Result`. The error is of kind
 `Cancelled` and means the executor shut down first. What each resolution guarantees:
 
 - **`GraphRun`.** When it resolves, with `Ok` or with `Cancelled`, no unit, scope child or
@@ -48,6 +49,15 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - **`Task`.** When it resolves to `Cancelled` the task's future has been dropped: its body is
   not running and will not run again. A task that is being polled when shutdown begins
   finishes that poll first.
+- **`JobRun`.** When it resolves with `Ok`, the closure has returned, every scope it opened
+  has closed, and everything the closure and its children wrote happens before the
+  resolution. It resolves to `Cancelled` only when shutdown began before the job started: the
+  closure has then been dropped unrun, under the abort-on-unwind guard, on the thread that
+  gave it up. A job that started finishes and hands its value back, shutdown or not, which is
+  a rule a graph run does not have. Dropping a `JobRun` cancels nothing: the job runs, and
+  the value is dropped by the worker that ran it or by the thread that dropped the future,
+  whichever comes last. Polling it again after it resolved panics, and so does polling a
+  `LaneCall` again.
 - **`Sleep`.** Resolves to `Cancelled` as soon as shutdown begins. It guards nothing.
 
 `lactose_task::bench_support` is hidden and exists for `benches/whisk.rs` alone.
@@ -99,8 +109,8 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - "Only its own scope" is decided by a scope tag on each deque entry, checked when popped. A
   deque length recorded at scope open is not enough, because thieves remove from the other
   end and the length drops below the mark while the opener's own children remain.
-- The opener finds its children by popping its own deque, and this is the invariant that
-  makes that complete: **while a scope is open, nothing but that scope's children is pushed
+- The opener finds its children by popping its own deque, except in a scope of a job of
+  `run_job` (below), and this is the invariant that makes that complete: **while a scope is open, nothing but that scope's children is pushed
   onto the opening worker's deque.** Anything else the worker submits meanwhile, such as a
   graph started from the scope body or from a child the opener runs itself, goes to the
   shared queue. The children are therefore the topmost entries, and an entry with another tag
@@ -112,6 +122,81 @@ and list what changed, because `lactose-ecs` is written against this surface.
   storage. Scope job storage is reset when the scope closes. Child scratch is reset after
   each child, which must not disturb the scratch of an opener that is running that child
   inline.
+
+**Jobs of `run_job`**
+
+- *A job like any other.* The closure is queued when `run_job` is called, as a graph run
+  starts at the call, and a frame-critical worker runs it once: never inside the call, and
+  never a background worker. Where a task on a frame-critical worker calls it, the job may run
+  on that worker, once the task's poll has returned, or on another that takes it sooner. A
+  caller that is no worker, as the thread that drives a stepped run is, never runs it. It is
+  one job as one call of `GraphNode::run` with one unit is. It has that job's `JobContext`,
+  whose `slot` is the worker's; the job scratch is reset when it returns; one abort-on-unwind
+  guard wraps it; it may open scopes one after another, and their children are its own. It is
+  one entry and never split. A worker that takes it while the gate is closed puts it back
+  unstarted, as the rest of a range is put back. It has no `finalize`. It runs untagged, as a
+  graph job does, under one span of target `whisk` named `run_job`.
+- *The gate and the reservation.* A worker takes it only while it holds a run permit, as it
+  takes a graph's job. So while `block_in_place` holds the gate it starts on a worker the
+  reservation leaves awake, or waits for the gate; a job that is running when a block begins
+  finishes; and one parked on its own scope's latch holds no permit.
+- *The width.* The jobs `run_job` starts, and the children their scopes fork, occupy
+  `run_job_width()` frame-critical workers at most at any moment, counted over all such jobs
+  together: `frame_worker_count()` less one, and one where that is one. A worker is occupied
+  from the moment it takes such a job until the closure has returned, whether it is running
+  the closure, running a child of one of its scopes, parked on a scope's latch or waiting for
+  the gate; and for as long as it runs a child of such a job that it took from elsewhere. A
+  worker with a scope of such work open runs that scope's children itself, under the place it
+  holds: while one of them is still to be started it takes that one and does not park, the
+  gate letting it run. One that parked and was woken looks for its scope's children again
+  before it parks again, whatever woke it. So no child of its scope waits queued while its
+  opener could start it, and where the width is one they all run on the job's own worker. So
+  with two frame-critical workers or more, at every moment one of them is occupied by no such
+  job: it takes graph jobs and tasks as before, fires the due timers where it looks for work,
+  and is the keeper while it sleeps. A timed wake is then late by the keeper's wake, or by what
+  is left of a job or a poll that is no such job's. The width parks nobody and spins nobody: a
+  worker that may not take such work looks past it, takes whatever else there is, and sleeps
+  as any idle worker does. An entry queued while fewer than the width are occupied is taken,
+  and one queued while the width is full is taken once a worker leaves it, with no wake-up lost
+  in either case. Under `block_in_place` the gate applies first: a worker needs a run permit to
+  take anything, and a worker the width counts may hold none. It is scheduling and nothing
+  else: an execution log records what ran where, and a replay follows the log. There is no
+  knob.
+- *How the width is kept.* Such jobs, the children of their scopes, the halves split off those
+  children and the rest a worker puts back wait on two queues of the frame-critical pool's
+  that hold such work alone, one for jobs and one for children, and never on a worker's deque,
+  so no thief takes one blind. A worker that holds no place takes from them only after raising
+  a count while it is below the width, children first, and lowers it when the entry is done.
+  A job raises a flag in the same word, and no worker takes a job while it is up: such jobs run
+  one after the other, so every queued child is a child of the one scope that is open, and a
+  worker inside one such job never runs another scope's entry or another such job, which would
+  nest a scope (architecture section 5.1, "Fork-join inside a job only"). The opener takes its
+  scope's children from the queue under its job's place, with no raise. A worker running such
+  a child splits what is left of its range while the children's queue is empty, the rule a
+  deque's range follows with the deque; a half another worker splits off, or puts back, wakes
+  the opener. The pool's
+  look for visible work counts these queues only while a worker without a place could take
+  from them. Queueing an entry and then reading the count, and lowering the count and then
+  reading the queues, is a store-buffering pair: each side has a `SeqCst` fence between its
+  write and its read (`width.rs`).
+- *What it is for.* The frame of `lactose-app` is its one caller (D162): a task that is in no
+  job gets a `JobContext` from it, with no lock, no `Sync` bound and no world. It may not be
+  used for a wait in the closure other than its own scopes, since a job that blocks keeps its
+  run permit and `block_in_place` is the physics step's alone; for a world's work outside its
+  schedule, nothing inside the determinism boundary being a task, which clippy refuses in a
+  boundary crate (`crates/core/clippy.toml`); or for what a graph is for. Two in flight at
+  once wait for each other, the second starting once the first's closure has returned.
+- *What it costs.* A call allocates one cell, which holds the closure, then the value, and the
+  future's waker, under `AllocTag::Task` on the calling thread; where std's mutex allocates on
+  its first lock, as on Apple targets, the cell's mutex is a second allocation, made there too.
+  Beyond those, a share of a block of the jobs' queue, and a child a share of a block of the
+  children's queue: one block per 63 entries. It takes no lock but the completion slot's,
+  and that one twice at its start, on the calling thread and on the worker that takes the
+  closure; once at its end; at each poll of the future; once when the future is dropped
+  unresolved; and, for a job shutdown cancels, once if a worker has taken it and twice if not.
+  A fan-out cut for W − 1 workers takes W/(W − 1) as long as one cut for W; one that is not
+  takes as many rounds as its pieces need on W − 1 workers (four equal children on four
+  workers take twice as long).
 
 **Workers**
 
@@ -220,10 +305,12 @@ and list what changed, because `lactose-ecs` is written against this surface.
   and a push onto the worker's own list. The log grows by 28 bytes per job for the life of
   the executor.
 - A recorded `ExecutionLog` replays the same job-to-worker order. The log lists every call of
-  `GraphNode::run` and `finalize` and every scope child in the order they started, with the
-  worker that ran each. Replay hands each worker exactly the job the log names next. It needs
-  the frame-critical worker count the log was recorded with and a program that starts the
-  same graph runs in the same order. Tasks are not recorded.
+  `GraphNode::run` and `finalize`, every scope child and every closure of `run_job` in the
+  order they started, with the worker that ran each. Replay hands each worker exactly the job
+  the log names next. It needs the frame-critical worker count the log was recorded with and a
+  program that starts the same graph runs and `run_job` calls in the same order. Tasks are not
+  recorded. A replay does not keep the width of `run_job`: it hands out such work by the log
+  and leaves the count alone, so it runs as the recorded run did and no narrower.
 - A log the program cannot follow aborts the process with a diagnostic, two seconds after the
   replay has work waiting, nothing running, and the job the log names next not among it. A
   log whose next job belongs to a graph run the program has not started yet is not stuck:
@@ -296,9 +383,41 @@ Correctness:
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
   Eleven models are explored exhaustively. The three with three threads are bounded at five
   preemptions, the idle-release one at four, the parking lane's at three
-  (`LOOM_MAX_PREEMPTIONS` overrides the bounds). The parking lane's model fails, as a
-  deadlock, with the unpark alone and with the flag alone; both run beside it, at its bound,
-  as `weakened_*` models over a copy of its wake and wait.
+  (`LOOM_MAX_PREEMPTIONS` overrides the bounds).
+  Eight more hold `run_job`: the completion slot against a dropped `JobRun`, exhaustively; a
+  worker taking the job against shutdown beginning, at five preemptions; the width in three
+  configurations with the sleep protocol, at two: a width of one, two workers beside a main
+  thread that queues two jobs; a width of two with two jobs on three workers; and a width of
+  two with one job on three workers whose scope forks a range, the worker that puts a half
+  back held until that half has run; a job queued at a width of two while a worker gives back
+  a child's place it took for nothing, at two; a child that only the wake of a holder's
+  `leave` can deliver, at one; and a job and a task queued through `ShutdownFlag::queue`
+  against shutdown's flag and sweep, at one. The jobs of the width's configurations of three
+  workers are queued before their workers start, which keeps those searches within minutes.
+  Each model counts only beside weakened variants that fail it, which run with it
+  (`weakened_*`), each at the model's bound: under loom 0.7.2 a model whose reader is the main
+  thread may explore one execution. The parking lane's model fails, as a deadlock, with the
+  unpark alone and with the flag alone; both run beside it as `weakened_*` models over a copy
+  of its wake and wait. Five terms are copies in the models, since loom cannot run
+  the types they live in: four of `run_job`'s, and what the pool's three submissions hand
+  `ShutdownFlag::queue` with the sweep they hand it. The module's doc names each and the
+  native test that holds it.
+- `src/executor/job_tests.rs` holds the width by order and never by a time, each wait bounded
+  by a thread of the test's own: with children of a `run_job` job held where they begin, a
+  task's `sleep_until` resolves and a graph run completes beside them, on four
+  frame-critical workers, on two, where every child runs on the job's own worker, and with
+  the opener parked on its latch, its place kept, and a second job waiting behind it. There
+  too: a second job waits beside a first that leaves room in the width, by the flag alone; a
+  job queued while the gate holds the other worker is still queued once that worker, woken
+  for it, sleeps again; a range in a job splits to a second worker; and an opener that parked
+  takes the halves queued after it parked. `tests/jobs.rs` holds where a job runs, shutdown,
+  the reservation, who drops the value, a job queued as the one frame-critical worker goes
+  idle, 5,000 times with the gaps swept across the window before it sleeps, and a child that
+  crosses to another worker, which the Miri runs check too. `src/pool.rs` holds a job taken
+  at a closed gate and one taken after shutdown began, and a job, a task and a graph's range
+  each queued as shutdown begins, the flag set between the push and the read by a hook that
+  only its tests compile, and swept by the submission itself. `tests/job_alloc.rs` counts a call's
+  allocations, in a binary of its own because it installs a global allocator.
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it
   would run on loom primitives, which panic outside a loom model.

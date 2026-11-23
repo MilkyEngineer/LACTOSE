@@ -109,12 +109,15 @@ contract leaves to the backend.
   can be refused by while recording; the first breach stops the recording, and its submit is
   refused with the breach's rule. A transition is recorded as one `vkCmdPipelineBarrier2` on
   the recording queue, its scopes from the two states (`lactose-rhi-api`'s README, "States");
-  a family without `GRAPHICS` gets no graphics stage. A re-take from `Undefined` carries
-  `ALL_COMMANDS` and `MEMORY_WRITE` as its source scope. Two roles on two queues of one family
-  are one layout change on the releasing queue and a semaphore (D160). A local read is a
-  by-region barrier from colour attachment output to fragment shader input reads inside the
-  render pass, and a render pass that marks attachments for it binds an input attachment set
-  from the encoder's own pools.
+  its elements are unordered, so a call that names one subresource or one buffer twice is
+  refused `state` at the call, before any of it is recorded, images by
+  `ImageRange::overlaps` and buffers by handle, as null compares; a family without
+  `GRAPHICS` gets no graphics stage. A re-take from `Undefined` carries `ALL_COMMANDS` and
+  `MEMORY_WRITE` as its source scope. Two roles on two queues of one family are one layout
+  change on the releasing queue and a semaphore (D160). A local read is a by-region barrier
+  from colour attachment output to fragment shader input reads inside the render pass, and a
+  render pass that marks attachments for it binds an input attachment set from the encoder's
+  own pools.
 - **The submit** takes its queue's lock and the records', makes every check a submit can be
   refused by, stamps the submit, gives the records' lock up and calls `vkQueueSubmit2` with
   the caller's waits and signals and the queue's own timeline signal last.
@@ -156,7 +159,9 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   through a staging copy and read back through a copy; the engine's shader,
   `shaders/surface.slang` as cooked, making its two pipelines, not run; a compute stage whose
   workgroup is not its module's, refused; an entry point the module lacks, or declares for the
-  other stage, refused; a heap and sampler table past the driver's support refused
+  other stage, refused; a graphics signal, and a host signal, beside a lagging compute
+  submit's promise, refused while it is in flight, skipped where compute shares the graphics
+  queue; a heap and sampler table past the driver's support refused
   `Unsupported`, and one within it made; a buffer and a block past the device's size refused
   `ResourceExhausted`; a cache that fails a check (a corrupt payload, a truncated file, a
   wrong checksum, a stale header) starting empty; a cache whose directory cannot be written,
@@ -187,11 +192,19 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   a family without `GRAPHICS`, and two writes in one writing state. In `src/raw.rs`: compute
   takes a family that does not draw first, and viewport bounds rounded inward to what an Apple
   GPU honours. In `src/records.rs`: a reached point completing its submit and the earlier ones
-  of its queue, a failed submit's promise dropped and its point retried, another queue's
-  pending signal needing a wait, a host signal below a promise; the interleavings of a driver
-  read and its hold, each fixed in order against a model driver (a host signal or a dropped
-  promise between a read and its hold, a pass begun during a slot write, a destroy at once
-  after a wait with the queue behind, a failed submit's point signalled from the host, a
+  of its queue, a failed submit's promise kept until its stamp and its wait are known
+  reached and its point then retried, a failed submit let go once the caller has seen its
+  waits and a later point of its queue, its promise of a removed timeline completing
+  nothing, its waits ordering no later submit of its queue and giving no credit at the
+  top, and its wait for its own timeline met by a host signal below its promise, another
+  queue's pending signal needing a wait, a wait
+  ordering only the signal it waits for and the earlier submits of that signal's queue (the
+  shapes null's test of the same name holds null to), a host signal below a promise; the
+  interleavings of a driver read and its hold, each fixed in order against a model driver (a
+  host signal or a dropped promise between a read and its hold, a pass begun during a slot
+  write, a destroy at once after a wait with the queue behind, a failed submit's point
+  signalled from the host after another queue's submit was ordered through its promise or
+  its wait, which no device test can provoke since no driver's submit fails on demand, a
   wait-only submit 2^31 below a marked host signal, a stale read folded at a late hold, a
   wait that reaches two submits of one queue), and host signals racing on threads over one
   timeline, which stays behind the driver. In `src/table.rs`: a replaced or removed value
@@ -207,15 +220,15 @@ MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choos
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2, under Metal API and shader validation | 150 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363) | 143 | 50: 30 null alone, 8 no window, 4 no loss, 5 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
-| KosmicKrisp under GPU-assisted validation | 138 | 50: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
+| MoltenVK 1.4.2, under Metal API and shader validation | 158 | 45: 31 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363) | 147 | 55: 31 null alone, 8 no window, 4 no loss, 9 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
+| KosmicKrisp under GPU-assisted validation | 142 | 55: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
 
-The counts are of the device tests: the suite's 175 cases, 147 contract and 28 output, and the
+The counts are of the device tests: the suite's 183 cases, 155 contract and 28 output, and the
 device's own; the Metal canary runs under MoltenVK alone. Each driver passes 27 of the 28
 output cases: MoltenVK skips the count draw, and KosmicKrisp the ownership transfer, since
 compute shares its one queue. Under Metal's validation every case that does not skip prints
-both banners; a skipped case is exempt, 14 of MoltenVK's 44 having made a device first.
+both banners; a skipped case is exempt, 14 of MoltenVK's 45 having made a device first.
 
 GPU-assisted validation does not run under MoltenVK 1.4.2: its instrumented shaders fail in
 SPIRV-Cross (a `uint` to `ulong` `reinterpret_cast`). On an Apple GPU the device reports

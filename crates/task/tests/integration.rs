@@ -8,6 +8,7 @@ mod abort;
 mod block_in_place;
 mod chaos;
 mod graph;
+mod jobs;
 mod lanes;
 mod scope;
 mod stress;
