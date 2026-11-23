@@ -12,8 +12,9 @@ use std::time::{Duration, SystemTime};
 
 /// Held from the first panic's report to the abort, so that a panic on another thread
 /// waits for the abort and the report is of the process's first panic. It is never
-/// released, so it is never poisoned. No other lock is taken while it is held: stderr is
-/// written through a handle of its own ([`write_stderr`]).
+/// released, so it is never poisoned. While it is held the hook takes `std`'s backtrace
+/// lock alone, inside `std`'s capture and symbol lookup, where no user code runs; never
+/// `std`'s stderr lock ([`write_stderr`]).
 static REPORTING: Mutex<()> = Mutex::new(());
 
 /// Installs the process's panic hook (`README.md`, "The crash hook"). A panic then writes to
@@ -37,6 +38,9 @@ static REPORTING: Mutex<()> = Mutex::new(());
 /// separator, `..` or an absolute path would put the file outside `dir`.
 pub fn install_crash_hook(binary: &'static str, dir: Option<PathBuf>) {
     assert!(is_file_name(binary), "the crash hook's binary name {binary:?} is not a file name");
+    // Made while descriptors are free, for a crash whose own duplicate fails: a panic is
+    // often a full descriptor table's.
+    let reserve = duplicate_stderr().ok();
     std::panic::set_hook(Box::new(move |info| {
         let _first = REPORTING.lock();
         let thread = std::thread::current();
@@ -49,10 +53,10 @@ pub fn install_crash_hook(binary: &'static str, dir: Option<PathBuf>) {
             "{binary} crashed\nthread: {}\n{info}\n",
             thread.name().unwrap_or("<unnamed>"),
         );
-        let _ = write_stderr(&report);
+        let _ = write_stderr(&report, reserve.as_ref());
         let start = report.len();
         let _ = write!(report, "backtrace:\n{backtrace}\n");
-        let _ = write_stderr(&report[start..]);
+        let _ = write_stderr(&report[start..], reserve.as_ref());
         if let Some(dir) = &dir {
             let line = match write_file(binary, dir, &report) {
                 Ok(path) => format!("{binary}: the crash report is in {}\n", path.display()),
@@ -60,7 +64,7 @@ pub fn install_crash_hook(binary: &'static str, dir: Option<PathBuf>) {
                     format!("{binary}: no crash report file at {}: {error}\n", path.display())
                 }
             };
-            let _ = write_stderr(&line);
+            let _ = write_stderr(&line, reserve.as_ref());
         }
         std::process::abort();
     }));
@@ -72,25 +76,23 @@ fn is_file_name(binary: &str) -> bool {
     !binary.is_empty() && Path::new(binary).file_name() == Some(OsStr::new(binary))
 }
 
-/// Writes `text` to stderr through a duplicate of its handle, which takes none of `std`'s
-/// locks. A thread that holds the stderr lock, inside `eprintln!`, and then panics, or
-/// waits there on a lock the panicking thread holds, would otherwise hold the report back
-/// for ever. The cost: what other threads write to stderr meanwhile can interleave with the
-/// report; the file is written whole. Where the handle cannot be duplicated, the locked
-/// stderr.
-fn write_stderr(text: &str) -> std::io::Result<()> {
-    match duplicate_stderr() {
-        Ok(mut stderr) => stderr.write_all(text.as_bytes()),
-        Err(_) => {
-            let mut stderr = std::io::stderr().lock();
-            stderr.write_all(text.as_bytes())?;
-            stderr.flush()
-        }
+/// Writes `text` to stderr through a duplicate of its handle made now, or else through
+/// `reserve`, the one made at install; never through `std`'s stderr, whose lock a thread
+/// that holds it inside `eprintln!`, and then panics, or waits there on a lock the panicking
+/// thread holds, would hold for ever. With neither handle, nothing is written. The
+/// duplicate made now comes first so that a stderr redirected since install is followed.
+fn write_stderr(text: &str, reserve: Option<&File>) -> std::io::Result<()> {
+    match (duplicate_stderr(), reserve) {
+        (Ok(mut stderr), _) => stderr.write_all(text.as_bytes()),
+        (Err(_), Some(mut reserve)) => reserve.write_all(text.as_bytes()),
+        (Err(error), None) => Err(error),
     }
 }
 
 /// A file over a new handle to the process's stderr; `std`'s `Stderr` is unbuffered, so
-/// nothing written through it is still in `std`'s hands.
+/// nothing written through it is still in `std`'s hands. On Windows a process with no
+/// console has a null stderr, which `std` copies without duplicating: a write to it fails,
+/// and nothing is written, as through `std`'s stderr.
 fn duplicate_stderr() -> std::io::Result<File> {
     #[cfg(unix)]
     let handle = std::os::fd::AsFd::as_fd(&std::io::stderr()).try_clone_to_owned()?;

@@ -8,9 +8,11 @@
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use lactose_cook::{Shaders, Slang};
 use lactose_core::{Error, ErrorKind, Result};
@@ -90,11 +92,19 @@ fn run(arguments: &Arguments) -> Result<()> {
     Ok(())
 }
 
+/// Held from the first panic's report to the abort, as in `lactose-app`'s hook: a panic on
+/// another thread waits for the abort, so the report is of the process's first panic. It is
+/// never released, so it is never poisoned.
+static REPORTING: Mutex<()> = Mutex::new(());
+
 /// Architecture section 5.1: a panic writes a crash report and aborts. The report is the
 /// text `lactose_app::install_crash_hook` writes, on stderr alone: a tool does not link the
 /// assembly, so it keeps a hook of its own (D155).
 fn install_crash_hook() {
-    std::panic::set_hook(Box::new(|info| {
+    // Made while descriptors are free, for a crash whose own duplicate fails.
+    let reserve = duplicate_stderr().ok();
+    std::panic::set_hook(Box::new(move |info| {
+        let _first = REPORTING.lock();
         let thread = std::thread::current();
         let backtrace = std::backtrace::Backtrace::force_capture();
         let report = format!(
@@ -102,26 +112,30 @@ fn install_crash_hook() {
             thread.name().unwrap_or("<unnamed>"),
         );
         // Nothing is left to report a failed write to: the process aborts either way.
-        let _ = write_stderr(&report);
+        let _ = write_stderr(&report, reserve.as_ref());
         std::process::abort();
     }));
 }
 
-/// Writes `text` to stderr through a duplicate of its handle, which takes none of `std`'s
-/// locks, as `lactose-app`'s hook does: a thread that holds the stderr lock inside
-/// `eprintln!` and panics, or waits there on a lock the panicking thread holds, cannot hold
-/// the report back. Where the handle cannot be duplicated, the locked stderr.
-fn write_stderr(text: &str) -> std::io::Result<()> {
-    #[cfg(unix)]
-    let handle = std::os::fd::AsFd::as_fd(&std::io::stderr()).try_clone_to_owned();
-    #[cfg(windows)]
-    let handle = std::os::windows::io::AsHandle::as_handle(&std::io::stderr()).try_clone_to_owned();
-    match handle {
-        Ok(handle) => std::fs::File::from(handle).write_all(text.as_bytes()),
-        Err(_) => {
-            let mut stderr = std::io::stderr().lock();
-            stderr.write_all(text.as_bytes())?;
-            stderr.flush()
-        }
+/// Writes `text` to stderr through a duplicate of its handle made now, or else through
+/// `reserve`, the one made at install; never through `std`'s stderr, as in `lactose-app`'s
+/// hook: a thread that holds its lock inside `eprintln!` and panics, or waits there on a lock
+/// the panicking thread holds, would hold the report back for ever. With neither handle,
+/// nothing is written.
+fn write_stderr(text: &str, reserve: Option<&File>) -> std::io::Result<()> {
+    match (duplicate_stderr(), reserve) {
+        (Ok(mut stderr), _) => stderr.write_all(text.as_bytes()),
+        (Err(_), Some(mut reserve)) => reserve.write_all(text.as_bytes()),
+        (Err(error), None) => Err(error),
     }
+}
+
+/// A file over a new handle to the process's stderr.
+fn duplicate_stderr() -> std::io::Result<File> {
+    #[cfg(unix)]
+    let handle = std::os::fd::AsFd::as_fd(&std::io::stderr()).try_clone_to_owned()?;
+    #[cfg(windows)]
+    let handle =
+        std::os::windows::io::AsHandle::as_handle(&std::io::stderr()).try_clone_to_owned()?;
+    Ok(File::from(handle))
 }

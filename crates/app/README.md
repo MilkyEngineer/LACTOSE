@@ -2693,14 +2693,17 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
 `install_crash_hook(binary, dir)` installs the process's panic hook (architecture section
 5.1, D155). Every engine binary calls it first in `main`, before its subscriber and before
 anything that can panic; RICOTTA keeps a hook of its own, since a tool does not link the
-assembly, and writes stderr the same way. It is safe code over `std` alone: no signal
+assembly, and takes its lock and writes stderr the same way. It is safe code over `std` alone: no signal
 handler, no minidump, no second process. `binary` names the report's file, so the call
 asserts, at startup, that it is one non-empty path component: no separator, no root, not
 `.` or `..`. On a panic, on any thread, the hook:
 
 1. takes a lock it never releases, so that a panic on another thread waits for the abort
-   and the report is the process's first panic's. It takes no other lock while it holds
-   this one: a panic inside the hook makes `std` abort before the hook runs again;
+   and the report is the process's first panic's. While it holds this one it takes `std`'s
+   backtrace lock alone, inside `std`'s capture and symbol lookup, where no user code runs
+   and the engine's allocator takes no lock, so no thread that waits on the hook's lock or
+   holds one the panicking thread waits on can hold it. A panic inside the hook makes `std`
+   abort before the hook runs again;
 2. captures a backtrace with `Backtrace::force_capture`, whatever `RUST_BACKTRACE` says;
 3. writes to stderr `<binary> crashed`, `thread: <name>` (`<unnamed>` for a thread without
    one) and the panic's location and message as `std` prints them, before anything else
@@ -2718,10 +2721,18 @@ asserts, at startup, that it is one non-empty path component: no separator, no r
 Stderr is written through a duplicate of its handle, never through `std`'s stderr lock: a
 thread that panics inside `eprintln!` holds that lock while its own hook waits for the
 first, and a thread waiting inside `eprintln!` on a lock the panicking thread holds would
-hold it until the abort, so a hook that took it would hang. The cost: what other threads
-write to stderr while the hook runs can interleave with the report on the terminal; the file
-is written whole. Where the handle cannot be duplicated (a Windows process with no console),
-the hook falls back to the locked stderr. A directory that cannot be created or written, or a
+hold it until the abort, so a hook that took it would hang. The hook duplicates the handle
+at the panic, so that a stderr redirected since install is followed, and keeps a second
+duplicate made at install for a panic whose own duplicate fails: a full descriptor table
+(EMFILE), itself a common cause of a panic, or on Windows a full handle quota. With neither,
+the hook writes no stderr and goes on to the file. The reserve costs one descriptor or
+handle for the life of the process. On Windows a process with no console has a null stderr,
+which `std` copies without duplicating; a write to it fails and writes nothing, as `std`'s
+stderr does there, so such a process's report is its file. The cost: what other threads
+write to stderr while the hook runs can interleave with the report on the terminal, and on
+a Windows console that is not UTF-8 non-ASCII text (a message, a path) prints in the
+console's code page, since a raw handle bypasses `std`'s conversion for the console; the
+file is written whole and in UTF-8. A directory that cannot be created or written, or a
 file that cannot be written, costs the file alone: the failure is that one line, never a
 second panic, and the abort follows (`docs/verification.md`, the writable disk). `None`
 writes stderr alone. The directory is the binary's to choose (`crates/app-headless/README.md`

@@ -2,7 +2,8 @@
 //! in a subprocess with its test hook set panics on a frame worker, writes the report to
 //! stderr and to a file in the directory it names, and aborts; a directory that cannot be
 //! written costs the file alone; another thread that holds stderr's lock, or waits inside
-//! `eprintln!`, does not hold the report back. No test installs the hook (D16).
+//! `eprintln!`, does not hold the report back, even with the descriptor table full. No test
+//! installs the hook (D16).
 
 #![forbid(unsafe_code)]
 
@@ -39,7 +40,31 @@ struct Run {
 /// and the crash directory named or not. A run that has not exited within [`BOUND`] is
 /// killed, and the test fails: a hook that hangs is the failure.
 fn run(cwd: &Path, hook: Option<&str>, crash_dir: Option<&Path>) -> Run {
-    let mut command = Command::new(BINARY);
+    run_command(Command::new(BINARY), cwd, hook, crash_dir)
+}
+
+/// [`run`], with the process's descriptor limit lowered to `descriptors` by the shell that
+/// starts it, so that filling the table is quick on a machine whose limit is high.
+#[cfg(unix)]
+fn run_with_descriptors(
+    descriptors: u32,
+    cwd: &Path,
+    hook: Option<&str>,
+    crash_dir: Option<&Path>,
+) -> Run {
+    let mut command = Command::new("/bin/sh");
+    // `exec`, so that the process the test waits on and kills is the binary.
+    command.arg("-c").arg(format!("ulimit -n {descriptors} && exec \"$0\" \"$@\"")).arg(BINARY);
+    run_command(command, cwd, hook, crash_dir)
+}
+
+/// `command`, the binary or the shell that execs it, run as [`run`] says.
+fn run_command(
+    mut command: Command,
+    cwd: &Path,
+    hook: Option<&str>,
+    crash_dir: Option<&Path>,
+) -> Run {
     command.arg("1").current_dir(cwd);
     command.env_remove("LACTOSE_TEST_PANIC").env_remove("LACTOSE_CRASH_DIR");
     if let Some(hook) = hook {
@@ -240,6 +265,30 @@ fn a_panic_while_stderr_waits_on_the_panicking_thread_is_reported_and_aborts() {
                    stderr waits on";
     let report = frame_report(&run.stderr, message);
     assert_one_file(&dir, report);
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+/// As above, with the descriptor table full when the frame panics: the hook cannot duplicate
+/// stderr at the panic, so it writes through the duplicate it made at install, and a hook
+/// that fell back to `std`'s stderr would never write. The file cannot be created, and the
+/// line says so.
+#[cfg(unix)]
+#[test]
+fn a_panic_with_the_descriptor_table_full_is_reported_on_stderr_and_aborts() {
+    let cwd = scratch("stderr-blocked-emfile");
+    let dir = cwd.join("crash");
+    let run = run_with_descriptors(256, &cwd, Some("stderr-blocked-emfile"), Some(&dir));
+    assert_aborted(&run);
+    // Not `frame_report`: with no descriptor free, the backtrace's symbols may not be read.
+    let (report, thread, message) = report_in(&run.stderr);
+    assert!(thread.starts_with("whisk-frame-"), "{report}");
+    let expected = "LACTOSE_TEST_PANIC=stderr-blocked-emfile: the first frame panics holding \
+                    what stderr waits on";
+    assert_eq!(message, expected, "{report}");
+    let refused = format!("lactose-app-headless: no crash report file at {}", dir.display());
+    assert!(run.stderr.contains(&refused), "{}", run.stderr);
+    assert!(run.stderr.contains("(os error 24)\n"), "{}", run.stderr);
+    assert!(files_in(&dir).is_empty());
     fs::remove_dir_all(&cwd).unwrap();
 }
 

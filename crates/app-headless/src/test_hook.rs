@@ -3,14 +3,15 @@
 //! abort in a subprocess. Unset or empty, nothing here runs.
 
 use std::fmt;
+use std::fs::File;
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use lactose_core::Tick;
 use lactose_sim::TickInput;
 
-/// The variable. Its value names the panic: `stderr-held`, `stderr-blocked`, or any other
-/// value for a plain panic.
+/// The variable. Its value names the panic: `stderr-held`, `stderr-blocked`, on unix
+/// `stderr-blocked-emfile`, or any other value for a plain panic.
 const VARIABLE: &str = "LACTOSE_TEST_PANIC";
 
 /// The callback that panics on its first call, on the frame worker that runs the timer root,
@@ -19,7 +20,11 @@ pub(crate) fn frames() -> Option<Box<dyn FnMut(Tick) -> TickInput + Send>> {
     let value = std::env::var_os(VARIABLE).filter(|value| !value.is_empty())?;
     Some(match value.to_str() {
         Some("stderr-held") => Box::new(|_| stderr_held()),
-        Some("stderr-blocked") => Box::new(|_| stderr_blocked()),
+        Some("stderr-blocked") => Box::new(|_| stderr_blocked("stderr-blocked", Vec::new)),
+        #[cfg(unix)]
+        Some("stderr-blocked-emfile") => {
+            Box::new(|_| stderr_blocked("stderr-blocked-emfile", fill_descriptors))
+        }
         _ => Box::new(|_| panic!("{VARIABLE} is set: the first frame panics")),
     })
 }
@@ -53,7 +58,8 @@ static HELD: Mutex<()> = Mutex::new(());
 
 /// A panic while holding a lock that another thread waits on inside `eprintln!`, so that
 /// thread holds stderr's lock until the abort: a hook that takes that lock never writes.
-fn stderr_blocked() -> ! {
+/// `files`, called just before the panic, gives files to keep open until the abort.
+fn stderr_blocked(value: &str, files: fn() -> Vec<File>) -> ! {
     let _held = HELD.lock();
     let (ready, started) = mpsc::channel();
     let waiter = std::thread::Builder::new()
@@ -63,7 +69,8 @@ fn stderr_blocked() -> ! {
     let _ = started.recv();
     // The waiter sends before it waits on `HELD`: the moment to get there.
     std::thread::sleep(Duration::from_millis(100));
-    panic!("{VARIABLE}=stderr-blocked: the first frame panics holding what stderr waits on");
+    let _files = files();
+    panic!("{VARIABLE}={value}: the first frame panics holding what stderr waits on");
 }
 
 /// Sends once its `Display` runs, inside `eprintln!`, then waits for [`HELD`].
@@ -75,4 +82,26 @@ impl fmt::Display for WaitsForHeld {
         let _held = HELD.lock();
         f.write_str("HELD was released")
     }
+}
+
+/// The most files [`fill_descriptors`] opens. A larger table is not filled quickly, so a run
+/// whose limit is above it (the test lowers the limit) panics instead.
+#[cfg(unix)]
+const FILL_LIMIT: usize = 1 << 16;
+
+/// Opens the null device until the process's descriptor table is full, so that duplicating
+/// stderr fails with EMFILE, and gives the files.
+#[cfg(unix)]
+fn fill_descriptors() -> Vec<File> {
+    // The same number on Linux and macOS.
+    const EMFILE: i32 = 24;
+    let mut files = Vec::new();
+    while files.len() < FILL_LIMIT {
+        match File::open("/dev/null") {
+            Ok(file) => files.push(file),
+            Err(error) if error.raw_os_error() == Some(EMFILE) => return files,
+            Err(error) => panic!("{VARIABLE}: the descriptor table did not fill: {error}"),
+        }
+    }
+    panic!("{VARIABLE}: the descriptor table holds more than {FILL_LIMIT} files");
 }
