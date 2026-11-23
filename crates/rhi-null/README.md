@@ -28,7 +28,8 @@ in its rules table, both columns, and this file states only what the contract le
 | `NullSurface` | A surface with no window, for a device that makes a swapchain; its handles are unavailable |
 
 The swapchain has three images of `Bgra8Unorm`. `acquire` and the present's wait for an
-undecided point are bounded at one second.
+undecided point are bounded at one second. Its present ids count each present taken;
+nothing shows its images, so `display_times` is `None` (D162).
 
 ## What null counts and runs
 
@@ -100,7 +101,10 @@ walk refuse it `destroyed`, with nothing submitted.
   whose index a later buffer took, which resolves nothing; four refusals null alone makes,
   each by its rule; and two
   races from several threads, submits on two queues racing a present, each round of which
-  fails with a message past three refusals, and a destroy racing a present's wait.
+  fails with a message past three refusals, and a destroy racing a present's wait; and,
+  under each layout, the frame's submits on the graphics queue completing beside a present
+  whose submit is held, a frame write of the target that present took refused (`no-qfot`)
+  where the present role has a queue of its own, and a loss with a frame in flight.
 - `tests/wakes.rs`: the wakes null alone makes, each bounded by how soon its waiter returns
   (10 s for a 60 s wait, 600 ms for a present or an acquire bounded at a second): a
   timeline's destroy under a wait; a loss, a destroy and a frame submit on its shared queue

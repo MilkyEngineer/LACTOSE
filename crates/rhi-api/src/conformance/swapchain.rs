@@ -7,8 +7,8 @@ use lactose_core::Result;
 use super::kit::{Body, Ctx, EXTENT, PATIENCE, attachment, begin, buffer_to, clear, image_to};
 use crate::{
     Acquired, BufferCopy, BufferState, BufferUsage, Device, Encoder, Extent, ImageHandle,
-    ImageState, Load, MemoryClass, PassReach, Presented, QueuePath, QueueRole, Rule, Store, Submit,
-    Swapchain, SwapchainDesc, TimelinePoint,
+    ImageState, Load, MemoryClass, PassReach, PresentId, Presented, QueuePath, QueueRole, Rule,
+    Store, Submit, Swapchain, SwapchainDesc, TimelinePoint,
 };
 
 type Applies = core::result::Result<(), &'static str>;
@@ -39,6 +39,10 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     (
         "frame_submits_complete_while_a_present_is_pending",
         frame_submits_complete_while_a_present_is_pending,
+    ),
+    (
+        "present_ids_count_up_and_display_times_follow_them",
+        present_ids_count_up_and_display_times_follow_them,
     ),
 ];
 
@@ -346,6 +350,50 @@ fn frame_submits_complete_while_a_present_is_pending(ctx: &Ctx<'_>) -> Applies {
     show(ctx, &*device, &mut *swapchain, next);
     if stalled {
         ctx.stall(&*device, false);
+    }
+    Ok(())
+}
+
+/// Each present taken has the next id from one, a refused present takes none, and a resize
+/// restarts nothing. Where the swapchain reports display times, each report is of a present
+/// taken, each id once and in increasing order; a swapchain whose device has no source
+/// answers `None` at every call.
+fn present_ids_count_up_and_display_times_follow_them(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.presenting()?;
+    let mut swapchain = swapchain(ctx, &*device);
+    ctx.check(swapchain.last_present().is_none(), "no id before the first present");
+    let reports = swapchain.display_times().is_some();
+    let mut reported: Option<PresentId> = None;
+    for round in 1..=6 {
+        if round == 4 {
+            ctx.ok(
+                swapchain.resize(Extent { width: EXTENT.width * 2, height: EXTENT.height }),
+                "a resize",
+            );
+        }
+        let image = acquire(ctx, &mut *swapchain);
+        let mut encoders = [ctx.encoder(&*device, G)];
+        ctx.refused_by(
+            present(&mut *swapchain, image, &mut encoders, &[], &[]),
+            Rule::Encoding,
+            "a present of a graphics encoder",
+        );
+        show(ctx, &*device, &mut *swapchain, image);
+        ctx.check(swapchain.last_present() == Some(PresentId(round)), "the present's id");
+        match swapchain.display_times() {
+            Some(times) => {
+                ctx.check(reports, "a swapchain that answered `None` reports");
+                for time in times {
+                    ctx.check(
+                        reported.is_none_or(|last| time.present > last),
+                        "the reports' ids increase, each once",
+                    );
+                    ctx.check(time.present.0 <= round, "a report is of a present taken");
+                    reported = Some(time.present);
+                }
+            }
+            None => ctx.check(!reports, "a swapchain that reported answers `None`"),
+        }
     }
     Ok(())
 }

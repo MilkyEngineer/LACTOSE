@@ -59,7 +59,7 @@ included: a change that breaks one is a signature change to list.
 | `GraphicsPipelineDesc`, `ComputePipelineDesc`, `StageDesc`, `Constant`, `ConstantValue`, `ColourTargetDesc`, `WriteMask`, `DepthDesc`, `Compare`, `Cull`, the two pipeline handles | Pipelines from cooked shaders, with specialisation |
 | `seal_cache`, `open_cache`, `CacheIdentity`, `CacheStart`, `PipelineStats` | The driver cache's bytes under the facade's own length and checksum, and what a device counts |
 | `TimelineHandle`, `TimelinePoint`, `Submit` | Timelines, and a submit with its waits and signals |
-| `SurfaceSource`, `SwapchainDesc`, `Swapchain`, `Acquired`, `Presented` | A surface from `raw-window-handle`'s types, and the swapchain the present thread holds |
+| `SurfaceSource`, `SwapchainDesc`, `Swapchain`, `Acquired`, `Presented`, `PresentId`, `DisplayTime` | A surface from `raw-window-handle`'s types, the swapchain the present thread holds, and when its presents reached the display |
 | `MessageSink`, `Message`, `MessageSource`, `Severity` | Where validation and driver messages go |
 | `Rule`, `Refusal` | The rules a backend checks, by name, and the value a refused call returns |
 | `HEAP_SLOTS_DEFAULT`, `SAMPLERS_DEFAULT`, `OFFSCREEN_TARGET_IMAGES_MIN` | The heap's and the sampler table's capacities milestone 2's shaders are cooked for, and the least images of an offscreen target |
@@ -75,7 +75,7 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
 | `lactose-rhi-null` (`rhi-null`) | Every call honourable by kept state, with no `unsafe`; each misuse the plan's row names as a rule with a name a test asserts; a capability set to be created with; the suite's contract cases to fill in | Handles as plain data; recording that cannot fail and a submit that checks in submission order; `write_buffer` and `read_buffer` lend a range for a call, so a store behind a lock serves; `Rule`, `Rule::refuse`, `Rule::of`; `Capabilities` as plain data; `conformance::CASES` |
 | `lactose-rhi-vulkan` (`vulkan`) | The spike's fourteen points; states and queues enough to emit every barrier and transfer without tracking state itself; the cache blob's framing; output cases to fill in | `ImageTransition` and `BufferTransition` carry both states and both queues; `Sharing`; `seal_cache`, `open_cache`; `conformance::Harness::shader` |
 | `lactose-rhi-metal` (milestone 3) | Residency and its usage per encoder with no call of its own; the alias relation to fence; nothing that names a layout, a family or a hazard-tracking mode | `PassReach` on every pass, each buffer with its exact state; `ImageMemory::Placed` and `Encoder::alias`; states that Metal reads as usage and otherwise ignores |
-| `swapchain` (in `lactose-rhi-vulkan` and `lactose-platform`'s tests) | Acquire with no caller timeout, present as part of a submit, the present role's queue held by one thread, resize, which queue path the device took | `Swapchain`, `Acquired`, `Presented`, `Capabilities::queues` |
+| `swapchain` (in `lactose-rhi-vulkan` and `lactose-platform`'s tests) | Acquire with no caller timeout, present as part of a submit, the present role's queue held by one thread, resize, which queue path the device took, each present's id and its display time where the device reports one (D162) | `Swapchain`, `Acquired`, `Presented`, `PresentId`, `DisplayTime`, `Capabilities::queues` |
 | `lactose-platform` (`platform`, `platform-impl`) | To hand over a window without a backend naming it; to know which thread reads the handles | `SurfaceSource`, implemented for any `HasWindowHandle + HasDisplayHandle + Send + Sync`; the handles are read once, in the constructor, on the calling thread |
 | `lactose-render-graph` (`graph`, `graph-impl`) | Passes by usage mapped to states; transients that alias; queue assignment and crossings; record on frame workers, one pool for each job and frame in flight, reset after the frame's timeline value; submission in graph order | `ImageState`, `BufferState`; `ImageMemory::Placed`, `Encoder::alias`, `Device::image_placement`; `QueueLayout::same_queue`, transfers recorded on both sides; `Encoder` is its own pool, `Send`, and `reset` is refused while pending; `Submit` takes encoders in slice order with waits and signals |
 | `lactose-renderer` (`renderer`, `renderer-impl`) | The staging ring written in place and never read; the scatter writing through an address; the latched camera; an indexed indirect draw; heap slots for textures | `Device::write_buffer` on `MemoryClass::Upload`; `push_address`, `BufferReach`; `draw_indexed_indirect`, `IndexedIndirectArgs`; `write_heap_slot`, `push_slot` |
@@ -239,11 +239,12 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   a heap slot its pass declares. A copy is not offered for it: it would swap channels into a
   BGRA surface and skip the encoding into an sRGB one.
 - The offscreen target is `OFFSCREEN_TARGET_IMAGES_MIN` images or more. The present thread
-  holds one at a time, the newest the frame has finished. A finished image crosses to the
-  present role by a transition the frame's last submit for it records and the present
-  thread's encoder records again, the present's submit waiting for a point the frame's
-  submit signals; or, for an image made `Sharing::Concurrent`, by a transition the present
-  thread records alone.
+  names one at a time in a command, for the span of one present call: the newest the frame
+  had finished when the call was queued. Between calls its heap slot keeps the last (D162).
+  A finished image crosses to the present role by a transition the frame's last submit for
+  it records and the present thread's encoder records again, the present's submit waiting
+  for a point the frame's submit signals; or, for an image made `Sharing::Concurrent`, by a
+  transition the present thread records alone.
 - The frame takes an image back only after the point the present thread signals when its
   read of it is done, which the frame waits for on the host or its submit waits for, and by
   a transition from `Undefined`: it overwrites the image whole, so nothing crosses back. A
@@ -251,9 +252,11 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   does not wait for that point, is refused on null (`no-qfot`; "States"), which is how the
   frame is kept from writing the image the present thread holds. Where the roles share
   one queue there is no such refusal and none is needed: the queue runs the read before the
-  write. A backend sees a hold only while a present that reads the image is pending; which
-  image the present thread holds between its presents is the frame's protocol to keep
-  (`frame-design`).
+  write. A backend sees a hold only while a present that reads the image is pending; between
+  its presents no command of the present thread's names a target, and its heap slot may
+  hold the last target's image until a call names another for the index or `close`: the
+  frame's protocol queues one call for one finished image and takes the image back by the
+  point that call reports (D162).
 
 **The surface** (plan section 3, `rhi-api`)
 
@@ -1012,6 +1015,43 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   minimum and maximum, as the backend's query found them just before the call, and none with
   a zero dimension, reaches the driver.
 
+**The display-time report** (D162, an amendment of D158; `crates/app/README.md`, "What D162
+asks of other crates")
+
+- Each present the swapchain takes, `Presented::Shown` or `Stale`, has a `PresentId`, one for
+  the first and one more for each after it; a `resize` does not restart it, and a present
+  that is refused or returns `DeviceLost` takes none. `last_present` reads it after the
+  call. A backend gives its driver that id with every present, none left out.
+- `display_times` gives the reports that arrived since its last call, oldest first: for
+  each, the present's id and the `Instant` its image reached the display. Each id is
+  reported once at most, in increasing order. It never waits and reaches no queue. It is
+  called on the thread that presents, between that thread's other calls of the swapchain:
+  every Vulkan source's read is externally synchronised on the swapchain with the acquire
+  and the present (`vkGetPastPresentationTimingGOOGLE`, `vkAcquireNextImageKHR`,
+  `VkPresentInfoKHR::pSwapchains`), so a read from another thread is invalid, and `Swapchain`
+  is not `Sync`. A backend whose driver keeps a bounded history drains it within that bound
+  at each call; a caller that calls it as each of its presents begins is far inside
+  MoltenVK's 60.
+- Whether a swapchain reports is fixed at its creation: `display_times` answers `None` at
+  every call where its device has no source, and `Some` of a list, empty where nothing has
+  arrived, where it has one. So a caller tells "nothing has reached the display yet" from
+  "this device never says".
+- A present the display never took (one discarded at a `resize`, or replaced) is either
+  left out, a report of a later id covering it, or reported so that the caller can tell it
+  apart; where the backend cannot tell them apart its README says so. A caller that takes a
+  present as displayed once its id or a later one is reported needs neither in particular.
+- Each backend's README states: the source; which instant the time is (the refresh at which
+  the image is on the glass, or which stage of `VK_EXT_present_timing`); how late a report
+  may arrive after that instant; how a present the display never took is reported; the
+  error of the time against an `Instant`; and the bound within which `display_times`
+  returns.
+
+| Backend | Source | Reports |
+|---|---|---|
+| Null | None: nothing shows its images | `None` |
+| Vulkan | `VK_GOOGLE_display_timing`'s `actualPresentTime` under MoltenVK, with `VkPresentTimesInfoGOOGLE` chained to every present and `desiredPresentTime` zero; `VK_EXT_present_timing` where a device offers it, not built while no device here offers it; `VK_KHR_present_id` with `VK_KHR_present_wait` only where a run shows its completion follows the display, which MoltenVK's does not | `None` on every other device, lavapipe and a headless surface among them (`crates/rhi-vulkan/README.md`, "The display-time report") |
+| Metal | `CAMetalDrawable.presentedTime`, zero for a present the display never took, which the backend leaves out. The backend is not built | |
+
 **Device loss** (architecture section 19, verification row 192)
 
 - A loss is a value. Any call that reaches the device may return an error of kind
@@ -1455,7 +1495,7 @@ Some output cases count as evidence only in the shape, or on the device, named h
 | Timelines, destroys and races | `timeline_is_signalled_waited_and_read_by_the_host`, `timeline_wait_times_out`, `waits_are_woken_by_the_submit_that_reaches_them`, `wait_is_woken_by_a_host_signal`, `timeline_value_that_does_not_grow_is_refused`, `host_signal_above_a_pending_signal_is_refused`, `host_signal_below_a_promise_that_does_not_wait_for_it_is_refused`, `host_signal_below_a_pending_signal_releases_its_waiter`, `host_signal_below_a_promise_whose_wait_is_met_is_refused`, `submit_signalling_no_more_than_it_waits_for_is_refused`, `timeline_value_beyond_the_difference_limit_is_refused`, `timeline_signalled_from_two_queues_without_a_wait_is_refused`, `timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused`, `signal_after_a_wait_for_another_signal_of_its_submit_is_refused`, `wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline`, `wait_for_a_signal_orders_the_earlier_submits_of_its_queue`, `destroy_under_a_pending_submit_is_refused`, `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`, `destroy_after_an_unobserved_submit_is_refused`, `destroy_at_once_after_the_wait_is_accepted`, `destroy_racing_a_submit_refuses_one`, `submits_racing_on_one_queue_keep_their_order`, `host_signals_racing_on_one_timeline_keep_it_growing`, `use_after_destruction_is_refused`, `destroyed_after_recording_is_refused_at_submit`, `handle_of_another_device_is_refused` | |
 | Render passes and the local read | `input_read_without_a_local_read_is_refused`, `input_read_of_another_attachment_is_refused`, `attachments_of_unequal_extent_are_refused`, `scissor_outside_the_attachments_is_refused`, `viewport_outside_its_rules_is_refused` | `triangle_matches_the_reference`, `local_read_sees_what_the_pass_wrote`, `clear_and_keep_load_as_described`, `viewport_and_scissor_place_the_triangles`, `draw_parameters_reach_the_shader` |
 | Indirect draws and dispatches | `index_buffer_offset_outside_or_unaligned_is_refused`, `indexed_draw_past_its_index_buffer_is_refused`, `indirect_arguments_outside_or_unaligned_are_refused`, `dispatch_beyond_the_group_limit_is_refused` | `indexed_indirect_draw_matches_the_reference`, `indirect_count_draws_where_reported`, `dispatch_writes_through_an_address`, `dispatches_of_one_pass_see_each_others_writes`, `dispatch_indirect_reads_its_counts` |
-| The swapchain and the present role | `second_acquire_before_a_present_is_refused`, `present_of_an_image_not_acquired_is_refused`, `present_behind_an_unmet_wait_is_refused`, `present_of_an_image_not_in_present_is_refused`, `swapchain_image_on_a_frame_encoder_is_refused`, `swapchain_image_used_outside_its_acquire_is_refused`, `second_swapchain_is_refused`, `swapchain_extent_with_a_zero_dimension_is_refused`, `resize_with_a_present_pending_is_refused`, `image_of_before_a_resize_is_refused`, `frame_submits_complete_while_a_present_is_pending` | |
+| The swapchain and the present role | `second_acquire_before_a_present_is_refused`, `present_of_an_image_not_acquired_is_refused`, `present_behind_an_unmet_wait_is_refused`, `present_of_an_image_not_in_present_is_refused`, `swapchain_image_on_a_frame_encoder_is_refused`, `swapchain_image_used_outside_its_acquire_is_refused`, `second_swapchain_is_refused`, `swapchain_extent_with_a_zero_dimension_is_refused`, `resize_with_a_present_pending_is_refused`, `image_of_before_a_resize_is_refused`, `frame_submits_complete_while_a_present_is_pending`, `present_ids_count_up_and_display_times_follow_them` | |
 | Device loss and messages | `loss_is_returned_and_stays`, `waits_return_at_once_after_a_loss`, `wait_is_woken_by_a_loss`, `teardown_succeeds_after_a_loss`, `clean_run_sends_no_message` | `each_validator_reports_its_canary` |
 
 The swapchain's cases run on null's swapchain, which needs no window. What needs a window or

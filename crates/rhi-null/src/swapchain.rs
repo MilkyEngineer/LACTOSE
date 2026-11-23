@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use lactose_core::Result;
 use lactose_rhi_api::{
-    Acquired, Extent, Format, ImageHandle, ImageState, ImageUsage, Presented, QueueRole, Rule,
-    Sharing, Submit, Swapchain,
+    Acquired, DisplayTime, Extent, Format, ImageHandle, ImageState, ImageUsage, PresentId,
+    Presented, QueueRole, Rule, Sharing, Submit, Swapchain,
 };
 
 use crate::device::{BOUND, ImageObj, Shared, alive};
@@ -31,6 +31,8 @@ pub(crate) struct NullSwapchain {
     /// Where the next acquire starts looking.
     next: usize,
     acquired: Option<ImageHandle>,
+    /// The id of the last present taken.
+    presented: Option<PresentId>,
 }
 
 impl NullSwapchain {
@@ -46,7 +48,15 @@ impl NullSwapchain {
         let images = make_images(shared, records, extent)?;
         records.next_swapchain += 1;
         records.swapchain = Some(number);
-        Ok(Self { shared: shared.hold(), number, extent, images, next: 0, acquired: None })
+        Ok(Self {
+            shared: shared.hold(),
+            number,
+            extent,
+            images,
+            next: 0,
+            acquired: None,
+            presented: None,
+        })
     }
 
     /// The queue the present role is served by.
@@ -168,6 +178,8 @@ impl Swapchain for NullSwapchain {
                         rec.acquired = Some(false);
                     }
                     self.acquired = None;
+                    let id = self.presented.map_or(1, |PresentId(last)| last + 1);
+                    self.presented = Some(PresentId(id));
                     drop(records);
                     drop(held);
                     shared.progressed();
@@ -227,6 +239,15 @@ impl Swapchain for NullSwapchain {
         self.acquired = None;
         self.next = 0;
         Ok(())
+    }
+
+    fn last_present(&self) -> Option<PresentId> {
+        self.presented
+    }
+
+    /// Nothing shows null's images, so it has no display time to report.
+    fn display_times(&mut self) -> Option<Vec<DisplayTime>> {
+        None
     }
 }
 

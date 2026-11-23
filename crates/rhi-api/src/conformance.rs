@@ -406,6 +406,7 @@ pub const CASES: &[Case] = cases! {
     contract "resize_with_a_present_pending_is_refused" => Pending everywhere;
     contract "image_of_before_a_resize_is_refused" => Destroyed everywhere;
     contract "frame_submits_complete_while_a_present_is_pending";
+    contract "present_ids_count_up_and_display_times_follow_them";
     // Device loss and messages.
     contract "loss_is_returned_and_stays";
     contract "waits_return_at_once_after_a_loss";
