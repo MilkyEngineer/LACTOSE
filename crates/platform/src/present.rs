@@ -5,11 +5,10 @@ use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 
 use lactose_core::{Error, ErrorKind, Result, ThreadClass};
-use lactose_task::{Lane, LaneCall, Platform, ThreadSpec, lane};
+use lactose_task::{Lane, LaneCall, Platform, ThreadSpec, lane, parking_lane};
 
 thread_local! {
     /// Set by the stop call, read by the body that runs it once its drain is done. The
@@ -64,17 +63,9 @@ pub fn present_thread<S: Send + 'static>(
 /// closes that lane, hands the state back once, and returns.
 fn present<S: 'static>(mut state: S, started: mpsc::Sender<(Lane<S>, Lane<Option<S>>)>) {
     STOPPING.set(false);
-    // The flag, not the thread's park token, says a call was queued: a call that parks, as a
-    // channel's receive and a lock's wait do, may take the token. The store follows the
-    // queue's release, so a swap that reads it is followed by a drain that finds the call.
-    let woken = Arc::new(AtomicBool::new(false));
-    let (present, mut pump) = {
-        let (woken, thread) = (woken.clone(), std::thread::current());
-        lane("present", move || {
-            woken.store(true, Ordering::Release);
-            thread.unpark();
-        })
-    };
+    // `lactose-task`'s parking lane: a call that parks, as a channel's receive and a lock's
+    // wait do, may take the thread's unpark, and the lane's wait does not lose that wake.
+    let (present, mut pump) = parking_lane("present");
     // Drained once, after the stop: the take is queued before the stop, so it needs no wake.
     let (hand_back, mut handing_back) = lane("present hand-back", || {});
     if started.send((present, hand_back)).is_err() {
@@ -86,10 +77,8 @@ fn present<S: 'static>(mut state: S, started: mpsc::Sender<(Lane<S>, Lane<Option
         if STOPPING.get() {
             break;
         }
-        // A wake after the drain began sets the flag, and the loop drains again.
-        while !woken.swap(false, Ordering::Acquire) {
-            std::thread::park();
-        }
+        // A call queued after the drain began ends the wait at once.
+        pump.wait();
     }
     // Every call not run, and every call queued from here on, resolves to `Cancelled`.
     drop(pump);

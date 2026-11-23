@@ -12,8 +12,8 @@
 //!
 //! Where things live: `pool` is the worker loop, stealing and idling; `graph` and `job` are
 //! the two kinds of work a frame-critical worker runs; `task` is the third, on either class;
-//! `latch` and `sleep` are the two wait protocols, written against `sync` so loom can model
-//! them (`models`).
+//! `latch` and `sleep` are the two wait protocols, and `parking` a lane's thread's, written
+//! against `sync` so loom can model them (`models`).
 
 mod chaos;
 mod deque;
@@ -26,6 +26,7 @@ mod lane;
 mod latch;
 #[cfg(all(test, feature = "loom"))]
 mod models;
+mod parking;
 mod platform;
 mod pool;
 mod quiesce;
@@ -40,6 +41,7 @@ pub use executor::{Executor, ExecutorBuilder};
 pub use graph::{Graph, GraphBuilder, GraphError, GraphNode, GraphRun, NodeId};
 pub use job::{ChildContext, JobContext, Scope};
 pub use lane::{Lane, LaneCall, LanePump, lane};
+pub use parking::{ParkingPump, parking_lane};
 pub use platform::{CoreTopology, Platform, StdPlatform, ThreadHandle, ThreadSpec};
 pub use task::{Task, YieldNow, yield_now};
 pub use time::{Sleep, TickBudget, TickPacer};

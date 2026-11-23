@@ -26,6 +26,7 @@ and list what changed, because `lactose-ecs` is written against this surface.
 | `Executor::spawn`, `Task`, `yield_now` | `'static` stackless tasks |
 | `Executor::sleep_until`, `Sleep`, `TickPacer`, `TickBudget` | Timers and tick pacing for the timer root |
 | `lane`, `Lane`, `LanePump`, `LaneCall` | Calls onto one particular thread, returned as futures |
+| `parking_lane`, `ParkingPump` | A lane whose thread parks while nothing is queued, for a thread that runs nothing but its calls |
 | `ChaosConfig`, `ExecutionLog`, `Executor::execution_log`, `Executor::chaos_config` | Seeded schedule perturbation and exact replay for SOUR, and the configuration a run reports it applied |
 
 `GraphRun`, `Task` and `Sleep` resolve to a `lactose_core::Result`. The error is of kind
@@ -200,6 +201,15 @@ and list what changed, because `lactose-ecs` is written against this surface.
   store the call's result, when it returns or is dropped unrun, and by each poll of its
   `LaneCall`. Neither is held while a call runs or while a waker is woken, and neither is
   taken while the other is held.
+- A `parking_lane` is drained by the thread that made it, which parks in
+  `ParkingPump::wait` until a call has been queued since the last `wait` returned, and
+  returns at once if one has. Its wake is a flag the queueing thread sets before it unparks
+  the lane's thread, so a call that parks inside its own body, on a channel or a lock, and so
+  takes the unpark of a call queued meanwhile, does not lose that call's wake; an unpark from
+  elsewhere does not end the wait. The flag publishes nothing: the queue's lock orders the
+  call. `wait` runs no call, and the thread drains after it. This is the present thread's
+  pump (`lactose-platform`), whose loop drains, checks its own stop and waits; the wake is
+  `lactose-task`'s so that it is modelled, since no other crate names loom.
 
 **Chaos**
 
@@ -273,8 +283,9 @@ Correctness:
 - The scope latch and the sleep-and-wake protocol are modelled under `loom` (`src/models.rs`),
   and with them what is built on them: the opener's wait with its permit and the
   `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, the
-  timer keeper's hand-off, the task kept by the worker that fires its timer, and the
-  quiescence of a cancelled run (`src/quiesce.rs`). The models call the shipped functions.
+  timer keeper's hand-off, the task kept by the worker that fires its timer, the
+  quiescence of a cancelled run (`src/quiesce.rs`), and a parking lane's wait under a call
+  that takes its thread's unpark (`src/parking.rs`). The models call the shipped functions.
   Under loom a timed park waits on a flag that only `Sleep::wake_worker` sets and that an
   unpark alone does not satisfy, as the Windows wait is not ended by an unpark, so a waker
   that skips it fails the keeper hand-off model.
@@ -283,7 +294,9 @@ Correctness:
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
   Eleven models are explored exhaustively. The three with three threads are bounded at five
-  preemptions, the idle-release one at four (`LOOM_MAX_PREEMPTIONS` overrides the bounds).
+  preemptions, the idle-release one at four, the parking lane's at three
+  (`LOOM_MAX_PREEMPTIONS` overrides the bounds). The parking lane's model fails, as a
+  deadlock, with the unpark alone and with the flag alone.
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it
   would run on loom primitives, which panic outside a loom model.

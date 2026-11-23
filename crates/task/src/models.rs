@@ -789,3 +789,45 @@ fn a_task_kept_by_the_worker_that_fired_its_timer_is_taken() {
         other.join().unwrap();
     });
 }
+
+/// A parking lane's thread loses no wake to a call that takes its unpark, as a present call
+/// that waits on a channel does. The first call parks unless the second has been queued,
+/// so it can take the unpark the second's queueing gives; the thread must still drain the
+/// second. A wait that parks on the unpark alone deadlocks here, and so does one that reads
+/// the flag with no unpark to end its park.
+#[test]
+fn a_parked_lane_loses_no_wake_to_a_call_that_parks() {
+    bounded(3, || {
+        let (lane, mut pump) = crate::parking_lane::<usize>("model");
+        let second = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        let queuer = {
+            let (second, ended) = (second.clone(), ended.clone());
+            thread::spawn(move || {
+                let queued = second.clone();
+                drop(lane.run(move |ran: &mut usize| {
+                    if !queued.load(Ordering::SeqCst) {
+                        thread::park();
+                    }
+                    *ran += 1;
+                }));
+                second.store(true, Ordering::SeqCst);
+                drop(lane.run(|ran: &mut usize| *ran += 1));
+                ended.store(true, Ordering::SeqCst);
+            })
+        };
+        let mut ran = 0;
+        loop {
+            pump.drain(&mut ran);
+            if ran == 2 {
+                break;
+            }
+            pump.wait();
+        }
+        // loom cannot have a thread unparked while it is blocked in `join`.
+        while !ended.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        queuer.join().unwrap();
+    });
+}

@@ -1,7 +1,8 @@
-//! The primitives the scope latch and the sleep-and-wake protocol are built from.
+//! The primitives the scope latch, the sleep-and-wake protocol and a parking lane's wake are
+//! built from.
 //!
 //! With the `loom` feature these are loom's model-checked versions, so `latch` and `sleep`
-//! and the modules built on them (`gate`, `quiesce`)
+//! and the modules built on them (`gate`, `quiesce`), and `parking`,
 //! compile unchanged against either. Nothing else in the crate goes through this module: the
 //! rest of the executor is not modelled, and with the feature on it must not be run, because a
 //! loom object panics outside `loom::model`.
@@ -15,9 +16,9 @@ pub(crate) use core::sync::atomic::Ordering;
 
 #[cfg(not(feature = "loom"))]
 mod imp {
-    pub(crate) use core::sync::atomic::{AtomicU64, AtomicUsize, fence};
+    pub(crate) use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
     pub(crate) use std::sync::{Mutex, MutexGuard};
-    pub(crate) use std::thread::park;
+    pub(crate) use std::thread::{Thread, current, park};
 
     #[cfg(not(all(windows, not(miri))))]
     pub(crate) use super::portable::TimedPark;
@@ -29,9 +30,9 @@ mod imp {
 mod imp {
     use core::time::Duration;
 
-    pub(crate) use loom::sync::atomic::{AtomicU64, AtomicUsize, fence};
+    pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
     pub(crate) use loom::sync::{Mutex, MutexGuard};
-    pub(crate) use loom::thread::park;
+    pub(crate) use loom::thread::{Thread, current, park};
 
     /// One worker's timed wait. loom has no clock, so a wait lasts until a waker ends it,
     /// which only removes wake-ups: a model that passes does not depend on a timeout for

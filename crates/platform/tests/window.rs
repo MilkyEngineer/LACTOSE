@@ -13,9 +13,12 @@
 //! cargo nextest run -p lactose-platform --test window --run-ignored only
 //! ```
 
-// The one module that reaches the operating system directly, to do what a user does to a
-// window and to read back a thread's scheduling, allows it (`SAFETY.md`).
+// The two modules that reach the operating system directly, `os`, to do what a user does to
+// a window and to read back a thread's scheduling, and `thread_cpu`, to read a thread's CPU
+// clock, allow it (`SAFETY.md`).
 #![deny(unsafe_code)]
+
+mod thread_cpu;
 
 use core::fmt::Debug;
 use core::future::Future;
@@ -30,11 +33,13 @@ use std::time::{Duration, Instant};
 
 use lactose_core::{Error, ErrorKind, Result, ThreadClass};
 use lactose_platform::{
-    ClientPlatform, EventPump, LOG_TARGET, MainThread, PixelSize, Window, WindowDesc, event_pump,
-    present_thread,
+    ClientPlatform, EventPump, LOG_TARGET, MainThread, PixelSize, Window, WindowDesc,
+    WindowReports, event_pump, present_thread,
 };
 use lactose_task::{Executor, Lane, Platform, StdPlatform, ThreadHandle, ThreadSpec, WorkerClass};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
+
+use crate::thread_cpu::thread_cpu;
 
 /// The variable that makes this binary a case's child, naming the case.
 const CHILD: &str = "PAIL_WINDOW_CASE";
@@ -117,7 +122,16 @@ const CASES: &[Case] = &[
     Case {
         name: "a_worker_that_waits_on_the_main_thread_aborts",
         child: a_worker_that_waits_on_the_main_thread_aborts,
-        expect: Expect::Aborts { says: "block_on called on a worker thread stalls the frame" },
+        expect: if cfg!(debug_assertions) {
+            Expect::Aborts { says: "block_on called on a worker thread stalls the frame" }
+        } else {
+            Expect::Done
+        },
+    },
+    Case {
+        name: "the_pump_idles_open_and_while_a_window_is_held",
+        child: the_pump_idles_open_and_while_a_window_is_held,
+        expect: Expect::Done,
     },
     Case {
         name: "a_present_call_that_blocks_holds_only_the_calls_behind_it",
@@ -460,35 +474,60 @@ fn opens_pumps_and_closes() -> Result<()> {
     })
 }
 
-/// A call queued before `run` runs after the window opens; once `run` has returned, a task
-/// whose call came back `Cancelled` reads the close, and a call queued later is
+/// A call queued before `run` runs after the window opens; the close is reported before the
+/// lane is closed, so the waker of a call that the close cancels reads it `true` when the
+/// cancel wakes it, on the main thread; and a call queued after `run` returned is
 /// `Cancelled`.
 fn a_call_queued_before_run_runs_and_one_after_is_cancelled() -> Result<()> {
+    /// Reads the close when the cancel wakes it: 1 for `false`, 2 for `true`.
+    struct ReadsTheClose(WindowReports, Arc<AtomicUsize>);
+    impl Wake for ReadsTheClose {
+        fn wake(self: Arc<Self>) {
+            self.1.store(1 + usize::from(self.0.close_requested()), Ordering::SeqCst);
+        }
+    }
+
     let (main, pump) = event_pump(desc())?;
     let before = main.run(|main| {
         let window = main.window();
         (window.size(), window.reports())
     });
-    pump_with(&main, pump, move |main| {
-        let (size, reports) = wait(before)?;
-        assert!(!size.is_empty(), "the call ran before the window opened");
-        assert!(!reports.close_requested());
-        println!("stage: the call queued before run ran");
-        wait(main.run(MainThread::exit))?;
-        let executor = Executor::builder().build()?;
-        let task = executor.spawn(WorkerClass::Background, async move {
-            loop {
-                if let Err(error) = main.run(|_| ()).await {
-                    assert_eq!(error.kind(), ErrorKind::Cancelled);
-                    return reports.close_requested();
-                }
-            }
-        });
-        assert!(executor.block_on(task)?, "a task whose call was cancelled read no close");
-        executor.shutdown();
-        println!("stage: a call came back cancelled, and the close read true");
-        Ok(())
+    let read = Arc::new(AtomicUsize::new(0));
+    let returned = Arc::new(AtomicBool::new(false));
+    let driver = drive(&main, {
+        let (read, returned) = (read.clone(), returned.clone());
+        move |main| {
+            let (size, reports) = wait(before)?;
+            assert!(!size.is_empty(), "the call ran before the window opened");
+            assert!(!reports.close_requested());
+            println!("stage: the call queued before run ran");
+            // No `Arc<Window>` is held, so `exit` lets the window go in the turn that runs
+            // it, and the pump drains nothing more: the next call is cancelled by its end.
+            wait(main.run(MainThread::exit))?;
+            let mut call = pin!(main.run(|_| ()));
+            let waker = Waker::from(Arc::new(ReadsTheClose(reports, read)));
+            let mut context = Context::from_waker(&waker);
+            assert!(call.as_mut().poll(&mut context).is_pending(), "the call resolved at once");
+            // Polled again only once `run` has returned, so the waker stays the one above.
+            poll_until(BOUND, "run's return", || returned.load(Ordering::SeqCst));
+            let Poll::Ready(cancelled) = call.as_mut().poll(&mut context) else {
+                return Err(failed("the call is pending after run returned"));
+            };
+            assert_eq!(cancelled.expect_err("never drained").kind(), ErrorKind::Cancelled);
+            Ok(())
+        }
     })?;
+    println!("stage: pumping");
+    let pumped = pump.run();
+    returned.store(true, Ordering::SeqCst);
+    println!("stage: the pump returned");
+    let checked = driver.finish();
+    pumped?;
+    checked?;
+    let read = read.load(Ordering::SeqCst);
+    assert_ne!(read, 0, "the cancel woke no one");
+    assert_eq!(read, 2, "the cancel woke its task before the close was reported");
+    println!("stage: the cancel's wake read the close true");
     let after = wait(main.run(|_| ())).expect_err("nothing runs after run returned");
     assert_eq!(after.kind(), ErrorKind::Cancelled);
     println!("stage: a call queued after run returned is cancelled");
@@ -640,8 +679,36 @@ fn run_waits_for_the_last_window_and_warns() -> Result<()> {
     checked?;
     let after = back.saturating_duration_since(dropped?);
     println!("stage: run returned {after:?} after the last drop");
-    assert!(after < Duration::from_secs(2), "run returned {after:?} after the last drop");
+    // The pump looks every 50 ms and returns on the window's destruction: a look once a
+    // second, or a wait for the second's fallback, overshoots this by half a second.
+    assert!(after < Duration::from_millis(500), "run returned {after:?} after the last drop");
     Ok(())
+}
+
+/// The pump uses no CPU while it waits: with the window open and nothing to do, and after
+/// `exit` while an `Arc<Window>` is held, when it looks for the last drop every 50 ms. The
+/// main thread reads its own CPU clock in a main-lane call before and after each spell, so
+/// a loaded machine slows the case and cannot fail it.
+fn the_pump_idles_open_and_while_a_window_is_held() -> Result<()> {
+    const IDLE: Duration = Duration::from_secs(2);
+    const MOST: Duration = Duration::from_millis(200);
+    let (main, pump) = event_pump(desc())?;
+    pump_with(&main, pump, move |main| {
+        let spell = |main: &Lane<MainThread>, what: &str| -> Result<()> {
+            let before = wait(main.run(|_| thread_cpu()))?;
+            std::thread::sleep(IDLE);
+            let spent = wait(main.run(|_| thread_cpu()))? - before;
+            println!("stage: {what}: {spent:?} of the main thread's CPU over {IDLE:?}");
+            assert!(spent < MOST, "{what}: the pump used {spent:?} of CPU over {IDLE:?}");
+            Ok(())
+        };
+        let window = wait(main.run(|main| main.window()))?;
+        spell(&main, "idle with the window open")?;
+        wait(main.run(MainThread::exit))?;
+        spell(&main, "after exit with the window held")?;
+        drop(window);
+        Ok(())
+    })
 }
 
 fn a_driver_that_panics_still_lets_the_pump_return() -> Result<()> {
@@ -716,24 +783,35 @@ fn after_an_error_from_run_main_returns_within_its_bound() -> Result<()> {
     let executor = Executor::builder().platform(Arc::new(ClientPlatform::new())).build()?;
     let dropped_on = Arc::new(Mutex::new(None));
     let (_release, released) = mpsc::channel::<()>();
+    let (lent, window) = mpsc::channel();
     let root = executor.spawn(WorkerClass::FrameCritical, {
         let (executor, dropped_on) = (executor.clone(), dropped_on.clone());
         async move {
             let guard = DropsOn(dropped_on);
             let exit = ExitOnDrop(main.clone());
+            // The root keeps a `Weak` and the reports alone: the pump's `Arc` is the last.
             let window = main.run(|main| main.window()).await?;
+            let _ = lent.send((Arc::downgrade(&window), window.reports()));
+            drop(window);
             main.run(|_| os::end_event_loop()).await?;
             // The last step, which nothing releases within the bound.
             while matches!(released.try_recv(), Err(mpsc::TryRecvError::Empty)) {
                 executor.sleep_until(Instant::now() + Duration::from_millis(10)).await?;
             }
-            drop((window, exit, guard));
+            drop((exit, guard));
             Ok::<_, Error>(())
         }
     });
     let error = pump.run().expect_err("the event loop ended with the window held");
     assert_eq!(error.kind(), ErrorKind::Platform);
     println!("stage: run returned an error: {error}");
+    let (window, reports) =
+        window.recv_timeout(BOUND).map_err(|_| failed("the root lent no window"))?;
+    assert!(reports.close_requested(), "run returned an error and reported no close");
+    // The window is left to the end of the process, its handles valid: never destroyed.
+    let window = window.upgrade().ok_or_else(|| failed("run destroyed the window on an error"))?;
+    std::mem::forget(window);
+    println!("stage: the close was reported, and the window is alive");
     let started = Instant::now();
     let (answer, answered) = mpsc::channel();
     let waiter = executor.clone();
@@ -760,7 +838,9 @@ fn after_an_error_from_run_main_returns_within_its_bound() -> Result<()> {
 }
 
 /// `Executor::block_on` of a main-lane call on a worker is `lactose-task`'s debug
-/// assertion, and the process aborts.
+/// assertion, and the process aborts. The assertion is a `debug_assert!` (architecture
+/// section 5.1): in a release build the worker waits, the main thread runs the call, and
+/// the wait resolves, which the case prints.
 fn a_worker_that_waits_on_the_main_thread_aborts() -> Result<()> {
     let (main, pump) = event_pump(desc())?;
     pump_with(&main, pump, |main| {
@@ -770,8 +850,14 @@ fn a_worker_that_waits_on_the_main_thread_aborts() -> Result<()> {
         let task = executor.spawn(WorkerClass::FrameCritical, async move {
             on_worker.block_on(main.run(|main| main.window().size()))
         });
-        let _ = wait(task);
-        Err(failed("the process did not abort"))
+        let waited = wait(task);
+        if cfg!(debug_assertions) {
+            return Err(failed("the process did not abort"));
+        }
+        let size = waited??;
+        println!("stage: a release build has no assertion: the wait resolved, to {size:?}");
+        executor.shutdown();
+        Ok(())
     })
 }
 

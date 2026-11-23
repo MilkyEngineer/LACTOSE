@@ -1,13 +1,14 @@
 //! The present thread with no window (`README.md`, "Proof"): its spec, a call that blocks,
-//! the stop under a queuing task, the calls after the hand-back, a second present thread
-//! on one platform thread, the drop, a platform that drops the body and a call that
-//! panics. Miri runs this file.
+//! a call queued while a call parks, the stop and the drop under queuing threads, the
+//! lane's close before the hand-back, an idle thread's CPU, the calls after the hand-back,
+//! a second present thread on one platform thread, the drop, a platform that drops the body
+//! and a call that panics. Miri runs this file, save the CPU test.
 
 use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::task::Wake;
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,9 @@ use lactose_core::{ErrorKind, Result, ThreadClass};
 use lactose_platform::{ClientPlatform, PresentThread, present_thread};
 use lactose_task::{
     CoreTopology, Executor, LaneCall, Platform, StdPlatform, ThreadHandle, ThreadSpec, WorkerClass,
-    yield_now,
 };
+
+use crate::thread_cpu::thread_cpu;
 
 /// How long a test waits for anything: far past what any wait here takes, so that only a
 /// hang reaches it. Miri's clock runs with the instructions it interprets.
@@ -103,16 +105,13 @@ fn the_present_thread_is_made_through_the_platform_with_its_spec() {
 fn a_call_that_blocks_holds_the_calls_behind_it_and_nothing_else() {
     let executor = executor();
     let (present, thread) = present_thread(&ClientPlatform::new(), Vec::new()).expect("a thread");
-    let entered = Arc::new(Barrier::new(2));
+    let (entered, inside) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
-    let blocking = {
-        let entered = entered.clone();
-        present.run(move |order: &mut Vec<&str>| {
-            order.push("blocking");
-            entered.wait();
-            released.recv_timeout(BOUND).expect("the test releases the call");
-        })
-    };
+    let blocking = present.run(move |order: &mut Vec<&str>| {
+        order.push("blocking");
+        entered.send(()).expect("the test waits for the call");
+        released.recv_timeout(BOUND).expect("the test releases the call");
+    });
     let behind_ran = Arc::new(AtomicBool::new(false));
     let behind = {
         let behind_ran = behind_ran.clone();
@@ -121,7 +120,7 @@ fn a_call_that_blocks_holds_the_calls_behind_it_and_nothing_else() {
             order.push("behind");
         })
     };
-    entered.wait();
+    inside.recv_timeout(BOUND).expect("the blocking call started");
     // The blocking call is in progress.
     let task = executor.spawn(WorkerClass::FrameCritical, async { 7 });
     assert_eq!(wait(task).expect("the task completes"), 7);
@@ -141,16 +140,13 @@ fn a_call_that_blocks_holds_the_calls_behind_it_and_nothing_else() {
 fn a_call_queued_while_a_call_parks_runs_after_it() {
     let (present, thread) = present_thread(&ClientPlatform::new(), 0u32).expect("a thread");
     for round in 0..if cfg!(miri) { 3 } else { 50 } {
-        let entered = Arc::new(Barrier::new(2));
+        let (entered, inside) = mpsc::channel();
         let (release, released) = mpsc::channel::<()>();
-        let parking = present.run({
-            let entered = entered.clone();
-            move |_: &mut u32| {
-                entered.wait();
-                released.recv_timeout(BOUND).expect("the test releases the call");
-            }
+        let parking = present.run(move |_: &mut u32| {
+            entered.send(()).expect("the test waits for the call");
+            released.recv_timeout(BOUND).expect("the test releases the call");
         });
-        entered.wait();
+        inside.recv_timeout(BOUND).expect("the parking call started");
         // The drain that runs `parking` has begun: this call waits for the next one.
         let behind = present.run(move |count: &mut u32| {
             *count += 1;
@@ -165,98 +161,221 @@ fn a_call_queued_while_a_call_parks_runs_after_it() {
     wait(thread.stop()).expect("the state comes back");
 }
 
-/// What the queuing task and the caller of `stop` share: the calls queued, in order, and
-/// how many had been queued when `stop` was called.
+/// The state of a stop round: the index of every call that ran, in order. Its drop records
+/// the thread it is dropped on, for a round whose `PresentThread` is dropped.
+struct Logged {
+    ran: Vec<usize>,
+    dropped_on: Arc<Mutex<Option<String>>>,
+}
+
+impl Drop for Logged {
+    fn drop(&mut self) {
+        let name = std::thread::current().name().unwrap_or("unnamed").to_owned();
+        *self.dropped_on.lock().expect("not poisoned") = Some(name);
+    }
+}
+
+/// What the queuing threads and the caller of `stop` share: the calls queued, in the order
+/// the lock gave them, and how many had been queued when `stop` or the drop was called.
 struct Queued {
     calls: Vec<LaneCall<()>>,
     at_stop: Option<usize>,
 }
 
-/// What one round saw: how many calls queued after `stop` ran, and how many came back
+/// What one round saw: whether a call queued after the stop ran, and whether one came back
 /// `Cancelled`.
 struct Round {
-    ran_after: usize,
-    cancelled: usize,
+    ran_after: bool,
+    cancelled: bool,
 }
 
-/// One round: a task queues calls in a loop, each recording its index in the state, while
-/// the test calls `stop` once `before` calls are queued. Holding the lock that each queue
-/// takes, the test reads which calls were queued before `stop`.
-fn stop_under_a_queuing_task(executor: &Executor, before: usize, after: usize) -> Round {
-    let (present, thread) = present_thread(&ClientPlatform::new(), Vec::new()).expect("a thread");
+/// One round: several threads queue calls in a loop, each under the lock that the stop is
+/// made under too, and each call records its index in the state and in a log of the test's.
+/// Once `before` calls are queued the test calls `stop`, or, in a round `by_drop`, drops
+/// the `PresentThread`.
+fn stop_under_queuing_threads(before: usize, by_drop: bool) -> Round {
+    const SENDERS: usize = if cfg!(miri) { 2 } else { 3 };
+    // How many more each sender queues past the stop before it ends.
+    const AFTER: usize = 16;
+    let dropped_on = Arc::new(Mutex::new(None));
+    let state = Logged { ran: Vec::new(), dropped_on: dropped_on.clone() };
+    let (present, thread) = present_thread(&ClientPlatform::new(), state).expect("a thread");
+    let log = Arc::new(Mutex::new(Vec::new()));
     let queued = Arc::new(Mutex::new(Queued { calls: Vec::new(), at_stop: None }));
-    let queuing = {
-        let queued = queued.clone();
-        executor.spawn(WorkerClass::Background, async move {
-            loop {
-                {
-                    let mut queued = queued.lock().expect("no test panics with it held");
-                    let index = queued.calls.len();
-                    if queued.at_stop.is_some_and(|at| index >= at + after) {
-                        return;
+    let senders: Vec<_> = (0..SENDERS)
+        .map(|_| {
+            let (present, queued, log) = (present.clone(), queued.clone(), log.clone());
+            std::thread::spawn(move || {
+                loop {
+                    {
+                        let mut queued = queued.lock().expect("no test panics with it held");
+                        let index = queued.calls.len();
+                        if queued.at_stop.is_some_and(|at| index >= at + AFTER) {
+                            return;
+                        }
+                        let log = log.clone();
+                        let call = present.run(move |state: &mut Logged| {
+                            state.ran.push(index);
+                            log.lock().expect("not poisoned").push(index);
+                        });
+                        queued.calls.push(call);
                     }
-                    let call = present.run(move |ran: &mut Vec<usize>| ran.push(index));
-                    queued.calls.push(call);
+                    std::thread::yield_now();
                 }
-                yield_now().await;
-            }
+            })
         })
-    };
+        .collect();
     until(|| queued.lock().expect("no test panics with it held").calls.len() >= before);
     let stopped = {
         let mut queued = queued.lock().expect("no test panics with it held");
-        let stopped = thread.stop();
+        let stopped = if by_drop {
+            drop(thread);
+            None
+        } else {
+            Some(thread.stop())
+        };
         queued.at_stop = Some(queued.calls.len());
         stopped
     };
-    let ran = wait(stopped).expect("the hand-back gives the state in every round");
-    wait(queuing).expect("the queuing task ends");
+    let handed = stopped.map(|stopped| wait(stopped).expect("the hand-back gives the state"));
+    for sender in senders {
+        sender.join().expect("a sender ends");
+    }
+    let ran = if let Some(state) = &handed {
+        state.ran.clone()
+    } else {
+        until(|| dropped_on.lock().expect("not poisoned").is_some());
+        assert_eq!(dropped_on.lock().expect("not poisoned").as_deref(), Some("present"));
+        log.lock().expect("not poisoned").clone()
+    };
     let Queued { calls, at_stop } =
-        Arc::into_inner(queued).expect("the task let go").into_inner().expect("not poisoned");
-    let at_stop = at_stop.expect("stop was called");
+        Arc::into_inner(queued).expect("the senders let go").into_inner().expect("not poisoned");
+    let at_stop = at_stop.expect("stopped");
 
-    // The calls ran in the order they were queued, every one queued before `stop` among
+    // The calls ran in the order they were queued, every one queued before the stop among
     // them, and those queued after it that ran are the first of them: the last drain's.
-    assert!(ran.len() >= at_stop, "a call queued before stop did not run: {ran:?}");
+    assert!(ran.len() >= at_stop, "a call queued before the stop did not run: {ran:?}");
     assert!(ran.iter().enumerate().all(|(position, &index)| position == index), "{ran:?}");
-    // A call queued after `stop` ran in the last drain or is `Cancelled`, and none ran
-    // after the hand-back: the state handed back holds every call that ran.
-    let mut cancelled = 0;
+    // A call queued after the stop ran in the last drain or is `Cancelled`.
+    let mut cancelled = false;
     for (index, call) in calls.into_iter().enumerate() {
         match wait(call) {
-            Ok(()) => assert!(index < ran.len(), "call {index} ran after the hand-back"),
+            Ok(()) => assert!(index < ran.len(), "call {index} ran and is not in the state"),
             Err(error) => {
                 assert_eq!(error.kind(), ErrorKind::Cancelled);
                 assert!(index >= ran.len(), "call {index} ran and was cancelled");
-                assert!(index >= at_stop, "call {index}, queued before stop, was cancelled");
-                cancelled += 1;
+                assert!(index >= at_stop, "call {index}, queued before the stop, was cancelled");
+                cancelled = true;
             }
         }
     }
-    Round { ran_after: ran.len() - at_stop, cancelled }
+    // None ran after the hand-back: the test's log is the state's own.
+    if let Some(state) = handed {
+        assert_eq!(*log.lock().expect("not poisoned"), state.ran, "a call ran after the hand-back");
+    }
+    Round { ran_after: ran.len() > at_stop, cancelled }
 }
 
+/// `stop` runs every call queued before it and hands the state back, and a dropped
+/// `PresentThread` runs them and drops the state on the present thread. Three threads queue
+/// while the rounds alternate the two, so that a stop that could outrun its take, as one
+/// queued before the take would, meets an idle present thread in many rounds.
 #[test]
 fn stop_runs_every_call_queued_before_it_and_hands_the_state_back() {
-    let executor = executor();
-    let (rounds, after) = if cfg!(miri) { (6, 4) } else { (2_000, 32) };
-    let (mut ran_after, mut cancelled, mut played) = (0, 0, 0);
+    let rounds = if cfg!(miri) { 4 } else { 300 };
+    let (mut ran_after, mut cancelled) = (0, 0);
     for round in 0..rounds {
-        let seen = stop_under_a_queuing_task(&executor, 1 + round % 5, after);
-        ran_after += usize::from(seen.ran_after > 0);
-        cancelled += usize::from(seen.cancelled > 0);
-        played += 1;
-        // Natively the rounds go on until both outcomes have occurred, within the cap.
-        if ran_after > 0 && cancelled > 0 && !cfg!(miri) && round >= 20 {
-            break;
+        let seen = stop_under_queuing_threads(1 + round % 7, round % 2 == 1);
+        ran_after += usize::from(seen.ran_after);
+        cancelled += usize::from(seen.cancelled);
+    }
+    println!("{rounds} rounds: {ran_after} ran a later call, {cancelled} cancelled one");
+    if !cfg!(miri) {
+        assert!(ran_after > 0, "no round ran a call queued after the stop in its last drain");
+        assert!(cancelled > 0, "no round cancelled a call queued after the stop");
+    }
+}
+
+/// The present lane is closed before the state is handed back: a call that the close
+/// cancels has been dropped, and its drop is still running, while the stop's future is
+/// pending. A call in the stop's drain queues one more, which that drain does not run; that
+/// one's drop signals, then waits for the test.
+#[test]
+fn the_lane_is_closed_before_the_state_is_handed_back() {
+    struct Signals {
+        dropping: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Drop for Signals {
+        fn drop(&mut self) {
+            let _ = self.dropping.send(());
+            let _ = self.release.recv_timeout(BOUND);
         }
     }
-    println!("{played} rounds: {ran_after} ran a later call, {cancelled} cancelled one");
-    if !cfg!(miri) {
-        assert!(ran_after > 0, "no round ran a call queued after stop in its last drain");
-        assert!(cancelled > 0, "no round cancelled a call queued after stop");
+
+    let (present, thread) = present_thread(&ClientPlatform::new(), ()).expect("a thread");
+    let (entered, inside) = mpsc::channel();
+    let (release_held, held) = mpsc::channel::<()>();
+    let holding = present.run(move |()| {
+        entered.send(()).expect("the test waits for the call");
+        held.recv_timeout(BOUND).expect("the test releases the call");
+    });
+    inside.recv_timeout(BOUND).expect("the held call started");
+    // Queued while the call is held, so the stop and the next call share the stop's drain.
+    let mut stopped = pin!(thread.stop());
+    let (dropping, dropped) = mpsc::channel();
+    let (release, waiting) = mpsc::channel();
+    let signals = Signals { dropping, release: waiting };
+    let lane = present.clone();
+    let queuing = present.run(move |()| drop(lane.run(move |()| drop(signals))));
+    release_held.send(()).expect("the call waits for the release");
+    wait(holding).expect("the held call ran");
+    wait(queuing).expect("the call in the stop's drain ran");
+    dropped.recv_timeout(BOUND).expect("the call the lane's close cancelled was dropped");
+    let early = stopped.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+    assert!(early.is_pending(), "the state was handed back before the lane was closed");
+    release.send(()).expect("the drop waits for the release");
+    wait(stopped).expect("the state comes back");
+}
+
+/// An idle present thread uses no CPU: after plain calls, after a call that parked with a
+/// call queued behind it, and after a call that unparked its own thread. The present thread
+/// reads its own CPU clock in a call before and after each idle spell, so a loaded machine
+/// slows the test and cannot fail it.
+#[test]
+#[cfg_attr(miri, ignore = "reads the thread's CPU clock through the operating system")]
+fn an_idle_present_thread_uses_no_cpu() {
+    const IDLE: Duration = Duration::from_millis(500);
+    const MOST: Duration = Duration::from_millis(50);
+    let (present, thread) = present_thread(&ClientPlatform::new(), ()).expect("a thread");
+    let idle = |after: &str| {
+        let before = wait(present.run(|()| thread_cpu())).expect("the call ran");
+        std::thread::sleep(IDLE);
+        let spent = wait(present.run(|()| thread_cpu())).expect("the call ran") - before;
+        println!("{after}: {spent:?} of the present thread's CPU over {IDLE:?}");
+        assert!(spent < MOST, "{after}: the present thread used {spent:?} of CPU over {IDLE:?}");
+    };
+    for _ in 0..10 {
+        wait(present.run(|()| ())).expect("the call ran");
     }
-    executor.shutdown();
+    idle("after plain calls");
+
+    let (entered, inside) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let parking = present.run(move |()| {
+        entered.send(()).expect("the test waits for the call");
+        released.recv_timeout(BOUND).expect("the test releases the call");
+    });
+    inside.recv_timeout(BOUND).expect("the parking call started");
+    let behind = present.run(|()| ());
+    release.send(()).expect("the call waits for the release");
+    wait(parking).expect("the parking call ran");
+    wait(behind).expect("the call behind ran");
+    idle("after a call that parked with one queued behind it");
+
+    wait(present.run(|()| std::thread::current().unpark())).expect("the call ran");
+    idle("after a call that unparked its own thread");
+    wait(thread.stop()).expect("the state comes back");
 }
 
 #[test]

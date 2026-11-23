@@ -29,11 +29,15 @@ winit.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 winit = { workspace = true, features = ["x11"] }
 
+# A thread's CPU clock, which both test binaries read to bound an idle pump's cost
+# (tests/thread_cpu.rs).
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
 # The window tests' one module that calls the operating system (tests/window.rs, `os`): a
 # close sent as the close button sends it, the application's own stop, and the present
 # thread's scheduling read back.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-libc.workspace = true
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = [
     "NSApplication",
