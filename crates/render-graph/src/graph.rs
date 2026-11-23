@@ -1,14 +1,22 @@
 //! The graph: the plan cache, the transients and the encoders, and the three steps a frame
 //! takes through them.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
-use lactose_core::Result;
-use lactose_rhi_api::{Device, Encoder, TimelinePoint};
+use lactose_core::{Error, ErrorKind, Result};
+use lactose_rhi_api::{
+    Capabilities, Device, Encoder, ImageDesc, ImageHandle, ImageMemory, MemoryBlockDesc,
+    MemoryBlockHandle, QueueRole, Sharing, Submit, TimelineHandle, TimelinePoint,
+};
 use lactose_task::JobContext;
 
-use crate::decl::FrameDecl;
-use crate::plan::{CompiledFrame, CompiledPlan};
+use crate::compile::{Shape, derive, validate};
+use crate::decl::{DeclaredImage, FrameDecl, Recorder};
+use crate::job::{self, Owned, Shared};
+use crate::plan::{CompiledFrame, CompiledPlan, GraphKey, Owner, Resource, Transient};
+use crate::resource::TransientMemory;
 use crate::sync_view::SyncView;
 
 /// The target of the graph's spans and events. Every kept pass is recorded inside one
@@ -67,9 +75,151 @@ pub struct GraphStats {
 pub struct RenderGraph {
     /// The device every call reaches.
     device: Arc<dyn Device>,
+    /// The device's capabilities, which are fixed.
+    caps: Capabilities,
+    desc: GraphDesc,
+    /// The mark of the plans this graph compiles.
+    owner: Arc<Owner>,
+    /// The plans the cache holds, at most `desc.plans`.
+    cache: Vec<Entry>,
+    /// Evicted plans whose transients are not yet destroyed.
+    retired: Vec<Entry>,
+    /// The count of `compile`'s returns, which orders the cache's entries by use.
+    tick: u64,
+    compiles: u64,
+    hits: u64,
+    evictions: u64,
+    timelines: Timelines,
+    /// The last frame point made and where it was signalled from: the last returned, or
+    /// the one signalled in a torn frame's place since.
+    previous: Option<(TimelinePoint, QueueRole)>,
+    /// The point the last call to `submit` returned.
+    last_frame: Option<TimelinePoint>,
+    /// The frame that a later submit failed in, whose point is owed.
+    torn: Option<Torn>,
     /// The encoders no frame holds.
-    encoders: SyncView<Vec<Box<dyn Encoder>>>,
+    encoders: Encoders,
 }
+
+/// A plan in the cache, or evicted.
+struct Entry {
+    key: GraphKey,
+    /// What the key hashed, compared on a hit.
+    shape: Shape,
+    plan: Arc<CompiledPlan>,
+    /// The tick of the last `compile` that returned it.
+    used: u64,
+    /// The point of the last frame submitted from it.
+    last: Option<u64>,
+}
+
+/// The timelines the graph's submits signal.
+struct Timelines {
+    /// The frame points'.
+    frame: TimelineHandle,
+    /// The last frame value assigned.
+    frame_value: u64,
+    /// On a device whose compute role has a queue of its own, one for each queue the graph
+    /// submits to, graphics then compute, which its submits signal so that a submit to
+    /// the other waits for them.
+    queues: Option<[QueueTimeline; 2]>,
+}
+
+struct QueueTimeline {
+    timeline: TimelineHandle,
+    /// The last value a made submit signalled.
+    value: u64,
+}
+
+/// A frame torn by a refused submit after its first.
+struct Torn {
+    /// Its point, which the submit in its place signals.
+    point: TimelinePoint,
+    /// The queue its last submit was planned for.
+    queue: QueueRole,
+}
+
+/// The encoders the graph holds, and how many: the count is read through `&self`, which
+/// never reaches the encoders.
+struct Encoders {
+    held: SyncView<Held>,
+    count: usize,
+}
+
+struct Held {
+    /// Reset and free, graphics then compute.
+    free: [Vec<Box<dyn Encoder>>; 2],
+    /// Submitted, by the frame value whose point frees them, in growing order.
+    pending: VecDeque<(u64, Vec<Box<dyn Encoder>>)>,
+}
+
+impl Encoders {
+    const fn new() -> Self {
+        Self {
+            held: SyncView::new(Held { free: [Vec::new(), Vec::new()], pending: VecDeque::new() }),
+            count: 0,
+        }
+    }
+
+    /// A free encoder of `role`'s.
+    fn take(&mut self, role: QueueRole) -> Option<Box<dyn Encoder>> {
+        let encoder = self.held.get_mut().free[role_index(role)].pop();
+        self.count -= usize::from(encoder.is_some());
+        encoder
+    }
+
+    /// Resets `encoders`, none of which is pending, and frees them.
+    fn free_all(&mut self, encoders: impl IntoIterator<Item = Box<dyn Encoder>>) {
+        let held = self.held.get_mut();
+        for mut encoder in encoders {
+            match encoder.reset() {
+                Ok(()) => {
+                    held.free[role_index(encoder.queue())].push(encoder);
+                    self.count += 1;
+                }
+                Err(error) => log("an encoder's reset", &error),
+            }
+        }
+    }
+
+    /// Holds `encoders`, submitted in the frame of value `value`, until its point.
+    fn pend(&mut self, value: u64, encoders: Vec<Box<dyn Encoder>>) {
+        self.count += encoders.len();
+        self.held.get_mut().pending.push_back((value, encoders));
+    }
+
+    /// Resets and frees the encoders of every frame whose value is at most `reached`.
+    fn reclaim(&mut self, reached: u64) {
+        loop {
+            let pending = &mut self.held.get_mut().pending;
+            if !pending.front().is_some_and(|&(value, _)| value <= reached) {
+                return;
+            }
+            let (_, done) = pending.pop_front().expect("checked above");
+            self.count -= done.len();
+            self.free_all(done);
+        }
+    }
+}
+
+/// The index of a queue the graph records for.
+const fn role_index(role: QueueRole) -> usize {
+    match role {
+        QueueRole::Compute => 1,
+        QueueRole::Graphics | QueueRole::Present => 0,
+    }
+}
+
+fn log(what: &str, error: &Error) {
+    tracing::warn!(target: LOG_TARGET, "{what} failed: {error}");
+}
+
+fn foreign(what: &str) -> Error {
+    Error::new(ErrorKind::InvalidData, format!("a {what} another graph made"))
+}
+
+/// The label of every encoder and block the graph makes.
+const LABEL: &str = "render-graph";
 
 impl RenderGraph {
     /// A graph for `device`, with an empty cache and no encoder. Reads the device's
@@ -80,13 +230,57 @@ impl RenderGraph {
     /// `ErrorKind::InvalidData` where `desc.jobs` or `desc.plans` is zero; what
     /// `Device::create_timeline` returns.
     pub fn new(device: Arc<dyn Device>, desc: &GraphDesc) -> Result<Self> {
-        todo!()
+        if desc.jobs == 0 || desc.plans == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "a render graph of no recording job or no plan",
+            ));
+        }
+        let caps = *device.capabilities();
+        let frame = device.create_timeline(0)?;
+        let queues = if caps.queues.same_queue(QueueRole::Graphics, QueueRole::Compute) {
+            None
+        } else {
+            let made = device.create_timeline(0).and_then(|graphics| {
+                device.create_timeline(0).map(|compute| [graphics, compute]).inspect_err(|_| {
+                    if let Err(error) = device.destroy_timeline(graphics) {
+                        log("a timeline's destroy", &error);
+                    }
+                })
+            });
+            match made {
+                Ok(made) => Some(made.map(|timeline| QueueTimeline { timeline, value: 0 })),
+                Err(error) => {
+                    if let Err(error) = device.destroy_timeline(frame) {
+                        log("a timeline's destroy", &error);
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        Ok(Self {
+            device,
+            caps,
+            desc: *desc,
+            owner: Arc::new(Owner),
+            cache: Vec::new(),
+            retired: Vec::new(),
+            tick: 0,
+            compiles: 0,
+            hits: 0,
+            evictions: 0,
+            timelines: Timelines { frame, frame_value: 0, queues },
+            previous: None,
+            last_frame: None,
+            torn: None,
+            encoders: Encoders::new(),
+        })
     }
 
     /// The device the graph was made for.
     #[must_use]
     pub fn device(&self) -> &Arc<dyn Device> {
-        todo!()
+        &self.device
     }
 
     /// Compiles `decl`, or finds the plan an equal declaration compiled to.
@@ -105,7 +299,103 @@ impl RenderGraph {
     /// `DeviceLost`). After an error the cache holds no plan for the declaration and the
     /// graph is as it was.
     pub fn compile<'f>(&mut self, decl: FrameDecl<'f>) -> Result<CompiledFrame<'f>> {
-        todo!()
+        validate(&decl.declared, self.caps.queues)?;
+        let shape = Shape::of(&decl.declared, self.caps.queues);
+        let key = shape.key();
+        let hit = self.cache.iter_mut().find(|entry| entry.key == key && entry.shape == shape);
+        let (plan, fresh) = if let Some(entry) = hit {
+            self.tick += 1;
+            entry.used = self.tick;
+            self.hits += 1;
+            (Arc::clone(&entry.plan), false)
+        } else {
+            let plan = Arc::new(self.make_plan(&decl, key)?);
+            if self.cache.len() >= self.desc.plans as usize {
+                let oldest = (0..self.cache.len())
+                    .min_by_key(|&at| self.cache[at].used)
+                    .expect("a full cache holds a plan");
+                self.retired.push(self.cache.remove(oldest));
+                self.evictions += 1;
+            }
+            self.tick += 1;
+            self.cache.push(Entry {
+                key,
+                shape,
+                plan: Arc::clone(&plan),
+                used: self.tick,
+                last: None,
+            });
+            self.compiles += 1;
+            (plan, true)
+        };
+        self.reclaim();
+        Ok(CompiledFrame { decl, plan, fresh })
+    }
+
+    /// Derives the plan of a valid declaration and makes its blocks and transients,
+    /// destroying what it made where a call fails.
+    fn make_plan(&self, decl: &FrameDecl<'_>, key: GraphKey) -> Result<CompiledPlan> {
+        let device = &*self.device;
+        let derived = derive(&decl.declared, device, &self.caps, self.desc.jobs)?;
+        let mut blocks: Vec<MemoryBlockHandle> = Vec::new();
+        let mut transients: Vec<Option<Transient>> = vec![None; derived.transients.len()];
+        let made: Result<()> = (|| {
+            for &size in &derived.blocks {
+                blocks.push(device.create_memory_block(&MemoryBlockDesc { label: LABEL, size })?);
+            }
+            for (index, transient) in derived.transients.iter().enumerate() {
+                let Some((usage, memory)) = *transient else { continue };
+                let DeclaredImage::Transient(declared) = &decl.declared.images[index] else {
+                    unreachable!("the plan makes transients alone");
+                };
+                let image = device.create_image(&ImageDesc {
+                    label: &declared.label,
+                    format: declared.format,
+                    extent: declared.extent,
+                    mips: declared.mips,
+                    layers: declared.layers,
+                    usage,
+                    memory: match memory {
+                        TransientMemory::Own => ImageMemory::Own,
+                        TransientMemory::Memoryless => ImageMemory::Memoryless,
+                        TransientMemory::Placed { block, offset, .. } => {
+                            ImageMemory::Placed { block: blocks[block as usize], offset }
+                        }
+                    },
+                    sharing: Sharing::Exclusive,
+                })?;
+                transients[index] = Some(Transient { image, memory });
+            }
+            Ok(())
+        })();
+        if let Err(error) = made {
+            destroy(device, &transients, &blocks);
+            return Err(error);
+        }
+        Ok(CompiledPlan::new(key, Arc::clone(&self.owner), derived.parts, transients, blocks))
+    }
+
+    /// Frees the encoders of every frame whose point is seen reached, and destroys the
+    /// transients of every evicted plan that no frame holds and whose last frame's point
+    /// is: by reading the frame timeline's value, never by waiting.
+    fn reclaim(&mut self) {
+        let reached = match self.device.timeline_value(self.timelines.frame) {
+            Ok(value) => value,
+            Err(error) => {
+                log("reading the frame timeline", &error);
+                return;
+            }
+        };
+        self.encoders.reclaim(reached);
+        let device = &*self.device;
+        self.retired.retain(|entry| {
+            let done = Arc::strong_count(&entry.plan) == 1
+                && entry.last.is_none_or(|last| last <= reached);
+            if done {
+                destroy(device, &entry.plan.transients, &entry.plan.blocks);
+            }
+            !done
+        });
     }
 
     /// Records `frame`: forks its recording jobs in one scope of `ctx` and returns when
@@ -138,7 +428,88 @@ impl RenderGraph {
         frame: CompiledFrame<'_>,
         ctx: &mut JobContext<'_>,
     ) -> Result<RecordedFrame> {
-        todo!()
+        if !Arc::ptr_eq(&frame.plan.owner, &self.owner) {
+            return Err(foreign("frame compiled by"));
+        }
+        self.reclaim();
+        let CompiledFrame { decl, plan, .. } = frame;
+        let FrameDecl { declared, recorders } = decl;
+        let mut recorders = recorders.into_inner();
+
+        let mut encoders: Vec<Box<dyn Encoder>> = Vec::with_capacity(plan.jobs.len());
+        for job in &plan.jobs {
+            let free = self.encoders.take(job.queue);
+            match free.map_or_else(|| self.device.create_encoder(job.queue, LABEL), Ok) {
+                Ok(encoder) => encoders.push(encoder),
+                Err(error) => {
+                    // Those taken are free ones, untouched since their reset.
+                    self.encoders.free_all(encoders);
+                    return Err(error);
+                }
+            }
+        }
+
+        let images: Vec<Option<ImageHandle>> = declared
+            .images
+            .iter()
+            .zip(&plan.transients)
+            .map(|(image, transient)| match image {
+                DeclaredImage::Import(import) => Some(import.image),
+                DeclaredImage::Transient(_) => transient.map(|transient| transient.image),
+            })
+            .collect();
+        let buffers: Vec<_> = declared.buffers.iter().map(|buffer| buffer.buffer).collect();
+        let shared = Shared { declared: &declared, images: &images, buffers: &buffers };
+        let mut breaches: Vec<Option<String>> = vec![None; plan.jobs.len()];
+        {
+            // What each job owns, split by job: its encoder, its breach, and the recorders
+            // of its passes, which are consecutive in the declaration.
+            let shared = &shared;
+            let mut rest: &mut [Option<Recorder<'_>>] = &mut recorders;
+            let mut start = 0;
+            let mut owned = Vec::with_capacity(plan.jobs.len());
+            for ((job, encoder), breach) in plan.jobs.iter().zip(&mut encoders).zip(&mut breaches) {
+                let mine: &mut [Option<Recorder<'_>>] = if job.passes.is_empty() {
+                    &mut []
+                } else {
+                    let skipped = job.passes.start - start;
+                    let (_, tail) = core::mem::take(&mut rest).split_at_mut(skipped);
+                    let (mine, tail) = tail.split_at_mut(job.passes.len());
+                    rest = tail;
+                    start = job.passes.end;
+                    mine
+                };
+                owned.push((job, Owned { encoder: &mut **encoder, recorders: mine, breach }));
+            }
+            ctx.scope(|scope| {
+                for (job, owned) in owned {
+                    scope.fork(move |_| job::run(shared, job, owned));
+                }
+            });
+        }
+        drop(recorders);
+
+        if let Some(breach) = breaches.into_iter().flatten().next() {
+            self.encoders.free_all(encoders);
+            return Err(Error::new(ErrorKind::InvalidData, breach));
+        }
+        let ready = plan
+            .submits
+            .iter()
+            .map(|submit| {
+                submit
+                    .names
+                    .iter()
+                    .filter_map(|&resource| match resource {
+                        Resource::Image(image) => {
+                            declared.images[image as usize].import().and_then(|import| import.ready)
+                        }
+                        Resource::Buffer(buffer) => declared.buffers[buffer as usize].ready,
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(RecordedFrame { plan, encoders: SyncView::new(encoders), ready })
     }
 
     /// Submits `frame`: one `Device::submit` for each submit of its plan, in order, and
@@ -167,20 +538,213 @@ impl RenderGraph {
     /// submitted, its encoders are free, the graph still owes that submit, and the error
     /// is returned unchanged (`README.md`, "Submission").
     pub fn submit(&mut self, frame: RecordedFrame) -> Result<TimelinePoint> {
-        todo!()
+        if !Arc::ptr_eq(&frame.plan.owner, &self.owner) {
+            return Err(foreign("frame recorded by"));
+        }
+        self.reclaim();
+        let RecordedFrame { plan, encoders, ready } = frame;
+        let mut encoders = encoders.into_inner();
+        if let Some(torn) = self.torn.take()
+            && let Err(error) = self.replace(&torn)
+        {
+            self.torn = Some(torn);
+            self.encoders.free_all(encoders);
+            return Err(error);
+        }
+
+        let point =
+            TimelinePoint { timeline: self.timelines.frame, value: self.timelines.frame_value + 1 };
+        let last = plan.submits.len() - 1;
+        let mut points: Vec<Option<TimelinePoint>> = Vec::with_capacity(plan.submits.len());
+        let mut made: Vec<Box<dyn Encoder>> = Vec::with_capacity(encoders.len());
+        for (number, submit) in plan.submits.iter().enumerate() {
+            let mut waits: Vec<TimelinePoint> = Vec::new();
+            if self.timelines.queues.is_some() {
+                waits.extend(self.previous.map(|(previous, _)| previous));
+            }
+            waits.extend(submit.waits.iter().filter_map(|&earlier| points[earlier as usize]));
+            waits.extend(ready[number].iter().copied());
+            let waits = latest(waits);
+            let queue_point = self.timelines.queues.as_ref().map(|queues| {
+                let queue = &queues[role_index(submit.queue)];
+                TimelinePoint { timeline: queue.timeline, value: queue.value + 1 }
+            });
+            let signals: Vec<TimelinePoint> =
+                queue_point.into_iter().chain((number == last).then_some(point)).collect();
+            let mut chunk: Vec<Box<dyn Encoder>> = encoders.drain(..submit.jobs.len()).collect();
+            let result = self.device.submit(
+                submit.queue,
+                Submit { encoders: &mut chunk, waits: &waits, signals: &signals },
+            );
+            if let Err(error) = result {
+                // The refused submit's encoders are not pending, nor are those of the
+                // submits not made.
+                self.encoders.free_all(chunk.into_iter().chain(encoders));
+                if number > 0 {
+                    // Torn: the made submits' encoders and the plan are held until the
+                    // point the next call signals in the frame's place.
+                    self.timelines.frame_value = point.value;
+                    self.torn = Some(Torn { point, queue: plan.submits[last].queue });
+                    self.encoders.pend(point.value, made);
+                    self.note_submitted(&plan, point.value);
+                }
+                return Err(error);
+            }
+            if let (Some(queues), Some(signalled)) = (self.timelines.queues.as_mut(), queue_point) {
+                queues[role_index(submit.queue)].value = signalled.value;
+            }
+            points.push(queue_point);
+            made.append(&mut chunk);
+        }
+        self.timelines.frame_value = point.value;
+        self.previous = Some((point, plan.submits[last].queue));
+        self.last_frame = Some(point);
+        self.encoders.pend(point.value, made);
+        self.note_submitted(&plan, point.value);
+        Ok(point)
+    }
+
+    /// Makes the submit in a torn frame's place: no encoders, the waits the torn frame's
+    /// last submit would have made, and its point.
+    fn replace(&mut self, torn: &Torn) -> Result<()> {
+        let waits = self.replacement_waits(torn.queue);
+        let signals = [torn.point];
+        self.device
+            .submit(torn.queue, Submit { encoders: &mut [], waits: &waits, signals: &signals })?;
+        self.previous = Some((torn.point, torn.queue));
+        Ok(())
+    }
+
+    /// What a frame's last submit to `queue` waits for beside its frame's own submits:
+    /// the last submit made to the other queue and the frame point before.
+    fn replacement_waits(&self, queue: QueueRole) -> Vec<TimelinePoint> {
+        let Some(queues) = &self.timelines.queues else { return Vec::new() };
+        let other = &queues[1 - role_index(queue)];
+        let made = (other.value > 0)
+            .then_some(TimelinePoint { timeline: other.timeline, value: other.value });
+        latest(made.into_iter().chain(self.previous.map(|(previous, _)| previous)).collect())
+    }
+
+    /// Notes that a frame of `plan` was submitted under the frame value `value`.
+    fn note_submitted(&mut self, plan: &Arc<CompiledPlan>, value: u64) {
+        let entry = self
+            .cache
+            .iter_mut()
+            .chain(&mut self.retired)
+            .find(|entry| Arc::ptr_eq(&entry.plan, plan))
+            .expect("a frame's plan is cached or retired while the frame holds it");
+        entry.last = Some(value);
     }
 
     /// The point of the last frame [`submit`](Self::submit) returned, or `None` before
     /// the first.
     #[must_use]
     pub fn last_frame(&self) -> Option<TimelinePoint> {
-        todo!()
+        self.last_frame
     }
 
     /// The graph's counts.
     #[must_use]
     pub fn stats(&self) -> GraphStats {
-        todo!()
+        GraphStats {
+            compiles: self.compiles,
+            hits: self.hits,
+            evictions: self.evictions,
+            plans: crate::plan::count(self.cache.len()),
+            encoders: u32::try_from(self.encoders.count).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The drop of a thread that is not unwinding: every submit waited for, then every
+    /// object destroyed.
+    fn drop_waiting(&mut self) {
+        let mut waits: Vec<TimelinePoint> = Vec::new();
+        if let Some(torn) = self.torn.take()
+            && let Err(error) = self.replace(&torn)
+        {
+            log("the submit in a torn frame's place", &error);
+            // Every other point the graph's made submits signal.
+            if let Some(queues) = &self.timelines.queues {
+                waits.extend(
+                    queues.iter().filter(|queue| queue.value > 0).map(|queue| TimelinePoint {
+                        timeline: queue.timeline,
+                        value: queue.value,
+                    }),
+                );
+            }
+        }
+        // The last frame point, or the one just signalled in a torn frame's place.
+        waits.extend(self.previous.map(|(previous, _)| previous));
+        for point in waits {
+            if let Err(error) = self.device.wait_timeline(point, Duration::MAX) {
+                log("the wait for the graph's submits", &error);
+            }
+        }
+        drop(core::mem::replace(&mut self.encoders, Encoders::new()));
+        for entry in self.cache.drain(..).chain(self.retired.drain(..)) {
+            destroy(&*self.device, &entry.plan.transients, &entry.plan.blocks);
+        }
+        for timeline in self.timeline_handles() {
+            if let Err(error) = self.device.destroy_timeline(timeline) {
+                log("a timeline's destroy", &error);
+            }
+        }
+    }
+
+    /// The drop of a thread that is unwinding: no submit, no wait, and no destroy a
+    /// pending submit would refuse.
+    fn drop_unwinding(&mut self) {
+        let device = &*self.device;
+        let Ok(reached) = device.timeline_value(self.timelines.frame) else { return };
+        for entry in self.cache.drain(..).chain(self.retired.drain(..)) {
+            if entry.last.is_none_or(|last| last <= reached) {
+                destroy(device, &entry.plan.transients, &entry.plan.blocks);
+            }
+        }
+        let queues_done = self.timelines.queues.as_ref().is_none_or(|queues| {
+            queues.iter().all(|queue| {
+                device.timeline_value(queue.timeline).is_ok_and(|value| value >= queue.value)
+            })
+        });
+        if self.torn.is_none() && reached >= self.timelines.frame_value && queues_done {
+            for timeline in self.timeline_handles() {
+                if let Err(error) = device.destroy_timeline(timeline) {
+                    log("a timeline's destroy", &error);
+                }
+            }
+        }
+    }
+
+    fn timeline_handles(&self) -> Vec<TimelineHandle> {
+        let queues = self.timelines.queues.iter().flatten().map(|queue| queue.timeline);
+        core::iter::once(self.timelines.frame).chain(queues).collect()
+    }
+}
+
+/// The greatest point of each timeline among `points`, in the order the timelines first
+/// occur.
+fn latest(points: Vec<TimelinePoint>) -> Vec<TimelinePoint> {
+    let mut kept: Vec<TimelinePoint> = Vec::with_capacity(points.len());
+    for point in points {
+        match kept.iter_mut().find(|kept| kept.timeline == point.timeline) {
+            Some(kept) => kept.value = kept.value.max(point.value),
+            None => kept.push(point),
+        }
+    }
+    kept
+}
+
+/// Destroys a plan's transients, then its blocks, logging what fails.
+fn destroy(device: &dyn Device, transients: &[Option<Transient>], blocks: &[MemoryBlockHandle]) {
+    for transient in transients.iter().flatten() {
+        if let Err(error) = device.destroy_image(transient.image) {
+            log("a transient's destroy", &error);
+        }
+    }
+    for &block in blocks {
+        if let Err(error) = device.destroy_memory_block(block) {
+            log("a memory block's destroy", &error);
+        }
     }
 }
 
@@ -197,7 +761,11 @@ impl Drop for RenderGraph {
     /// it makes no destroy a pending submit would refuse, and its encoders' drops leak
     /// what is pending.
     fn drop(&mut self) {
-        todo!()
+        if std::thread::panicking() {
+            self.drop_unwinding();
+        } else {
+            self.drop_waiting();
+        }
     }
 }
 
@@ -213,4 +781,6 @@ pub struct RecordedFrame {
     plan: Arc<CompiledPlan>,
     /// The frame's encoders, in the order its submits take them.
     encoders: SyncView<Vec<Box<dyn Encoder>>>,
+    /// For each submit, the `ready` points of the imports it names.
+    ready: Vec<Vec<TimelinePoint>>,
 }

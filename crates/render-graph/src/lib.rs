@@ -4,10 +4,9 @@
 //! runs on, then recorded on the frame-critical workers and submitted in graph order. It
 //! reaches a device through `lactose-rhi-api` and names no backend.
 //!
-//! **Status: facade.** Every signature is final for milestone 2's lanes and every body that
-//! decides anything is `todo!()`. What runs is plain data: the ids, a key's value and
-//! [`History`]. `README.md` is the contract, and every sentence under "Behaviour the
-//! signatures cannot express" is one a dependent crate may rely on.
+//! **Status: implemented, proved on the null backend.** `README.md` is the contract, and
+//! every sentence under "Behaviour the signatures cannot express" is one a dependent crate
+//! may rely on. The device tests come with the Vulkan backend.
 //!
 //! # Where to start
 //!
@@ -98,17 +97,13 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every deciding body is `todo!()` until `graph-impl` replaces it, and \
-              the parameters and fields it will use are declared now"
-)]
 
+mod compile;
 mod decl;
 mod graph;
 mod history;
 mod id;
+mod job;
 mod pass;
 mod plan;
 mod recorder;

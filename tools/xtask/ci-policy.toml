@@ -141,6 +141,7 @@ separate = [
   "lactose-ecs::units",
   "lactose-io::spans",
   "lactose-predict::logs",
+  "lactose-render-graph::spans",
   "lactose-task::spans",
   # Each measures what is one per process: its CPU time, and whether rayon's global pool
   # was started, which another test of the binary would add to or start.

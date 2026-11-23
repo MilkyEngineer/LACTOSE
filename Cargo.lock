@@ -735,7 +735,9 @@ version = "0.0.0"
 dependencies = [
  "lactose-core",
  "lactose-rhi-api",
+ "lactose-rhi-null",
  "lactose-task",
+ "tracing",
 ]
 
 [[package]]

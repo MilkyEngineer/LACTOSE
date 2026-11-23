@@ -1,7 +1,12 @@
 //! One frame's declaration: its imports, its transients and its passes, in order.
 
+use lactose_rhi_api::{
+    BufferHandle, BufferState, Extent, Format, HeapSlot, ImageHandle, ImageState, Sharing, StateOn,
+    TimelinePoint,
+};
+
 use crate::id::{BufferId, ImageId, PassId};
-use crate::pass::{ComputePassDecl, CopyPassDecl, RenderPassDecl};
+use crate::pass::{BufferUse, ColourUse, ComputePassDecl, CopyPassDecl, DepthUse, RenderPassDecl};
 use crate::recorder::{ComputeRecorder, CopyRecorder, RenderRecorder};
 use crate::resource::{BufferImport, ImageImport, TransientImage};
 use crate::sync_view::SyncView;
@@ -9,7 +14,7 @@ use crate::sync_view::SyncView;
 /// A pass's recorder, boxed by the call that declared the pass. It is called at most once,
 /// by the one recording job that owns it, so it is `FnOnce` and `Send` and need be neither
 /// `Fn` nor `Sync`.
-enum Recorder<'f> {
+pub(crate) enum Recorder<'f> {
     /// A render pass's.
     Render(Box<dyn FnOnce(&mut RenderRecorder<'_>) + Send + 'f>),
     /// A compute pass's.
@@ -37,11 +42,128 @@ enum Recorder<'f> {
 /// the recording jobs; each recorder is owned by the one job that calls it (`README.md`,
 /// "Concurrency").
 pub struct FrameDecl<'f> {
+    /// What the calls declared, copied: read by `compile` and shared read-only by the
+    /// recording jobs.
+    pub(crate) declared: Declared,
+    /// The recorders, by pass, reached through `&mut` or by value alone. The job that
+    /// calls a recorder takes it out of its slot.
+    pub(crate) recorders: SyncView<Vec<Option<Recorder<'f>>>>,
+}
+
+/// Everything a declaration's calls were given but the recorders, owned.
+pub(crate) struct Declared {
     /// The view count.
-    views: u32,
-    /// The recorders, by pass, reached through `&mut` or by value alone. The
-    /// implementation keeps the copied declarations beside them.
-    recorders: SyncView<Vec<Recorder<'f>>>,
+    pub(crate) views: u32,
+    /// The images, by id.
+    pub(crate) images: Vec<DeclaredImage>,
+    /// The buffers, by id.
+    pub(crate) buffers: Vec<DeclaredBuffer>,
+    /// The passes, by id.
+    pub(crate) passes: Vec<DeclaredPass>,
+}
+
+/// An image of a declaration.
+pub(crate) enum DeclaredImage {
+    /// An [`ImageImport`], owned.
+    Import(DeclaredImageImport),
+    /// A [`TransientImage`], owned.
+    Transient(DeclaredTransient),
+}
+
+impl DeclaredImage {
+    /// The label it was declared under.
+    pub(crate) fn label(&self) -> &str {
+        match self {
+            Self::Import(import) => &import.label,
+            Self::Transient(transient) => &transient.label,
+        }
+    }
+
+    /// The mips and layers it was declared with: what each of its transitions covers.
+    pub(crate) const fn mips_and_layers(&self) -> (u32, u32) {
+        match self {
+            Self::Import(import) => (import.mips, import.layers),
+            Self::Transient(transient) => (transient.mips, transient.layers),
+        }
+    }
+
+    /// The import, for an image the caller made.
+    pub(crate) const fn import(&self) -> Option<&DeclaredImageImport> {
+        match self {
+            Self::Import(import) => Some(import),
+            Self::Transient(_) => None,
+        }
+    }
+}
+
+/// An [`ImageImport`], owned.
+pub(crate) struct DeclaredImageImport {
+    pub(crate) label: String,
+    pub(crate) image: ImageHandle,
+    pub(crate) mips: u32,
+    pub(crate) layers: u32,
+    pub(crate) sharing: Sharing,
+    pub(crate) initial: StateOn<ImageState>,
+    pub(crate) last: StateOn<ImageState>,
+    pub(crate) handoff: Option<StateOn<ImageState>>,
+    pub(crate) ready: Option<TimelinePoint>,
+}
+
+/// A [`TransientImage`], owned.
+pub(crate) struct DeclaredTransient {
+    pub(crate) label: String,
+    pub(crate) format: Format,
+    pub(crate) extent: Extent,
+    pub(crate) mips: u32,
+    pub(crate) layers: u32,
+}
+
+/// A [`BufferImport`], owned.
+pub(crate) struct DeclaredBuffer {
+    pub(crate) label: String,
+    pub(crate) buffer: BufferHandle,
+    pub(crate) sharing: Sharing,
+    pub(crate) initial: StateOn<BufferState>,
+    pub(crate) last: StateOn<BufferState>,
+    pub(crate) ready: Option<TimelinePoint>,
+}
+
+/// A pass of a declaration, owned.
+pub(crate) struct DeclaredPass {
+    pub(crate) label: String,
+    pub(crate) kind: DeclaredKind,
+}
+
+/// What a pass of each kind declared, owned.
+pub(crate) enum DeclaredKind {
+    /// A [`RenderPassDecl`]'s lists.
+    Render {
+        colour: Vec<ColourUse>,
+        depth: Option<DepthUse>,
+        sampled: Vec<ImageId>,
+        buffers: Vec<BufferUse>,
+        slots: Vec<HeapSlot>,
+    },
+    /// A [`ComputePassDecl`]'s lists.
+    Compute { sampled: Vec<ImageId>, buffers: Vec<BufferUse>, slots: Vec<HeapSlot> },
+    /// A [`CopyPassDecl`]'s lists.
+    Copy {
+        image_sources: Vec<ImageId>,
+        image_destinations: Vec<ImageId>,
+        buffer_sources: Vec<BufferId>,
+        buffer_destinations: Vec<BufferId>,
+    },
+}
+
+impl DeclaredKind {
+    /// The buffers a render or compute pass declared, with their access; none for a copy
+    /// pass, whose buffers are its sources and destinations.
+    pub(crate) fn buffers(&self) -> &[BufferUse] {
+        match self {
+            Self::Render { buffers, .. } | Self::Compute { buffers, .. } => buffers,
+            Self::Copy { .. } => &[],
+        }
+    }
 }
 
 impl<'f> FrameDecl<'f> {
@@ -53,29 +175,62 @@ impl<'f> FrameDecl<'f> {
     /// yet").
     #[must_use]
     pub fn new(views: u32) -> Self {
-        todo!()
+        Self {
+            declared: Declared {
+                views,
+                images: Vec::new(),
+                buffers: Vec::new(),
+                passes: Vec::new(),
+            },
+            recorders: SyncView::new(Vec::new()),
+        }
     }
 
     /// The view count the declaration was made with.
     #[must_use]
     pub fn views(&self) -> u32 {
-        todo!()
+        self.declared.views
     }
 
     /// Declares an image the caller made.
     pub fn import_image(&mut self, import: &ImageImport<'_>) -> ImageId {
-        todo!()
+        self.image(DeclaredImage::Import(DeclaredImageImport {
+            label: import.label.to_owned(),
+            image: import.image,
+            mips: import.mips,
+            layers: import.layers,
+            sharing: import.sharing,
+            initial: import.initial,
+            last: import.last,
+            handoff: import.handoff,
+            ready: import.ready,
+        }))
     }
 
     /// Declares a buffer the caller made.
     pub fn import_buffer(&mut self, import: &BufferImport<'_>) -> BufferId {
-        todo!()
+        let id = BufferId::new(next_id(self.declared.buffers.len()));
+        self.declared.buffers.push(DeclaredBuffer {
+            label: import.label.to_owned(),
+            buffer: import.buffer,
+            sharing: import.sharing,
+            initial: import.initial,
+            last: import.last,
+            ready: import.ready,
+        });
+        id
     }
 
     /// Declares an image the graph makes, which lives from its first to its last kept use
     /// in this frame and is undefined when the frame begins.
     pub fn transient_image(&mut self, image: &TransientImage<'_>) -> ImageId {
-        todo!()
+        self.image(DeclaredImage::Transient(DeclaredTransient {
+            label: image.label.to_owned(),
+            format: image.format,
+            extent: image.extent,
+            mips: image.mips,
+            layers: image.layers,
+        }))
     }
 
     /// Declares a render pass, after every pass declared so far.
@@ -90,7 +245,14 @@ impl<'f> FrameDecl<'f> {
         pass: &RenderPassDecl<'_>,
         record: impl FnOnce(&mut RenderRecorder<'_>) + Send + 'f,
     ) -> PassId {
-        todo!()
+        let kind = DeclaredKind::Render {
+            colour: pass.colour.to_vec(),
+            depth: pass.depth,
+            sampled: pass.sampled.to_vec(),
+            buffers: pass.buffers.to_vec(),
+            slots: pass.slots.to_vec(),
+        };
+        self.pass(pass.label, kind, Recorder::Render(Box::new(record)))
     }
 
     /// Declares a compute pass, after every pass declared so far. `record` is called as a
@@ -100,7 +262,12 @@ impl<'f> FrameDecl<'f> {
         pass: &ComputePassDecl<'_>,
         record: impl FnOnce(&mut ComputeRecorder<'_>) + Send + 'f,
     ) -> PassId {
-        todo!()
+        let kind = DeclaredKind::Compute {
+            sampled: pass.sampled.to_vec(),
+            buffers: pass.buffers.to_vec(),
+            slots: pass.slots.to_vec(),
+        };
+        self.pass(pass.label, kind, Recorder::Compute(Box::new(record)))
     }
 
     /// Declares a copy pass, after every pass declared so far. `record` is called as a
@@ -111,6 +278,30 @@ impl<'f> FrameDecl<'f> {
         pass: &CopyPassDecl<'_>,
         record: impl FnOnce(&mut CopyRecorder<'_>) + Send + 'f,
     ) -> PassId {
-        todo!()
+        let kind = DeclaredKind::Copy {
+            image_sources: pass.image_sources.to_vec(),
+            image_destinations: pass.image_destinations.to_vec(),
+            buffer_sources: pass.buffer_sources.to_vec(),
+            buffer_destinations: pass.buffer_destinations.to_vec(),
+        };
+        self.pass(pass.label, kind, Recorder::Copy(Box::new(record)))
     }
+
+    fn image(&mut self, image: DeclaredImage) -> ImageId {
+        let id = ImageId::new(next_id(self.declared.images.len()));
+        self.declared.images.push(image);
+        id
+    }
+
+    fn pass(&mut self, label: &str, kind: DeclaredKind, recorder: Recorder<'f>) -> PassId {
+        let id = PassId::new(next_id(self.declared.passes.len()));
+        self.declared.passes.push(DeclaredPass { label: label.to_owned(), kind });
+        self.recorders.get_mut().push(Some(recorder));
+        id
+    }
+}
+
+/// The id the next entry of a list of `len` takes.
+fn next_id(len: usize) -> u32 {
+    u32::try_from(len).expect("a declaration holds fewer than 2^32 of each kind")
 }
