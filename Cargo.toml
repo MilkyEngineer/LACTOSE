@@ -37,6 +37,7 @@ lactose-platform = { path = "crates/platform" }
 lactose-persist = { path = "crates/persist" }
 lactose-app = { path = "crates/app" }
 lactose-present-api = { path = "crates/present-api" }
+lactose-presentation = { path = "crates/presentation" }
 game-sim = { path = "game/game-sim" }
 lactose-rhi-api = { path = "crates/rhi-api" }
 lactose-render-graph = { path = "crates/render-graph" }

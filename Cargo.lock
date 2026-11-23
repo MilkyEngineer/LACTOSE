@@ -697,6 +697,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-presentation"
+version = "0.0.0"
+dependencies = [
+ "lactose-asset-api",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-input",
+ "lactose-input-host",
+ "lactose-math",
+ "lactose-net-api",
+ "lactose-net-host",
+ "lactose-physics-api",
+ "lactose-present-api",
+ "lactose-renderer",
+ "lactose-sim",
+ "lactose-task",
+]
+
+[[package]]
 name = "lactose-reflect"
 version = "0.0.0"
 dependencies = [

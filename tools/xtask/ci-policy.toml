@@ -179,5 +179,5 @@ base = [
 physics = [
   "lactose-physics-api", "lactose-physics-rapier", "lactose-anim", "lactose-predict",
   "lactose-app", "lactose-app-headless", "lactose-cook", "lactose-present-api",
-  "lactose-renderer",
+  "lactose-renderer", "lactose-presentation",
 ]
