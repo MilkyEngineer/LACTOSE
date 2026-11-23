@@ -730,7 +730,12 @@ writes its report.
      thread-safety validation; with `--gpu-assisted`, GPU-assisted validation and
      thread-safety validation, with core and synchronisation validation off, as the layer
      advises beside it, and its note of the features it turns on for its instrumentation
-     filtered (`WARNING-Setting-Limit-Adjusted`);
+     filtered (`WARNING-Setting-Limit-Adjusted`). Its safe mode is on, which skips an access
+     its instrumentation finds invalid and still reports it: without it the access is made,
+     and under lavapipe, a CPU driver, the heap canary's slot past the heap is read as a host
+     pointer and the process dies before the layer reads its report back (the nightly of 23
+     November 2026). The sanitizer, which safe mode would also turn on, is off, so the run
+     checks what it checked before;
    - MoltenVK writes its warnings and errors (`MVK_CONFIG_LOG_LEVEL=2`), and Mesa's banner for
      a driver that is not conformant is off (`MESA_VK_IGNORE_CONFORMANCE_WARNING=1`): it is
      no message about a call;
@@ -783,8 +788,12 @@ writes its report.
    driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
    cleared:`, or `none`), every variable it set, the canaries heard or skipped, the
    device's `DeviceInfo` and `Capabilities`, and each test with `passed`, the suite's
-   `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed. A failed
-   test fails the run, under every driver.
+   `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed. Under a
+   failed test it writes how its process ended, its exit status or on unix the signal that
+   killed it, and the last lines of its standard output and of its standard error, 40 at
+   most between them (`TAIL_LINES` in `src/vulkan.rs`), and prints the same to standard
+   error, so a process that died silently still says how. A failed test fails the run, under
+   every driver.
 
 The `shaders` CI job runs `gpu --driver system --only metal` on the macOS runner that cooks,
 and the `shaders-oldest` job runs `gpu --driver system --only metal --cooked` on the oldest
