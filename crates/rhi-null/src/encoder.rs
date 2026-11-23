@@ -409,7 +409,7 @@ impl Encoder for NullEncoder {
         if !self.recording() || !self.outside("a transition") {
             return;
         }
-        for transition in transitions {
+        for (at, transition) in transitions.iter().enumerate() {
             let Some(object) = self.image(transition.image) else { return };
             let range = transition.range;
             let inside = range.mips > 0
@@ -431,6 +431,13 @@ impl Encoder for NullEncoder {
                 );
                 return;
             }
+            let repeats = transitions[..at]
+                .iter()
+                .any(|earlier| earlier.image == transition.image && earlier.range.overlaps(range));
+            if repeats {
+                self.fail(Rule::State, "a transition call that names a subresource twice");
+                return;
+            }
         }
         self.commands.push(Cmd::Images(transitions.to_vec()));
     }
@@ -439,8 +446,12 @@ impl Encoder for NullEncoder {
         if !self.recording() || !self.outside("a transition") {
             return;
         }
-        for transition in transitions {
+        for (at, transition) in transitions.iter().enumerate() {
             if self.buffer(transition.buffer).is_none() {
+                return;
+            }
+            if transitions[..at].iter().any(|earlier| earlier.buffer == transition.buffer) {
+                self.fail(Rule::State, "a transition call that names a buffer twice");
                 return;
             }
         }

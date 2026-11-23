@@ -57,11 +57,11 @@ fn between<T: Send + 'static>(
     let out = Arc::new(Mutex::new(None));
     let kept = Arc::clone(&out);
     let done = AtomicBool::new(false);
-    *lock(&device.shared().between) = Some(Box::new(move |reached| {
+    *lock(&device.shared().between) = Some(Arc::new(Mutex::new(move |reached| {
         if reached == at && !done.swap(true, Ordering::Relaxed) {
             *lock(&kept) = Some(call(&twin));
         }
-    }));
+    })));
     out
 }
 
@@ -494,6 +494,21 @@ fn a_heap_write_started_inside_another_waits_for_it() {
     assert!(!landed, "a second heap write ran to its end inside the first's holds");
 }
 
+/// A hook cleared while it runs stays cleared, as `taken` needs of a call that runs it on
+/// another thread: a hook put back after it ran would keep its twin of the device, and so
+/// the device, alive (Miri's leak check under one seed of the test above).
+#[test]
+fn a_hook_cleared_while_it_runs_stays_cleared() {
+    let device = device(QueueLayout::ONE, false);
+    let image = sampled(&device);
+    let out = between(&device, Between::HeapWrite, |twin| {
+        *lock(&twin.shared().between) = None;
+    });
+    device.write_heap_slot(HeapSlot(3), image).expect("the write");
+    assert!(lock(&device.shared().between).is_none(), "a cleared hook was put back");
+    assert!(lock(&out).is_some(), "the hook ran");
+}
+
 /// With the queues running nothing, a present is shown with its submit pending: the
 /// swapchain's drop waits until that submit runs, and returns once it has.
 #[test]
@@ -680,4 +695,63 @@ fn a_host_signal_landed_between_another_host_signals_holds_keeps_the_timeline_gr
         }
     }
     assert_eq!(landings, [ROUNDS; 2], "a landing in every round of each order");
+}
+
+/// A wait orders the one signal it waits for, every signal of an earlier submit of that
+/// signal's queue, and what an earlier submit of the new one's own queue waits for; not the
+/// other signals of the waited submit, and not a signal above the value it waits for.
+/// `lactose-rhi-vulkan`'s records test of the same name holds its records to the same
+/// shapes.
+#[test]
+fn a_wait_orders_only_the_signal_it_waits_for() {
+    let two_timelines = || {
+        let device = device(QueueLayout::SEVERAL, false);
+        let c = device.create_timeline(0).expect("a timeline");
+        let f = device.create_timeline(0).expect("a timeline");
+        lag(&device, true);
+        (device, c, f)
+    };
+
+    let (device, c, f) = two_timelines();
+    submit(&device, C, &[], &[at(c, 1), at(f, 1)]).expect("the pair's first submit");
+    let refused = submit(&device, G, &[at(c, 1)], &[at(f, 2)]);
+    assert_eq!(rule(&refused), Some(Rule::Timeline), "a wait for another signal of the batch");
+    submit(&device, G, &[at(f, 1)], &[]).expect("a wait for the signal itself");
+    submit(&device, G, &[], &[at(f, 2)]).expect("an earlier submit's wait for it");
+    lag(&device, false);
+    assert!(device.wait_timeline(at(f, 2), PATIENCE).expect("a wait"));
+
+    let (device, c, f) = two_timelines();
+    submit(&device, C, &[], &[at(f, 1)]).expect("the earlier batch");
+    submit(&device, C, &[], &[at(c, 1)]).expect("the later batch");
+    submit(&device, G, &[at(c, 1)], &[at(f, 2)]).expect("an earlier batch's signal");
+    lag(&device, false);
+    assert!(device.wait_timeline(at(f, 2), PATIENCE).expect("a wait"));
+
+    for host in [true, false] {
+        let (device, c, f) = two_timelines();
+        if host {
+            device.signal_timeline(at(f, 1)).expect("the host's f = 1");
+        } else {
+            submit(&device, C, &[], &[at(f, 1)]).expect("an earlier batch's f = 1");
+        }
+        submit(&device, C, &[], &[at(c, 1), at(f, 2)]).expect("the pair's first submit");
+        let refused = submit(&device, G, &[at(c, 1), at(f, 1)], &[at(f, 3)]);
+        assert_eq!(rule(&refused), Some(Rule::Timeline), "a wait below the promise, host {host}");
+        lag(&device, false);
+        assert!(device.wait_timeline(at(f, 2), PATIENCE).expect("a wait"));
+    }
+}
+
+/// Null's second leniency against a device ("Queues by role"): it takes the 2^31 limit from
+/// the value it has run a timeline to, not from one the caller has seen. A compute submit
+/// with no gate signals f = 1, which null runs at once and the caller has not seen; a later
+/// compute submit of f = 2^31 is accepted, where a device with f = 1 in flight, its value
+/// 0, refuses it.
+#[test]
+fn a_signal_2_31_above_a_value_the_caller_has_not_seen_is_accepted() {
+    let device = device(QueueLayout::SEVERAL, false);
+    let f = device.create_timeline(0).expect("a timeline");
+    submit(&device, C, &[], &[at(f, 1)]).expect("f = 1, run and unseen");
+    submit(&device, C, &[], &[at(f, LIMIT)]).expect("2^31 from 0, within it from 1");
 }
