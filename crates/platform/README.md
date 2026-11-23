@@ -12,12 +12,11 @@ and never name it.
 |---|---|
 | Tier | backend; on `[server_denylist]`, so no server binary links it |
 | Determinism boundary | outside |
-| Unsafe | none, `#![forbid(unsafe_code)]`; architecture section 21 lists the crate, and `SAFETY.md` says where the implementation's `unsafe` will live |
+| Unsafe | none, `#![forbid(unsafe_code)]`; architecture section 21 lists the crate, and `SAFETY.md` says why none is needed and where the tests' is |
 
-**Status: facade.** Every public signature is final and every body that decides anything is
-`todo!()`; `PixelSize::is_empty`, `ClientPlatform::new` and the plain values run, and nothing
-else does. This file is the contract the implementation lane (`platform-impl`) meets, and
-every sentence under "Behaviour the signatures cannot express" is one a dependent crate may
+**Status: implemented** over winit 0.30 on macOS and Windows (`platform-impl`). On Linux it
+builds over X11 and is not run, save the check that `event_pump` panics off the main thread.
+This file is the contract the implementation meets, and every sentence under "Behaviour the signatures cannot express" is one a dependent crate may
 rely on. Architecture sections 2, 3, 4, 5.1 and 21 are the design, with the milestone 2
 plan's decisions 5.6 and 5.11 (`docs/plans/milestone-2.md`); where this file and the
 architecture disagree, the architecture wins and this file is wrong. Decision D159 records
@@ -32,6 +31,12 @@ description and list what changed, because `lactose-app-client`, the `swapchain`
 tests and, through the lanes, `lactose-app` and the renderer are written against this
 surface. `tests/consumers.rs` is a compile-only sketch of what each of them writes: a change
 that breaks one is a signature change to list.
+
+The windowing library is winit 0.30.13, pinned exactly in the root `Cargo.toml` with its
+default features off and `rwh_06` on, and on Linux `x11` as well, whose libraries it loads at
+run time, so the crate builds and lints where no window system's libraries are installed. No
+signature names it. It is outside the determinism boundary and carries no patch, so
+`cargo xtask vendor` has nothing of it to check.
 
 ## Surface
 
@@ -176,7 +181,8 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
 **The main thread and its pump** (architecture section 5.1)
 
 - `event_pump` makes the operating system's event loop and shows nothing. A process has
-  one pump: a second call returns `Unsupported`, whether or not the first has finished.
+  one pump: a second call returns `Unsupported`, whether or not the first has finished. A
+  first call that panicked, off the main thread, was the process's one call.
   Where the operating system gives the process no window system, it returns `Platform`.
 - `run` opens the window before it drains a call. If the operating system refuses the
   window, `run` returns `Platform` at once and no call has run. Otherwise every call sees
@@ -197,14 +203,21 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
   window to the end of the process, as an error does, so a surface another thread holds
   stays valid and the test fails with its panic's message.
 - When `run` returns, with a value or an error, `Window::close_requested` turns `true`,
-  and every call still queued and every call queued later resolves to `Cancelled`. A
-  frame that loops until a close therefore ends after a failed `run` too. `run` turns
-  `close_requested` true before it closes the lane, so a task whose main-lane call came
-  back `Cancelled` reads the close. The lane's wake ignores an event loop that has ended
-  (winit's `EventLoopClosed`), even after the lane is closed, since `Lane::run` wakes
-  after it releases the queue: `exit` is queued from destructors, unwinding included,
-  where a panic in the wake would abort. An `EventPump` dropped before `run` has opened
-  no window, and its lane's calls resolve to `Cancelled`.
+  and every call still queued and every call queued later resolves to `Cancelled`. A frame
+  that loops until a close therefore ends after a failed `run` too. `run` turns
+  `close_requested` true before it drops its pump, which closes the lane. A call the close
+  cancels has its reply dropped as the pump drops, which releases the call's slot lock,
+  and the `LaneCall`'s poll acquires that lock. A call queued after the close finds the
+  lane closed under the queue's lock, which the pump's drop released after it marked the
+  lane closed, and is cancelled on the thread that queued it. So in a binary, a task whose
+  main-lane call came back `Cancelled` reads the close, and so does the waker the cancel
+  wakes. In a test, a main-lane call that panics drops the rest of its batch as it
+  unwinds, before the close is set, so those calls' tasks may read it `false`. The lane's
+  wake ignores an event loop that has ended (winit's `EventLoopClosed`), even after the
+  lane is closed, since `Lane::run` wakes after it releases the queue: `exit` is queued
+  from destructors, unwinding included, where a panic in the wake would abort. An
+  `EventPump` dropped before `run` has opened no window, and its lane's calls resolve to
+  `Cancelled`.
 - An error from `run` is `Platform`: the window was refused, or the operating system's
   event loop failed. `lactose-app`'s policy for it is the binary's to choose; nothing can
   be shown after it.
@@ -314,7 +327,11 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
   state, with no check here.
 - The thread runs the lane's calls one at a time, in the order `lactose-task`'s lanes
   give, and parks between them. It has no clock, it runs nothing but the calls, and it
-  skips, merges and reorders none. The lane is named `present`.
+  skips, merges and reorders none. The lane is named `present`, and is `lactose-task`'s
+  `parking_lane`: the thread parks in the lane's own wait, which a call that parks inside
+  its body, on a channel or a fence's wait, cannot rob of the wake of a call queued
+  meanwhile. That wait is `lactose-task`'s, with its loom model, and this crate keeps no
+  flag or park for it.
 - A call may block for as long as an acquire or a present does. It holds the calls queued
   behind it and nothing else: not the main thread, not a worker, and not its caller, which
   holds a future. Every wait inside a present call is bounded, by the caller, save the
@@ -428,7 +445,9 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
   see the last drop: from `exit` until the window is let go it wakes every 50 ms on a
   timer of its own, the one time it does, so it returns within about 50 ms of the last
   drop. The last drop does not wake it instead: the pump keeps its own `Arc`, so the last
-  other one runs no destructor.
+  other one runs no destructor. Once it has dropped the window it waits for the operating
+  system's report that the window is destroyed, which Windows defers to a message, and
+  returns on it; past a second without one it warns on `pail` and returns.
 - No `Arc<Window>` is returned from the root task, kept in a world or resource that
   outlives `exit`, or dropped by `executor.shutdown`. What reads the window's reports
   past `exit` holds a `WindowReports`, which keeps nothing open.
@@ -447,10 +466,11 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
   process, so a client's worker counts are the headless binary's on the same machine.
 - `spawn_thread` makes a thread as `StdPlatform` does: named `spec.name`, in `spec.class`
   through `ThreadClass::enter` before `body` runs, with its errors. For
-  `ThreadClass::Present` it also applies what the operating system offers a thread that
-  presents, where `platform-impl` finds one worth applying; `SAFETY.md` then records it,
-  and no caller relies on it. A class or a treatment the operating system refuses is a
-  warning on `pail`, and the thread runs.
+  `ThreadClass::Present` it applies nothing more: `ThreadClass::enter` gives that class
+  macOS's user-interactive quality of service and Windows's above-normal priority, and
+  `SAFETY.md` says why the one further treatment is not applied. No caller relies on a
+  treatment. A class the operating system refuses is a warning on `pail`, and the thread
+  runs.
 - A value holds nothing. It is made on any thread, before or after the pump, and any
   number of them behave alike.
 - The worker counts are `lactose-task`'s, from that topology: its frame-critical workers
@@ -479,73 +499,129 @@ No other kind comes from this crate, and no request of the window is an error.
   `false`, and macOS's Quit is not intercepted. Both arrive with the game's menus, at
   milestone 5.
 - **Fullscreen and borderless modes, displays and their refresh, a display's scale, focus
-  and occlusion, more than one window.** No milestone 2 row reads one. `frame-design` names
-  a display's refresh here if the frame's pacing needs it.
-- **The windowing library.** `winit`, its version, its features and its vendor check are
-  `platform-impl`'s. No signature names it, and `Cargo.lock` does not hold it yet.
+  and occlusion, more than one window.** No milestone 2 row reads one. The frame's pacing
+  needs no display's refresh at milestone 2: the timer root paces it at the tick's deadline
+  (D162), and the change that gives the frame a deadline between ticks asks for one here.
 - **The tests with a device.** `swapchain` writes them here, with `lactose-rhi-vulkan` as
   a test-support dev-dependency, as subprocesses.
 - **The crash hook** is `lactose-app`'s (D155), not this crate's.
 
 ## Proof
 
-The facade proves what the compiler can. `src/lib.rs` asserts the auto traits under
-"Threads" and the surface-source bounds; `tests/consumers.rs` type-checks what each consumer
-writes, with stand-ins for `lactose-rhi-api`'s items that carry their bounds; `tests/values.rs`
-runs the plain values; the crate's doctest type-checks a client's `main`.
+The compiler proves what it can. `src/lib.rs` asserts the auto traits under "Threads" and the
+surface-source bounds; `tests/consumers.rs` type-checks what each consumer writes, with
+stand-ins for `lactose-rhi-api`'s items that carry their bounds; the crate's doctest
+type-checks a client's `main`.
 
-`platform-impl` shows the rest, each as a named test. A test that needs a window is a
-subprocess whose `main` is the test, on the M1 and on the laptop. Every wait in a test is
-bounded, and each test shows the interleaving it names, by a barrier or a count and never
-by a sleep's length alone. Each window subprocess runs under a deadline its parent keeps
-(`tests/consumers.rs`, `under_a_deadline`): the parent reads the child's output while it
-waits, and past the deadline it kills the child and fails, naming the last stage the
-child printed. It takes the output within a bound too, and fails with "stdout held open"
-past it, since a process the child started may keep the pipe. The subprocess's driver
-holds the `exit` guard of "Shutdown" from its start, so a check that fails ends the pump
-too. `ThreadHandle::join` discards a panic, so the driver sends its result on a channel
-as its last act and the subprocess's exit status carries it; the parent checks the status
-and that the last stage printed is the final one. The tests that need no window, the stop
-under a queuing task and the torn-size read, also run under nightly Miri.
+The rest is a named test each, in three places. `tests/integration.rs` (`present`, `threads`,
+`values`) and the unit tests of `src/window.rs` need no window and run everywhere CI does,
+and nightly Miri runs them, save the present thread's CPU test, which reads a clock
+through the operating system. `tests/window.rs` is the tests that open a window, a binary of
+its own with its own `main`: a test harness's thread is not the main thread, so each case is
+that binary run again as a subprocess whose `main` is the case, and the binary speaks enough
+of the harness's arguments for `cargo nextest` to list and run it. Every case is ignored, so
+CI lists them and runs none and no case passes where no window opens; on the M1 and on the
+laptop they run by
+
+```text
+cargo nextest run -p lactose-platform --test window --run-ignored only
+```
+
+Every wait in a test is bounded, and each test shows the interleaving it names, by a barrier
+or a count and never by a sleep's length alone. The two CPU tests idle for a set length and
+bound the CPU the idle thread spent in it, read from that thread's own clock, which a loaded
+machine does not raise. Each window subprocess runs under a deadline its parent keeps, as
+`tests/consumers.rs`, `under_a_deadline`, sketches it: the parent reads the child's output
+while it waits, and past the deadline it kills the child and fails, naming the last stage
+the child printed. It takes the output within a bound too, and fails with "stdout held open"
+past it, since a process the child started may keep the pipe. The subprocess's driver holds
+the `exit` guard of "Shutdown" from its start, so a check that fails ends the pump too.
+`ThreadHandle::join` discards a panic, so the driver sends its result on a channel as its
+last act and the subprocess's exit status carries it; the parent checks the status and that
+the last stage printed is the final one, or, for a case that must fail or abort, the stage
+and the text it must end with.
 
 - A window opens, events are pumped, one call runs on the main thread and one on the
   present thread, and the process closes: `run` returns and the exit status is zero.
+  (`window`: `opens_pumps_and_closes`, which also reads the present thread's scheduling
+  back from the operating system.)
 - A call queued before `run` runs after the window opens; a call queued after `run`
-  returned is `Cancelled`; a dropped pump cancels its calls and opens nothing.
+  returned is `Cancelled`; a dropped pump cancels its calls. A dropped pump opens no
+  window, which no case checks: the window is made in winit's `resumed` alone, which only
+  `run_app` reaches, and a dropped pump never calls it. (`window`:
+  `a_call_queued_before_run_runs_and_one_after_is_cancelled`,
+  `a_dropped_pump_cancels_its_calls_and_a_second_pump_is_unsupported`.)
 - `event_pump` on a second thread panics; a second `event_pump` is `Unsupported`.
+  (`integration`: `threads::event_pump_panics_off_the_main_thread_and_a_second_is_unsupported`,
+  on Linux too; `window`: the second call on the main thread, in the dropped pump's case.)
 - The handles are lent inside a main-lane call and are `Unavailable` on every other thread.
+  (`window`: `the_handles_are_lent_on_the_main_thread_alone`, on the driver and the present
+  thread, and the same handles at every call.)
 - `request_size` is answered by `Window::size` and by a `WindowReports`, polled under a
   deadline; a minimised window on Windows reports empty, and `is_minimised` reports it; a
   read on another thread never sees a torn size, under a writer that alternates two sizes.
+  (`window`: `a_requested_size_and_a_minimise_are_reported`; `src/window.rs`:
+  `a_read_never_sees_a_torn_size`.)
 - `close_requested` turns `true` on a close the test sends the window, and the window
-  stays open; it turns `true` when `run` returns, by value and by error, and a task whose
-  main-lane call came back `Cancelled` then reads it `true`.
+  stays open; it turns `true` when `run` returns, by value and by error; and it is `true`
+  before the lane is closed: the waker of a main-lane call that the close cancels reads it
+  `true` when the cancel wakes it, on the main thread, as the pump drops. That call is
+  queued and polled while the main thread is still inside the call that runs `exit`, so
+  the lane is open then however late the test's thread runs. (`window`:
+  `a_close_sent_to_the_window_is_reported_and_the_window_stays_open`, and the case of the
+  call queued before `run` for the waker; by error, the case after an error from `run`.)
 - `run` does not return after `exit` while an `Arc<Window>` is held: it has not returned
   a set time after `exit`, and has warned on `pail`; it returns within a bound of the last
-  drop, made on another thread. A `WindowReports` held past `exit` does not keep it.
+  drop, made on another thread, of 500 ms, which a pump that looked once a second or
+  waited for the second's fallback overshoots. A `WindowReports` held past `exit` does not
+  keep it. (`window`: `run_waits_for_the_last_window_and_warns`.)
+- The pump spends under 200 ms of the main thread's CPU in each of two 2 s spells: idle
+  with the window open, and after `exit` while an `Arc<Window>` is held. The main thread
+  reads its own CPU clock in a main-lane call at each end. (`window`:
+  `the_pump_idles_open_and_while_a_window_is_held`.)
 - A driver that panics before its last step still lets the pump return: its `exit` guard
-  queues `exit` while it unwinds, and the subprocess's exit status is not zero.
+  queues `exit` while it unwinds, and the subprocess's exit status is not zero. (`window`:
+  `a_driver_that_panics_still_lets_the_pump_return`.)
 - A last device whose drop would block, after step 4's bound expired, is dropped on step
   4's thread, a thread of its own: the pump warns, a main-lane call queued meanwhile
-  runs, and no worker is held.
+  runs, and no worker is held. (`window`:
+  `a_last_device_whose_drop_blocks_holds_its_own_thread_alone`.)
 - After an error from `run`, with a root whose last step blocks, `main` returns `run`'s
-  error within its bound, having logged on `pail`, and the root is not dropped on the
-  main thread.
+  error within its bound, having logged on `pail`, and the root is not dropped on the main
+  thread. The close is reported after the error, and the window, held by the pump's `Arc`
+  alone and by the test's `Weak`, is still alive. (`window`:
+  `after_an_error_from_run_main_returns_within_its_bound`, on macOS alone: the error is
+  the event loop ended by the application's own stop, and winit's loop on Windows ends
+  through its `exit` alone.)
 - A worker that waits on the main thread fails: `Executor::block_on` of a main-lane call
-  on a worker is `lactose-task`'s debug assertion, and the subprocess aborts.
+  on a worker is `lactose-task`'s debug assertion, and the subprocess aborts. In a release
+  build there is no assertion, the main thread runs the call and the wait resolves, which
+  the case expects and prints. (`window`: `a_worker_that_waits_on_the_main_thread_aborts`.)
 - The present thread has the spec above, through a spy `Platform`. A call that blocks
-  holds the calls behind it and no other thread: a barrier shows the blocking call in
-  progress while a main-lane call and a worker's task complete, and the call behind it
-  not yet run. `stop` runs every call queued before it and hands the state back: in each
-  round a task queues calls in a loop while `stop` is called, every call queued before
-  `stop` runs, each later one runs in the last drain or is `Cancelled`, none runs after
-  the hand-back, the hand-back gives the state in every round, and across the rounds both
-  outcomes occur; so a stop queued before the take fails it. A call queued after the
-  hand-back is `Cancelled`. A platform that runs every body on one thread makes a second
-  present thread after the first stopped, and the second runs its calls. A dropped
-  `PresentThread` drops the state on the present thread, which the test sees by polling a
-  flag the state's drop sets, under a deadline. A platform that drops the body unrun
-  makes `present_thread` return `Cancelled`.
+  holds the calls behind it and no other thread: a bounded handshake shows the blocking
+  call in progress while a main-lane call and a worker's task complete, and the call
+  behind it not yet run. `stop` runs every call queued before it and hands the state back,
+  and a drop runs them and drops the state on the present thread: in 3,000 rounds that
+  alternate the two, three threads queue calls in a loop while the stop or the drop is
+  made; every call queued before it runs, in order, each later one runs in the last drain
+  or is `Cancelled`, none runs after the hand-back, and across the rounds both outcomes
+  occur; so a stop queued before the take fails it, in about one stop round in a hundred,
+  and so in all but about one run in 10^8 (Miri runs four rounds, which check the order
+  but do not catch that stop). The lane is closed before the state is handed back: a call
+  that the close cancels is in its drop while the stop's future is polled pending. An idle
+  present thread spends under 50 ms of its CPU in each of three 500 ms spells: after plain
+  calls, after a call that parked with one behind it, and after a call that unparked its
+  own thread; it reads its own CPU clock in a call at each end. A call queued after the
+  hand-back is `Cancelled`. A platform that runs every body on one
+  thread makes a second present thread after the first stopped, and the second runs its
+  calls. A dropped `PresentThread` drops the state on the present thread, which the test
+  sees by polling a flag the state's drop sets, under a deadline. A platform that drops
+  the body unrun makes `present_thread` return `Cancelled`. A call queued while a call
+  that parks the present thread is in progress runs after it, its wake not lost to the
+  park, and a call that panics ends the thread with the stop `Cancelled`. (`integration`:
+  each of `present::`; `window`:
+  `a_present_call_that_blocks_holds_only_the_calls_behind_it`.)
 - `ClientPlatform` reports `StdPlatform`'s topology and hardware threads, and enters the
-  class of each thread it makes.
+  class of each thread it makes. (`integration`: `threads::`; the present class read back,
+  in `opens_pumps_and_closes`.)
 - Clippy passes for `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` from the M1.

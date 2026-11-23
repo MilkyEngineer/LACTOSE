@@ -1,8 +1,9 @@
 //! Compile-only consumer sketches: what `lactose-app-client`, `lactose-app` and the
 //! renderer, a graphics backend, the `swapchain` lane's tests and `platform-impl`'s
-//! subprocess test write against this crate, type-checked and never run (every deciding
-//! body is `todo!()`). They pin the surface the README promises: a change that breaks one
-//! is a signature change to list.
+//! subprocess test write against this crate, type-checked and never run: the stand-ins for
+//! `lactose-rhi-api` are `todo!()`, and the tests that run are `present`, `threads` and
+//! `tests/window.rs`. They pin the surface the README promises: a change that breaks one is
+//! a signature change to list.
 
 #![allow(dead_code, unused_variables, missing_docs)]
 

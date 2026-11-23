@@ -1,5 +1,6 @@
 //! loom models of the scope latch, the sleep-and-wake protocol, the permit gate, run
-//! quiescence, the shutdown flag, and the completion slot and the width of `Executor::run_job`.
+//! quiescence, the shutdown flag, the completion slot and the width of `Executor::run_job`,
+//! and a parking lane's wait.
 //!
 //! Run with `cargo test -p lactose-task --features loom --release`. Every model calls the
 //! functions the executor ships: `gate::wait_for_children` is the opener's wait,
@@ -7,7 +8,9 @@
 //! is how it wakes a worker, `Timers::fire_due`
 //! is how a deadline reaches its task, `Quiesce` is what holds a run's future back,
 //! `ShutdownFlag::queue` is how work is queued against shutdown's sweep, `JobSlot` is where a
-//! job's value waits for its future, and `Width` is what bounds the workers such jobs occupy.
+//! job's value waits for its future, `Width` is what bounds the workers such jobs occupy,
+//! `ParkingPump::wait` is how a parking lane's thread waits and `parking_lane`'s wake is how a
+//! queued call ends that wait.
 //! What a model supplies is only what loom does not model: a deque is a counter, a worker is a
 //! loom thread, and a scope's children are a number.
 //!
@@ -32,6 +35,10 @@
 //!   `a_task_queued_as_shutdown_begins_is_cancelled` and
 //!   `a_range_queued_as_shutdown_begins_is_dropped`, each with shutdown set between the push
 //!   and the read).
+//!
+//! The parking lane's two weakened models, `weakened_a_parked_lane_woken_by_*`, run copies
+//! of `parking.rs`'s wake and wait with one side removed (`parking::WeakenedSignal`), on a
+//! plain lane; each fails as a deadlock at the shipped model's bound.
 //!
 //! A lost wake-up shows as a deadlock, which loom reports. The models are exhaustive
 //! except where a preemption bound is named; `LOOM_MAX_PREEMPTIONS` overrides the bounds.
@@ -1666,5 +1673,155 @@ mod jobs {
     #[should_panic(expected = "an entry stayed queued after shutdown's sweep")]
     fn weakened_a_sweep_without_its_fence() {
         submissions_against_shutdown(Some(shutdown::Weakened::SweepFence));
+    }
+}
+
+// The parking lane (`parking.rs`), and the two weakened copies of its wake and wait.
+
+mod parking {
+    // Not loom's `Arc`: a weakened model fails by deadlock and unwinds with its threads'
+    // handles still live, and dropping a loom `Arc` then panics in loom's runtime, which
+    // aborts the test binary instead of failing the one test.
+    use std::sync::Arc;
+
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::thread::{self, Thread};
+
+    use super::bounded;
+    use crate::{LanePump, ParkingPump, lane, parking_lane};
+
+    /// Which side of `parking.rs`'s wake and wait a weakened copy removes.
+    #[derive(Clone, Copy)]
+    enum Weakened {
+        /// The wake only unparks, and the wait only parks.
+        UnparkOnly,
+        /// The wake only sets the flag: nothing unparks the wait.
+        FlagOnly,
+    }
+
+    /// `parking.rs`'s `Signal`, weakened.
+    struct WeakenedSignal {
+        queued: AtomicBool,
+        thread: Thread,
+        weakened: Weakened,
+    }
+
+    impl WeakenedSignal {
+        fn wake(&self) {
+            match self.weakened {
+                Weakened::UnparkOnly => self.thread.unpark(),
+                Weakened::FlagOnly => {
+                    self.queued.swap(true, Ordering::Release);
+                }
+            }
+        }
+
+        fn wait(&self) {
+            match self.weakened {
+                Weakened::UnparkOnly => thread::park(),
+                Weakened::FlagOnly => {
+                    while !self.queued.swap(false, Ordering::Acquire) {
+                        thread::park();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pump as the model drains it: the shipped one, or a plain lane's pump beside a
+    /// weakened copy of the wait.
+    enum Pump {
+        Shipped(ParkingPump<usize>),
+        Weakened(LanePump<usize>, Arc<WeakenedSignal>),
+    }
+
+    impl Pump {
+        fn drain(&mut self, ran: &mut usize) {
+            match self {
+                Self::Shipped(pump) => drop(pump.drain(ran)),
+                Self::Weakened(pump, _) => drop(pump.drain(ran)),
+            }
+        }
+
+        fn wait(&self) {
+            match self {
+                Self::Shipped(pump) => pump.wait(),
+                Self::Weakened(_, signal) => signal.wait(),
+            }
+        }
+    }
+
+    /// A parking lane's thread loses no wake to a call that takes its unpark, as a present
+    /// call that waits on a channel does. The first call parks unless the second has been
+    /// queued, so it can take the unpark the second's queueing gives; the thread must still
+    /// drain the second. `None` is the shipped lane.
+    fn a_parked_lane_against(weakened: Option<Weakened>) {
+        bounded(3, move || {
+            let (lane, mut pump) = match weakened {
+                None => {
+                    let (lane, pump) = parking_lane::<usize>("model");
+                    (lane, Pump::Shipped(pump))
+                }
+                Some(weakened) => {
+                    let signal = Arc::new(WeakenedSignal {
+                        queued: AtomicBool::new(false),
+                        thread: thread::current(),
+                        weakened,
+                    });
+                    let waking = signal.clone();
+                    let (lane, pump) = lane("model", move || waking.wake());
+                    (lane, Pump::Weakened(pump, signal))
+                }
+            };
+            let second = Arc::new(AtomicBool::new(false));
+            let ended = Arc::new(AtomicBool::new(false));
+            let queuer = {
+                let (second, ended) = (second.clone(), ended.clone());
+                thread::spawn(move || {
+                    let queued = second.clone();
+                    drop(lane.run(move |ran: &mut usize| {
+                        if !queued.load(Ordering::SeqCst) {
+                            thread::park();
+                        }
+                        *ran += 1;
+                    }));
+                    second.store(true, Ordering::SeqCst);
+                    drop(lane.run(|ran: &mut usize| *ran += 1));
+                    ended.store(true, Ordering::SeqCst);
+                })
+            };
+            let mut ran = 0;
+            loop {
+                pump.drain(&mut ran);
+                if ran == 2 {
+                    break;
+                }
+                pump.wait();
+            }
+            // loom cannot have a thread unparked while it is blocked in `join`.
+            while !ended.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            queuer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn a_parked_lane_loses_no_wake_to_a_call_that_parks() {
+        a_parked_lane_against(None);
+    }
+
+    /// The first call takes the unpark, and the thread parks for a wake already spent.
+    #[test]
+    #[should_panic(expected = "deadlock")]
+    fn weakened_a_parked_lane_woken_by_the_unpark_alone() {
+        a_parked_lane_against(Some(Weakened::UnparkOnly));
+    }
+
+    /// The thread finds nothing queued and parks, and nothing unparks it.
+    #[test]
+    #[should_panic(expected = "deadlock")]
+    fn weakened_a_parked_lane_woken_by_the_flag_alone() {
+        a_parked_lane_against(Some(Weakened::FlagOnly));
     }
 }

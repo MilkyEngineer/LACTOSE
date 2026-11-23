@@ -1,11 +1,13 @@
-//! The primitives the scope latch and the sleep-and-wake protocol are built from.
+//! The primitives the scope latch, the sleep-and-wake protocol and a parking lane's wake are
+//! built from.
 //!
 //! With the `loom` feature these are loom's model-checked versions, so `latch` and `sleep`
 //! and the modules built on them (`gate`, `quiesce`), the width and the completion slot of
-//! `Executor::run_job` (`width`, `job_run`), and the shutdown flag (`shutdown`), compile
-//! unchanged against either. Nothing else in the crate goes through this module: the
+//! `Executor::run_job` (`width`, `job_run`), the shutdown flag (`shutdown`), and `parking`
+//! compile unchanged against either. Nothing else in the crate goes through this module: the
 //! rest of the executor is not modelled, and with the feature on it must not be run, because a
-//! loom object panics outside `loom::model`.
+//! loom object panics outside `loom::model`. A parking lane's queue is `lane`'s, behind std's
+//! mutex, which a model runs as one step since nothing under it is loom's.
 //!
 //! [`TimedPark`] is one worker's timed wait, the step of the keeper's wait for a deadline
 //! (`Sleep::park`). It has three forms: on Windows a high-resolution waitable timer beside an
@@ -18,7 +20,7 @@ pub(crate) use core::sync::atomic::Ordering;
 mod imp {
     pub(crate) use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
     pub(crate) use std::sync::{Mutex, MutexGuard};
-    pub(crate) use std::thread::park;
+    pub(crate) use std::thread::{Thread, current, park};
 
     #[cfg(not(all(windows, not(miri))))]
     pub(crate) use super::portable::TimedPark;
@@ -32,7 +34,7 @@ mod imp {
 
     pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
     pub(crate) use loom::sync::{Mutex, MutexGuard};
-    pub(crate) use loom::thread::park;
+    pub(crate) use loom::thread::{Thread, current, park};
 
     /// One worker's timed wait. loom has no clock, so a wait lasts until a waker ends it,
     /// which only removes wake-ups: a model that passes does not depend on a timeout for

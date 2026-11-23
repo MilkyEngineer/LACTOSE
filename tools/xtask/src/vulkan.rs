@@ -190,12 +190,19 @@ impl Validators {
                 ("VK_KHRONOS_VALIDATION_GPUAV_ENABLE", "false"),
             ],
             // The filter drops the layer's own note, on every device, of the features it
-            // turns on for its instrumentation.
+            // turns on for its instrumentation. Safe mode skips an access the instrumentation
+            // finds invalid and still reports it: without it the access is made, and under
+            // lavapipe the heap canary's slot past the heap is a host descriptor whose
+            // sampling function is null, which ends the process before the layer reads its
+            // report back. The sanitizer, which safe mode also turns on, stays off, so the
+            // run checks what it did without safe mode.
             Self::GpuAssisted => &[
                 ("VK_KHRONOS_VALIDATION_VALIDATE_CORE", "false"),
                 ("VK_KHRONOS_VALIDATION_VALIDATE_SYNC", "false"),
                 ("VK_KHRONOS_VALIDATION_THREAD_SAFETY", "true"),
                 ("VK_KHRONOS_VALIDATION_GPUAV_ENABLE", "true"),
+                ("VK_KHRONOS_VALIDATION_GPUAV_SAFE_MODE", "true"),
+                ("VK_KHRONOS_VALIDATION_GPUAV_SHADER_SANITIZER", "false"),
                 ("VK_KHRONOS_VALIDATION_MESSAGE_ID_FILTER", "WARNING-Setting-Limit-Adjusted"),
             ],
         }
@@ -699,10 +706,24 @@ pub const DEADLINE: Duration = Duration::from_secs(120);
 pub struct Ended {
     /// Whether it exited with success.
     pub succeeded: bool,
-    /// Its standard output, then its standard error.
-    pub text: String,
+    /// Its exit status as std's `ExitStatus` words it: on unix `exit status: 101`, or
+    /// `signal: 11 (SIGSEGV)` for a process a signal killed, with ` (core dumped)` where a
+    /// core was written; on Windows `exit code: 101`, or `exit code: 0xc0000005`.
+    pub status: String,
+    /// Its standard output.
+    pub stdout: String,
+    /// Its standard error.
+    pub stderr: String,
     /// The deadline it ran past, and was killed at, if it did.
     pub killed_at: Option<Duration>,
+}
+
+impl Ended {
+    /// Its standard output, then its standard error: what [`judge`] reads.
+    #[must_use]
+    pub fn text(&self) -> String {
+        format!("{}{}", self.stdout, self.stderr)
+    }
 }
 
 /// Runs `command` with its standard output and error captured, and kills it where it runs
@@ -739,18 +760,80 @@ pub fn run_bounded(command: &mut Command, deadline: Duration) -> io::Result<Ende
     let text = |bytes: thread::JoinHandle<Vec<u8>>| {
         String::from_utf8_lossy(&bytes.join().unwrap_or_default()).into_owned()
     };
-    let text = format!("{}{}", text(stdout), text(stderr));
-    Ok(Ended { succeeded: status.success() && killed_at.is_none(), text, killed_at })
+    Ok(Ended {
+        succeeded: status.success() && killed_at.is_none(),
+        status: status.to_string(),
+        stdout: text(stdout),
+        stderr: text(stderr),
+        killed_at,
+    })
 }
 
 /// [`judge`] of an ended test: one killed at its deadline fails for that, whatever it wrote.
 #[must_use]
 pub fn judge_ended(test: &str, ended: &Ended, expected: Option<&[&str]>, metal: bool) -> Verdict {
-    let mut verdict = judge(test, ended.succeeded, &ended.text, expected, metal);
+    let mut verdict = judge(test, ended.succeeded, &ended.text(), expected, metal);
     if let Some(deadline) = ended.killed_at {
         verdict.failure = Some(format!("past its deadline of {} s", deadline.as_secs_f64()));
     }
     verdict
+}
+
+/// The most lines of a failed test's output its entry in the report holds, of its standard
+/// output and its standard error together.
+pub const TAIL_LINES: usize = 40;
+
+/// The entry of the device test `test` of `package` in its run's report: its name and word,
+/// then each message, report and driver line it printed; for a failed test, how its process
+/// ended and the last lines of its standard output and of its standard error, [`TAIL_LINES`]
+/// at most between them, each half of them and a share one leaves to the other. The run
+/// prints a failed test's entry to standard error too, then its [`output`] in full.
+#[must_use]
+pub fn entry(package: &str, test: &str, verdict: &Verdict, ended: &Ended) -> String {
+    let mut entry = format!("{package} {test}: {}\n", verdict.word());
+    for line in verdict.messages.iter().chain(&verdict.reports).chain(&verdict.driver) {
+        entry.push_str(&format!("  {line}\n"));
+    }
+    if verdict.failure.is_none() {
+        return entry;
+    }
+    entry.push_str(&format!("  ended with {}\n", ended.status));
+    let out: Vec<&str> = ended.stdout.lines().collect();
+    let err: Vec<&str> = ended.stderr.lines().collect();
+    let from_out = out.len().min((TAIL_LINES / 2).max(TAIL_LINES.saturating_sub(err.len())));
+    let from_err = err.len().min(TAIL_LINES - from_out);
+    for (stream, lines, kept) in
+        [("standard output", out, from_out), ("standard error", err, from_err)]
+    {
+        if lines.is_empty() {
+            entry.push_str(&format!("  {stream}: nothing\n"));
+            continue;
+        }
+        entry.push_str(&format!("  {stream}, its last {kept} of {} line(s):\n", lines.len()));
+        for line in &lines[lines.len() - kept..] {
+            entry.push_str(&format!("    {line}\n"));
+        }
+    }
+    entry
+}
+
+/// The whole of what the failed device test `test` wrote, for the run's log: its standard
+/// output, then its standard error, each in full under a heading of its own. The report keeps
+/// the [`entry`] alone, whose tail is cut at [`TAIL_LINES`].
+#[must_use]
+pub fn output(test: &str, ended: &Ended) -> String {
+    let mut output = String::new();
+    for (stream, text) in [("standard output", &ended.stdout), ("standard error", &ended.stderr)] {
+        if text.is_empty() {
+            output.push_str(&format!("gpu: {test}, its {stream}: nothing\n"));
+            continue;
+        }
+        output.push_str(&format!("gpu: {test}, its {stream} in full:\n{text}"));
+        if !text.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output
 }
 
 impl Verdict {
@@ -966,6 +1049,113 @@ mod tests {
         let ended = run_bounded(&mut command, Duration::from_secs(60)).expect("sh runs");
         assert_eq!((ended.succeeded, ended.killed_at), (true, None));
         assert_eq!(judge_ended("device::a_case", &ended, None, false).word(), "passed");
+    }
+
+    fn ended(status: &str, stdout: &str, stderr: &str) -> Ended {
+        Ended {
+            succeeded: status == "exit status: 0",
+            status: status.to_owned(),
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+            killed_at: None,
+        }
+    }
+
+    /// A process that died silently, as the nightly's heap canary did under lavapipe: its
+    /// entry says how it ended and what little it wrote, where the word alone said neither.
+    #[test]
+    fn a_failed_tests_entry_says_how_it_ended_and_what_it_wrote() {
+        let test = "device::a_canary";
+        let died =
+            ended("signal: 11 (SIGSEGV)", "\nrunning 1 test\ntest device::a_canary ... ", "");
+        let verdict = judge_ended(test, &died, Some(&["AN-ID"]), false);
+        assert_eq!(
+            entry("a-package", test, &verdict, &died),
+            "a-package device::a_canary: FAILED, the test failed\n  ended with signal: 11 \
+             (SIGSEGV)\n  standard output, its last 3 of 3 line(s):\n    \n    running 1 \
+             test\n    test device::a_canary ... \n  standard error: nothing\n"
+        );
+        // Where the system wrote a core, std's wording says so, and the entry keeps it.
+        let dumped = ended("signal: 11 (SIGSEGV) (core dumped)", "", "");
+        let verdict = judge_ended(test, &dumped, Some(&["AN-ID"]), false);
+        let dumped = entry("a-package", test, &verdict, &dumped);
+        assert!(dumped.contains("  ended with signal: 11 (SIGSEGV) (core dumped)\n"), "{dumped}");
+        // A passing test's entry is its word and messages alone.
+        let passed = ended("exit status: 0", &message("AN-ID"), "");
+        let verdict = judge_ended(test, &passed, Some(&["AN-ID"]), false);
+        assert_eq!(
+            entry("a-package", test, &verdict, &passed),
+            format!("a-package device::a_canary: passed\n  {}", message("AN-ID"))
+        );
+        // A message fails a case whose process succeeded: its entry has the tail too.
+        let sent = ended("exit status: 0", &format!("{CLEAN}{}", message("VUID-x")), "");
+        let verdict = judge_ended("conformance::a_case", &sent, None, false);
+        let sent = entry("a-package", "conformance::a_case", &verdict, &sent);
+        assert!(sent.contains("FAILED, 1 message(s)\n  message: Message {"), "{sent}");
+        assert!(sent.contains("ended with exit status: 0\n"), "{sent}");
+    }
+
+    /// The log has a failed test's whole output, past the entry's tail: each stream as it was
+    /// written, under its heading, a line it left open ended.
+    #[test]
+    fn a_failed_tests_whole_output_is_for_the_log() {
+        let lines: String = (1..=100).map(|at| format!("err {at}\n")).collect();
+        let died = ended("signal: 6 (SIGABRT)", "running 1 test\ntest device::a ... ", &lines);
+        assert_eq!(
+            output("device::a", &died),
+            format!(
+                "gpu: device::a, its standard output in full:\nrunning 1 test\ntest device::a \
+                 ... \ngpu: device::a, its standard error in full:\n{lines}"
+            )
+        );
+        let silent = ended("signal: 11 (SIGSEGV)", "", "");
+        assert_eq!(
+            output("device::a", &silent),
+            "gpu: device::a, its standard output: nothing\ngpu: device::a, its standard error: \
+             nothing\n"
+        );
+    }
+
+    /// The tail holds [`TAIL_LINES`] at most: each stream half, and what one leaves the other.
+    #[test]
+    fn a_failed_tests_tail_is_the_last_lines_of_each_stream() {
+        let numbered = |name: &str, count: usize| -> String {
+            (1..=count).map(|at| format!("{name} {at}\n")).collect()
+        };
+        let tail = |out: usize, err: usize| {
+            let failed = ended("exit status: 101", &numbered("out", out), &numbered("err", err));
+            let verdict = judge_ended("device::a_case", &failed, None, false);
+            entry("a-package", "device::a_case", &verdict, &failed)
+        };
+        let short_out = tail(2, 100);
+        assert!(short_out.contains("standard output, its last 2 of 2 line(s):\n    out 1\n"));
+        assert!(short_out.contains("standard error, its last 38 of 100 line(s):\n    err 63\n"));
+        assert!(short_out.ends_with("    err 100\n"), "{short_out}");
+        let both_long = tail(100, 100);
+        assert!(both_long.contains("its last 20 of 100 line(s):\n    out 81\n"), "{both_long}");
+        assert!(both_long.contains("its last 20 of 100 line(s):\n    err 81\n"), "{both_long}");
+        let short_err = tail(100, 3);
+        assert!(short_err.contains("its last 37 of 100 line(s):\n    out 64\n"), "{short_err}");
+        assert!(short_err.contains("its last 3 of 3 line(s):\n    err 1\n"), "{short_err}");
+        for entry in [short_out, both_long, short_err] {
+            assert_eq!(entry.lines().filter(|line| line.starts_with("    ")).count(), TAIL_LINES);
+        }
+    }
+
+    /// A real process a signal kills is worded so by its status, its two streams kept apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_a_signal_killed_is_recorded_with_its_signal() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo out; echo err >&2; kill -SEGV $$"]);
+        let died = run_bounded(&mut command, Duration::from_secs(60)).expect("sh runs");
+        assert!(!died.succeeded);
+        assert_eq!((died.stdout.as_str(), died.stderr.as_str()), ("out\n", "err\n"));
+        // ` (core dumped)` follows where the system writes a core.
+        assert!(died.status.starts_with("signal: 11 (SIGSEGV)"), "{}", died.status);
+        let verdict = judge_ended("device::a_case", &died, None, false);
+        let entry = entry("a-package", "device::a_case", &verdict, &died);
+        assert!(entry.contains(&format!("  ended with {}\n", died.status)), "{entry}");
     }
 
     #[test]

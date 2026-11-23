@@ -101,10 +101,19 @@ jobs:
           # frame's slices, the jobs forked on frame-critical workers, chaos and the bounded
           # rendezvous, on null under four seeds. Its other tests record through the same paths,
           # most of them in one job, and the whole crate under one seed took 14 minutes on a
-          # loaded M1; these took 9.
+          # loaded M1; these took 5 to 9 minutes at loads of 19 to 44.
           - name: render-graph, recording
             key: render-graph-recording
             args: '-p lactose-render-graph --test integration -- recording::'
+            miriflags: -Zmiri-many-seeds=0..4
+          # The platform crate's tests that open no window: the present thread's stop and drop
+          # under queuing threads, its lane's close before the hand-back and its wake under a
+          # call that parks, and the torn-size read, whose atomics Miri's weak-memory emulation
+          # checks. Its window tests are a binary of their
+          # own, which this does not select; each needs the process's main thread and a display.
+          - name: platform
+            key: platform
+            args: -p lactose-platform --lib --test integration
             miriflags: -Zmiri-many-seeds=0..4
     steps:
       - uses: actions/checkout@v4
@@ -125,7 +134,7 @@ jobs:
   # slot sequence lock (architecture section 5.3), each switched on by a Cargo feature of its
   # crate and never by a `--cfg` flag in the environment, which would replace the x86-64 pin.
   # Release, because the models' searches are long: every interleaving, or those loom reaches
-  # within a preemption bound where a model names one (ten of task's, and input-host's and
+  # within a preemption bound where a model names one (eleven of task's, and input-host's and
   # net-host's).
   loom:
     name: loom
