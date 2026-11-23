@@ -67,16 +67,17 @@ pub const JOIN_MARGIN: Duration = Duration::from_millis(2);
 /// a present ([`PresentReport::waiting`], [`Rendered::Drew::shed`]). A frame is shed
 /// where the count rose to this: the last report reads it or more, and the one before
 /// read less; the next `SHED_DEPTH` reports that carry a count are then passed over,
-/// after a shed and after a frame dropped for a call in flight, since they count that
-/// frame's gap. Three. `reviewer-gpu` measured the count on the M1, under MoltenVK and
-/// native Metal at 60 Hz with three images, in the review of D162's fourth draft: it
-/// reads one at the swapchain's floor, two in the floor's top band, about 9% of a sweep
-/// of the frames' phase against the refresh, and never none while the GPU keeps up; two
-/// with one image waiting behind another; and three where the present call waits for an
-/// image, in whichever of its driver calls that driver blocks. So three sheds what a
-/// drift owes and nothing at the floor, and its steady state is one image waiting.
-/// `frame-pace` reads each other device that reports display times; a follow-up commit
-/// changes this constant and nothing else (`README.md`, "Pacing", *The shedding rule*).
+/// after a shed and after any other frame that queued no present, one dropped for a call
+/// in flight or one that drew nothing, since they count that frame's gap. Three.
+/// `reviewer-gpu` measured the count on the M1, under MoltenVK and native Metal at 60 Hz
+/// with three images, in the review of D162's fourth draft: it reads one at the
+/// swapchain's floor, two in the floor's top band, about 9% of a sweep of the frames'
+/// phase against the refresh, and never none while the GPU keeps up; two with one image
+/// waiting behind another; and three where the present call waits for an image, in
+/// whichever of its driver calls that driver blocks. So three sheds what a drift owes and
+/// nothing at the floor, and its steady state is one image waiting. `frame-pace` reads
+/// each other device that reports display times; a follow-up commit changes this constant
+/// and nothing else (`README.md`, "Pacing", *The shedding rule*).
 pub const SHED_DEPTH: u32 = 3;
 
 /// One of the frame's offscreen targets, by its index below [`TARGETS`]. The render side
@@ -491,6 +492,13 @@ pub struct Shown {
     flight: Flight,
     policy: ErrorPolicy,
     stats: ShownStats,
+    /// Whether a frame was busy behind the render task in `flight`
+    /// ([`Rendered::Busy`], at step 2). Such a frame queued no present and could not
+    /// reach `Side`, which the task owns. Where the task is taken back,
+    /// `Side::pass_over` is set to [`SHED_DEPTH`] unless `Side::gap` is set, and this is
+    /// cleared: the task made its decision at its end, which had not come at the busy
+    /// frame's limit, so the report of a call it queued is the first passed over.
+    busy_gap: bool,
 }
 
 /// The render side between frames, or the frame in flight that owns it. A render task
@@ -528,24 +536,32 @@ struct Side {
     below: bool,
     /// Whether the report taken since the last decision rose to [`SHED_DEPTH`]: it read
     /// that or more, and the one before it read below. The next decision reads it and
-    /// clears it, so a rise sheds one frame. The report of a call that a frame was
-    /// dropped for never sets it (`dropped`), and nor does a report that is passed over.
+    /// clears it, so a rise sheds one frame; a frame that queues no present for another
+    /// reason clears it as well, being the frame left out. The report of a call whose
+    /// return was still to be taken when a frame queued no present never sets it (`gap`),
+    /// and nor does a report that is passed over.
     rose: bool,
-    /// How many of the reports after the last frame left out, shed or dropped, are still
-    /// to be passed over. It is set to [`SHED_DEPTH`] where a frame is shed, and, for a
-    /// frame dropped for a call in flight, where that call's return is taken, after its
-    /// report is read (`dropped`). It is counted down by each report taken that carries a
-    /// count, which then changes neither `below` nor `rose`. A frame left out presented
-    /// nothing, so the reports of the calls queued after it count one present fewer, and
+    /// How many of the reports after the last frame that queued no present are still to
+    /// be passed over: a frame shed, a frame dropped for a call in flight, or a frame
+    /// that drew nothing, having waited for a region or been busy, hidden or torn. It is
+    /// set to [`SHED_DEPTH`], and never added to: where a frame is shed; where a frame
+    /// queues none with no call's return still to be taken; where the return of a call
+    /// that was still out at such a frame is taken, after its report is read (`gap`); and
+    /// where a render task is taken back that a frame was busy behind
+    /// (`Shown::busy_gap`). It is counted down by each report taken that carries a count,
+    /// which then changes neither `below` nor `rose`. A frame that queued no present left
+    /// the reports of the calls queued after it one present fewer to count, and they
     /// would read as the count falling and then rising again. A report whose `waiting` is
     /// `None`, and a call that brought no report, leave it as it was.
     pass_over: u32,
-    /// Whether a frame was dropped for the call in flight: its submit was held for
-    /// that call on a shared queue, or it was not queued at its submit on a queue of
-    /// its own. The report of such a call was counted before the dropped frame's gap:
-    /// it never sets `rose`, and once the call's return is taken, whatever it brought,
-    /// `pass_over` is set to [`SHED_DEPTH`] and this is cleared.
-    dropped: bool,
+    /// Whether a frame queued no present while the return of the call in `call` was still
+    /// to be taken: a frame dropped for that call, its submit held for it on a shared
+    /// queue or not queued at its submit on a queue of its own; a frame busy behind it at
+    /// step 3; or a frame that waited for a region, was hidden or was torn while it was
+    /// out. The count of such a call was taken before the gap: its report never sets
+    /// `rose`, and once the call's return is taken, whatever it brought, `pass_over` is
+    /// set to [`SHED_DEPTH`] and this is cleared.
+    gap: bool,
     /// Whether a region is open, as the render side last said; `None` before the first
     /// frame and after a torn one, when the frame asks.
     region: Option<Region>,

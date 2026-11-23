@@ -1057,11 +1057,11 @@ theirs too. Each sentence is one a dependent crate may rely on.
   reports no display time. `Side` keeps three things of the reports: whether the last one
   read below `SHED_DEPTH`; whether the one taken since the last decision *rose* to it,
   reading `SHED_DEPTH` or more where the one before it read below; and how many of the
-  reports after the last frame left out, shed or dropped, are still to be passed over. At
-  the decision, a frame that would queue a call, with no earlier call in flight on a queue
-  of its own and not held on a shared one, queues none where the report rose. `SHED_DEPTH`
-  is three. The frame is submitted and dropped as a held frame is: the next frame draws
-  into the same target, `Rendered::Drew::shed` is `true`, `queued` is `false` and
+  reports after the last frame that queued no present are still to be passed over. At the
+  decision, a frame that would queue a call, with no earlier call in flight on a queue of
+  its own and not held on a shared one, queues none where the report rose. `SHED_DEPTH` is
+  three. The frame is submitted and dropped as a held frame is: the next frame draws into
+  the same target, `Rendered::Drew::shed` is `true`, `queued` is `false` and
   `ShownStats::shed` counts it. A report is read by the first decision after its call
   returned and by no other, so a rise sheds one frame. A shed frame queued no present, so
   the calls after it count one present fewer until its gap has left what they count: for
@@ -1072,16 +1072,39 @@ theirs too. Each sentence is one a dependent crate may rely on.
   its own shed. Where the level is above the depth the gap outlasts them, and the calls
   left read at the depth or above and change nothing. After them the rule reads as before:
   a count that stays at the depth sheds no more until one has read below it and a later
-  one has risen. A frame dropped for a call still in flight, held or not queued at its
-  submit, was the frame left out, and it leaves the same gap. That call's report sheds
-  nothing: its count was taken before the gap, so it is read as the report before the next
-  and never as a rise, and it is passed over only where an earlier pass-over is still
-  counting. Once that call's return is taken, whatever it brought, the pass-over is set as
-  a shed sets it: the next `SHED_DEPTH` reports that carry a count, which are those of the
-  calls queued after the dropped frame, are passed over. So one rule serves both gaps. A
-  report whose `waiting` is `None` changes nothing and is not among the reports passed
-  over, and a call that failed brings none; so where the swapchain reports no display time
-  no frame is shed, and the drop above is the whole rule.
+  one has risen. Every other frame that queues no present leaves the same gap, and one
+  rule serves them all: a frame dropped for a call still in flight, held or not queued at
+  its submit, and a frame that drew nothing, having waited for a region or been busy,
+  hidden or torn. The count does not depend on why a present is missing. What the rule
+  needs of each is which calls were queued before the gap. A call whose return is still to
+  be taken when a frame queues none is one: its count was taken before the gap. So that
+  call's report sheds nothing, being read as the report before the next and never as a
+  rise, and it is passed over only where an earlier pass-over is still counting. Once that
+  call's return is taken, whatever it brought, the pass-over is set as a shed sets it: the
+  next `SHED_DEPTH` reports that carry a count, which are those of the calls queued after
+  the gap, are passed over. Where no call's return is still to be taken, the pass-over is
+  set at that frame. So a dropped frame sets it at the return of the call it was dropped
+  for, and a frame busy at step 3 at the return of the call it waited behind. A frame that
+  waited for a region, a hidden frame and a torn one set it at once, or with a call still
+  out at that call's return, which the next decision takes on a queue of its own, and the
+  next hold or step 3's wait on a shared one. A frame busy at step 2 cannot reach `Side`,
+  which the render task in flight owns. That task reads the report it takes as any other,
+  and it makes its decision at its end, which had not come at the busy frame's limit, so a
+  call it queues is queued a frame late and after the gap. `Shown` keeps that such a frame
+  passed, and where the task is taken back the pass-over is set there, the report of the
+  call that task queued being the first passed over; unless that task's own frame queued
+  none behind a call still out, where the rule above has the gap already. A pass-over is
+  set and never added to, so a run of such frames, as a hidden window's, passes over the
+  `SHED_DEPTH` reports after its last. Where such frames keep coming within `SHED_DEPTH`
+  calls of one another, as where every other frame is busy behind a record longer than its
+  period, every report is passed over and the rule is off. Each of those frames left a
+  present out as a shed would have, so the rule owes nothing there; that is reasoning, and
+  no run's. And a rise is answered by the first frame after it that queues no present,
+  whatever the reason: a frame that drew nothing clears it as a shed does, so a rise that
+  step 3's wait took in a frame which then drew nothing sheds no later frame. A report
+  whose `waiting` is `None` changes nothing and is not among the reports passed over, and
+  a call that failed brings none; so where the swapchain reports no display time no frame
+  is shed, and the drop above is the whole rule.
 - So at most one present call is in flight and at most one is queued a frame (architecture
   section 3; D159), and the lane never grows. On either layout that is back-pressure and
   not pacing: a present call that outlasts a frame costs pictures. On a shared queue it
@@ -1389,29 +1412,41 @@ the row on the keeper's timed wait on Windows)
     resized at every frame may be that case under MoltenVK, by its source and not by a run
     ("What D162 asks of other crates", *A present the display never took*). A frame
     dropped for a call in flight leaves the same gap as a shed frame and sets the same
-    pass-over, once that call's report is in ("The targets and the present thread").
-    `reviewer-gpu` ran both at a depth of three in the review of D162's fifth draft: on
-    the M1, with each report counted two refreshes late so that the floor read three, the
-    ages staying real, and a shed or a drop forced every ten seconds for 40 s. The rise
-    alone fed on its own sheds, 480 of them, 12 a second, the counts around each reading
-    two, three, two, two, two, three. With the reports passed over it shed 5, at start-up
-    and the 4 forced, each followed by three counts of two, then three, and by no further
-    shed. A forced drop that set no pass-over was followed by one shed, three calls later,
-    and by nothing more; one that set it was followed by none, in a run that shed once, at
-    start-up, and held one frame of its own beside the 4 forced; and at the M1's own
-    level, where the count reads two, no shed followed a drop that set none. On that floor
-    at three a backlog that built after the first shed was not shed, the latch 38.7 to
-    64.9 ms old and 53.4 ms at the median, which is the cost stated above. So the passing
-    over is measured at a depth of two and of three, the three on a floor made by delaying
-    the reports, since MoltenVK did not honour a later `desiredPresentTime` to lengthen
-    the path itself. The probe's forced drop had no call in flight, so what it passed over
-    were the three reports after the drop. The frame passes over the same three by
-    starting after the report of the call the frame was dropped for, whose count was taken
-    before the gap; that order is reasoning from the count's definition, and `frame-impl`
-    holds it over scripted reports ("Proof for the shown frame"). A frame that drew
-    nothing, busy, waiting, hidden or torn, leaves a gap as well and sets no pass-over: on
-    a floor at the depth each can arm one shed as a drop did, which is reasoning too, no
-    run having made such frames there.
+    pass-over, once that call's report is in, and so does every other frame that queues no
+    present ("The targets and the present thread"). `reviewer-gpu` ran both at a depth of
+    three in the review of D162's fifth draft: on the M1, with each report counted two
+    refreshes late so that the floor read three, the ages staying real, and a shed or a
+    drop forced every ten seconds for 40 s. The rise alone fed on its own sheds, 480 of
+    them, 12 a second, the counts around each reading two, three, two, two, two, three.
+    With the reports passed over it shed 5, at start-up and the 4 forced, each followed by
+    three counts of two, then three, and by no further shed. A forced drop that set no
+    pass-over was followed by one shed, three calls later, and by nothing more; one that
+    set it was followed by none, in a run that shed once, at start-up, and held one frame
+    of its own beside the 4 forced; and at the M1's own level, where the count reads two,
+    no shed followed a drop that set none. On that floor at three a backlog that built
+    after the first shed was not shed, the latch 38.7 to 64.9 ms old and 53.4 ms at the
+    median, which is the cost stated above. So the passing over is measured at a depth of
+    two and of three, the three on a floor made by delaying the reports, since MoltenVK
+    did not honour a later `desiredPresentTime` to lengthen the path itself. The probe's
+    forced drops had no call in flight, so what it passed over were the three reports
+    after each drop. The frame passes over the same three by starting after the report of
+    the call the frame was dropped for, whose count was taken before the gap. One frame of
+    the run that set the pass-over was held for a call in flight, on a shared queue, and
+    went through that order at a level of four, above the depth, where the count shows no
+    gap: it shows that the order does no harm there, and not that it covers a gap.
+    `reviewer-gpu` replayed three orders over that run's counts by call, in the review of
+    the sixth draft, at its three drops at the depth. With no pass-over at a drop a shed
+    follows each, three calls later, which is what the run that set none measured; with
+    the pass-over set before the report of the call the frame was dropped for is read, the
+    same three sheds, that report being counted as the first passed over and the gap's
+    last report read as the count falling; and with it set after that report, none. No GPU
+    run has made the order on a queue of its own, and `frame-impl` holds it over scripted
+    reports ("Proof for the shown frame"). A frame that drew nothing leaves the same gap,
+    the count not depending on why a present is missing, and sets the same pass-over ("The
+    targets and the present thread", which gives the order for each). That is the replay's
+    reasoning: no run has made such frames on a floor at the depth, and for a frame busy
+    at step 2, whose gap lies before the call the late task queues, the order is reasoning
+    from the count's definition alone.
   - *What it gives.* A shed takes a refresh off the age of every picture after it. So the
     rule turns the latch's age at the display back where it passes three frame periods, 50
     ms at 60 Hz, whatever the swapchain's image count; how far that is above a device's
@@ -1512,19 +1547,21 @@ the row on the keeper's timed wait on Windows)
   start of the frame's job to `draw`'s return, the record's greatest width, which is the
   most frame-critical workers inside the frame's job at one moment, the job's own worker
   counted from the job's start to `draw`'s return and every other for as long as it is
-  inside a recorder or a closure the object forks, taken from the entry and the return of
-  each by the slot that ran it, the record's longest job, which is the longest of those
-  closures by the same stamps, the time `RenderSide::submit` took and, on a shared queue,
-  the hold, which is the time from `draw`'s return to `submit`'s entry. It records each
-  present call in three parts, taken by the binary's present side: its own waits (for its
-  last read, and the resize), the acquire, and the driver's submit and present, which is
-  the part under the queue's lock; and the `waiting` each call reported. And it records
-  the latch's age twice. The render side stamps each latch and `Finished::point` joins it
-  to its present. The first row is the age at the display: the swapchain's report gives
-  the time each present reached the display, by present id, and the present side keeps
-  each id beside its call ("What D162 asks of other crates"). Its source is
-  `VK_GOOGLE_display_timing`'s `actualPresentTime` on MoltenVK, `presentedTime` on Metal,
-  `VK_EXT_present_timing` where a device offers it, and `VK_KHR_present_id` with
+  inside a recorder, a closure the object forks or the writer's closure that
+  `lactose-presentation`'s `upload` calls from the jobs it forks in `present`
+  (`RemoteWriter::write`, which the binary stamps as it stamps a recorder), taken from the
+  entry and the return of each by the slot that ran it, the record's longest job, which is
+  the longest of those closures by the same stamps, the time `RenderSide::submit` took
+  and, on a shared queue, the hold, which is the time from `draw`'s return to `submit`'s
+  entry. It records each present call in three parts, taken by the binary's present side:
+  its own waits (for its last read, and the resize), the acquire, and the driver's submit
+  and present, which is the part under the queue's lock; and the `waiting` each call
+  reported. And it records the latch's age twice. The render side stamps each latch and
+  `Finished::point` joins it to its present. The first row is the age at the display: the
+  swapchain's report gives the time each present reached the display, by present id, and
+  the present side keeps each id beside its call ("What D162 asks of other crates"). Its
+  source is `VK_GOOGLE_display_timing`'s `actualPresentTime` on MoltenVK, `presentedTime`
+  on Metal, `VK_EXT_present_timing` where a device offers it, and `VK_KHR_present_id` with
   `VK_KHR_present_wait` only where the swapchain's README shows from a run that its
   completion follows the display ("What D162 asks of other crates"); a device with none of
   these reports no display time. An age at the display below half the floor run's median
@@ -1540,37 +1577,60 @@ the row on the keeper's timed wait on Windows)
   run, three such runs read 29.9, 21.4 and 22.3 ms, each within 0.3 ms, where floors swept
   at 60 Hz read 17.6 to 35.4 ms, 25.0 to 26.5 ms at the median and 34.2 to 34.9 ms at P99,
   and the floor run as it is specified here read 17.0 to 35.1 ms, 27.3 ms at the median
-  and 34.7 ms at P99. Both of its runs last a minute or more, so that the sweep covers the
-  phase several times and a drift between the frames and the display, where a display has
-  one, has time to show. The file reports the P50 and P99 of the lateness, of the record,
-  of the record's longest job, of the submit's time, of the hold, of each part of the
-  present call and of the latch's two ages; the greatest `waiting`, the share of the calls
-  that reported two or more, and the count of the ages dropped; the greatest width any
-  record reached, and how many records reached `Executor::frame_worker_count()`; the
-  counters of `Shown::stats`, `busy` and `shed` among them; and the frames that reported
-  `behind`, beside the device's `QueueLayout`, `Executor::frame_worker_count()` and
-  `Executor::run_job_width()`. It records what moves those figures as well: the load
-  averages before and after the run, the swapchain's image count, whether a validation
-  layer was on, and the display's state (its refresh rate, whether the window was
-  occluded, whether another client was drawing). Each row is run once on a quiet machine.
-  A device that reports display times is flagged where its greatest `waiting` stayed at
-  none or one through a run whose present calls blocked: the acquire, or the driver's
-  submit and present, took over a millisecond at the median. Its report may then not
-  follow the display, as `VK_KHR_present_wait`'s does not on MoltenVK. Which call blocks
-  is the driver's. MoltenVK 1.4.2's acquire never waits, 0.30 ms at most in
-  `reviewer-gpu`'s runs for D162's fifth draft: it takes the drawable inside
+  and 34.7 ms at P99. The display's rate is the display mode's exact figure, not one
+  rounded to whole hertz and not a swapchain's fallback, and the file records it and where
+  it came from, beside the refresh a swapchain reports where it reports one. MoltenVK
+  1.4.2 reports its refresh from the mode's rate and, where the mode gives zero, as a
+  built-in panel's does, from `NSScreen.maximumFramesPerSecond`, an integer and the
+  panel's greatest (`MVKSwapchain.mm`, as `reviewer-gpu` read it in the review of D162's
+  sixth draft). A rate taken a thousandth fast, as 59.94 Hz taken as 60 is, puts the floor
+  run's frames at exactly half the true rate, which is the one phase above; taken half as
+  far out, the sweep takes 33 s and a minute covers the phase under twice. So the file
+  records how many times the floor run swept: how often the latches' phase went round the
+  refresh fitted to the display times, a fit left free here, since times that follow the
+  frames show no sweep at all. A run that swept fewer than twice is no floor and is
+  recorded as that, with no reading made against it, and it is made again with its frames
+  set from the fitted refresh: a display whose rate was misreported then sweeps, and a
+  source that follows the frames still does not. Both of its runs last a minute or more,
+  so that the sweep covers the phase several times and a drift between the frames and the
+  display, where a display has one, has time to show. The file reports the P50 and P99 of
+  the lateness, of the record, of the record's longest job, of the submit's time, of the
+  hold, of each part of the present call, with its P90, and of the latch's two ages; the
+  greatest `waiting`, the share of the calls that reported two or more, and the count of
+  the ages dropped; the greatest width any record reached, and how many records reached
+  `Executor::frame_worker_count()`; the counters of `Shown::stats`, `busy` and `shed`
+  among them; and the frames that reported `behind`, beside the device's `QueueLayout`,
+  `Executor::frame_worker_count()` and `Executor::run_job_width()`. It records what moves
+  those figures as well: the load averages before and after the run, the swapchain's image
+  count, whether a validation layer was on, and the display's state (its refresh rate,
+  whether the window was occluded, whether another client was drawing). Each row is run
+  once on a quiet machine. A device that reports display times is flagged where its
+  greatest `waiting` stayed at none or one through a run whose present calls blocked: the
+  acquire, or the driver's submit and present, took over a millisecond at P90. The median
+  is read beside it and is not the key, since it misses a run whose queue filled late: in
+  one of `reviewer-gpu`'s for D162's fifth draft, 20 s under drift with no frame shed, the
+  present call read 0.29 ms at the median and 1.94 ms at P90, where behind a full queue it
+  read 3.2 ms or more at the median and with no image waiting 0.37 ms at P90 at most. Its
+  report may then not follow the display, as `VK_KHR_present_wait`'s does not on MoltenVK.
+  Which call blocks is the driver's. MoltenVK 1.4.2's acquire never waits, 0.30 ms at most
+  in `reviewer-gpu`'s runs for D162's fifth draft: it takes the drawable inside
   `vkQueueSubmit2`, at the first use of the image, where behind a full queue the submit
   took 3.1 ms at the median and 16.7 ms at most in one run, and the whole present call 9.6
-  ms at the median in another; a present call that waited for no image left the latch 0.12
-  to 0.22 ms old at its return. Other drivers wait in the acquire or in the present. A
-  saturated GPU holds the count down as well, so the flag is a question and no verdict.
-  The floor run answers it on a display of fixed rate: the file gives how far the reported
-  times lie from one phase of the refresh, the grid test of the ask ("What D162 asks of
-  other crates"), which read 0.07 ms at most on the M1. The lateness is read against
-  D144's 1 ms on Windows and D156's 50 µs on macOS. Those are criteria of a tick's start
-  with idle workers, so a figure over one in a shown run is a finding for the planner and
-  no failed criterion. Four readings are fixed, and everything else is recorded with no
-  threshold:
+  ms at the median in another; a present call that waited for no image left the latch 0.09
+  to 0.24 ms old at its return, by the median of each run. Other drivers wait in the
+  acquire or in the present. A saturated GPU holds the count down as well, so the flag is
+  a question and no verdict. The floor run answers it on a display of fixed rate: the file
+  gives how far the reported times lie from one phase of the refresh, the grid test of the
+  ask ("What D162 asks of other crates"), which read 0.07 ms at most on the M1, and beside
+  that bounded result the period a free fit lands on. Where the bounded test refuses a
+  source and the floor run did not sweep, the refusal says nothing of the source yet: the
+  frames may have sat at half the display's true rate, as on a display at 59.94 Hz taken
+  as 60, where the bounded test refuses a source that follows the display with one that
+  does not. The run made again from the fitted refresh says which. The lateness is read
+  against D144's 1 ms on Windows and D156's 50 µs on macOS. Those are criteria of a tick's
+  start with idle workers, so a figure over one in a shown run is a finding for the
+  planner and no failed criterion. Four readings are fixed, and everything else is
+  recorded with no threshold:
   - On every layout, the submit's P99 is read beside the P99 of the present call's third
     part. A submit that took as long as a present's driver call waited behind one on a
     worker. Where the roles share a queue the frame's order rules that out; where they do
@@ -1605,19 +1665,23 @@ the row on the keeper's timed wait on Windows)
     beside the record's greatest width and by what the frame before did. Busy frames
     beside a record whose P99 is under a period less the margin are not the record's: on a
     shared queue they are the hold's or step 3's, and on a queue of its own they point at
-    the wake. A lateness beside a greatest width equal to `Executor::frame_worker_count()`
-    says that no worker was left to wake the root while the record ran: the width was not
-    held, or the binary has one frame-critical worker. That is a finding for
-    `lactose-task` or for the binary's worker count, and `JOIN_MARGIN` does not mend it,
-    since a larger margin lowers it only by what it adds. The record's longest job does
-    not show it, and is a figure of the record's cost alone: a worker fires timers only
-    where it looks for work, and one that drains a range or runs its scope's children goes
-    from one closure to the next without looking, so that in `reviewer-concurrency`'s
-    range of 20 µs units the limit woke 8.5 ms late at P99 beside closures of 20 µs each.
-    With no such record, the lateness of a frame's first tick after a busy frame is the
-    keeper's wake less the margin, and after a frame that drew following a wait it is what
-    the passes ran past the margin. A figure above zero in either of those two is what
-    changes `JOIN_MARGIN`. None of the three is a failed criterion.
+    the wake. The greatest width covers the whole of the frame's job, `present` with
+    `draw`: the jobs `lactose-presentation`'s `upload` forks in `present` are stamped at
+    the writer's closure, so a width that was not held there shows as one not held in the
+    record does. A lateness beside a greatest width equal to
+    `Executor::frame_worker_count()` says that no worker was left to wake the root while
+    the record ran: the width was not held, or the binary has one frame-critical worker.
+    That is a finding for `lactose-task` or for the binary's worker count, and
+    `JOIN_MARGIN` does not mend it, since a larger margin lowers it only by what it adds.
+    The record's longest job does not show it, and is a figure of the record's cost alone:
+    a worker fires timers only where it looks for work, and one that drains a range or
+    runs its scope's children goes from one closure to the next without looking, so that
+    in `reviewer-concurrency`'s range of 20 µs units the limit woke 8.5 ms late at P99
+    beside closures of 20 µs each. With no such record, the lateness of a frame's first
+    tick after a busy frame is the keeper's wake less the margin, and after a frame that
+    drew following a wait it is what the passes ran past the margin. A figure above zero
+    in either of those two is what changes `JOIN_MARGIN`. None of the three is a failed
+    criterion.
 - The frame names no use that needs a tick or a frame to start within 35 µs of its deadline
   on macOS, which is what `docs/proposals/tick-start-macos-27.md` asks a milestone 2 design
   to say if it has one. A frame that starts late takes its fraction from `now`, so the
@@ -1969,28 +2033,29 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
     latch or waiting for the gate; and for as long as it runs a child of such a job that
     it took from elsewhere. A worker with a scope of such work open runs that scope's
     children itself, under the place it holds: while one of them is still to be started it
-    takes that one and does not park. A scope's children are therefore never left to the
-    other workers alone, and where the width is one they all run on the job's own worker.
-    So with two frame-critical workers or more, at every moment one of them is occupied by
-    no such job: it takes graph jobs and tasks as today, fires the due timers where it
-    looks for work, and is the keeper while it sleeps. A timed wake is then late by the
-    keeper's wake, or by what is left of a job or a poll that is no such job's. The width
-    parks nobody and spins nobody: a worker that may not take such work looks past it,
-    takes whatever else there is, and sleeps as any idle worker does. An entry queued
-    while fewer than the width are occupied is taken, and one queued while the width is
-    full is taken once a worker leaves it, with no wake-up lost in either case. Under
-    `block_in_place` the gate applies first, as now: a worker needs a run permit to take
-    anything. A worker the width counts may hold none, as when it is parked on its latch
-    or waits for the gate. It is scheduling and nothing else: an execution log records
-    what ran where, and a replay follows the log. How two such jobs in flight at once
-    share the width, side by side or one after the other, is the lane's, and the frame
-    does not rely on it, since it never has two: the job that asks `open` is awaited
-    before a render task is spawned, and a render task is taken back before the next
-    `open`. Their safety is not the lane's to choose: a worker inside one such job runs
-    the children of the scope it has open and nothing else of such work, never a child of
-    another scope and never another such job, which would nest a scope (architecture
-    section 5.1, "Fork-join inside a job only"). There is no knob. Every `run_job` job is
-    so counted, this crate being the one caller.
+    takes that one and does not park, the gate letting it run. One that parked and was
+    woken looks for its scope's children again before it parks again, whatever woke it. So
+    no child of its scope waits queued while its opener could start it, and where the
+    width is one they all run on the job's own worker. So with two frame-critical workers
+    or more, at every moment one of them is occupied by no such job: it takes graph jobs
+    and tasks as today, fires the due timers where it looks for work, and is the keeper
+    while it sleeps. A timed wake is then late by the keeper's wake, or by what is left of
+    a job or a poll that is no such job's. The width parks nobody and spins nobody: a
+    worker that may not take such work looks past it, takes whatever else there is, and
+    sleeps as any idle worker does. An entry queued while fewer than the width are
+    occupied is taken, and one queued while the width is full is taken once a worker
+    leaves it, with no wake-up lost in either case. Under `block_in_place` the gate
+    applies first, as now: a worker needs a run permit to take anything. A worker the
+    width counts may hold none, as when it is parked on its latch or waits for the gate.
+    It is scheduling and nothing else: an execution log records what ran where, and a
+    replay follows the log. How two such jobs in flight at once share the width, side by
+    side or one after the other, is the lane's, and the frame does not rely on it, since
+    it never has two: the job that asks `open` is awaited before a render task is spawned,
+    and a render task is taken back before the next `open`. Their safety is not the lane's
+    to choose: a worker inside one such job runs the children of the scope it has open and
+    nothing else of such work, never a child of another scope and never another such job,
+    which would nest a scope (architecture section 5.1, "Fork-join inside a job only").
+    There is no knob. Every `run_job` job is so counted, this crate being the one caller.
   - *Why a count beside the run permit, and one way to keep it.* The gate cannot be the
     width. It counts every kind of work: a worker without a run permit takes no job and
     polls no task. A gate closed at the width while the frame's job runs would leave the
@@ -2007,34 +2072,46 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
     scope's children from the queue under the place it holds, with no raise of the count,
     before it parks: never another scope's entry and never a job, and it parks on the
     latch only when none of its scope's children is queued. An entry of its scope that is
-    queued after it parked, the half of a range or what a worker put back, wakes it.
-    Without that an opener would look for its children on its own deque, as it does today,
-    find none and park: on two frame-critical workers, where its place is the whole width,
-    no worker could take them and the job would never return, and on four the fan-out
-    would have the two other places alone. The pool's look for visible work counts that
-    queue only while the count is below the width; and a worker that lowers the count with
-    the queue not empty wakes a sleeper, the one side's push before its read of the count
-    meeting the other's lowering before its read of the queue. That pair is a
-    store-buffering pattern: each side writes one word and then reads the other, so each
-    needs a `SeqCst` fence between its write and its read, or `SeqCst` operations on both
-    words, and release with acquire loses the wake-up. And a range needs a split rule of
-    its own: `drain_range` splits what is left of a range when its worker's own deque is
-    empty, which is always so once the halves go to a queue of the pool's. The lane holds
-    four things in loom models through the shipped functions, at a width of one and at a
-    width of two with two such jobs in flight: the count never exceeds the width; an entry
-    queued while the count is below the width is taken, and one queued while the count is
-    at the width is taken once it is lowered, with no wake-up lost in either; no child
-    stays queued while its opener is parked on the latch, the gate being open; and no
-    worker inside one such job runs another scope's entry or another such job. Under loom
-    0.7.2 a model whose reader is the main thread, its writer spawned, may explore one
-    execution, so a model counts only beside weakened variants of the shipped orderings
-    that fail it. Architecture section 5.1 gains the width with that lane's merge, as an
-    amendment of its own. It is owed in two places, whatever way the lane takes: the split
-    bullet of "Scheduling mechanics", for the width and for where the halves of such a
-    job's range go, and "Fork-join inside a job only", for how the opener of such a job
-    finds its children. The way sketched here departs from both, for such work alone: from
-    "the thief pushes one half to its own deque", and from an opener's deque that "holds
-    only its own children", which then holds none of them.
+    queued after it parked, the half of a range or what a worker put back, wakes it, and
+    it reads the queue for its scope's entries again after every wake, before it parks
+    again. The opener's loop as it is does not: once `wait_for_children` has found no
+    child of its own to run, it parks again at every wake without looking, which would
+    swallow that wake and leave the half queued beside a parked opener. No wake-up would
+    be lost by it, since the worker that lowers the count wakes a sleeper for the half,
+    but the fan-out would be back on the other places alone. Without the take an opener
+    would look for its children on its own deque, as it does today, find none and park: on
+    two frame-critical workers, where its place is the whole width, no worker could take
+    them and the job would never return, and on four the fan-out would have the two other
+    places alone. The pool's look for visible work counts that queue only while the count
+    is below the width; and a worker that lowers the count with the queue not empty wakes
+    a sleeper, the one side's push before its read of the count meeting the other's
+    lowering before its read of the queue. That pair is a store-buffering pattern: each
+    side writes one word and then reads the other, so each needs a `SeqCst` fence between
+    its write and its read, or `SeqCst` operations on both words, and release with acquire
+    loses the wake-up. And a range needs a split rule of its own: `drain_range` splits
+    what is left of a range when its worker's own deque is empty, which is always so once
+    the halves go to a queue of the pool's. The lane holds four things in loom models
+    through the shipped functions, in three configurations: a width of one; a width of two
+    with two such jobs in flight, on three workers, so that a worker which holds no place
+    tries to raise the count and the first of the four means something; and a width of two
+    with one such job on three workers, whose scope forks a range of two units or more.
+    The four: the count never exceeds the width; an entry queued while the count is below
+    the width is taken, and one queued while the count is at the width is taken once it is
+    lowered, with no wake-up lost in either; no child stays queued while its opener is
+    parked on the latch, the gate being open; and no worker inside one such job runs
+    another scope's entry or another such job. In the third configuration the worker that
+    takes the range and puts a half back is held until that half has run, so that a half
+    left queued beside a parked opener is a deadlock loom reports: left free, that worker
+    would take the half itself where it lowers the count, and the model would end clean.
+    Under loom 0.7.2 a model whose reader is the main thread, its writer spawned, may
+    explore one execution, so a model counts only beside weakened variants of the shipped
+    orderings that fail it. Architecture section 5.1 gains the width with that lane's
+    merge, as an amendment of its own. It is owed in two places, whatever way the lane
+    takes: the split bullet of "Scheduling mechanics", for the width and for where the
+    halves of such a job's range go, and "Fork-join inside a job only", for how the opener
+    of such a job finds its children. The way sketched here departs from both, for such
+    work alone: from "the thief pushes one half to its own deque", and from an opener's
+    deque that "holds only its own children", which then holds none of them.
   - *What was weighed for it, and what the lane shows.* Timers fired inside a long job: a
     root woken between a range's units would go onto the firing worker's own deque behind
     its share (`keep_woken_task`), and running it inline would nest a scope. A width the
@@ -2047,13 +2124,21 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
     that the plan cuts, and a recorder is one call of the binary's, so neither this crate
     nor `lactose-task` can bound one. What the lane shows, beside the loom models: by
     order and never by a time, each wait bounded by a thread of the test's own, that with
-    every worker the width allows held inside the children of a `run_job` job, a task's
-    `sleep_until` resolves and a graph run started meanwhile completes while they are
-    still held; the same on an executor of two frame-critical workers, where every child
-    of the job's scope runs on the job's own worker while the other fires the timer and
-    completes the graph run; the same with the opener parked on its latch, on three
-    frame-critical workers or more, every child of its scope having begun on another
-    worker before the scope's body returned, and held there; that on an executor of one
+    a `run_job` job whose scope forks `frame_worker_count()` children and one more, each
+    held where it begins, a task's `sleep_until` resolves and a graph run started
+    meanwhile completes while they are still held, which an executor that keeps no width
+    fails, every worker being held, where a job that forks only as many as the width
+    passes on any executor, as `reviewer-concurrency`'s cut records did on the executor as
+    it is; the same on an executor of two frame-critical workers, where every child of the
+    job's scope runs on the job's own worker while the other fires the timer and completes
+    the graph run; the same with the opener parked on its latch, on three frame-critical
+    workers or more, where the scope forks one child fewer than the width, each of them
+    has begun on another worker before the scope's body returns and is held there, and a
+    second `run_job` job started once the opener has parked does not begin before a child
+    is released, the timer resolving and the graph run completing meanwhile: the count is
+    full with the parked opener in it, whatever way the lane shares two jobs, and the test
+    sees the park by a count of parked openers kept under `cfg(test)`, as
+    `Pool::sleepers()` shows the idle protocol's; that on an executor of one
     frame-critical worker the width is one and a job's children run on its own worker;
     and, as figures with no threshold, the lateness of a timed wake set inside a fan-out
     that fills the width, for the three shapes `reviewer-concurrency` ran ("The shown
@@ -2192,19 +2277,34 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
     that follow the frames do not: `VK_KHR_present_wait`'s lay up to 8.3 ms either side in
     the same runs, the whole period. The review took its period from the display times,
     16.6668 ms in the floor run, which a device whose one source is the pair does not
-    have; so the period here is the reported refresh, and no run has made the test in that
-    form. Where the bounded fit finds no phase, as on a display whose rate varies or is
-    not the rate reported, the pair is no source. The extension promises no such thing
-    ("There is no requirement for any precise timing relationship between the presentation
-    of the image to the user and the update of the presentId value"). MoltenVK completes
-    the wait when the present's command buffer completes, 31.7 to 48.5 ms before the
-    display in `reviewer-gpu`'s run and 38.75 ms at the median: a count made from it read
-    none at all 1,800 calls where the count from display times read two at 1,751, so no
-    frame would be shed and `frame-pace`'s first row would leave out the swapchain's
-    queue. Where it is a source, "never waits" is a poll with a timeout of zero for each
-    outstanding id, on the thread that presents, and the time is the poll's: late by up to
-    the gap between polls, which is a frame period where it is polled only as a call
-    begins. A device with none of these answers `None`.
+    have; so the period here is the reported refresh. `reviewer-gpu` made the test in that
+    form in the review of the sixth draft, offline, over the times of three of those runs
+    and the reported 16.666666 ms: the display times passed, 99.9 to 100% of them within
+    the tenth, and the wait's completions were refused at 25.6 to 30.0%, where a fit left
+    free within three parts in a thousand passed the same completions at 99.9%, on the
+    frames' period or on half of it. Where the bounded fit finds no phase, as on a display
+    whose rate varies or is not the rate reported, the pair is no source. A display at
+    59.94 Hz reported as 60 is that case, emulated in the same review from the floor run's
+    times. The frames sit at exactly half the true rate and do not sweep; the times of
+    both sources lie on one phase of the true refresh, which the bound excludes; and the
+    bounded test refuses both, the display times at 24.4% and the completions at 25.6%,
+    where a free fit passes both. That is safe for the pair, which is refused, and wrong
+    for a source that does follow the display, which `frame-pace` meets in its own grid
+    reading: its count of the floor run's sweeps shows the run for what it was ("Pacing").
+    The extension promises no such thing ("There is no requirement for any precise timing
+    relationship between the presentation of the image to the user and the update of the
+    presentId value"). MoltenVK completes the wait when the present's command buffer
+    completes, 31.7 to 48.5 ms before the display in `reviewer-gpu`'s run and 38.75 ms at
+    the median: a count made from it read none at all 1,800 calls where the count from
+    display times read two at 1,751, so no frame would be shed and `frame-pace`'s first
+    row would leave out the swapchain's queue. Where it is a source, "never waits" is a
+    poll with a timeout of zero for each outstanding id, on the thread that presents, and
+    the time is the poll's: late by up to the gap between polls, which is a frame period
+    where it is polled only as a call begins. The grid run therefore polls at an interval
+    under its tolerance, 0.25 ms in a run of `reviewer-gpu`'s for the fourth draft: polled
+    only as each call begins, the poll's time is that call's start, which follows the
+    frames whatever the source does, and the test would refuse a source that follows the
+    display. A device with none of these answers `None`.
   - *What its README states.* Which instant the time is: the refresh at which the image is
     on the glass, as the first two sources give it, or which stage of the third, since
     what the count reads at a device's floor differs by a refresh between an early stage
@@ -2213,12 +2313,12 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
     MoltenVK and under two on Metal, as `reviewer-gpu` measured ("Pacing", *The shedding
     rule*). How a present the display never took is reported. How the time compares with
     an `Instant`, and within what error. Where the source is `VK_KHR_present_wait`, the
-    grid run that makes it one, with what it read against the tenth of a period, and that
-    its time is a poll's. A report costs the caller no wait and no lock held across a
-    driver call that blocks; the README states the bound within which the report's call
-    returns, and the lane holds it at every call of a run in which each present call waits
-    for an image, the report being called on the thread that presents, between its
-    presents.
+    grid run that makes it one, with what it read against the tenth of a period and the
+    interval it polled at, and that its time is a poll's. A report costs the caller no
+    wait and no lock held across a driver call that blocks; the README states the bound
+    within which the report's call returns, and the lane holds it at every call of a run
+    in which each present call waits for an image, the report being called on the thread
+    that presents, between its presents.
   - *What uses it.* The binary's present side alone, on the present thread: it counts
     `PresentReport::waiting` from the reports and its own timeline's value ("Pacing", *The
     shedding rule*), and gives `frame-pace` each present's display time beside the
@@ -2790,29 +2890,41 @@ call that a frame was dropped for, or on the first report after a call that fail
 `SHED_DEPTH` reports after a dropped frame passed over as after a shed, the report of the
 call it was dropped for not among them, where that report is taken after the drop on a
 queue of its own and by the hold on a shared one, so that counts that read below the depth
-for those reports and then at it shed nothing; a held frame that is not counted shed;
-every wait of these tests bounded, at ten seconds, with a message that names what never
-arrived, the bound kept by the driving thread's own clock or a thread of the test's and
-never by the executor's timers, since the failures the bounds are for leave no worker to
-fire one; in `lactose-app-client`, the present side's count over scripted display-time
-reports and timeline values, with no device: a present counted from when its `read` is
-reached until its id or a later one is reported, one that is never reported covered by a
-later id, and `None` where the swapchain reports none; the policy's two rows; `stop` with
-a frame and a call in flight, with none after a shutdown, and after a lost device; a paced
-frame driven through `Executor::block_on` and suspended in its wait while a clone of the
-executor is shut down, `Cancelled` with nothing kept, once with the render task suspended,
-which the join reports, and once with it inside a poll, which the `Sleep` reports; it is
-driven through `block_on` because a root task met in its wait is cancelled unpolled and
-resolves nothing, which the same test shows of a root whose future is dropped on the
-thread that shut the executor down; the fraction at a deadline, a period later and while
-paused, and unchanged by a wait in step 2; on `lactose-rhi-null`, that a run through each
-state is refused nothing on each queue layout, the extent going E1, E2, E1 with the frame
-at E2 dropped or torn among them, and held frames dropped among them on a shared queue;
-and section 6 against `Executor::run_job`, with the stand-in deleted, on an executor of
-two frame workers, where the width is one and the job's own worker runs every child it
-forks, and of three, where one other worker shares them. Once a Vulkan backend can run it,
-a run on one queue under the Khronos layer's synchronisation validation, with held frames
-in it ("Two rules of the layers below").
+for those reports and then at it shed nothing; the same after a frame that drew nothing,
+on each layout: a frame that waited for a region, a hidden frame and a torn one, each once
+with no call's return still to be taken, where the `SHED_DEPTH` reports passed over are
+the next ones, and once with a call still out, where they are the ones after that call's
+report, which sheds nothing whatever it reads; a frame busy at step 2, where they begin
+with the report of the call the late task queued, or follow the report of the call that
+task's own frame was dropped for; on a shared queue, a frame busy at step 3, where they
+follow the report of the call it waited behind; in each of these, and after a dropped
+frame, the report before the gap reading the depth, the `SHED_DEPTH` reports after it
+below the depth and the next at it, with no frame shed, which an order one report early or
+one late does not pass; a run of hidden frames passing over the `SHED_DEPTH` reports after
+its last and no more; a rise that step 3's wait took in a frame which then waited for a
+region, with no later frame shed for it; a held frame that is not counted shed; every wait
+of these tests bounded, at ten seconds, with a message that names what never arrived, the
+bound kept by the driving thread's own clock or a thread of the test's and never by the
+executor's timers, since the failures the bounds are for leave no worker to fire one; in
+`lactose-app-client`, the present side's count over scripted display-time reports and
+timeline values, with no device: a present counted from when its `read` is reached until
+its id or a later one is reported, one that is never reported covered by a later id, and
+`None` where the swapchain reports none; the policy's two rows; `stop` with a frame and a
+call in flight, with none after a shutdown, and after a lost device; a paced frame driven
+through `Executor::block_on` and suspended in its wait while a clone of the executor is
+shut down, `Cancelled` with nothing kept, once with the render task suspended, which the
+join reports, and once with it inside a poll, which the `Sleep` reports; it is driven
+through `block_on` because a root task met in its wait is cancelled unpolled and resolves
+nothing, which the same test shows of a root whose future is dropped on the thread that
+shut the executor down; the fraction at a deadline, a period later and while paused, and
+unchanged by a wait in step 2; on `lactose-rhi-null`, that a run through each state is
+refused nothing on each queue layout, the extent going E1, E2, E1 with the frame at E2
+dropped or torn among them, and held frames dropped among them on a shared queue; and
+section 6 against `Executor::run_job`, with the stand-in deleted, on an executor of two
+frame workers, where the width is one and the job's own worker runs every child it forks,
+and of three, where one other worker shares them. Once a Vulkan backend can run it, a run
+on one queue under the Khronos layer's synchronisation validation, with held frames in it
+("Two rules of the layers below").
 
 ## Proof for D142
 
