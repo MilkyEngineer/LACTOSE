@@ -19,7 +19,7 @@ use lactose_rhi_api::{
     Target, Viewport,
 };
 
-use crate::convert::{self, Change, Side, aspect, buffer_scope, image_scope};
+use crate::convert::{self, Barrier, Change, Side, aspect, buffer_scope, image_scope};
 use crate::device::{BufferObj, ComputeObj, GraphicsObj, ImageObj, Shared, range};
 use crate::heap::GRAPHICS_PUSH;
 use crate::lock;
@@ -774,6 +774,7 @@ impl Encoder for VulkanEncoder {
             return;
         }
         let mut barriers = Vec::with_capacity(transitions.len());
+        let mut hosts = Vec::new();
         for (at, transition) in transitions.iter().enumerate() {
             let Some(object) = self.buffer(transition.buffer) else { return };
             if transitions[..at].iter().any(|earlier| earlier.buffer == transition.buffer) {
@@ -789,22 +790,15 @@ impl Encoder for VulkanEncoder {
                 object.exclusive,
             );
             let Some(barrier) = convert::barrier(&change, self.side) else { continue };
-            let (src_family, dst_family) =
-                barrier.families.unwrap_or((vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED));
-            barriers.push(
-                vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(barrier.src_stages)
-                    .src_access_mask(barrier.src_access)
-                    .dst_stage_mask(barrier.dst_stages)
-                    .dst_access_mask(barrier.dst_access)
-                    .src_queue_family_index(src_family)
-                    .dst_queue_family_index(dst_family)
-                    .buffer(object.buffer)
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE),
-            );
+            barriers.push(buffer_barrier(&barrier, object.buffer));
+            if let Some(host) = convert::host_after(&change, self.side) {
+                hosts.push(buffer_barrier(&host, object.buffer));
+            }
         }
         self.barriers(&[], &barriers);
+        // A later call: the elements of one call are not ordered with one another, and the
+        // host's barrier must follow the acquire it makes visible.
+        self.barriers(&[], &hosts);
     }
 
     fn alias(&mut self, image: ImageHandle) {
@@ -1619,6 +1613,22 @@ fn flipped(viewport: Viewport) -> vk::Viewport {
         min_depth: viewport.near,
         max_depth: viewport.far,
     }
+}
+
+/// `barrier` as Vulkan's, over the whole of `buffer`.
+fn buffer_barrier(barrier: &Barrier, buffer: vk::Buffer) -> vk::BufferMemoryBarrier2<'static> {
+    let (src_family, dst_family) =
+        barrier.families.unwrap_or((vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED));
+    vk::BufferMemoryBarrier2::default()
+        .src_stage_mask(barrier.src_stages)
+        .src_access_mask(barrier.src_access)
+        .dst_stage_mask(barrier.dst_stages)
+        .dst_access_mask(barrier.dst_access)
+        .src_queue_family_index(src_family)
+        .dst_queue_family_index(dst_family)
+        .buffer(buffer)
+        .offset(0)
+        .size(vk::WHOLE_SIZE)
 }
 
 /// The usage an image needs for a transition to `state`: Vulkan's layout of each is valid

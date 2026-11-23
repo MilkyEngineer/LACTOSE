@@ -778,13 +778,27 @@ canaries the run hears first. A test passes only where neither the layer, the dr
 Metal speaks, and each test that makes the GPU lag checks that the lag held:
 - Frames on both queues read back what each pass wrote: words written on the compute
   queue, where it has one of its own, and read on the graphics queue in the next frame,
-  and a target filled and read. A build that drops the barrier on an attachment, or on a
-  buffer between two copies, fails it by the layer's message. The layer tracks no access
-  through a buffer's address, which is every shader's access to a buffer here, nor a
-  missing ownership transfer that a semaphore orders: a build that drops every transition
-  out of `ShaderWrite` passes on the M1, and null's state rule is what fails it.
-- The five chains of two transitions of "Transitions and store actions", each two calls,
-  are clean.
+  and a target filled in a colour of its frame's and read, its readback ending each frame
+  on the compute queue, which is not its last user's where compute has a queue of its own.
+  A build that drops the barrier on an attachment, or on a buffer between two copies, fails
+  it by the layer's message.
+- Under rhi-api the layer's synchronisation validation at 1.4.363 tracks no shader access
+  at all: none through a device address, which is every shader's access to a buffer here;
+  none through a descriptor array, since it skips every binding of more than one
+  descriptor; and none through any descriptor unless `syncval_shader_accesses_heuristic` is
+  set, which is off by default (`CollectDescriptorAccesses` in the layer's
+  `layers/sync/sync_command_buffer.cpp`, and the SDK's `VkLayer_khronos_validation.json`, at
+  `vulkan-sdk-1.4.363`). Nor does it report a missing ownership transfer that a semaphore
+  orders. A build that drops every transition out of `ShaderWrite` passes every device test
+  on the M1 with the words read back right, and fails 13 tests on null: null's state rule,
+  and a readback, are the proof for a buffer a shader uses.
+- The five chains of two transitions of "Transitions and store actions" are clean, and the
+  three image chains again toward the compute queue where it has a family of its own. A
+  chain is two transitions only where its hand-off's queue is not its last use's: under
+  MoltenVK on the M1, where present shares the graphics queue, the buffer chains and the
+  image chains toward the compute queue are two, and a build that puts a frame's-end chain
+  in one call is refused there (`state`); under KosmicKrisp and lavapipe, one queue, every
+  chain is one. The image chains toward a present family of their own are the desktop's.
 - A host write under a pending reader is what the reader reads, a wrong readback, and one
   after the frame's point is not; a host read or invalidate under a pending writer is
   refused (`pending`).
@@ -792,20 +806,39 @@ Metal speaks, and each test that makes the GPU lag checks that the lag held:
   (`VUID-vkResetCommandPool-commandPool-00040`, which `rhi-vulkan` refuses as `pending`).
 - Under several queues, a frame after one that ended on the compute queue waits for its
   point, and a torn frame is finished by the next: the frame timeline's values grow by one
-  a frame, the torn point is reached and its encoders are held until it.
+  a frame, the torn point is reached while the next frame lags, so by the submit made in
+  its place, and its encoders are held until it.
+- A buffer moved into `HostRead` or out of it between two families: `rhi-vulkan` recorded
+  the transfer into `HostRead` with the host's stage as its acquire's destination, and the
+  one out of it with the host's stage as its release's source, which Vulkan forbids
+  between two families (`VUID-VkBufferMemoryBarrier2-srcStageMask-03851`); null accepts
+  both. It is fixed in `rhi-vulkan` at `graph-impl`: neither half names the host; a release
+  out of `HostRead` takes no source stage, since the submit orders the host's earlier read;
+  an acquire into `HostRead` takes every command as its destination, and a barrier on its
+  own family after it takes every write to the host's read. rhi-api's conformance cases
+  `transfer_into_host_read_is_read_back` and `transfer_out_of_host_read_is_copied` show it
+  on every device with two families, and here a readback that ends on a queue other than
+  its last user's, and one left on its writer's queue and copied on the other queue the
+  next frame.
 - A depth transient of one pass orders two triangles as a CPU reference does, `Memoryless`
   where the device reports it and `Placed` where it places images.
-- Two figures, printed and asserted of nothing: what the waits across queues cost, against
-  the same work on two graphs, one for each queue, that make none; and whether two images
-  placed at one offset of one block share bytes.
+- Two figures, printed and asserted of nothing, each frame's lag checked: what the waits
+  across queues cost, against the same work on two graphs, one for each queue, that make
+  none; and whether two images placed at one offset of one block share bytes, which they
+  do, every byte, under MoltenVK and KosmicKrisp. The cost is unpriced on the M1: under
+  MoltenVK 1.4.2 the two queues' work ran one after the other even on the two graphs that
+  wait for nothing across queues, so the figure shows nothing and discharges nothing
+  (decision 5.17). Measured at review: one lagging dispatch on each queue, with no graph
+  and no waits, takes 256 ms alone and 511 ms for both under MoltenVK; native Metal
+  overlaps the two queues almost fully, about 260 ms wall for both, and not at all when
+  each encoder declares a shared buffer read-write. So the serialisation is MoltenVK's,
+  suspected to be its marking every buffer with a device address read-write in each
+  encoder (`encodeGPUAddressableBuffers`); the price is owed to a device that overlaps
+  queues, the desktop's, and to `rhi-metal`.
 
 Where the compute role shares the graphics queue, as on lavapipe in the `gpu (lavapipe)`
 job, the tests of the several-queue path say they are skipped and why, and the rest run
-with every pass on the graphics queue. A buffer imported to end in `HostRead` on a queue
-other than its last user's is moved by one transfer into `HostRead`, which `rhi-vulkan`
-records as one barrier with the host stage between two families, and the layer refuses it
-(`VUID-VkBufferMemoryBarrier2-srcStageMask-03851`): until that transfer is split, a
-readback ends on its last writer's queue. Every device run, the `gpu (lavapipe)` job's
+with every pass on the graphics queue. Every device run, the `gpu (lavapipe)` job's
 included, sets the Khronos layer's
 `VK_KHRONOS_VALIDATION_SYNCVAL_LOAD_OP_AFTER_STORE_OP_VALIDATION=true` beside
 `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`: without it the layer does not report a load

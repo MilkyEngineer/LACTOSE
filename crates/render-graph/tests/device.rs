@@ -1,9 +1,12 @@
 //! The graph on a Vulkan device, by class of hazard (decision 5.17 of the milestone 2 plan):
 //! the frames the null tests hold, run under the Khronos layer's core and synchronisation
 //! validation and, under MoltenVK, Metal's API and shader validation, which `cargo xtask gpu`
-//! sets and judges, each test in a process of its own. A dropped barrier is what the layer
-//! reports; the tests here are the clean frames it reports on, and the builds that drop one
-//! fail them by its message. A host access under pending work, a reset of a pending
+//! sets and judges, each test in a process of its own. A dropped barrier on an attachment or
+//! between copies is what the layer reports; the tests here are the clean frames it reports
+//! on, and the builds that drop one fail them by its message. Under rhi-api the layer's
+//! synchronisation validation tracks no shader access (the crate README, "Proof"), so a
+//! barrier of a shader's buffer is held by null's state rule and by a readback, not by the
+//! layer. A host access under pending work, a reset of a pending
 //! encoder's pool and a frame point's lost wait are held with the GPU made to lag, and each
 //! test that lags checks that the lag held: the point it lags is not reached when the test
 //! looks. Where the device has one queue, a test of the several-queue path says it is
@@ -229,15 +232,29 @@ fn float_bytes(values: &[f32]) -> Vec<u8> {
 
 const MAGENTA: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
 
+/// A fill for each frame of a test of four, so that a frame's lost copy of its target reads
+/// back the frame before's colour.
+const FILLS: [[f32; 4]; 4] =
+    [MAGENTA, [0.0, 1.0, 1.0, 1.0], [1.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]];
+
+/// `colour`'s pixel as `Rgba8Unorm` reads it back, one word.
+fn pixel(colour: [f32; 4]) -> u32 {
+    u32::from_le_bytes(colour.map(|channel| (channel * 255.0) as u8))
+}
+
 /// Frames on the several-queue path: a compute pass writes words into one of two buffers,
 /// which no graphics-role pass of its frame uses, so it is the compute role's where that
 /// has a queue of its own; a render pass fills a target; on the graphics queue, a copy
 /// stages the words the frame before wrote, which cross the queues at the frames' edges,
 /// and a copy reads back them and the target. Four frames, each from where the ones before
-/// left its imports, read back what each wrote. A build that drops the barrier between the
-/// two copies or on the target fails it by the layer's message; the M1's four families of
-/// one queue each give compute a family of its own (`rhi-vulkan`, "Queues"), and lavapipe's
-/// one queue runs the same frames with every pass on the graphics queue.
+/// left its imports, read back what each wrote, the target in a colour of its frame's. The
+/// target's readback ends each frame in `HostRead` on the compute role's queue, which its
+/// last user, the graphics copy, is not, and the next frame takes it back: a transfer into
+/// `HostRead` and one out of it, between two families where compute has one of its own. A
+/// build that drops the barrier between the two copies or on the target fails it by the
+/// layer's message; the M1's four families of one queue each give compute a family of its
+/// own (`rhi-vulkan`, "Queues"), and lavapipe's one queue runs the same frames with every
+/// pass on the graphics queue.
 #[test]
 #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
 fn frames_on_both_queues_read_back_what_each_pass_wrote() {
@@ -288,8 +305,12 @@ fn frames_on_both_queues_read_back_what_each_pass_wrote() {
             let pixels_out = decl.import_buffer(&moved(
                 "pixels back",
                 pixels_back,
-                back(BufferState::HostRead),
-                on(BufferState::HostRead, G),
+                if at == 0 {
+                    on(BufferState::Undefined, G)
+                } else {
+                    on(BufferState::HostRead, home)
+                },
+                on(BufferState::HostRead, home),
             ));
             let drawn = decl.import_image(&image_import(
                 "target",
@@ -298,16 +319,17 @@ fn frames_on_both_queues_read_back_what_each_pass_wrote() {
                 on(ImageState::CopySource, G),
             ));
             let write = store(&mut decl, "write", store_pipeline, written, (WORDS, 0, 100 * at));
+            let fill_colour = FILLS[at as usize];
             decl.render_pass(
                 &draws("fill", &[colour(drawn, Load::Clear([0.0; 4]))]),
                 move |pass| {
                     pass.bind_pipeline(fill);
-                    pass.push_bytes(0, &float_bytes(&MAGENTA));
+                    pass.push_bytes(0, &float_bytes(&fill_colour));
                     pass.draw(0..3, 0..1);
                 },
             );
             // The words go through `middle` by two copies, the barrier between which the
-            // layer sees: it tracks no access through a buffer's address, so not the store's.
+            // layer sees: it tracks no shader access, so not the store's.
             let all = BufferCopy { source_offset: 0, destination_offset: 0, size: WORD_BYTES };
             let staged = read.map(|read| {
                 let staged = decl.import_buffer(&moved(
@@ -356,8 +378,8 @@ fn frames_on_both_queues_read_back_what_each_pass_wrote() {
                 assert_eq!(read_words(device, words_back, WORDS), expected, "frame {at}");
             }
             let pixels = read_words(device, pixels_back, (PIXEL_BYTES / 4) as u32);
-            let magenta = u32::from_le_bytes([255, 0, 255, 255]);
-            assert!(pixels.iter().all(|&pixel| pixel == magenta), "frame {at}: the fill");
+            let want = pixel(FILLS[at as usize]);
+            assert!(pixels.iter().all(|&got| got == want), "frame {at}: the fill");
         }
     });
     passed(test, device, &sink);
@@ -365,10 +387,16 @@ fn frames_on_both_queues_read_back_what_each_pass_wrote() {
 
 /// The five chains of two transitions a frame can give one resource at its end (the null
 /// tests' `transitions::no_transition_call_names_a_resource_twice`), each a frame of its
-/// own, clean under the layer. Each chain is two transition calls in order; a build that
-/// puts both in one call is refused by every backend (`state`, rhi-api's "States"). A build
-/// that drops a chain's closing transition is not heard here, since nothing in the frame
-/// uses the resource after it: null's state rule fails that one.
+/// own, clean under the layer, and the three image chains again handed off toward the
+/// compute role where it has a queue of its own. A chain is two transitions only where its
+/// handoff's queue is not its last use's: on the M1 under MoltenVK the present role shares
+/// the graphics queue, so each image chain toward present is one transition there, and the
+/// image chains toward the compute queue, a family of its own, and the two buffer chains are
+/// two; under KosmicKrisp and lavapipe, one queue, every chain is one. Where a chain is two,
+/// a build that puts both in one call is refused by every backend (`state`, rhi-api's
+/// "States"); the image chains toward a present family of their own are the desktop's. A
+/// build that drops a chain's closing transition is not heard here, since nothing in the
+/// frame uses the resource after it: null's state rule fails that one.
 #[test]
 #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
 fn the_five_chains_of_two_transitions_are_clean() {
@@ -378,9 +406,13 @@ fn the_five_chains_of_two_transitions_are_clean() {
     let shared = Arc::clone(&device);
     in_job(move |ctx| {
         let device = &*shared;
-        let present = QueueRole::Present;
         let sampled = on(ImageState::SampledRead, G);
-        for chain in 0..5 {
+        let mut chains: Vec<(u32, QueueRole)> =
+            (0..5).map(|chain| (chain, QueueRole::Present)).collect();
+        if own_compute(device) {
+            chains.extend((0..3).map(|chain| (chain, C)));
+        }
+        for (chain, toward) in chains {
             let target = image(device, "target", Sharing::Exclusive);
             let data = written(device, "data");
             let out = written(device, "out");
@@ -390,13 +422,13 @@ fn the_five_chains_of_two_transitions_are_clean() {
             let mut graph = graph(&shared, 1);
             let mut decl = FrameDecl::new(1);
             let handed = |initial, last| ImageImport {
-                handoff: Some(on(ImageState::SampledRead, present)),
+                handoff: Some(on(ImageState::SampledRead, toward)),
                 ..image_import("target", target, initial, last)
             };
             let data_import =
                 moved("data", data, on(BufferState::Undefined, G), on(BufferState::ShaderRead, C));
             match chain {
-                // A target drawn, closed into `SampledRead`, then released toward present.
+                // A target drawn, closed into `SampledRead`, then released toward `toward`.
                 0 => {
                     let image = decl.import_image(&handed(on(ImageState::Undefined, G), sampled));
                     decl.render_pass(
@@ -536,7 +568,9 @@ fn a_host_write_under_a_pending_reader_is_read_and_one_after_the_frame_point_is_
 
 /// A host access under a pending writer is refused on every backend (`pending`): a frame
 /// writes a readback buffer with a lagging pass, and the host's read of it while the frame
-/// is pending is refused; after the frame's point it reads what the pass wrote.
+/// is pending is refused; after the frame's point it reads what the pass wrote. The buffer
+/// ends in `HostRead` on the graphics queue, so where the pass is the compute queue's the
+/// frame moves it into `HostRead` between two families.
 #[test]
 #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
 fn a_host_read_under_a_pending_writer_is_refused() {
@@ -551,14 +585,11 @@ fn a_host_read_under_a_pending_writer_is_refused() {
     in_job(move |ctx| {
         let mut graph = graph(&shared, 1);
         let mut decl = FrameDecl::new(1);
-        // Left in `HostRead` on the writer's queue: a transfer into `HostRead` across families
-        // is a barrier with the host stage between two families, which Vulkan forbids
-        // (`VUID-VkBufferMemoryBarrier2-srcStageMask-03851`).
         let id = decl.import_buffer(&moved(
             "out",
             out,
             on(BufferState::Undefined, home),
-            on(BufferState::HostRead, home),
+            on(BufferState::HostRead, G),
         ));
         store(&mut decl, "lag", store_pipeline, id, (1, LAG, 7));
         let point = frame(&mut graph, ctx, decl).expect("the frame");
@@ -571,6 +602,74 @@ fn a_host_read_under_a_pending_writer_is_refused() {
         assert!(pending(device, point), "the lag held: the refusals were under the writer");
         reached(device, point);
         assert_eq!(read_words(device, out, 1), [7], "the pass's write, after the point");
+    });
+    passed(test, device, &sink);
+}
+
+/// A readback a compute pass writes, left in `HostRead` on its writer's queue and read by the
+/// host, then imported the next frame from there and copied on the graphics queue: the
+/// first frame ends it on its last user's queue, and the second moves it out of `HostRead`,
+/// between two families where compute has one of its own.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn a_readback_left_on_its_writers_queue_is_copied_on_the_other_queue_the_next_frame() {
+    let test = "a_readback_left_on_its_writers_queue_is_copied_on_the_other_queue_the_next_frame";
+    let sink = Arc::new(Kept::default());
+    let device = vulkan(&sink);
+    if !own_compute(&*device) {
+        skipped(test, "compute shares the graphics queue");
+        return;
+    }
+    let store_pipeline = kernel(&*device, "store");
+    let usage = BufferUsage::DEVICE_ADDRESS.union(BufferUsage::COPY_SOURCE);
+    let out = buffer(&*device, "out", WORD_BYTES, usage, MemoryClass::Readback);
+    let back = readback(&*device, "back", WORD_BYTES);
+    let shared = Arc::clone(&device);
+    in_job(move |ctx| {
+        let mut graph = graph(&shared, 1);
+        let mut decl = FrameDecl::new(1);
+        let id = decl.import_buffer(&moved(
+            "out",
+            out,
+            on(BufferState::Undefined, C),
+            on(BufferState::HostRead, C),
+        ));
+        let write = store(&mut decl, "write", store_pipeline, id, (WORDS, 0, 500));
+        let compiled = graph.compile(decl).expect("the writing frame compiles");
+        let planned = compiled.plan().passes().iter().find(|planned| planned.pass == write);
+        assert_eq!(planned.expect("the write is kept").queue, C, "the write's queue");
+        let recorded = graph.record(compiled, ctx).expect("the writing frame records");
+        let point = graph.submit(recorded).expect("the writing frame submits");
+        reached(&**graph.device(), point);
+        let expected: Vec<u32> = (0..WORDS).map(|i| 500 + i).collect();
+        assert_eq!(read_words(&**graph.device(), out, WORDS), expected, "the host's read");
+        let mut decl = FrameDecl::new(1);
+        let id = decl.import_buffer(&moved(
+            "out",
+            out,
+            on(BufferState::HostRead, C),
+            on(BufferState::CopySource, G),
+        ));
+        let to = decl.import_buffer(&moved(
+            "back",
+            back,
+            on(BufferState::Undefined, G),
+            on(BufferState::HostRead, G),
+        ));
+        let all = BufferCopy { source_offset: 0, destination_offset: 0, size: WORD_BYTES };
+        decl.copy_pass(
+            &CopyPassDecl {
+                label: "copy",
+                image_sources: &[],
+                image_destinations: &[],
+                buffer_sources: &[id],
+                buffer_destinations: &[to],
+            },
+            move |pass| pass.copy_buffer(id, to, &[all]),
+        );
+        let point = frame(&mut graph, ctx, decl).expect("the copying frame");
+        reached(&**graph.device(), point);
+        assert_eq!(read_words(&**graph.device(), back, WORDS), expected, "the graphics copy");
     });
     passed(test, device, &sink);
 }
@@ -680,9 +779,10 @@ fn a_frame_after_one_that_ended_on_the_compute_queue_is_ordered_after_its_point(
 /// A torn frame on the several-queue path: a lagging compute frame, then a frame
 /// `[draw, compute, draw]` whose compute submit `rhi-vulkan` refuses for a slot its pass did
 /// not declare (`undeclared`), torn with its first graphics submit made while the first
-/// frame is pending. The next frame makes the torn frame's last submit in its place: the
-/// frame timeline's values grow by one a frame, the torn frame's point is reached, and the
-/// torn frame's encoders are held until it, as the layer and `rhi-vulkan`'s refusal of a
+/// frame is pending. The next frame, which lags, makes the torn frame's last submit in its
+/// place: the frame timeline's values grow by one a frame, the torn frame's point is reached
+/// while the next frame is pending, so by that submit and not by the next frame's own, and
+/// the torn frame's encoders are held until it, as the layer and `rhi-vulkan`'s refusal of a
 /// pending reset check.
 #[test]
 #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
@@ -706,7 +806,7 @@ fn a_torn_frame_is_finished_by_the_next_and_its_point_is_reached() {
         let id = decl.import_buffer(&fresh_buffer("lagged", lagged, C, BufferState::ShaderWrite));
         store(&mut decl, "lag", store_pipeline, id, (1, LAG, 7));
         let first = frame(&mut graph, ctx, decl).expect("the lagging frame");
-        let declare = |breach: bool| {
+        let declare = |breach: bool, lag: u32| {
             let mut decl = FrameDecl::new(1);
             let draw = |decl: &mut FrameDecl<'_>, label: &'static str, at: usize| {
                 let target = decl.import_image(&image_import(
@@ -725,7 +825,7 @@ fn a_torn_frame_is_finished_by_the_next_and_its_point_is_reached() {
                     pass.bind_pipeline(store_pipeline);
                     pass.push_address(0, id, 0);
                     pass.push_bytes(8, &1u32.to_le_bytes());
-                    pass.push_bytes(12, &0u32.to_le_bytes());
+                    pass.push_bytes(12, &lag.to_le_bytes());
                     pass.push_bytes(16, &7u32.to_le_bytes());
                     if breach {
                         pass.push_slot(20, HeapSlot(7));
@@ -736,7 +836,7 @@ fn a_torn_frame_is_finished_by_the_next_and_its_point_is_reached() {
             draw(&mut decl, "b", 1);
             decl
         };
-        let refused = frame(&mut graph, ctx, declare(true)).expect_err("the slot is refused");
+        let refused = frame(&mut graph, ctx, declare(true, 0)).expect_err("the slot is refused");
         assert_eq!(Rule::of(&refused), Some(Rule::Undeclared), "{refused}");
         let device = &**graph.device();
         assert!(pending(device, first), "the lag held: the frame tore under the first");
@@ -744,14 +844,16 @@ fn a_torn_frame_is_finished_by_the_next_and_its_point_is_reached() {
         // The lagging frame's encoder and the torn frame's made one, pending, and the two of
         // its submits never made, free.
         let held = graph.stats().encoders;
-        let third = frame(&mut graph, ctx, declare(false)).expect("the frame after");
+        let third = frame(&mut graph, ctx, declare(false, LAG)).expect("the frame after");
         assert!(pending(&**graph.device(), first), "the lag held: no encoder was reclaimed");
         assert_eq!(graph.stats().encoders, held + 1, "the two free ones taken, one more made");
         assert_eq!(third.timeline, first.timeline, "one frame timeline");
         assert_eq!(third.value, first.value + 2, "the torn frame's point, then the next's");
         reached(&**graph.device(), torn);
+        let lagging = pending(&**graph.device(), third);
+        assert!(lagging, "the lag held: the torn point is its replacement's, not the next frame's");
         reached(&**graph.device(), third);
-        let fourth = frame(&mut graph, ctx, declare(false)).expect("a frame after the torn one");
+        let fourth = frame(&mut graph, ctx, declare(false, 0)).expect("a frame after the torn one");
         assert_eq!(graph.stats().encoders, held + 1, "reused once the torn point is reached");
         reached(&**graph.device(), fourth);
     });
@@ -764,9 +866,11 @@ fn a_torn_frame_is_finished_by_the_next_and_its_point_is_reached() {
 /// the frame before). The figures are wall time on the host from the first submit to the
 /// last point reached, with each queue's work a lagging pass and two frames in flight, set
 /// against the same work on two graphs, one for each queue, which wait for nothing across
-/// queues; the test prints them, as `measured:` lines, and asserts nothing of them. rhi-api
-/// has no timestamp query, so they are not GPU timestamps, and on the M1 they are
-/// MoltenVK's figures, not native Metal's.
+/// queues; the test prints them, as `measured:` lines, and asserts nothing of them, and
+/// checks at every frame that its lag held: each frame's point is pending at its submit, and
+/// the frame before still runs then. rhi-api has no timestamp query, so they are not GPU
+/// timestamps. Under MoltenVK 1.4.2 the two queues' work runs one after the other on two
+/// graphs too, so on the M1 the figures price nothing (the crate README, "Proof").
 #[test]
 #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
 fn the_waits_across_the_queues_are_measured() {
@@ -843,13 +947,17 @@ fn the_waits_across_the_queues_are_measured() {
                 let mut points = Vec::new();
                 for (graph, compute, graphics) in graphs.iter_mut() {
                     let point = frame(graph, ctx, declare(*compute, *graphics)).expect("a frame");
-                    if at == 0 {
-                        assert!(pending(&**graph.device(), point), "the lag held at the first");
-                    }
+                    assert!(pending(&**graph.device(), point), "the lag held: frame {at}");
                     points.push(point);
                 }
                 steps.push(points);
+                // The frame before is still running once this one is recorded and submitted:
+                // a frame just submitted is pending by submission's latency alone. Of two
+                // graphs, a device that overlaps queues and lags one less than the other may
+                // have finished the lesser's frame by then; the greater's is still pending.
                 if at >= 1 {
+                    let held = steps[at - 1].iter().any(|&point| pending(&*shared, point));
+                    assert!(held, "the lag held: frame {} at frame {at}'s submit", at - 1);
                     for &point in &steps[at - 1] {
                         reached(&*shared, point);
                     }
@@ -1054,9 +1162,10 @@ fn a_depth_transient_of_one_pass_orders_two_triangles() {
 /// Whether two images placed at one offset of one memory block share bytes on this device:
 /// one is cleared and copied out, the other then begins by the alias call and is copied out
 /// before any write. The second copy reads the first image's clear only where the two
-/// share memory. Under MoltenVK's defaults a placed image may be given memory of its own,
-/// which makes no aliasing result on the M1 evidence of aliasing; the test prints which
-/// holds, as a `measured:` line, and asserts nothing of it.
+/// share memory. Under MoltenVK 1.4.2 and KosmicKrisp the bytes are shared (D160's addendum
+/// at `graph-impl`); on another device a result of no sharing is not evidence of no
+/// aliasing, since the second image begins undefined. The test prints which holds, as a
+/// `measured:` line, and asserts nothing of it.
 #[test]
 #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
 fn whether_placed_images_share_bytes_is_measured() {

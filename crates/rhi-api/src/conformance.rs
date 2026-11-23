@@ -271,6 +271,8 @@ pub const CASES: &[Case] = cases! {
     contract "cross_queue_use_without_a_transfer_is_refused" => Queue;
     contract "acquire_without_a_release_is_refused" => Queue;
     contract "release_and_acquire_cross_a_resource";
+    contract "transfer_into_host_read_is_read_back";
+    contract "transfer_out_of_host_read_is_copied";
     contract "shared_and_discarded_resources_cross_without_a_transfer";
     contract "roles_on_one_queue_need_no_transfer";
     contract "image_taken_while_another_queue_reads_it_is_refused" => Queue;
