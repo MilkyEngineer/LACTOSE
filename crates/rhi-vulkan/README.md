@@ -175,8 +175,9 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   Metal's shader validation under MoltenVK, the same read past a buffer, whose report on
   standard error `cargo xtask gpu` must hear. In `src/canary.rs`, a unit test since its
   misuse is a driver call no safe call makes: thread safety, the graphics queue waited idle
-  with no lock on one thread under a lagging dispatch while another submits to it, with a
-  watchdog that fails the process after 30 seconds should the driver hang.
+  with no lock on one thread under a lagging dispatch while another submits to it, made only
+  while the dispatch is pending (its lag doubled up to four times where it ended first), with
+  a watchdog that aborts the process after 30 seconds should the driver hang.
 - Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, no size,
   two sizes or the built-in state no workgroup, an entry declared by its name and its stage's
   execution model, a `Bool` widened to four bytes and `Int64Atomics` refused unless enabled.
@@ -194,8 +195,8 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   wait that reaches two submits of one queue), and host signals racing on threads over one
   timeline, which stays behind the driver. In `src/table.rs`: a replaced or removed value
   dropped after its entry's lock, and a handle resolving to its own value or none across
-  threads. In `src/holders.rs`: the last holder sees every other holder's writes to plain
-  memory. Nightly runs these under Miri ("What Miri covers" in `SAFETY.md`).
+  threads. In `src/holders.rs`: the last holder sees every other holder's `Relaxed` stores,
+  ordered by the count alone. Nightly runs these under Miri ("What Miri covers" in `SAFETY.md`).
 
 ## Records
 

@@ -8,9 +8,11 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -684,6 +686,85 @@ pub fn judge(
     Verdict { said, messages, driver, reports, failure }
 }
 
+/// How long one device test's process may run before the run kills it and records it
+/// failed. The longest device test on the M1 takes under three seconds under either
+/// driver, so this is a margin of forty times, for a loaded machine and for a CPU driver
+/// such as lavapipe, which runs the suite's dispatches several times slower; and the
+/// thread-safety canary's watchdog aborts at 30 seconds, inside it, so that a hang there
+/// records the watchdog's own line.
+pub const DEADLINE: Duration = Duration::from_secs(120);
+
+/// How one device test's process ended, and what it wrote.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Ended {
+    /// Whether it exited with success.
+    pub succeeded: bool,
+    /// Its standard output, then its standard error.
+    pub text: String,
+    /// The deadline it ran past, and was killed at, if it did.
+    pub killed_at: Option<Duration>,
+}
+
+/// Runs `command` with its standard output and error captured, and kills it where it runs
+/// past `deadline`.
+///
+/// # Errors
+///
+/// The process cannot be started, waited on or killed.
+pub fn run_bounded(command: &mut Command, deadline: Duration) -> io::Result<Ended> {
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    // Both streams are drained while it runs, so that a full pipe never stalls it.
+    let drain = |stream: Option<Box<dyn Read + Send>>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|s| Box::new(s) as _));
+    let stderr = drain(child.stderr.take().map(|s| Box::new(s) as _));
+    let started = Instant::now();
+    let (status, killed_at) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, None);
+        }
+        if started.elapsed() >= deadline {
+            child.kill()?;
+            break (child.wait()?, Some(deadline));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let text = |bytes: thread::JoinHandle<Vec<u8>>| {
+        String::from_utf8_lossy(&bytes.join().unwrap_or_default()).into_owned()
+    };
+    let text = format!("{}{}", text(stdout), text(stderr));
+    Ok(Ended { succeeded: status.success() && killed_at.is_none(), text, killed_at })
+}
+
+/// [`judge`] of an ended test: one killed at its deadline fails for that, whatever it wrote.
+#[must_use]
+pub fn judge_ended(test: &str, ended: &Ended, expected: Option<&[&str]>, metal: bool) -> Verdict {
+    let mut verdict = judge(test, ended.succeeded, &ended.text, expected, metal);
+    if let Some(deadline) = ended.killed_at {
+        verdict.failure = Some(format!("past its deadline of {} s", deadline.as_secs_f64()));
+    }
+    verdict
+}
+
+impl Verdict {
+    /// The run file's word for the test: `FAILED, <why>`, the suite's own word, or `passed`.
+    #[must_use]
+    pub fn word(&self) -> String {
+        match (&self.failure, &self.said) {
+            (Some(why), _) => format!("FAILED, {why}"),
+            (None, Some(said)) => said.clone(),
+            (None, None) => "passed".to_owned(),
+        }
+    }
+}
+
 /// The SHA-256 of a file's bytes, in lowercase hexadecimal.
 fn digest_of(file: &Path) -> io::Result<String> {
     let bytes = fs::read(file)?;
@@ -863,6 +944,28 @@ mod tests {
         assert!(judge("conformance::b", true, &skipped_warned, None, true).failure.is_some());
         // Without Metal's validation neither is looked for.
         assert_eq!(judge("conformance::a_case", true, &warned, None, false).failure, None);
+    }
+
+    /// A stand-in for a hung test, `sleep`, is killed at its deadline and recorded failed for
+    /// it; one that ends inside its deadline is judged as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_test_past_its_deadline_is_killed_and_recorded_failed() {
+        let started = Instant::now();
+        let ended = run_bounded(Command::new("sleep").arg("600"), Duration::from_millis(200))
+            .expect("sleep runs");
+        assert!(started.elapsed() < Duration::from_secs(60), "not killed at its deadline");
+        assert_eq!(ended.killed_at, Some(Duration::from_millis(200)));
+        assert!(!ended.succeeded);
+        let verdict = judge_ended("device::a_case", &ended, None, false);
+        assert_eq!(verdict.word(), "FAILED, past its deadline of 0.2 s");
+        let canary = judge_ended("device::a_canary", &ended, Some(&["AN-ID"]), false);
+        assert_eq!(canary.word(), "FAILED, past its deadline of 0.2 s");
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo 'test device::a_case ... a_case: passed'"]);
+        let ended = run_bounded(&mut command, Duration::from_secs(60)).expect("sh runs");
+        assert_eq!((ended.succeeded, ended.killed_at), (true, None));
+        assert_eq!(judge_ended("device::a_case", &ended, None, false).word(), "passed");
     }
 
     #[test]

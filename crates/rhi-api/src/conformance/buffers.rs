@@ -648,8 +648,13 @@ fn submit_racing_a_host_access_refuses_one(ctx: &Ctx<'_>) -> Applies {
             (write(), submit)
         } else {
             std::thread::scope(|scope| {
-                let write = scope.spawn(write);
-                let submit = scope.spawn(submit);
+                let (write, submit) = if matches!(lead, Lead::Free { second_first: true }) {
+                    let submit = scope.spawn(submit);
+                    (scope.spawn(write), submit)
+                } else {
+                    let write = scope.spawn(write);
+                    (write, scope.spawn(submit))
+                };
                 (
                     write.join().unwrap_or_else(|_| ctx.fail("the writer panicked")),
                     submit.join().unwrap_or_else(|_| ctx.fail("the submitter panicked")),

@@ -1083,7 +1083,7 @@ honours by a call the Metal spike made. The Vulkan column is the RHI spike's.
 | The constructor against the two sets; `capabilities`, `info` | The set it is created with | Argument buffers tier 2, Metal 3, an Apple family, or `Unsupported`; reports no multi-draw and no indirect count | The features of the required table, or `Unsupported` | RHI item 1, point 1; Metal "The device", point 1 |
 | Roles and `QueueLayout` | The layout of its set, one queue or several | A command queue for each role; no families, no ownership | Compute on a family that computes and does not draw where there is one, else on another family that computes (MoltenVK's four all draw), else on a second queue of the graphics family, else on the graphics queue (lavapipe, KosmicKrisp); present on the graphics queue | RHI item 1, point 2; Metal item 11, point 2 |
 | `create_buffer`, `destroy_buffer`, `buffer_address` | A table by handle; addresses it invents, distinct | `makeBuffer`, `gpuAddress` | A buffer with `SHADER_DEVICE_ADDRESS` | RHI item 2, point 3; Metal item 2, point 3 |
-| `write_buffer`, `read_buffer`, `flush_buffer`, `invalidate_buffer` | A byte store for each buffer, lent for the call with the device's records unlocked; the range recorded as in progress; written and flushed ranges under a set that is not coherent | `contents()` of shared memory; flush and invalidate do nothing | Persistently mapped memory; `vkFlushMappedMemoryRanges`, `vkInvalidateMappedMemoryRanges` | RHI point 3, question 8; Metal point 3 |
+| `write_buffer`, `read_buffer`, `flush_buffer`, `invalidate_buffer` | A byte store for each buffer, lent for the call with the device's records unlocked; a write's or a read's range recorded as in progress, which a flush and an invalidate are checked against; written and flushed ranges under a set that is not coherent | `contents()` of shared memory; flush and invalidate do nothing | Persistently mapped memory; `vkFlushMappedMemoryRanges`, `vkInvalidateMappedMemoryRanges` | RHI point 3, question 8; Metal point 3 |
 | `create_image`, `destroy_image`, `image_memoryless` | Usage, state for each subresource, the request and whether its set honours it | `makeTexture`; `.memoryless` storage for colour and depth | An image; lazily allocated memory where offered | RHI item 7, point 4; Metal item 3, point 4 |
 | `create_memory_block`, `image_placement`, `ImageMemory::Placed`, `Encoder::alias` | Byte ranges for each block; which image last used each; refuses `no-fence` | An untracked placement heap; `heapTextureSizeAndAlign`; the block's fence waited on before, and updated after, every encoder that uses a placed image, at the alias call and at every other use | Bound memory at an offset; a barrier from undefined | Metal item 4, point 16 |
 | `write_heap_slot`, `clear_heap_slot` | The image for each slot; the declarations of pending submits; refuses `uuwp-used` | Under the heap's lock, the slot marked, a write of the texture's resource id into the argument buffer, the placeholder's on a clear, and the mark cleared | Under the heap's lock, the slot marked, an update-after-bind descriptor write, and the mark cleared | RHI item 3, point 5; Metal item 1, point 5 |
@@ -1197,10 +1197,11 @@ column, one or more for each of its clauses, 64 in all: `unreported_capability_i
   returned (or, for the host write, once its `fill` has begun), and fails where a led round
   ends in another order; its free rounds then race, the second call's thread spawned first
   in every other one, and it prints how many reached each order, as a device's free rounds
-  can meet one order in nearly every round. A device
-  backend's records are a type of its own that makes no driver call, and its tests run the
-  same interleavings under Miri with many seeds and under stress, with fixed interleavings
-  among them: a host signal made in full between
+  can meet one order in nearly every round: the host write's may stay with the write first on
+  KosmicKrisp for a whole run, whichever thread starts first, while its led rounds check
+  both outcomes on every run. A device backend's records are a type of its own that makes
+  no driver call, and its tests run the same interleavings under Miri with many seeds and
+  under stress, with fixed interleavings among them: a host signal made in full between
   another host signal's driver read and its hold, and between a submit's read and its hold;
   a promise reached, and dropped by a third call's check, in the same two windows; a pass
   that begins between a heap write's first hold and its descriptor write, with its submit's

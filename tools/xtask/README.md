@@ -764,17 +764,21 @@ writes its report.
    passes, its sinks printed no message and the driver wrote no line of its errors or
    warnings: MoltenVK's `[mvk-error]` and `[mvk-warn]`, Mesa's `MESA: error`, `MESA:
    warning` and any `WARNING: ` line. Under Metal's validation Metal must also write no
-   report of shader validation's (`Invalid Metal usage`) but the Metal canary's, no assertion of API validation's
-   (`failed assertion`) and no other line of the system log, which is where API validation's
-   warnings go; and every test, canaries included, must print both validators' banners to
-   the system log (`Metal API Validation Enabled`, `Metal GPU Validation Enabled`), which
+   report of shader validation's (`Invalid Metal usage`) but the Metal canary's, no
+   assertion of API validation's (`failed assertion`) and no other line of the system log,
+   which is where API validation's warnings go; and every test, canaries included, must
+   print both validators' banners to the system log (`Metal API Validation Enabled`, `Metal GPU Validation Enabled`), which
    shows them loaded in its process, unless it says it skipped: a case of the null backend's
    alone skips before it makes a device, so Metal never loads, and a case may skip after
-   making one (14 of MoltenVK's 44 skips do). The Metal step's canaries
-   show what the two report, and the Vulkan step's Metal canary that a report reaches the
-   judge from a test's process. The thread-safety canary's race may hang a driver: its
-   watchdog ends its process with a failure after 30 seconds, which the file records as
-   the canary failed (`the test failed`).
+   making one (14 of MoltenVK's 44 skips do). The Metal step's canaries show what the two
+   report, and the Vulkan step's Metal canary that a report reaches the judge from a test's
+   process. Each test's process has a deadline (`DEADLINE`, 120 seconds): one still running
+   then is killed and recorded failed, `past its deadline of 120 s`, so that a hung driver
+   ends the test and not the run. The thread-safety canary's race may hang a driver: its
+   watchdog aborts its process after 30 seconds, inside the deadline, which the file
+   records as the canary failed (`the test failed`); an abort, since an exit runs the
+   layer's teardown of the live device, which hangs where a stuck thread holds the layer's
+   lock.
 6. It writes `target/gpu/<driver>-vulkan.txt`, or `<driver>-vulkan-gpu-assisted.txt`: the
    driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
    cleared:`, or `none`), every variable it set, the canaries heard or skipped, the

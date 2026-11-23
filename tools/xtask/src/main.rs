@@ -528,18 +528,14 @@ fn run_vulkan(
             .chain(tests.iter().map(String::as_str).filter(|test| !vulkan::is_canary(test)));
         for test in order {
             let expected = canaries.iter().find(|(name, _)| *name == test).map(|(_, ids)| *ids);
-            let output = run
-                .apply(&mut Command::new(&binary))
+            let mut command = Command::new(&binary);
+            run.apply(&mut command)
                 .args(["--exact", test, "--ignored", "--nocapture", "--test-threads", "1"])
-                .stdin(Stdio::null())
-                .output()
+                .stdin(Stdio::null());
+            let ended = vulkan::run_bounded(&mut command, vulkan::DEADLINE)
                 .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let verdict = vulkan::judge(test, output.status.success(), &text, expected, run.metal);
+            let text = &ended.text;
+            let verdict = vulkan::judge_ended(test, &ended, expected, run.metal);
             if test.ends_with("device_reports_its_driver_and_sends_nothing_when_clean") {
                 lines.extend(
                     text.lines()
@@ -549,11 +545,7 @@ fn run_vulkan(
                         .map(|line| format!("{line}\n")),
                 );
             }
-            let word = match (&verdict.failure, &verdict.said) {
-                (Some(why), _) => format!("FAILED, {why}"),
-                (None, Some(said)) => said.clone(),
-                (None, None) => "passed".to_owned(),
-            };
+            let word = verdict.word();
             if expected.is_some() && verdict.failure.is_none() {
                 answered.push(test.to_owned());
                 heard.push(match &verdict.said {

@@ -18,7 +18,11 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
    an attachment not marked) reaches the driver unchecked. It breaks a valid-usage rule whose
    effect the specification leaves undefined; what both spikes saw of it is a wrong image.
    rhi-null refuses each in every consumer's tests. On a GPU (`cargo xtask gpu`) core
-   validation reports an image in another layout, and synchronisation validation a hazard
+   validation reports an image in another layout at a copy, a clear, an attachment or a
+   transition, but not an image a shader samples through the heap: no layer reports a
+   slot's image sampled in another layout (reviewer-gpu's probe, under MoltenVK and
+   KosmicKrisp, core and GPU-assisted validation, and Metal's), and rhi-null's
+   `heap-layout` rule is the check there. Synchronisation validation reports a hazard
    of a copy, a clear, an attachment or a layout transition within a submit and across
    submits and queues: the device learns that a submit has completed only through a wait
    that succeeds (`Shared::reached`), as the layer (1.4.363) takes any read of a timeline's
@@ -150,18 +154,19 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   the device down as any last holder does.
 - The holders' count (`Holders`, `holders.rs`) is decremented with `Release` and the last
   holder takes an `Acquire` fence, as `Arc`'s drop does, so every queue call another holder
-  made happens before the last holder's wait for idle. Its unit test has each holder write
-  plain memory that the last reads, so Miri reports a data race where the ordering is
-  weakened: each holder's cell is an `UnsafeCell` shared through a test-only
-  `unsafe impl Sync`, written by its holder and read only by the last, after `let_go`.
+  made happens before the last holder's wait for idle. Its unit test, which has no
+  `unsafe`, has each holder store to a cell of its own, `Relaxed`, and the last load the
+  other's, `Relaxed`, so only the count orders the two: with the decrement weakened to
+  `Relaxed`, or the fence removed, Miri's weak memory gives the load the value before the
+  store and the test fails, on 16 seeds of 16 each (seeds 0 to 15, four rounds a seed).
 
 ## What Miri covers
 
 Nightly runs the crate's unit tests under Miri with four seeds: the records' fixed
 interleavings, a race of host signals and reads on threads over them, the handle table's
 drops outside its entry lock and a race of its generations on threads, the holders' count
-on threads, and the conversions and module reads. Those are this crate's state that has no
-driver in it. Miri cannot load a driver, so nothing that reaches `ash` runs under it: `Raw`,
+on threads, through its weak memory, and the conversions and module reads. Those are this
+crate's state that has no driver in it. Miri cannot load a driver, so nothing that reaches `ash` runs under it: `Raw`,
 `Mapping`, `on_message`, `leaking` and `lost`, and the encoders. Those run on devices in `cargo xtask
 gpu`, the unwinding drops included, where a data race between two of this crate's threads is
 seen only if a validator or a test's assertion meets it.
@@ -176,6 +181,12 @@ another 300 ms later. The wait lasts until the dispatch ends, so both calls are 
 layer at once, and the layer reports `UNASSIGNED-Threading-MultipleThreads-Write` at the
 submit, under MoltenVK and KosmicKrisp. It is compiled into the unit tests alone, and ignored
 there: only `cargo xtask gpu` runs it, in a process of its own. The race is undefined
-behaviour for the driver, which may deadlock instead: a watchdog thread ends the process
-with a failure after 30 seconds, which the run records as the canary failed (`the test
-failed`), with the watchdog's line on its standard error.
+behaviour for the driver, which may deadlock instead: a watchdog thread aborts the process
+after 30 seconds, which the run records as the canary failed (`the test failed`), with the
+watchdog's line on its standard error. It aborts, not exits: an exit runs the layer's
+teardown of the live device, which takes the layer's locks, and hangs where a stuck thread
+holds one (reviewer-concurrency's probe, a thread parked in the layer's callback). The
+runner's deadline of each test bounds the canary as well. The racing submit is made only
+while the lagging dispatch is pending, checked by a wait of no time on the point it
+signals; where the dispatch ended before the pause, the lag is doubled and the race tried
+again, four times at most, and then the canary fails as `the lag ended before the pause`.
