@@ -816,10 +816,13 @@ Metal speaks, and each test that makes the GPU lag checks that the lag held:
   out of `HostRead` takes no source stage, since the submit orders the host's earlier read;
   an acquire into `HostRead` takes every command as its destination, and a barrier on its
   own family after it takes every write to the host's read. rhi-api's conformance cases
-  `transfer_into_host_read_is_read_back` and `transfer_out_of_host_read_is_copied` show it
-  on every device with two families, and here a readback that ends on a queue other than
-  its last user's, and one left on its writer's queue and copied on the other queue the
-  next frame.
+  `transfer_into_host_read_is_read_back` and `transfer_out_of_host_read_is_copied` show, on
+  every device with two families, that neither half is refused and that the bytes are read
+  back, and so here do a readback that ends on a queue other than its last user's and one
+  left on its writer's queue and copied on the other queue the next frame. The host's
+  barrier after the acquire is held by reading and by `rhi-vulkan`'s unit test
+  `the_hosts_barrier_follows_an_acquire_into_host_read_in_a_call_of_its_own`: a build that
+  drops it, or records it in the acquire's call, passes on the M1's coherent memory.
 - A depth transient of one pass orders two triangles as a CPU reference does, `Memoryless`
   where the device reports it and `Placed` where it places images.
 - Two figures, printed and asserted of nothing, each frame's lag checked: what the waits

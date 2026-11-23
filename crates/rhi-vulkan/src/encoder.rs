@@ -773,8 +773,7 @@ impl Encoder for VulkanEncoder {
         if !self.recording() || !self.outside("a transition") {
             return;
         }
-        let mut barriers = Vec::with_capacity(transitions.len());
-        let mut hosts = Vec::new();
+        let mut changes = Vec::with_capacity(transitions.len());
         for (at, transition) in transitions.iter().enumerate() {
             let Some(object) = self.buffer(transition.buffer) else { return };
             if transitions[..at].iter().any(|earlier| earlier.buffer == transition.buffer) {
@@ -789,15 +788,10 @@ impl Encoder for VulkanEncoder {
                 transition.from.state == BufferState::Undefined,
                 object.exclusive,
             );
-            let Some(barrier) = convert::barrier(&change, self.side) else { continue };
-            barriers.push(buffer_barrier(&barrier, object.buffer));
-            if let Some(host) = convert::host_after(&change, self.side) {
-                hosts.push(buffer_barrier(&host, object.buffer));
-            }
+            changes.push((change, object.buffer));
         }
+        let (barriers, hosts) = buffer_calls(&changes, self.side);
         self.barriers(&[], &barriers);
-        // A later call: the elements of one call are not ordered with one another, and the
-        // host's barrier must follow the acquire it makes visible.
         self.barriers(&[], &hosts);
     }
 
@@ -1615,6 +1609,27 @@ fn flipped(viewport: Viewport) -> vk::Viewport {
     }
 }
 
+/// One call's buffer barriers.
+type BufferBarriers = Vec<vk::BufferMemoryBarrier2<'static>>;
+
+/// The buffer barriers a transition call records on `side`, as two calls in this order: each
+/// change's barrier, then the host's barrier after each acquire into a scope of the host's
+/// between two families ([`convert::host_after`]). The second is a call of its own because
+/// the elements of one call are not ordered with one another, and the host's barrier must
+/// follow the acquire it makes visible.
+fn buffer_calls(changes: &[(Change, vk::Buffer)], side: Side) -> (BufferBarriers, BufferBarriers) {
+    let mut barriers = Vec::with_capacity(changes.len());
+    let mut hosts = Vec::new();
+    for (change, buffer) in changes {
+        let Some(barrier) = convert::barrier(change, side) else { continue };
+        barriers.push(buffer_barrier(&barrier, *buffer));
+        if let Some(host) = convert::host_after(change, side) {
+            hosts.push(buffer_barrier(&host, *buffer));
+        }
+    }
+    (barriers, hosts)
+}
+
 /// `barrier` as Vulkan's, over the whole of `buffer`.
 fn buffer_barrier(barrier: &Barrier, buffer: vk::Buffer) -> vk::BufferMemoryBarrier2<'static> {
     let (src_family, dst_family) =
@@ -1699,4 +1714,94 @@ fn draw_checks(pass: &RenderScope, indexed: bool) -> core::result::Result<(), Br
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ash::vk::{self, Handle};
+    use lactose_rhi_api::BufferState;
+
+    use super::buffer_calls;
+    use crate::convert::{Change, Side, buffer_scope};
+
+    const GRAPHICS: Side = Side { queue: 0, family: 0, graphics: true };
+    /// A second queue of the graphics queue's family.
+    const SIBLING: Side = Side { queue: 1, family: 0, graphics: true };
+    /// A queue of a family that computes and does not draw.
+    const COMPUTE: Side = Side { queue: 2, family: 2, graphics: false };
+
+    fn change(from: BufferState, to: BufferState, from_queue: Side, to_queue: Side) -> Change {
+        Change {
+            from: buffer_scope(from),
+            to: buffer_scope(to),
+            from_undefined: false,
+            from_queue,
+            to_queue,
+            exclusive: true,
+        }
+    }
+
+    fn names_the_host(barrier: &vk::BufferMemoryBarrier2<'_>) -> bool {
+        let host = vk::PipelineStageFlags2::HOST;
+        let access = vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE;
+        barrier.src_stage_mask.intersects(host)
+            || barrier.dst_stage_mask.intersects(host)
+            || barrier.src_access_mask.intersects(access)
+            || barrier.dst_access_mask.intersects(access)
+    }
+
+    #[test]
+    fn the_hosts_barrier_follows_an_acquire_into_host_read_in_a_call_of_its_own() {
+        let (into, out) = (vk::Buffer::from_raw(1), vk::Buffer::from_raw(2));
+        let changes = [
+            (change(BufferState::ShaderWrite, BufferState::HostRead, COMPUTE, GRAPHICS), into),
+            (change(BufferState::HostRead, BufferState::CopySource, COMPUTE, GRAPHICS), out),
+        ];
+        let (acquires, hosts) = buffer_calls(&changes, GRAPHICS);
+        assert_eq!(acquires.len(), 2, "the acquires alone in the first call");
+        assert!(acquires.iter().all(|acquire| !names_the_host(acquire)));
+        assert!(acquires.iter().all(|acquire| acquire.src_queue_family_index == 2));
+        assert_eq!(hosts.len(), 1, "one host barrier, the acquire into `HostRead`'s");
+        let host = hosts[0];
+        assert_eq!(host.buffer, into);
+        assert_eq!(
+            (host.src_queue_family_index, host.dst_queue_family_index),
+            (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+        );
+        assert_eq!(
+            (host.src_stage_mask, host.src_access_mask, host.dst_stage_mask, host.dst_access_mask),
+            (
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_WRITE,
+                vk::PipelineStageFlags2::HOST,
+                vk::AccessFlags2::HOST_READ
+            )
+        );
+        assert_eq!((host.offset, host.size), (0, vk::WHOLE_SIZE));
+        // The releasing side records the releases alone, none naming the host.
+        let (releases, hosts) = buffer_calls(&changes, COMPUTE);
+        assert_eq!(releases.len(), 2);
+        assert!(releases.iter().all(|release| !names_the_host(release)));
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn no_hosts_barrier_follows_a_change_within_one_family() {
+        let buffer = vk::Buffer::from_raw(3);
+        let into = BufferState::CopyDestination;
+        for (from_queue, to_queue) in [(GRAPHICS, GRAPHICS), (GRAPHICS, SIBLING)] {
+            let changes = [(change(into, BufferState::HostRead, from_queue, to_queue), buffer)];
+            for side in [from_queue, to_queue] {
+                let (barriers, hosts) = buffer_calls(&changes, side);
+                assert!(hosts.is_empty());
+                // The one barrier, on the releasing queue, takes the host itself.
+                if side == from_queue {
+                    assert_eq!(barriers.len(), 1);
+                    assert!(barriers[0].dst_stage_mask.contains(vk::PipelineStageFlags2::HOST));
+                } else {
+                    assert!(barriers.is_empty());
+                }
+            }
+        }
+    }
 }
