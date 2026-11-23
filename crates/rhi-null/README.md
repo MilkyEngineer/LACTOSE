@@ -113,7 +113,9 @@ walk refuse it `destroyed`, with nothing submitted.
   and keep the device alive through its twin; the present's walk
   against queues held from running; the drops that wait, of the swapchain with a present
   pending and of the device's last handle; a drop that is not the last, which returns at
-  once; and the drops made while a thread unwinds, none of which waits.
+  once; and the drops made while a thread unwinds, none of which waits. Beside them, the
+  shapes null accepts where a device refuses ("Queues by role" in `lactose-rhi-api`'s
+  README): a signal 2^31 above a value null has run and the caller has not seen.
 
 ## Proof
 

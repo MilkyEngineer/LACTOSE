@@ -196,21 +196,32 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   landing after the earlier command buffers of its queue complete, which Apple does not
   document; verification re-checks it. A point the caller has seen through `wait_timeline`
   or `timeline_value` is known before that call returns. A failed submit's promises stay
-  pending, and nothing orders them: every signal of their timelines, from a submit or from
-  the host, is refused until the device knows the failed submit's stamp reached, which the
-  batch with no work brings after the queue's earlier submits, and each of its waits
-  reached. Its waits order nothing once it has failed. Then its promises leave, never
-  reached, and the caller may signal those points from the host or retry them. A submit
-  ordered through the failed one before it failed keeps that order: what it waits for can
-  be signalled only after. No device test can make a driver's submit fail; the records tests
+  pending, and nothing orders them: every signal of their timelines from a submit is
+  refused, and every host signal of them not below a promise, or below one but meeting none
+  of the failed submit's waits, until the device knows the failed submit's stamp reached,
+  which the batch with no work brings after the queue's earlier submits, and each of its
+  waits reached. A host signal below the promise that meets one of its waits is accepted,
+  as for a live promise: a failed submit that waits for its own timeline is released by
+  nothing else, and would be kept for good. Its waits order nothing once it has failed.
+  Then its promises leave, never reached, and the caller may signal those points from the
+  host or retry them. The caller makes the device know it by seeing each of the failed
+  submit's waits and a point of a later submit to its queue, through `wait_timeline` or
+  `timeline_value`; `signal_timeline` reads only the timeline it signals, so a host signal
+  alone never learns them. A call that reads every queue's value (on Vulkan, `submit`,
+  `heap_write`, `host_access`, `create_sampler` and each destroy) learns the stamp too,
+  once the batch with no work has run, which the caller cannot see. A submit ordered
+  through the failed one before it failed keeps that order: what it waits for can be
+  signalled only after. No device test can make a driver's submit fail; the records tests
   of a device backend hold the order. No backend refuses a call as a pending submit once
   the caller has seen a point the submit signals. A device's refusal of a call made before
   then depends on timing; the call is wrong either way. Null is more lenient than a device
-  in one place: once the caller has seen one point of a submit, null counts the submit's
-  other promises reached, since they land together there, and accepts a signal of their
-  timelines from another queue with no wait; a device refuses it until it knows that
-  promise reached. Refusing it on null would need the value the caller has seen of each
-  timeline.
+  in two places, both since it keeps no value the caller has seen of a timeline. Once the
+  caller has seen one point of a submit, null counts the submit's other promises reached,
+  since they land together there, and accepts a signal of their timelines from another
+  queue with no wait; a device refuses it until it knows that promise reached. And null
+  takes the 2^31 limit of a signal or a wait from the value it has run a timeline to, not
+  from one the caller has seen: a submit 2^31 above a point null has run but the caller has
+  not seen is accepted, where a device with that point in flight refuses it.
 
 **The present thread** (decision 5.6, D153; Metal item 11)
 
@@ -893,7 +904,9 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   pending wait or promise on the timeline. A failed submit stays in it, its promises
   pending and ordered by nothing ("Queues by role"), until its stamp and its waits are known
   reached; then it leaves, and its promises, which never reached the driver, are not folded
-  in, so a retry of the same point is accepted. In every check the timeline's value is the
+  in, so a retry of the same point is accepted. While it is kept, `destroy_timeline` refuses
+  (`pending`) a timeline it signals, and one it waits for until its stamp is known reached,
+  as for any submit. In every check the timeline's value is the
   known value after the check's own read is folded in. Every value the timeline is ever
   signalled to is known, a promise in the list or the value of a host signal in progress, so
   the driver's value is at least the known value and at most the greatest of the three: a
@@ -1260,8 +1273,9 @@ column, one or more for each of its clauses, 69 in all: `unreported_capability_i
   failed submit's point signalled from the host after another queue's submit was ordered
   through its promise, or through its wait, between the failed submit's two holds, which is
   refused until its stamp and its waits are known reached, a destroy of what an earlier
-  submit of its queue uses refused meanwhile; and a submit that only waits, made between a
-  host signal's two holds, 2^31 below its value, which is refused.
+  submit of its queue uses refused meanwhile, the reads that make them known standing for a
+  call that reads every queue and a `timeline_value` of the wait; and a submit that only
+  waits, made between a host signal's two holds, 2^31 below its value, which is refused.
   Each asserts after every hold that the value known of each caller's timeline is at most
   the driver's; a queue's own value may be known ahead of its semaphore, from a caller's
   point its submit signals.

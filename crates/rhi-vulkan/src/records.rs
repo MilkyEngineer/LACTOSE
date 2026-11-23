@@ -207,7 +207,8 @@ pub(crate) struct SubmitRec {
     pub(crate) waits: Vec<TimelinePoint>,
     pub(crate) signals: Vec<TimelinePoint>,
     /// Its driver call failed: its signals stay promises that nothing orders, refusing
-    /// every signal of their timelines, and its waits order nothing, until its stamp and
+    /// every submit's signal of their timelines and every host signal of them but one below
+    /// them that meets one of its waits, and its waits order nothing, until its stamp and
     /// its waits are known reached. A submit already credited through either keeps the
     /// order it was credited with: what it waits for can be signalled only after.
     pub(crate) failed: bool,
@@ -314,7 +315,11 @@ impl Records {
             let done = rec
                 .submits
                 .iter()
-                .filter(|submit| submit.seq > rec.known && submit.signals.iter().any(reached))
+                // A failed submit's signal counts as reached once its timeline is gone, which
+                // `destroy_timeline` refuses while it is kept; it must complete nothing then.
+                .filter(|submit| {
+                    !submit.failed && submit.seq > rec.known && submit.signals.iter().any(reached)
+                })
                 .map(|submit| submit.seq)
                 .max();
             if let Some(done) = done {
@@ -699,8 +704,8 @@ mod tests {
         assert!(records.queues[0].submits.is_empty());
     }
 
-    /// A failed submit's promise refuses every signal of its timeline, a later one of its
-    /// own queue's among them, until its stamp and its wait are known reached; then it
+    /// A failed submit's promise refuses every submit's signal of its timeline, a later one
+    /// of its own queue's among them, and a host signal of it, until its stamp and its wait are known reached; then it
     /// leaves, not folded in, and its point is retried.
     #[test]
     fn a_failed_submits_promise_is_kept_until_its_stamp_and_waits_are_reached() {
@@ -1076,6 +1081,7 @@ mod tests {
         host_signal(&mut records, &mut driver, at(gate, 1));
         driver.complete(1, w, &[at(g, 1)]);
         driver.complete(1, x, &[]);
+        // The read of a call that reads every queue: a submit, a destroy, a heap write.
         let read = driver.read_queues(&records);
         records.fold(&read, &[]);
         behind(&records, &driver);
@@ -1117,6 +1123,7 @@ mod tests {
             submit(&mut records, &driver, &none, 2, &[at(d, 1)], &[at(f, 3)], false).unwrap_err();
         assert_eq!(rule(&refused), Some(Rule::Timeline), "{refused:?}");
         driver.complete(1, x, &[]);
+        // The read of a call that reads every queue: a submit, a destroy, a heap write.
         let read = driver.read_queues(&records);
         records.fold(&read, &[]);
         behind(&records, &driver);
@@ -1126,6 +1133,7 @@ mod tests {
         assert_eq!(rule(&refused), Some(Rule::Timeline), "{refused:?}");
         host_signal(&mut records, &mut driver, at(gate, 1));
         driver.complete(0, q, &[at(f, 1)]);
+        // The caller sees f = 1, as a `timeline_value` of f or a `wait_timeline` for it does.
         let read_f = driver.read_timeline(&records, f);
         records.fold(&[None; QUEUES], read_f.as_slice());
         behind(&records, &driver);
@@ -1258,5 +1266,123 @@ mod tests {
         records.settle();
         behind(&records, &driver);
         assert!(!records.pending(&[later, 0, 0]), "the destroy's check, accepted");
+    }
+
+    /// How the caller lets a failed submit's promise go: X on compute waits for f = 1, which
+    /// Q on graphics signals behind a gate, and signals c = 1, and fails; Y after it on
+    /// compute signals s = 1. Once the caller has seen s = 1 and f = 1, X has left and the
+    /// host signal of c = 1, which reads c alone, is accepted with no read of the queues.
+    #[test]
+    fn a_failed_submit_leaves_once_its_waits_and_a_later_point_of_its_queue_are_seen() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let (gate, f, c, s) = (
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+        );
+        let none = read(&records, &driver, &[]);
+        let q =
+            submit(&mut records, &driver, &none, 0, &[at(gate, 1)], &[at(f, 1)], false).expect("Q");
+        let x = submit(&mut records, &driver, &none, 1, &[at(f, 1)], &[at(c, 1)], true)
+            .expect("X, failed");
+        let y = submit(&mut records, &driver, &none, 1, &[], &[at(s, 1)], false).expect("Y");
+        host_signal(&mut records, &mut driver, at(gate, 1));
+        driver.complete(0, q, &[at(f, 1)]);
+        driver.complete(1, x, &[]);
+        driver.complete(1, y, &[at(s, 1)]);
+        // What the hold of a `wait_timeline` that returned `true` does, for s = 1 and f = 1.
+        for point in [at(s, 1), at(f, 1)] {
+            records.fold_timeline(point.timeline, point.value);
+            records.settle();
+        }
+        behind(&records, &driver);
+        assert!(records.queues[1].submits.is_empty(), "X and Y have left");
+        host_signal(&mut records, &mut driver, at(c, 1));
+    }
+
+    /// A failed submit's promise of a timeline that is gone completes nothing: W on compute
+    /// waits for a gate no one signals; X after it signals c = 1 and fails; c is then
+    /// removed, as `destroy_timeline` would if it did not refuse while X is kept. X's
+    /// promise counts as reached, and W stays pending.
+    #[test]
+    fn a_failed_promise_of_a_removed_timeline_completes_nothing() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let (gate, g, c) = (
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+        );
+        let none = read(&records, &driver, &[]);
+        let w =
+            submit(&mut records, &driver, &none, 1, &[at(gate, 1)], &[at(g, 1)], false).expect("W");
+        submit(&mut records, &driver, &none, 1, &[], &[at(c, 1)], true).expect("X, failed");
+        records.timelines.remove(c);
+        records.settle();
+        assert!(records.pending(&[0, w, 0]), "W counted complete");
+    }
+
+    /// The cover takes no failed submit's wait: P and Q on graphics wait for a gate and
+    /// signal h = 1 and f = 1; X on compute waits for f = 1 and fails; Y after X on compute
+    /// signals h = 2, which nothing orders after P's h = 1.
+    #[test]
+    fn a_failed_submits_wait_orders_no_later_submit_of_its_queue() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let (gate, f, c, h) = (
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+        );
+        let none = read(&records, &driver, &[]);
+        submit(&mut records, &driver, &none, 0, &[at(gate, 1)], &[at(h, 1)], false).expect("P");
+        submit(&mut records, &driver, &none, 0, &[at(gate, 1)], &[at(f, 1)], false).expect("Q");
+        submit(&mut records, &driver, &none, 1, &[at(f, 1)], &[at(c, 1)], true).expect("X, failed");
+        let refused = submit(&mut records, &driver, &none, 1, &[], &[at(h, 2)], false).unwrap_err();
+        assert_eq!(rule(&refused), Some(Rule::Timeline), "{refused:?}");
+    }
+
+    /// The credit at the top of a submit takes no failed submit's wait: Q on graphics waits
+    /// for a gate and signals g = 1 and f = 2; X on compute waits for f = 2 and fails; Y
+    /// after it signals d = 1; M on the present queue waits for d = 1 and g = 1 and signals
+    /// f = 3, which nothing orders after Q's f = 2.
+    #[test]
+    fn a_failed_submits_wait_gives_no_credit_at_the_top() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let (gate, f, c, d, g) = (
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+            timeline(&mut records, &mut driver, 0),
+        );
+        let none = read(&records, &driver, &[]);
+        submit(&mut records, &driver, &none, 0, &[at(gate, 1)], &[at(g, 1), at(f, 2)], false)
+            .expect("Q");
+        submit(&mut records, &driver, &none, 1, &[at(f, 2)], &[at(c, 1)], true).expect("X, failed");
+        submit(&mut records, &driver, &none, 1, &[], &[at(d, 1)], false).expect("Y");
+        let refused =
+            submit(&mut records, &driver, &none, 2, &[at(d, 1), at(g, 1)], &[at(f, 3)], false)
+                .unwrap_err();
+        assert_eq!(rule(&refused), Some(Rule::Timeline), "{refused:?}");
+    }
+
+    /// A failed submit that waits for its own timeline below its signal is released by the
+    /// host's signal of that wait: X on compute waits for c = 1, signals c = 2 and fails.
+    /// Nothing else can reach X's wait, so were the signal refused X would be kept for good.
+    #[test]
+    fn a_failed_submit_waiting_for_its_own_timeline_is_released_by_a_host_signal() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let c = timeline(&mut records, &mut driver, 0);
+        let none = read(&records, &driver, &[]);
+        let x = submit(&mut records, &driver, &none, 1, &[at(c, 1)], &[at(c, 2)], true)
+            .expect("X, failed");
+        driver.complete(1, x, &[]);
+        let queues = driver.read_queues(&records);
+        records.fold(&queues, &[]);
+        host_signal(&mut records, &mut driver, at(c, 1));
+        assert!(records.queues[1].submits.is_empty(), "X has left");
+        let now = read(&records, &driver, &[at(c, 2)]);
+        submit(&mut records, &driver, &now, 1, &[], &[at(c, 2)], false).expect("the retry");
     }
 }

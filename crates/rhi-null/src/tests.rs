@@ -742,3 +742,16 @@ fn a_wait_orders_only_the_signal_it_waits_for() {
         assert!(device.wait_timeline(at(f, 2), PATIENCE).expect("a wait"));
     }
 }
+
+/// Null's second leniency against a device ("Queues by role"): it takes the 2^31 limit from
+/// the value it has run a timeline to, not from one the caller has seen. A compute submit
+/// with no gate signals f = 1, which null runs at once and the caller has not seen; a later
+/// compute submit of f = 2^31 is accepted, where a device with f = 1 in flight, its value
+/// 0, refuses it.
+#[test]
+fn a_signal_2_31_above_a_value_the_caller_has_not_seen_is_accepted() {
+    let device = device(QueueLayout::SEVERAL, false);
+    let f = device.create_timeline(0).expect("a timeline");
+    submit(&device, C, &[], &[at(f, 1)]).expect("f = 1, run and unseen");
+    submit(&device, C, &[], &[at(f, LIMIT)]).expect("2^31 from 0, within it from 1");
+}
