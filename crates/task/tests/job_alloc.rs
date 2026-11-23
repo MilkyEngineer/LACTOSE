@@ -10,6 +10,11 @@
 #![cfg(not(miri))]
 #![cfg(not(feature = "loom"))]
 
+use core::pin::pin;
+use core::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use lactose_core::{AllocTag, TaggedAlloc};
 use lactose_task::Executor;
 
@@ -41,14 +46,20 @@ fn count(calls: u64, mut call: impl FnMut()) -> (u64, u64) {
 fn a_job_allocates_its_cell_and_a_child_a_share_of_a_queue_block() {
     const CHILDREN: u32 = 16;
     let executor = Executor::builder().frame_workers(4).background_workers(1).build().unwrap();
+    // Bit `s` is set once the worker of slot `s` has opened a scope that forks.
+    let forked = Arc::new(AtomicU32::new(0));
     let job = |forks: u32| {
+        let forked = forked.clone();
         executor
             .block_on(executor.run_job(move |ctx| {
-                let ran = core::sync::atomic::AtomicU32::new(0);
+                if forks > 0 {
+                    forked.fetch_or(1 << ctx.slot(), Ordering::Relaxed);
+                }
+                let ran = AtomicU32::new(0);
                 ctx.scope(|scope| {
                     for _ in 0..forks {
                         scope.fork(|_| {
-                            ran.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            ran.fetch_add(1, Ordering::Relaxed);
                         });
                     }
                 });
@@ -56,9 +67,39 @@ fn a_job_allocates_its_cell_and_a_child_a_share_of_a_queue_block() {
             }))
             .unwrap()
     };
-    // Warm up: the workers' arenas grow to their size and the queues' first blocks exist.
-    for _ in 0..4 * BLOCK {
+
+    // Warm up the queues, whose first blocks then exist, and every frame-critical worker's
+    // scope arena. A worker allocates the arena's chunk, and its list of chunks, the first
+    // time it opens a scope that forks, and which worker takes a job is the scheduler's
+    // choice: on a loaded machine one may take none of the first few hundred.
+    let every_slot = (1 << executor.slot_count()) - 1;
+    let mut jobs = 0;
+    while jobs < 4 * BLOCK || forked.load(Ordering::Relaxed) != every_slot {
+        assert!(
+            jobs < 400 * BLOCK,
+            "slots {:#b} of {every_slot:#b} opened a scope in {jobs} jobs",
+            forked.load(Ordering::Relaxed)
+        );
         assert_eq!(job(CHILDREN), CHILDREN);
+        jobs += 1;
+    }
+    // A frame-critical worker locks the timers' state whenever it goes idle. Where std's
+    // mutex is a pthread mutex, as on Apple targets, the first lock allocates it, once on
+    // each worker that races to it, and on a loaded machine no worker may have gone idle
+    // yet. A sleep that waits locks it first, on this thread, to register its timer.
+    loop {
+        let mut sleep = pin!(executor.sleep_until(Instant::now() + Duration::from_millis(1)));
+        let mut waited = false;
+        executor
+            .block_on(core::future::poll_fn(|cx| {
+                let poll = sleep.as_mut().poll(cx);
+                waited |= poll.is_pending();
+                poll
+            }))
+            .unwrap();
+        if waited {
+            break;
+        }
     }
 
     let calls = 20 * BLOCK;
