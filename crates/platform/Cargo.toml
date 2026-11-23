@@ -18,12 +18,57 @@ lactose-task.workspace = true
 # `HasWindowHandle` and `HasDisplayHandle`: the window lends the handles a backend makes
 # its surface from, so that no backend names this crate.
 raw-window-handle.workspace = true
+# Warnings on `pail`: a thread class refused, a pump still waiting for the window to be let go.
+tracing.workspace = true
+# The window, the event loop that owns the main thread, and the proxy that wakes it.
+winit.workspace = true
+
+# winit builds on Linux only with a window system's backend: X11 alone, whose libraries it
+# loads at run time, so the crate builds and lints where CI's Linux job does with no system
+# library installed. Nothing ships on Linux at milestone 2.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { workspace = true, features = ["x11"] }
+
+# A thread's CPU clock, which both test binaries read to bound an idle pump's cost
+# (tests/thread_cpu.rs).
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
+# The window tests' one module that calls the operating system (tests/window.rs, `os`): a
+# close sent as the close button sends it, the application's own stop, and the present
+# thread's scheduling read back.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = [
+    "NSApplication",
+    "NSEvent",
+    "NSGraphicsContext",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { workspace = true, features = ["NSGeometry", "NSThread"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # The integration tests as one test binary, whose root declares the files of tests/ as
 # modules (D150).
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+# A binary of its own ([test_targets] in tools/xtask/ci-policy.toml) with its own `main`: a
+# window's event loop needs the process's main thread, which a test harness keeps, so each
+# case runs as this binary's subprocess. Every case is ignored, and none runs unless asked.
+[[test]]
+name = "window"
+path = "tests/window.rs"
+harness = false
 
 [lints]
 workspace = true

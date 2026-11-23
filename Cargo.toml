@@ -59,6 +59,11 @@ libc = "0.2"
 # and `force-soft-floats` features must stay off (crates/math/README.md).
 libm = { version = "=0.2.16", default-features = false, features = ["arch"] }
 loom = "0.7"
+# The versions winit 0.30 builds on, so that `lactose-platform`'s window tests do on macOS what
+# a user does to a window without a second copy of either (crates/platform/SAFETY.md).
+objc2 = "0.5"
+objc2-app-kit = "0.2"
+objc2-foundation = "0.2"
 # The snapshot byte format of `lactose-physics-rapier`: fixed-width little-endian floats and
 # minimal varints, so equal values give equal bytes (crates/physics-rapier/README.md).
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
@@ -89,6 +94,11 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # no filter syntax, no `log` bridge.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 windows-sys = "0.61"
+# Pinned exactly: the window, the event loop and the proxy that wakes it in `lactose-platform`,
+# whose contract rests on this version's behaviour (docs/verification.md). No default features:
+# the handles through `raw-window-handle` 0.6, and on Linux X11 alone, which the platform crate
+# adds (crates/platform/Cargo.toml).
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
 xxhash-rust = "0.8"
 zstd = { version = "0.13", default-features = false }
 

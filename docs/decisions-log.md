@@ -8022,6 +8022,78 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   paragraph on locks, which gains two sentences; D90's "the present thread's surface need not
   be `Send`", since the state a present thread owns is `Send` and is moved onto it;
   `crates/app/README.md`'s "`app-client` passes the platform crate's instance at milestone 4".
+- Addendum (lane platform-impl, 2026-11-23): implemented over winit on macOS and Windows,
+  with no public signature changed and no `unsafe` in the library; on Linux it builds and
+  is linted, and runs one test.
+  - *winit is pinned exactly*, `=0.30.13` in the root `Cargo.toml`, with its default features
+    off and `rwh_06` on: the contract rests on that version's behaviours (`docs/verification.md`)
+    and the handles are `raw-window-handle` 0.6's. On Linux the platform crate adds `x11` alone:
+    winit builds there only with a window system's backend, and X11's libraries are loaded at run
+    time (`x11-dl`), so the crate builds and lints in CI's Linux job with no system library
+    installed; Wayland waits for a milestone that runs on Linux. It is outside the determinism
+    boundary and carries no patch, so `cargo xtask vendor` has nothing of it to check. The window
+    tests take, on macOS, `objc2` 0.5, `objc2-app-kit` 0.2 and `objc2-foundation` 0.2, the versions
+    winit builds on, and on Windows the workspace's `windows-sys`; none adds a package to the lock.
+  - *The handles are winit's, forwarded.* `Window`'s `HasWindowHandle` and `HasDisplayHandle`
+    compare the calling thread with the pump's and return `HandleError::Unavailable` on any other;
+    on the main thread they return winit's borrowed handles. No handle is made from a raw one, so
+    section 21's listing of the crate for the window handles needs no `unsafe`.
+  - *The present thread has no treatment beyond `ThreadClass::enter`*, which `ClientPlatform`
+    makes every thread enter before its body runs; a class the operating system refuses warns on
+    `pail` and the thread runs. Windows' multimedia class scheduler, the one further treatment
+    either system offers an unprivileged thread, would be the library's first `unsafe` and a
+    dependency, and no milestone 2 measurement asks for it. The library forbids `unsafe`.
+  - *The wakes.* The main lane's is winit's event-loop proxy, a user event sent by `send_event`,
+    whose refusal once the loop has ended is ignored. The present lane's is `lactose-task`'s:
+    `parking_lane` and `ParkingPump` are new there (`crates/task/src/parking.rs`), a lane drained by
+    the thread that made it, which parks in `ParkingPump::wait` until a call is queued. Its wake is
+    a flag the queueing thread swaps, with release ordering, before it unparks the lane's thread,
+    which parks until it swaps the flag back, with acquire ordering. An unpark alone was lost: a
+    present call that parks, on a channel or a fence's wait, takes the token, and a call queued
+    meanwhile waited for the next wake. The window test of a blocking present call found it, and
+    `present::a_call_queued_while_a_call_parks_runs_after_it` fails with the unpark alone. The wake
+    is `lactose-task`'s, not the platform crate's, because a sleeper's wake is the executor's to
+    synchronise and to model (checklist 7, and this decision's "no flag shared between threads
+    beside the lanes"), and loom is a feature of that crate alone: the model
+    `a_parked_lane_loses_no_wake_to_a_call_that_parks` calls the shipped `wait` at a preemption
+    bound of three and fails, as a deadlock, with the unpark alone and with the flag alone, which
+    its two `weakened_*` models check beside it. The release and acquire orderings are deliberate,
+    and nothing relies on them: the queue's lock orders the calls. `lactose-platform` keeps no
+    atomic or park for the wake.
+  - *The pump.* A flag of the crate's makes a second `event_pump` `Unsupported` before winit is
+    reached, and winit's own refusal of a second event loop maps to the same. After `exit` the pump
+    takes the window by `Arc::try_unwrap`; while another `Arc<Window>` is held it looks again
+    every 50 ms, and warns on `pail` once a second with the count held. Once it has dropped the
+    window it waits up to a second for winit's report that the window is destroyed, then warns and
+    ends the loop. `run` returns `Platform` when the operating system's loop ends before the window
+    is let go, which on macOS is the application's own `stop:`; winit's loop on Windows ends only
+    through its `exit`. A panic out of `run` leaves the window to the end of the process
+    (`mem::forget`). A size is one `AtomicU64`, width and height packed, and a close one
+    `AtomicBool`, both relaxed: a read is never torn and orders nothing else.
+  - *The window tests' runner rule.* `tests/window.rs` is a test binary with its own `main`
+    (`harness = false`, and `[test_targets] separate` in `tools/xtask/ci-policy.toml`): each case is
+    the binary run again as a subprocess whose main thread is the case's, under a deadline its
+    parent keeps, and the binary answers enough of the test harness's arguments for `cargo nextest`
+    to list and run it. Every case is ignored, so CI lists them (thirteen on macOS, twelve
+    elsewhere) and runs none, and no case passes where no window opens; a machine with a display
+    runs them by `cargo nextest run -p lactose-platform --test window --run-ignored only`. Whether
+    GitHub's macOS and Windows runners, which have a desktop session, can open the window is
+    untried, since a lane cannot push: a job that runs that command on each would make the M1's and
+    the laptop's runs CI's.
+  - *`unsafe` in the tests alone.* Both test binaries are `#![deny(unsafe_code)]`. In the window
+    binary one module, `os`, allows it: a close sent as the close button sends it, the
+    application's own stop, whether the window is shown, and the present thread's scheduling read
+    back. Both binaries share a second, `tests/thread_cpu.rs`, which reads the calling thread's
+    CPU clock, so that an idle pump's cost is bounded by the thread's own time and not by a
+    loaded machine's wall clock (`crates/platform/SAFETY.md`, "In the tests").
+  - *Nightly Miri* runs the tests that open no window, `-p lactose-platform --lib --test
+    integration`, under four seeds: the present thread's stop and drop under queuing threads, the
+    lane's close before the hand-back, its wake under a call that parks, and the torn-size read;
+    the present thread's CPU test is ignored there, since it reads a clock through the operating
+    system.
+  - Replaced: `crates/platform/README.md`'s "The windowing library" of "Not in this crate yet", by
+    a paragraph under its signature rule; its sentence on the frame's pacing, by the text of
+    `frame-design`'s merge (its section 6(g)).
 
 **D160. `lactose-render-graph`'s facade: a frame is declared afresh in graph order, a plan names no handle, an import states both its ends, a recording job owns its encoder and its recorders, and the crate takes no lock** (§3, §5.3, §12.3, `lactose-render-graph`, `crates/rhi-api/README.md`, `crates/task/README.md`)
 - Why: section 12.3 fixes what the graph derives and what its cache hashes, and the milestone 2
