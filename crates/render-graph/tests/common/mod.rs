@@ -230,6 +230,80 @@ pub fn submit_alone(
     assert!(device.wait_timeline(done, PATIENCE).expect("a wait"), "the test's submit ran");
 }
 
+/// Submits `encoder` alone to `queue` after `waits`, and returns the point it signals, which
+/// it reaches once `waits` are, and the encoder: a null encoder dropped while pending waits.
+pub fn submit_after(
+    device: &dyn Device,
+    queue: QueueRole,
+    encoder: Box<dyn Encoder>,
+    waits: &[TimelinePoint],
+) -> (TimelinePoint, Box<dyn Encoder>) {
+    let timeline = device.create_timeline(0).expect("a timeline");
+    let done = TimelinePoint { timeline, value: 1 };
+    let mut encoders = [encoder];
+    device
+        .submit(queue, Submit { encoders: &mut encoders, waits, signals: &[done] })
+        .expect("the test's own submit");
+    let [encoder] = encoders;
+    (done, encoder)
+}
+
+/// Takes `buffer` from `Undefined` to `to`, written by a shader on `to.queue` so that its
+/// bytes are defined, outside any graph, and waits.
+pub fn define_buffer(device: &dyn Device, buffer: BufferHandle, to: StateOn<BufferState>) {
+    let mut encoder = device.create_encoder(to.queue, "test").expect("an encoder");
+    let write = on(BufferState::ShaderWrite, to.queue);
+    encoder.transition_buffers(&[BufferTransition {
+        buffer,
+        from: on(BufferState::Undefined, to.queue),
+        to: write,
+    }]);
+    encoder.begin_compute_pass(&ComputePass {
+        label: "test",
+        reach: lactose_rhi_api::PassReach {
+            slots: &[],
+            buffers: &[lactose_rhi_api::BufferReach { buffer, state: BufferState::ShaderWrite }],
+        },
+    });
+    encoder.end_pass();
+    encoder.transition_buffers(&[BufferTransition { buffer, from: write, to }]);
+    submit_alone(device, to.queue, encoder, &[]);
+}
+
+/// Takes `image` from `Undefined` to `to`, cleared, outside any graph, and waits.
+pub fn bring_image(device: &dyn Device, image: ImageHandle, to: StateOn<ImageState>) {
+    let mut encoder = device.create_encoder(to.queue, "test").expect("an encoder");
+    clear(&mut *encoder, image, to);
+    submit_alone(device, to.queue, encoder, &[]);
+}
+
+/// Records a clear of `image`, from `Undefined` on `to.queue`, and its transition to `to`.
+pub fn clear(encoder: &mut dyn Encoder, image: ImageHandle, to: StateOn<ImageState>) {
+    let whole = lactose_rhi_api::ImageRange { mip: 0, mips: 1, layer: 0, layers: 1 };
+    let attachment = on(ImageState::ColourAttachment, to.queue);
+    encoder.transition_images(&[ImageTransition {
+        image,
+        range: whole,
+        from: on(ImageState::Undefined, to.queue),
+        to: attachment,
+    }]);
+    encoder.begin_render_pass(&RenderPass {
+        label: "test",
+        colour: &[lactose_rhi_api::ColourAttachment {
+            target: lactose_rhi_api::Target { image, mip: 0, layer: 0 },
+            load: Load::Clear([0.0; 4]),
+            store: lactose_rhi_api::Store::Store,
+            local_read: false,
+        }],
+        depth: None,
+        reach: lactose_rhi_api::PassReach { slots: &[], buffers: &[] },
+    });
+    encoder.end_pass();
+    if to != attachment {
+        encoder.transition_images(&[ImageTransition { image, range: whole, from: attachment, to }]);
+    }
+}
+
 // ---- The logging device ----
 
 /// What one encoder recorded, a line a command, and the role it was made for.
