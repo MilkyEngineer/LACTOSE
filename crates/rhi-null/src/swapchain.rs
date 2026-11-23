@@ -181,6 +181,8 @@ impl Swapchain for NullSwapchain {
                     let id = self.presented.map_or(1, |PresentId(last)| last + 1);
                     self.presented = Some(PresentId(id));
                     drop(records);
+                    #[cfg(test)]
+                    shared.between(crate::device::Between::PresentHeld);
                     drop(held);
                     shared.progressed();
                     return Ok(Presented::Shown);
@@ -246,8 +248,8 @@ impl Swapchain for NullSwapchain {
     }
 
     /// Nothing shows null's images, so it has no display time to report.
-    fn display_times(&mut self) -> Option<Vec<DisplayTime>> {
-        None
+    fn display_times(&mut self, _: &mut Vec<DisplayTime>) -> bool {
+        false
     }
 }
 

@@ -16,7 +16,7 @@ use lactose_platform::{
 };
 use lactose_rhi_api::{
     Acquired, BufferDesc, BufferHandle, BufferImageCopy, BufferState, BufferTransition,
-    BufferUsage, ColourAttachment, Device, DeviceRequest, Encoder, Extent, Format,
+    BufferUsage, ColourAttachment, Device, DeviceRequest, DisplayTime, Encoder, Extent, Format,
     HEAP_SLOTS_DEFAULT, ImageDesc, ImageHandle, ImageMemory, ImageRange, ImageState,
     ImageTransition, ImageUsage, Load, MemoryClass, Message, MessageSink, PassReach, PresentId,
     Presented, QueuePath, QueueRole, Rect, RenderPass, Rule, SAMPLERS_DEFAULT, Sharing, StateOn,
@@ -338,7 +338,7 @@ struct Record {
     rebuilds: Vec<Rebuild>,
     taken: Vec<Taken>,
     reports: Vec<Report>,
-    /// How long each `display_times` call took; `None` where it answered `None`.
+    /// How long each `display_times` call took; `None` where it answered `false`.
     report_calls: Vec<Option<Duration>>,
     /// Readbacks compared: the swapchain image's against the target's.
     compared: u32,
@@ -367,6 +367,8 @@ struct Presenter {
     stale: bool,
     generation: u32,
     record: Record,
+    /// The buffer `display_times` appends to, cleared and reused at each call.
+    times: Vec<DisplayTime>,
 }
 
 /// What the present thread says of the swapchain it made.
@@ -393,7 +395,7 @@ impl Presenter {
             format: swapchain.format(),
             extent: swapchain.extent(),
             images: swapchain.image_count(),
-            reports: swapchain.display_times().is_some(),
+            reports: swapchain.display_times(&mut Vec::new()),
         };
         let slots = (0..SLOTS)
             .map(|_| {
@@ -416,6 +418,7 @@ impl Presenter {
             stale: false,
             generation: 1,
             record: Record::default(),
+            times: Vec::new(),
         };
         Ok((presenter, made))
     }
@@ -561,11 +564,12 @@ impl Presenter {
 
     /// The display times that arrived, and how long the call took.
     fn reports(&mut self) {
+        self.times.clear();
         let before = Instant::now();
-        let times = self.swapchain.display_times();
+        let reports = self.swapchain.display_times(&mut self.times);
         let received = Instant::now();
-        self.record.report_calls.push(times.as_ref().map(|_| received - before));
-        for time in times.into_iter().flatten() {
+        self.record.report_calls.push(reports.then(|| received - before));
+        for time in &self.times {
             self.record.reports.push(Report { present: time.present, shown: time.shown, received });
         }
     }

@@ -787,7 +787,7 @@ fn waited_through(promise: &TimelinePoint, through: &[TimelinePoint]) -> bool {
 mod tests {
     use lactose_rhi_api::{CacheStart, ImageHandle, Rule, TimelineHandle, TimelinePoint};
 
-    use super::{DIFFERENCE_LIMIT, ImageRec, QUEUES, Records, TimelineRec};
+    use super::{DIFFERENCE_LIMIT, ImageRec, QUEUES, Records, Release, TimelineRec};
 
     fn records() -> Records {
         Records::new(4, 4, CacheStart::Empty)
@@ -1494,5 +1494,50 @@ mod tests {
         assert!(records.queues[1].submits.is_empty(), "X has left");
         let now = read(&records, &driver, &[at(c, 2)]);
         submit(&mut records, &driver, &now, 1, &[], &[at(c, 2)], false).expect("the retry");
+    }
+
+    /// A present's walk of a point another queue's submit promises: undecided while that
+    /// submit is stamped and its driver call has not returned, which may yet fail; released
+    /// once the call has returned; undecided for a submit whose call failed, whose promise
+    /// never reached the driver.
+    #[test]
+    fn a_walk_releases_a_promise_once_its_submit_is_received_and_not_failed() {
+        let (graphics, present) = (0, 2);
+        for failed in [false, true] {
+            let mut records = records();
+            let t = records.timelines.insert(TimelineRec { known: 0, mark: None }).unwrap();
+            let point = TimelinePoint { timeline: t, value: 1 };
+            let seq = records.stamp(graphics, &[], &[point]);
+            let walked = records.release(present, &[point]).unwrap();
+            assert_eq!(walked, Release::Undecided(point), "stamped and not received");
+            records.received(graphics, seq, failed);
+            let walked = records.release(present, &[point]).unwrap();
+            let expected = if failed { Release::Undecided(point) } else { Release::Released };
+            assert_eq!(walked, expected, "received, failed: {failed}");
+        }
+    }
+
+    /// A point already reached is released whatever promises it, a submit stamped and not
+    /// received among them; a promise's own waits are walked in turn.
+    #[test]
+    fn a_walk_releases_a_reached_point_and_walks_a_promises_waits() {
+        let (graphics, compute, present) = (0, 1, 2);
+        let mut records = records();
+        let mut timeline = || records.timelines.insert(TimelineRec { known: 0, mark: None });
+        let (t, gate) = (timeline().unwrap(), timeline().unwrap());
+        let at = |timeline, value| TimelinePoint { timeline, value };
+        let unreceived = records.stamp(compute, &[], &[at(t, 2)]);
+        records.fold(&[None, None, None], &[(t, 1)]);
+        assert_eq!(records.release(present, &[at(t, 1)]).unwrap(), Release::Released);
+        assert_eq!(records.release(present, &[at(t, 2)]).unwrap(), Release::Undecided(at(t, 2)));
+        records.received(compute, unreceived, false);
+        assert_eq!(records.release(present, &[at(t, 2)]).unwrap(), Release::Released);
+        // A received promise whose submit waits for a gate no one has signalled or promised.
+        let held = records.stamp(graphics, &[at(gate, 1)], &[at(t, 3)]);
+        records.received(graphics, held, false);
+        let walked = records.release(present, &[at(t, 3)]).unwrap();
+        assert_eq!(walked, Release::Undecided(at(gate, 1)));
+        records.fold(&[None, None, None], &[(gate, 1)]);
+        assert_eq!(records.release(present, &[at(t, 3)]).unwrap(), Release::Released);
     }
 }

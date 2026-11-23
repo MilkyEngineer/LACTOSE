@@ -6,9 +6,9 @@ use lactose_core::Result;
 
 use super::kit::{Body, Ctx, EXTENT, PATIENCE, attachment, begin, buffer_to, clear, image_to};
 use crate::{
-    Acquired, BufferCopy, BufferState, BufferUsage, Device, Encoder, Extent, ImageHandle,
-    ImageState, Load, MemoryClass, PassReach, PresentId, Presented, QueuePath, QueueRole, Rule,
-    Store, Submit, Swapchain, SwapchainDesc, TimelinePoint,
+    Acquired, BufferCopy, BufferState, BufferUsage, Device, DisplayTime, Encoder, Extent,
+    ImageHandle, ImageState, Load, MemoryClass, PassReach, PresentId, Presented, QueuePath,
+    QueueRole, Rule, Store, Submit, Swapchain, SwapchainDesc, TimelinePoint,
 };
 
 type Applies = core::result::Result<(), &'static str>;
@@ -357,13 +357,16 @@ fn frame_submits_complete_while_a_present_is_pending(ctx: &Ctx<'_>) -> Applies {
 
 /// Each present taken has the next id from one, a refused present takes none, and a resize
 /// restarts nothing. Where the swapchain reports display times, each report is of a present
-/// taken, each id once and in increasing order; a swapchain whose device has no source
-/// answers `None` at every call.
+/// taken, each id once and in increasing order, appended to what the buffer held; a
+/// swapchain whose device has no source answers `false` at every call and appends nothing.
 fn present_ids_count_up_and_display_times_follow_them(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.presenting()?;
     let mut swapchain = swapchain(ctx, &*device);
     ctx.check(swapchain.last_present().is_none(), "no id before the first present");
-    let reports = swapchain.display_times().is_some();
+    // A buffer that holds an earlier caller's entry, which every call keeps.
+    let earlier = DisplayTime { present: PresentId(0), shown: Instant::now() };
+    let mut times = vec![earlier];
+    let reports = swapchain.display_times(&mut times);
     let mut reported: Option<PresentId> = None;
     for round in 1..=6 {
         if round == 4 {
@@ -381,19 +384,18 @@ fn present_ids_count_up_and_display_times_follow_them(ctx: &Ctx<'_>) -> Applies 
         );
         show(ctx, &*device, &mut *swapchain, image);
         ctx.check(swapchain.last_present() == Some(PresentId(round)), "the present's id");
-        match swapchain.display_times() {
-            Some(times) => {
-                ctx.check(reports, "a swapchain that answered `None` reports");
-                for time in times {
-                    ctx.check(
-                        reported.is_none_or(|last| time.present > last),
-                        "the reports' ids increase, each once",
-                    );
-                    ctx.check(time.present.0 <= round, "a report is of a present taken");
-                    reported = Some(time.present);
-                }
-            }
-            None => ctx.check(!reports, "a swapchain that reported answers `None`"),
+        times.truncate(1);
+        let answered = swapchain.display_times(&mut times);
+        ctx.check(answered == reports, "whether the swapchain reports is fixed at its creation");
+        ctx.check(times.first() == Some(&earlier), "a call keeps what the buffer held");
+        ctx.check(answered || times.len() == 1, "a swapchain that reports nothing appends nothing");
+        for time in &times[1..] {
+            ctx.check(
+                reported.is_none_or(|last| time.present > last),
+                "the reports' ids increase, each once",
+            );
+            ctx.check(time.present.0 <= round, "a report is of a present taken");
+            reported = Some(time.present);
         }
     }
     Ok(())

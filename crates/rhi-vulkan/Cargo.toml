@@ -28,9 +28,13 @@ lactose-rhi-api.workspace = true
 raw-window-handle.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# The main thread's queue, on which the layer made for an AppKit view leaves the view.
+dispatch.workspace = true
 # `pthread_main_np` before a layer is made for an AppKit view, and the host clock
 # `VK_GOOGLE_display_timing`'s times are on (`CLOCK_UPTIME_RAW`).
 libc.workspace = true
+# `removeFromSuperlayer`, sent to that layer.
+objc2.workspace = true
 # The `CAMetalLayer` a surface is made on for an AppKit view.
 raw-window-metal.workspace = true
 

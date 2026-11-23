@@ -175,7 +175,7 @@ impl Drop for Raw {
                 self.device.destroy_semaphore(queue.timeline, None);
             }
             self.device.destroy_device(None);
-            if let Some(presents) = &self.presents {
+            if let Some(presents) = &mut self.presents {
                 presents.surface.destroy();
             }
             if let Some((utils, messenger)) = &self.debug {
@@ -381,10 +381,17 @@ fn present_queue(
 
 /// The device extensions a swapchain needs, of the forms `has` finds: `VK_KHR_swapchain`
 /// and `VK_EXT_swapchain_maintenance1`, else its `KHR` form, whose structures are the same.
-fn swapchain_extensions(has: impl Fn(&CStr) -> bool) -> Option<[&'static CStr; 2]> {
+/// Each form needs the instance's surface maintenance of its own form, which `surface`
+/// says were enabled, `EXT` first.
+fn swapchain_extensions(
+    has: impl Fn(&CStr) -> bool,
+    surface: [bool; 2],
+) -> Option<[&'static CStr; 2]> {
     let maintenance = [ash::ext::swapchain_maintenance1::NAME, KHR_SWAPCHAIN_MAINTENANCE1]
         .into_iter()
-        .find(|name| has(name))?;
+        .zip(surface)
+        .find(|&(name, enabled)| enabled && has(name))?
+        .0;
     has(ash::khr::swapchain::NAME).then_some([ash::khr::swapchain::NAME, maintenance])
 }
 
@@ -464,6 +471,8 @@ pub(crate) fn open(request: &DeviceRequest, target: Option<Target>) -> Result<Op
     if debug {
         extensions.push(ash::ext::debug_utils::NAME.as_ptr());
     }
+    // The forms of surface maintenance enabled, `EXT` first.
+    let mut surface_maintenance = [false; 2];
     if let Some(chosen) = &chosen {
         let required = [
             ash::khr::surface::NAME,
@@ -482,11 +491,13 @@ pub(crate) fn open(request: &DeviceRequest, target: Option<Target>) -> Result<Op
         // Either form of surface maintenance, both where both are offered: the
         // swapchain's maintenance extension needs the one of its own form.
         let maintenance = [ash::ext::surface_maintenance1::NAME, KHR_SURFACE_MAINTENANCE1];
-        let offered: Vec<&CStr> = maintenance.into_iter().filter(|name| has(name)).collect();
-        if offered.is_empty() {
+        let offered = maintenance.map(has);
+        if offered == [false; 2] {
             return Err(unsupported("a surface without VK_EXT_ or VK_KHR_surface_maintenance1"));
         }
-        extensions.extend(offered.iter().map(|name| name.as_ptr()));
+        let enabled = maintenance.into_iter().zip(offered);
+        extensions.extend(enabled.filter(|&(_, on)| on).map(|(name, _)| name.as_ptr()));
+        surface_maintenance = offered;
     }
     // From here every failure destroys what it made, and frees the sink after: `Partial`
     // does on its drop.
@@ -565,7 +576,7 @@ pub(crate) fn open(request: &DeviceRequest, target: Option<Target>) -> Result<Op
         }
         None => *adapters.first().ok_or_else(|| unsupported("the loader offers no adapter"))?,
     };
-    device(&entry, &instance, physical, request, &mut partial)
+    device(&entry, &instance, physical, request, surface_maintenance, &mut partial)
 }
 
 /// What `open` has made so far, destroyed on a failure. The sink is freed after the
@@ -587,7 +598,7 @@ impl Drop for Partial {
             if let Some(device) = self.device.take() {
                 device.destroy_device(None);
             }
-            if let Some(surface) = self.surface.take() {
+            if let Some(mut surface) = self.surface.take() {
                 surface.destroy();
             }
             if let Some((utils, messenger)) = self.debug.take() {
@@ -608,6 +619,7 @@ fn device(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     request: &DeviceRequest,
+    surface_maintenance: [bool; 2],
     partial: &mut Partial,
 ) -> Result<Opened> {
     let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
@@ -635,7 +647,7 @@ fn device(
     }
     let subset = has(ash::khr::portability_subset::NAME);
     let presenting = match &partial.surface {
-        Some(_) => Some(swapchain_extensions(has).ok_or_else(|| {
+        Some(_) => Some(swapchain_extensions(has, surface_maintenance).ok_or_else(|| {
             unsupported(format!(
                 "{adapter} lacks VK_KHR_swapchain or VK_EXT_ or VK_KHR_swapchain_maintenance1"
             ))
@@ -972,7 +984,9 @@ fn device(
 mod tests {
     use ash::vk;
 
-    use super::{APPLE, bounds, families};
+    use core::ffi::CStr;
+
+    use super::{APPLE, KHR_SWAPCHAIN_MAINTENANCE1, bounds, families, swapchain_extensions};
 
     fn family(flags: vk::QueueFlags, count: u32) -> vk::QueueFamilyProperties {
         vk::QueueFamilyProperties { queue_flags: flags, queue_count: count, ..Default::default() }
@@ -999,5 +1013,27 @@ mod tests {
         assert_eq!(bounds([-32768.0, 32767.0], APPLE), [-16384, 16383]);
         assert_eq!(bounds([-32768.0, 32767.0], 0x10DE), [-32768, 32767]);
         assert_eq!(bounds([-8192.5, 8191.5], 0x10DE), [-8192, 8191]);
+    }
+
+    /// A swapchain's maintenance extension is of a form the instance enabled for its
+    /// surface: never the `EXT` form over a `KHR` surface form alone.
+    #[test]
+    fn the_swapchain_maintenance_form_follows_the_surface_form_enabled() {
+        const SWAPCHAIN: &CStr = ash::khr::swapchain::NAME;
+        const EXT: &CStr = ash::ext::swapchain_maintenance1::NAME;
+        const KHR: &CStr = KHR_SWAPCHAIN_MAINTENANCE1;
+        let (swapchain, ext) = (SWAPCHAIN, EXT);
+        let khr = KHR;
+        let offering = |names: &'static [&'static CStr]| move |name: &CStr| names.contains(&name);
+        const BOTH: &[&CStr] = &[SWAPCHAIN, EXT, KHR];
+        assert_eq!(swapchain_extensions(offering(BOTH), [true, true]), Some([swapchain, ext]));
+        assert_eq!(swapchain_extensions(offering(BOTH), [false, true]), Some([swapchain, khr]));
+        assert_eq!(swapchain_extensions(offering(BOTH), [true, false]), Some([swapchain, ext]));
+        const EXT_ONLY: &[&CStr] = &[SWAPCHAIN, EXT];
+        assert_eq!(swapchain_extensions(offering(EXT_ONLY), [false, true]), None);
+        const KHR_ONLY: &[&CStr] = &[SWAPCHAIN, KHR];
+        assert_eq!(swapchain_extensions(offering(KHR_ONLY), [true, false]), None);
+        const NEITHER: &[&CStr] = &[EXT, KHR];
+        assert_eq!(swapchain_extensions(offering(NEITHER), [true, true]), None);
     }
 }

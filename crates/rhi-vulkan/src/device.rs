@@ -29,7 +29,7 @@ use crate::records::{
     stale,
 };
 use crate::surface::Target;
-use crate::swapchain::VulkanSwapchain;
+use crate::swapchain::{Left, SwapchainObj, VulkanSwapchain};
 use crate::table::Table;
 use crate::{lock, submit};
 
@@ -189,8 +189,10 @@ pub(crate) struct ImageObj {
     pub(crate) sampled: Option<vk::ImageView>,
     /// A view of each mip of each layer an attachment names, by `layer * mips + mip`.
     pub(crate) views: Vec<vk::ImageView>,
-    /// One of a swapchain's images: the swapchain owns the image, and the object its views.
-    pub(crate) swapchain: bool,
+    /// For one of a swapchain's images, the driver swapchain that owns the image, held so
+    /// that it is destroyed only after the image's last user lets go; the object owns its
+    /// views.
+    pub(crate) swapchain: Option<Arc<SwapchainObj>>,
 }
 
 impl ImageObj {
@@ -199,6 +201,7 @@ impl ImageObj {
     /// `usage`.
     pub(crate) fn swapchain_image(
         raw: &Arc<Raw>,
+        owner: &Arc<SwapchainObj>,
         image: vk::Image,
         format: Format,
         usage: ImageUsage,
@@ -220,7 +223,7 @@ impl ImageObj {
             exclusive: true,
             sampled: None,
             views: Vec::new(),
-            swapchain: true,
+            swapchain: Some(Arc::clone(owner)),
         };
         make_views(&raw.device, &mut object)?;
         Ok(object)
@@ -244,13 +247,13 @@ impl Drop for ImageObj {
             return;
         }
         // SAFETY: as `BufferObj`'s; no slot holds the image (`pending`), and its block, if
-        // any, is freed after it. A swapchain's image is the swapchain's to destroy; a view
-        // may be destroyed after its image, as nothing reads it then.
+        // any, is freed after it. A swapchain's image is its driver swapchain's to destroy,
+        // which this object's count keeps until the views are gone.
         unsafe {
             for view in self.sampled.iter().chain(&self.views) {
                 self.raw.device.destroy_image_view(*view, None);
             }
-            if self.swapchain {
+            if self.swapchain.is_some() {
                 return;
             }
             self.raw.device.destroy_image(self.image, None);
@@ -328,10 +331,10 @@ struct HeapState {
 
 /// What a device, its encoders and its submits share.
 ///
-/// The locks, in the one order any call takes them: a queue's (`queues`) or the heap's
-/// (`heap_state`), never both and never two queues'; then the records' (`records`); then
-/// one entry's, a handle's in a table or a heap slot's (`slots`). Recording takes an entry's
-/// lock alone. No lock but a queue's or the heap's is held across a driver call, and none
+/// The locks, in the one order any call takes them: a queue's (`queues`), the heap's
+/// (`heap_state`) or the swapchain's leftovers' (`left`), never two of them; then the
+/// records' (`records`); then one entry's, a handle's in a table or a heap slot's
+/// (`slots`). Recording takes an entry's lock alone. No lock but a queue's or the heap's is held across a driver call, and none
 /// across a wait or the caller's closure. A destroying call is one: the last count of a
 /// driver object is dropped, and a reaped sampler destroyed, once the records', entry and
 /// slot locks are given up.
@@ -345,6 +348,8 @@ pub(crate) struct Shared {
     /// Taken by a submit through its checks, its driver call and its hold after.
     pub(crate) queues: [Mutex<()>; QUEUES],
     heap_state: Mutex<HeapState>,
+    /// What a swapchain let go of that a submit or an encoder may still use.
+    pub(crate) left: Mutex<Left>,
     pub(crate) heap: Heap,
     pub(crate) records: Mutex<Records>,
     lost: AtomicBool,
@@ -380,7 +385,8 @@ impl Shared {
     }
 
     /// A holder's drop. The last waits for the device to idle, as the contract's last drop
-    /// waits for every submit, and destroys the samplers and the orphaned pools; one made
+    /// waits for every submit, and destroys the samplers, the orphaned pools and what a
+    /// swapchain left; one made
     /// while the thread unwinds a panic with a submit pending leaks the device instead, and
     /// one made so with none pending tears down as any other.
     pub(crate) fn let_go(&self) {
@@ -421,6 +427,10 @@ impl Shared {
                 device.destroy_command_pool(pool, None);
             }
         }
+        drop(guard);
+        // As above: no submit names the images, and no present reads them.
+        let left = core::mem::take(&mut *lock(&self.left));
+        drop(left);
     }
 
     /// The families a resource of `sharing` is made concurrent across: none for an
@@ -615,9 +625,11 @@ impl VulkanDevice {
     /// `ErrorKind::Unsupported` where no loader is found, the adapter lacks a feature of the
     /// required set (named in the message), its limits are below
     /// [`Capabilities::LEAST`]'s or below the heap and sampler table asked for, or the request
-    /// has a surface: this device presents to no window yet. `ErrorKind::NotFound` for an
-    /// adapter no name of the loader's contains. A driver's failure as its kind. A
-    /// pipeline cache that fails a check starts the cache empty and is no error.
+    /// has a surface the instance or adapter cannot present to (no swapchain or surface
+    /// maintenance extension, a handle of another kind, an AppKit view off the main
+    /// thread). `ErrorKind::NotFound` for an adapter no name of the loader's contains. A
+    /// driver's failure as its kind. A pipeline cache that fails a check starts the cache
+    /// empty and is no error.
     pub fn new(request: DeviceRequest) -> Result<Self> {
         let target = request.surface.as_ref().map(|source| Target::Window(Arc::clone(source)));
         Self::open(&request, target)
@@ -629,12 +641,13 @@ impl VulkanDevice {
     ///
     /// # Errors
     ///
-    /// As [`new`](Self::new)'s; `ErrorKind::Unsupported` too for a request that names a
-    /// window, and where the driver offers no headless surface.
+    /// As [`new`](Self::new)'s; `ErrorKind::InvalidData` for a request that names a window,
+    /// which is the caller's error, and `ErrorKind::Unsupported` too where the driver offers
+    /// no headless surface.
     pub fn headless(request: DeviceRequest) -> Result<Self> {
         if request.surface.is_some() {
             return Err(Error::new(
-                ErrorKind::Unsupported,
+                ErrorKind::InvalidData,
                 "a headless device for a request that names a window",
             ));
         }
@@ -659,6 +672,7 @@ impl VulkanDevice {
                 retired: Vec::new(),
                 orphans: Vec::new(),
             }),
+            left: Mutex::new(Left::default()),
             heap,
             records: Mutex::new(Records::new(caps.heap_slots, caps.samplers, start)),
             lost: AtomicBool::new(false),
@@ -1151,7 +1165,7 @@ impl Device for VulkanDevice {
             exclusive: desc.sharing == Sharing::Exclusive,
             sampled: None,
             views: Vec::new(),
-            swapchain: false,
+            swapchain: None,
         };
         // SAFETY: the image is live.
         let actual = unsafe { device.get_image_memory_requirements(image) };

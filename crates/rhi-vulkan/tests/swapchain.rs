@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use lactose_core::ErrorKind;
 use lactose_rhi_api::{
     Acquired, BufferDesc, BufferHandle, BufferImageCopy, BufferState, BufferTransition,
-    BufferUsage, ColourAttachment, Device, Encoder, Extent, Format, ImageDesc, ImageHandle,
-    ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryClass, PassReach,
-    Presented, QueuePath, QueueRole, Rect, RenderPass, Sharing, StateOn, Store, Submit, Swapchain,
-    SwapchainDesc, Target, TimelineHandle, TimelinePoint,
+    BufferUsage, ColourAttachment, Device, DeviceRequest, Encoder, Extent, Format, ImageDesc,
+    ImageHandle, ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage, Load,
+    MemoryClass, PassReach, Presented, QueuePath, QueueRole, Rect, RenderPass, Sharing, StateOn,
+    Store, Submit, Swapchain, SwapchainDesc, Target, TimelineHandle, TimelinePoint,
 };
 use lactose_rhi_vulkan::VulkanDevice;
 
@@ -265,7 +265,8 @@ fn frames_in_flight_are_presented_across_a_resize() {
             device.create_swapchain(&SwapchainDesc { extent: first }).expect("a swapchain");
         assert_eq!(swapchain.extent(), first);
         assert!(swapchain.image_count() >= 2, "{} images", swapchain.image_count());
-        assert!(swapchain.display_times().is_none(), "a headless surface reports no times");
+        let mut times = Vec::new();
+        assert!(!swapchain.display_times(&mut times), "a headless surface reports no times");
         let mut slots: Vec<Slot> = (0..IN_FLIGHT).map(|_| frames.slot()).collect();
         let mut shown = 0;
         let mut stale = 0;
@@ -306,7 +307,9 @@ fn frames_in_flight_are_presented_across_a_resize() {
         }
         eprintln!("{sharing:?}: {shown} shown, {stale} stale of {FRAMES} frames");
         assert_eq!(shown + stale, FRAMES, "every frame was presented");
-        assert!(swapchain.display_times().is_none());
+        // A headless surface is never out of date: every present was shown.
+        assert_eq!(stale, 0, "presents taken stale");
+        assert!(!swapchain.display_times(&mut times) && times.is_empty());
         drop(swapchain);
     }
     drop(device);
@@ -350,4 +353,146 @@ fn shutdown_with_frames_in_flight_ends_cleanly() {
     }
     drop(device);
     assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+/// Presents one frame on `swapchain`, an image moved straight to `Present`.
+fn show(device: &VulkanDevice, swapchain: &mut dyn Swapchain) {
+    let Acquired::Image(image) = acquire(swapchain) else { panic!("no image") };
+    let mut present = device.create_encoder(P, "present").expect("an encoder");
+    present.transition_images(&[image_to(
+        image,
+        on(ImageState::Undefined, P),
+        on(ImageState::Present, P),
+    )]);
+    let mut presents = [present];
+    let shown = swapchain
+        .present(image, Submit { encoders: &mut presents, waits: &[], signals: &[] })
+        .expect("a present");
+    assert_eq!(shown, Presented::Shown);
+    let [present] = presents;
+    // The encoder's drop waits for its submit.
+    drop(present);
+}
+
+/// An encoder that recorded the acquired image keeps it, and its driver swapchain, past a
+/// `resize` or the swapchain's drop: its later recording of that image names a live image,
+/// and the layer says nothing. After the drop a second swapchain is made while the encoder
+/// still holds the first one's image, from the first's driver swapchain, which the encoder's
+/// drop then destroys.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn an_encoder_keeps_its_swapchain_image_past_a_resize_or_the_drop() {
+    for by_drop in [false, true] {
+        let sink = Arc::new(Counting::default());
+        let test = "an_encoder_keeps_its_swapchain_image_past_a_resize_or_the_drop";
+        let Some(device) = headless(&sink, test) else { return };
+        let small = Extent { width: 64, height: 64 };
+        let mut swapchain =
+            device.create_swapchain(&SwapchainDesc { extent: small }).expect("a swapchain");
+        let Acquired::Image(image) = acquire(&mut *swapchain) else { panic!("no image") };
+        let mut encoder = device.create_encoder(P, "late").expect("an encoder");
+        encoder.transition_images(&[image_to(
+            image,
+            on(ImageState::Undefined, P),
+            on(ImageState::ColourAttachment, P),
+        )]);
+        if by_drop {
+            drop(swapchain);
+            swapchain = device.create_swapchain(&SwapchainDesc { extent: small }).expect("again");
+        } else {
+            swapchain.resize(Extent { width: 32, height: 32 }).expect("the resize");
+        }
+        clear(&mut *encoder, image, [0.0, 0.5, 1.0, 1.0]);
+        encoder.transition_images(&[image_to(
+            image,
+            on(ImageState::ColourAttachment, P),
+            on(ImageState::Present, P),
+        )]);
+        // The handle is stale: the encoder's present is refused, with nothing submitted.
+        let mut encoders = [encoder];
+        let refused = swapchain
+            .present(image, Submit { encoders: &mut encoders, waits: &[], signals: &[] })
+            .expect_err("a present of the image of before");
+        eprintln!("by_drop={by_drop}: {refused}");
+        drop(encoders);
+        show(&device, &mut *swapchain);
+        drop(swapchain);
+        drop(device);
+        assert_eq!(sink.count(), 0, "by_drop={by_drop}: {:?}", sink.texts());
+    }
+}
+
+/// A graphics submit that writes the acquired image, held by a host point, is pending while
+/// the swapchain is resized, or dropped and made again: the image and its driver swapchain
+/// are kept until the submit completes, and the layer says nothing. The Vulkan backend takes
+/// a swapchain image on a graphics encoder, which null alone refuses (`present-queue`).
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn a_frame_submit_pending_on_a_swapchain_image_keeps_it_past_a_resize_or_the_drop() {
+    for by_drop in [false, true] {
+        let sink = Arc::new(Counting::default());
+        let test = "a_frame_submit_pending_on_a_swapchain_image_keeps_it_past_a_resize_or_the_drop";
+        let Some(device) = headless(&sink, test) else { return };
+        let small = Extent { width: 64, height: 64 };
+        let mut swapchain =
+            device.create_swapchain(&SwapchainDesc { extent: small }).expect("a swapchain");
+        let Acquired::Image(image) = acquire(&mut *swapchain) else { panic!("no image") };
+        let gate = device.create_timeline(0).expect("a timeline");
+        let done = device.create_timeline(0).expect("a timeline");
+        let mut draw = device.create_encoder(G, "frame").expect("an encoder");
+        draw.transition_images(&[image_to(
+            image,
+            on(ImageState::Undefined, G),
+            on(ImageState::ColourAttachment, G),
+        )]);
+        clear(&mut *draw, image, [1.0, 0.5, 0.0, 1.0]);
+        let mut draws = [draw];
+        let waits = [TimelinePoint { timeline: gate, value: 1 }];
+        let signals = [TimelinePoint { timeline: done, value: 1 }];
+        device
+            .submit(G, Submit { encoders: &mut draws, waits: &waits, signals: &signals })
+            .expect("the frame's submit");
+        if by_drop {
+            drop(swapchain);
+            swapchain = device.create_swapchain(&SwapchainDesc { extent: small }).expect("again");
+        } else {
+            swapchain.resize(Extent { width: 96, height: 48 }).expect("the resize");
+        }
+        device.signal_timeline(waits[0]).expect("the gate");
+        assert!(device.wait_timeline(signals[0], PATIENCE).expect("the wait"), "the submit");
+        drop(draws);
+        show(&device, &mut *swapchain);
+        drop(swapchain);
+        drop(device);
+        assert_eq!(sink.count(), 0, "by_drop={by_drop}: {:?}", sink.texts());
+    }
+}
+
+/// A window no handle of which is available, for a request that names one.
+struct NoWindow;
+
+impl raw_window_handle::HasWindowHandle for NoWindow {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
+impl raw_window_handle::HasDisplayHandle for NoWindow {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Err(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
+/// A headless device for a request that names a window is the caller's error, refused
+/// before any loader is opened: it runs with no driver.
+#[test]
+fn a_headless_device_for_a_request_that_names_a_window_is_refused() {
+    let sink = Arc::new(Counting::default());
+    let named = DeviceRequest { surface: Some(Arc::new(NoWindow)), ..request(sink as _) };
+    let refused = VulkanDevice::headless(named).err().expect("a refusal");
+    assert_eq!(refused.kind(), ErrorKind::InvalidData, "{refused}");
 }

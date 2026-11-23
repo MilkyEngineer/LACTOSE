@@ -333,8 +333,16 @@ fn present_once(
 /// each call begins reads the display times on the thread that presents, with no wait. It
 /// counts the presents not yet known displayed: a present is taken as displayed once its
 /// own id or a later one is reported. `None` where the swapchain reports no display time.
-fn waiting(swapchain: &mut dyn Swapchain, displayed: &mut Option<PresentId>) -> Option<u64> {
-    let times: Vec<DisplayTime> = swapchain.display_times()?;
+/// The buffer is the caller's, cleared and reused at each call.
+fn waiting(
+    swapchain: &mut dyn Swapchain,
+    times: &mut Vec<DisplayTime>,
+    displayed: &mut Option<PresentId>,
+) -> Option<u64> {
+    times.clear();
+    if !swapchain.display_times(times) {
+        return None;
+    }
     if let Some(last) = times.last() {
         *displayed = Some(last.present);
         let age_at_display: Duration = last.shown.elapsed();
@@ -630,8 +638,8 @@ mod backend {
         fn last_present(&self) -> Option<PresentId> {
             None
         }
-        fn display_times(&mut self) -> Option<Vec<DisplayTime>> {
-            None
+        fn display_times(&mut self, into: &mut Vec<DisplayTime>) -> bool {
+            false
         }
     }
 

@@ -739,7 +739,7 @@ impl Encoder for VulkanEncoder {
             // caller moves to `Present` is in `GENERAL` (`convert::image_scope`).
             let scope = |state: ImageState| {
                 let mut scope = image_scope(state);
-                if state == ImageState::Present && object.swapchain {
+                if state == ImageState::Present && object.swapchain.is_some() {
                     scope.layout = vk::ImageLayout::PRESENT_SRC_KHR;
                 }
                 scope

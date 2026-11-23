@@ -1116,9 +1116,11 @@ name = "lactose-rhi-vulkan"
 version = "0.0.0"
 dependencies = [
  "ash",
+ "dispatch",
  "lactose-core",
  "lactose-rhi-api",
  "libc",
+ "objc2",
  "raw-window-handle",
  "raw-window-metal",
 ]

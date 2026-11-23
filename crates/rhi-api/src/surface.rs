@@ -162,14 +162,15 @@ pub trait Swapchain: Send {
     /// `Ok`, it is that present's. `None` before the first.
     fn last_present(&self) -> Option<PresentId>;
 
-    /// The display times that arrived since the last call, oldest first: each present's id
-    /// once at most, in increasing order. `None` from the swapchain's creation on where its
-    /// device has no source of display times; `Some` of an empty list where none has
+    /// Appends to `into` the display times that arrived since the last call, oldest first:
+    /// each present's id once at most, in increasing order. It allocates nothing once `into`
+    /// has room. `false` from the swapchain's creation on where its device has no source of
+    /// display times, and nothing appended; `true` where it has one, whether or not anything
     /// arrived. It never waits and reaches no queue, and returns within the bound its
     /// backend's README states. It is called on the thread that presents, between that
     /// thread's other calls of the swapchain, since every source's read is synchronised
     /// with the acquire and the present. A present the display never took may be left out
     /// or reported; each backend's README says which, and a report of a later id covers it
     /// either way (`README.md`, "The display-time report").
-    fn display_times(&mut self) -> Option<Vec<DisplayTime>>;
+    fn display_times(&mut self, into: &mut Vec<DisplayTime>) -> bool;
 }

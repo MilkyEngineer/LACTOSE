@@ -51,6 +51,9 @@ lactose-rhi-vulkan = { path = "crates/rhi-vulkan" }
 ash = { version = "=0.38.0", default-features = false, features = ["loaded", "debug", "std"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 crossbeam-deque = "0.8"
+# Pinned exactly: the main thread's queue, on which `lactose-rhi-vulkan` takes the layer it made
+# for an AppKit view out of the view once the surface is destroyed.
+dispatch = "=0.2.0"
 libc = "0.2"
 # Pinned exactly: libm releases swap in different algorithms, so a bump is a determinism change
 # that must regenerate and re-review crates/math/tests/golden/vectors.txt. Features are named

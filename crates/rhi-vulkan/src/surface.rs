@@ -104,11 +104,13 @@ pub(crate) struct Surface {
     pub(crate) surface: vk::SurfaceKHR,
     /// A window shows it.
     pub(crate) shown: bool,
+    /// The layer made for an AppKit view, which keeps its bounds and `contentsScale` equal
+    /// to the view's on the main thread. Taken out of the view by [`Surface::destroy`], and
+    /// leaked with the surface where that is never called. Declared before the source, so
+    /// that it is let go before the view is.
+    layer: Option<Layer>,
     /// The window, let go after the surface is destroyed.
     _source: Option<Arc<dyn SurfaceSource>>,
-    /// The layer made for an AppKit view, which keeps its bounds and `contentsScale` equal
-    /// to the view's on the main thread.
-    _layer: Option<Layer>,
 }
 
 /// The layer an AppKit view's surface is made on.
@@ -132,8 +134,7 @@ unsafe fn metal(
     view: NonNull<c_void>,
 ) -> Result<(vk::SurfaceKHR, Layer)> {
     // `Layer::from_ns_view` panics off the main thread.
-    // SAFETY: a query of the calling thread.
-    if unsafe { libc::pthread_main_np() } == 0 {
+    if !main_thread() {
         return Err(unsupported(
             "an AppKit window's surface off the main thread: AppKit's views are the main \
              thread's",
@@ -148,6 +149,41 @@ unsafe fn metal(
     let surface = unsafe { metal.create_metal_surface(&info, None) }
         .map_err(|e| driver(e, "vkCreateMetalSurfaceEXT"))?;
     Ok((surface, layer))
+}
+
+/// Whether the calling thread is the process's main thread, AppKit's.
+#[cfg(target_os = "macos")]
+fn main_thread() -> bool {
+    // SAFETY: a query of the calling thread. It answers 1 on the main thread, 0 on another,
+    // and -1 where the main thread is not yet known, which is not the main thread to AppKit.
+    unsafe { libc::pthread_main_np() == 1 }
+}
+
+/// Takes a layer made for a view out of the view, on the main thread, where AppKit's view
+/// tree is changed: at once on it, or later from its queue, which runs once the thread
+/// returns to its run loop. The layer is let go there too, its observers of the view's
+/// layer removed after it. A view's own layer (`pre_existing`) stays the view's.
+#[cfg(target_os = "macos")]
+fn detach(layer: Layer) {
+    if layer.pre_existing() {
+        return;
+    }
+    let remove = move || {
+        // SAFETY: the layer is a live `CAMetalLayer`, a `CALayer`, which `layer` holds, on
+        // the main thread; `removeFromSuperlayer` takes no argument and returns nothing.
+        unsafe {
+            let object: &objc2::runtime::AnyObject = layer.as_ptr().cast().as_ref();
+            let () = objc2::msg_send![object, removeFromSuperlayer];
+        }
+        drop(layer);
+    };
+    if main_thread() { remove() } else { dispatch::Queue::main().exec_async(remove) }
+}
+
+/// No layer is made away from macOS.
+#[cfg(not(target_os = "macos"))]
+fn detach(layer: Layer) {
+    match layer {}
 }
 
 /// An AppKit view has no surface away from macOS.
@@ -229,19 +265,22 @@ impl Surface {
             loader,
             surface,
             shown: !matches!(chosen.handles, Handles::Headless),
+            layer,
             _source: chosen.source,
-            _layer: layer,
         })
     }
 
-    /// Destroys the surface.
+    /// Destroys the surface, then takes the layer made for an AppKit view out of the view.
     ///
     /// # Safety
     ///
     /// No swapchain of it lives, its instance does, and it is destroyed once.
-    pub(crate) unsafe fn destroy(&self) {
+    pub(crate) unsafe fn destroy(&mut self) {
         // SAFETY: by the caller's promise.
         unsafe { self.loader.destroy_surface(self.surface, None) };
+        if let Some(layer) = self.layer.take() {
+            detach(layer);
+        }
     }
 
     /// Whether `family` of `physical` can present to it.
@@ -249,5 +288,15 @@ impl Surface {
         // SAFETY: the surface and the physical device are of one live instance.
         unsafe { self.loader.get_physical_device_surface_support(physical, family, self.surface) }
             .map_err(|e| driver(e, "vkGetPhysicalDeviceSurfaceSupportKHR"))
+    }
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        // A surface not destroyed is leaked with its device, and may still be presented to:
+        // its layer stays in the view, and alive.
+        if let Some(layer) = self.layer.take() {
+            core::mem::forget(layer);
+        }
     }
 }

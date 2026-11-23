@@ -135,7 +135,7 @@ pub(crate) fn submit(shared: &Shared, role: QueueRole, submit: Submit<'_>) -> Re
     let queue = shared.queue_of(role);
     let _queue = lock(&shared.queues[queue]);
     match stage(shared, queue, role, &mut submit, false)? {
-        Staging::Staged(staged) => send(shared, staged, &submit, Binary::default()),
+        Staging::Staged(staged) => send(shared, staged, &submit, Binary::default()).0,
         Staging::Undecided(point) => {
             unreachable!("a submit is staged without a walk, yet {point:?} was left undecided")
         }
@@ -201,13 +201,14 @@ pub(crate) fn stage(
 /// with `binary`'s semaphores; then the hold that records it received. Where the call
 /// fails and the device is not lost, an empty batch takes the stamp, waiting for
 /// `binary`'s wait, so that the acquire's semaphore is spent either way, and signalling no
-/// present semaphore.
+/// present semaphore. With the call's result, whether a batch the driver took waits for
+/// `binary`'s wait: not where both calls failed.
 pub(crate) fn send(
     shared: &Shared,
     staged: Staged,
     submit: &Submit<'_>,
     binary: Binary,
-) -> Result<()> {
+) -> (Result<()>, bool) {
     let Staged { queue, seq, waits, signals } = staged;
     let raw = &shared.raw;
     let target = shared.queue(queue);
@@ -244,6 +245,7 @@ pub(crate) fn send(
         .chain(binary.signal.map(|semaphore| point(semaphore, 0)))
         .collect();
     signal_infos.push(point(target.timeline, seq));
+    let mut spent = true;
     let submitted = ended.and_then(|()| {
         let info = vk::SubmitInfo2::default()
             .wait_semaphore_infos(&wait_infos)
@@ -274,6 +276,7 @@ pub(crate) fn send(
             let retried =
                 unsafe { raw.device.queue_submit2(target.queue, &[info], vk::Fence::null()) };
             if let Err(error) = retried {
+                spent = false;
                 shared.lost_on(error);
             }
         }
@@ -281,7 +284,7 @@ pub(crate) fn send(
     let mut records = shared.records();
     records.received(queue, seq, submitted.is_err());
     if records.lost {
-        return Err(lost());
+        return (Err(lost()), false);
     }
-    submitted
+    (submitted, spent)
 }

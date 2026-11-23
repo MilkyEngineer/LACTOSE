@@ -130,6 +130,9 @@ pub(crate) enum Between {
     HostLend,
     /// A present's wait for an undecided point, with no lock held.
     PresentWait,
+    /// A present taken, its submit committed and the records' lock given up, its queue's
+    /// lock still held.
+    PresentHeld,
 }
 
 /// What a device, its encoders and its swapchain share.
