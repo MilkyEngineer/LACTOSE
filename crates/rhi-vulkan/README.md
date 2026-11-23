@@ -98,8 +98,9 @@ contract leaves to the backend.
   whose `workgroup` is not the one `OpExecutionMode LocalSize` its module states for its entry
   point is refused `InvalidData`, as is one whose module states none, states two, or decorates
   an id `BuiltIn WorkgroupSize`. Each creation asks the driver for its creation feedback; a
-  stage the driver marks as an application cache hit counts as a hit in
-  `pipeline_cache_stats`.
+  stage the driver marks as an application cache hit counts as a hit in `pipeline_stats`,
+  and one it does not mark valid counts neither way: lavapipe (Mesa 26.0.8) marks the
+  pipeline's feedback valid and zeroes every stage's, so it counts no stage.
 - **The pipeline cache** is sealed with `lactose-rhi-api`'s seal under the vendor, the device
   and the driver's cache UUID. Where the sealed bytes are kept is the caller's. A payload that fails the seal, whose Vulkan header names
   another device, or that the driver refuses, starts the cache empty and `Rejected`.
