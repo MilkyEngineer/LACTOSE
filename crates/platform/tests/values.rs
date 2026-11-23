@@ -1,4 +1,4 @@
-//! What runs in the facade: the plain values, which no body of the implementation decides.
+//! The plain values, which no body of the implementation decides.
 
 use std::sync::Arc;
 

@@ -10,9 +10,8 @@
 //!
 //! # Status
 //!
-//! A facade: every public signature is final and every body that decides anything is
-//! `todo!()`. The implementation lane replaces the bodies behind this surface and removes
-//! the crate-level `allow` with the last `todo!()`.
+//! Implemented over winit 0.30 on macOS and Windows; on Linux it builds over X11 and is
+//! not run. It contains no `unsafe` (`SAFETY.md`).
 //!
 //! # Where to start
 //!
@@ -237,11 +236,6 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every deciding body is `todo!()` until the implementation lane replaces it, and the fields and parameters it will use are declared now"
-)]
 
 mod main_thread;
 mod present;

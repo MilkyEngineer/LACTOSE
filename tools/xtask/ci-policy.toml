@@ -151,6 +151,9 @@ separate = [
   # It asserts when a slot's lock is let go, and a process that another test of one binary
   # spawns holds a copy of the lock until its exec.
   "lactose-xtask::heavy",
+  # A window's event loop needs the process's main thread, which a test harness keeps: the
+  # binary has its own `main`, and each case runs as its subprocess.
+  "lactose-platform::window",
 ]
 
 # Milestone 2 plan, decision 5.15: each check job of .github/workflows/ci.yml builds, lints and
