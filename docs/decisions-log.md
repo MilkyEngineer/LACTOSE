@@ -7658,6 +7658,222 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     the triangle cases leave out half a pixel at each edge, as
     their doc says, not a whole one.
   The suite has 175 cases, 147 of them contract cases.
+- Addendum (lane `rhi-repeat`, 2026-11-23): one transition call names each subresource once.
+  The cause is finding G1 of the render graph's first review: the graph made one
+  `transition_images` call of a closing change and a hand-off release of one image, and one
+  `transition_buffers` call of a take and a release of one buffer. Null applied a call's
+  elements in order and accepted them, while `rhi-vulkan` sends a call as one
+  `vkCmdPipelineBarrier2`, whose elements the specification leaves unordered: "Each member of
+  pMemoryBarriers, pBufferMemoryBarriers, and pImageMemoryBarriers defines a separate memory
+  dependency" (`VkDependencyInfo`), and each dependency's first scope holds the operations
+  "that occurred earlier in submission order" than the command ("Pipeline Barriers").
+  - *The rule* (`lactose-rhi-api`'s "States", `Rule::State` and the two calls' docs): one
+    call's elements take effect together, not in order, and each element's `from` is the
+    state before the call. A call names an image's subresource in at most one element and a
+    buffer in at most one. A call that names one twice, by two ranges of one image that share
+    a subresource or by one buffer, is refused `Rule::State` on every backend, a transition
+    from or to `Undefined` and one whose `from` is on another role counted as any other.
+    Ranges of one image that share no subresource are not a repeat, so a mip chain's
+    per-level transitions stay one call. A change of two steps is two calls, which their
+    stages order. No `Rule` variant is added; the rules table lists the clause under "Every
+    backend".
+  - *The check, on both backends.* rhi-null and `rhi-vulkan` refuse a repeat at the call,
+    before they record any of it, as their bounds and usage refusals there do, and so refuse
+    the encoder's submit. Each compares every element with every earlier one: images by
+    handle and by `ImageRange::overlaps`, buffers by handle. `ImageRange::overlaps` is the one
+    public item the lane adds, a `const` method in `lactose-rhi-api`: whether two ranges share
+    a mip and a layer, computed in `u64` so no end wraps, and false for a range of no mips or
+    no layers. It is a method on the range, not a function of the `conformance` module,
+    because a backend's own code needs it and that module is behind a feature the backends'
+    libraries do not enable. `rhi-vulkan` checks before it skips an element to `Undefined`,
+    which it records nothing for, so it refuses what null refuses. One caller on main named a
+    resource twice: the suite's
+    `acquire_in_a_later_submit_than_the_wait_for_its_release_is_refused` took an image from
+    `Undefined` and released it in one call, and a buffer likewise. Each is now two calls.
+  - *Why a device backend checks it.* `Rule`'s doc has a device backend check a breach that
+    is undefined behaviour on the host, a GPU fault or a driver abort, and leave a wrong image
+    to null. A repeat breaks the same valid usage as a wrong `from`: an unordered layout change
+    breaks `VUID-VkImageMemoryBarrier2-oldLayout-01197`, and a release unordered with a change
+    or a take breaks the acquire's rule ("Applications must not execute an acquire operation
+    on any resource where it has been modified in any way other than a matching release
+    operation"). That a repeat gives only a wrong image is not established:
+    - The specification leaves a breach of valid usage undefined, "and may include program
+      termination" ("Valid Usage"), and it "may also result in device loss" ("Lost Device").
+      Its sentence that incorrect usage "does not affect the integrity of the operating
+      system, the Vulkan implementation, or other applications" protects those, not this
+      application's device, and is no ground.
+    - The drivers whose source is public would give a wrong image. RADV's `radv_barrier` takes
+      the union of every element's source scope, makes each image element's transition in
+      array order, then the union of the destinations, so a repeat there is the chain in
+      order. ANV walks the image elements in array order too, and says of invalid auxiliary
+      data of a single-sampled image that it "doesn't hang as far as we can tell but rendering
+      corruption can occur".
+    - NVIDIA's drivers and AMD's Windows driver publish nothing.
+    - No device has run a repeat that it could see: MoltenVK encodes no GPU work for a
+      layout change, and KosmicKrisp has one queue.
+
+    The check keeps no state and costs one comparison of each pair of a call's elements, so
+    `rhi-vulkan` makes it rather than leave the repeat to residual 1 on source reading alone.
+  - *What the validators hear* (layer 1.4.363, on MoltenVK and on KosmicKrisp alike, from the
+    GPU review's probes). Core validation reads a call's elements in order, and hears an
+    element whose `oldLayout` an earlier element changed: the same change twice is
+    `VUID-VkImageMemoryBarrier2-oldLayout-01197`. Synchronisation validation reads them
+    together, and hears a later element whose source scope does not hold an earlier write: an
+    image's layout change racing a copy's write (`SYNC-HAZARD-WRITE-AFTER-WRITE`, on the second
+    element), or, for a buffer's change and then another, the next copy reading it
+    (`SYNC-HAZARD-READ-AFTER-WRITE`, at that copy). Neither hears a take from `Undefined` and
+    then a change, and, on MoltenVK, neither hears a change or a take and then a release;
+    KosmicKrisp shares one queue and makes no release. Nothing relies on a layer hearing a
+    repeat, and no device test sends one: both backends refuse it before it is recorded.
+  - *The cases* (`states.rs`). Three refuse `state` on every backend:
+    - `transition_naming_a_subresource_twice_is_refused`: six chains of one subresource. They
+      are a change and then another; a change and then a release; a take and then a release;
+      a change to the state the subresource is in, then a change; a change to `Undefined`,
+      then a take; and a change and then one to `Undefined`, which a device records nothing
+      for. Where compute shares the graphics queue a seventh chain starts on the compute
+      role, as an acquire does where compute has a queue of its own (G1's form B, an acquire
+      and then a release). Then a change and another with another image's element between.
+    - `transition_of_overlapping_ranges_is_refused`: a whole image with its last subresource,
+      one mip of both layers with one layer of every mip, and the first two mips with the
+      last two.
+    - `transition_naming_a_buffer_twice_is_refused`: a take and then a change; a take and then
+      a release; where compute shares the graphics queue, a take on the compute role and then
+      a change; and a take and a change with another buffer's element between.
+
+    `transitions_of_disjoint_mips_in_one_call_pass` runs everywhere. It makes one call with an
+    element for each mip and one of a second image; one with an element for each of the first
+    two mips and each layer of the last; one back, the second mip's element before the
+    first's and the second layer's before the first's; one of two buffers; then a transition
+    of the whole image, accepted only where every element took effect.
+
+    Each check is shown to matter, by mutants of `ImageRange::overlaps` and of each backend's
+    loop, run against rhi-null's tests and against the four cases on MoltenVK and KosmicKrisp:
+    - removing the image check fails the first two cases, and removing the buffer check the
+      third;
+    - comparing each element with the one before only fails the first case for an image and
+      the third for a buffer;
+    - leaving out an element to `Undefined`, or one from it, fails the first case, and so
+      does `rhi-vulkan` checking after it skips an element to `Undefined`;
+    - leaving out an element whose `from` is on another role (an acquire) fails the first case
+      for an image and the third for a buffer, where compute shares the graphics queue: under
+      null's set and on KosmicKrisp, not on MoltenVK, whose compute has a queue of its own;
+    - comparing only elements that stay on one queue fails the first case for an image and
+      the third for a buffer;
+    - comparing ranges for equality, or for one holding the other on each axis, fails the
+      second case;
+    - either comparison of `overlaps` made `<=`, one axis alone, and dropping the handle
+      comparison fail `transitions_of_disjoint_mips_in_one_call_pass`.
+
+    Dropping `overlaps`' test of an empty range changes no backend, whose bounds check refuses
+    an empty range first; it, and ends computed in `u32`, fail `lactose-rhi-api`'s test of
+    `overlaps`.
+
+    The render graph's repeats are the other half of G1, `graph-impl`'s to split.
+  - *A wait credits only the signal it waits for* (finding G9 of the render graph's second
+    review, after its G5). The timeline rule read "a submit it waits for" as a wait for any
+    point that submit signals, and null and `rhi-vulkan` credited all of that submit's
+    signals. So a compute submit signalling `c = 1` and `f = 1`, then a graphics submit
+    waiting for `c = 1` and signalling `f = 2`, were both accepted. On Vulkan that pair is
+    undefined behaviour (`VUID-VkSubmitInfo2-semaphore-03882`): "Semaphore signal operations
+    defined by a single VkSubmitInfo or VkSubmitInfo2 or VkBindSparseInfo structure are
+    unordered with respect to other semaphore signal operations defined within the same
+    structure" ("Implicit Synchronization Guarantees").
+    - *The rule* (`lactose-rhi-api`'s "Timelines", the rules table, `Rule::Timeline`,
+      `Device::submit`, `TimelinePoint` and `Submit::signals`): a submit signals a timeline
+      only where every pending signal of it is from the submit's own queue, from a submit
+      whose signal of that timeline it waits for, or from a submit earlier on its queue than
+      one whose signal, of any timeline, it waits for. Waits count in turn, and so does a
+      signal the host has seen reached.
+    - The credit to earlier submits holds by signal operation order, in the note of
+      "Implicit Synchronization Guarantees": "all semaphore signal operations contained in
+      any given batch are guaranteed to happen-after all semaphore signal operations
+      contained in any previous batches"; "no ordering guarantee is provided between the
+      semaphore signal operations defined within a single batch".
+    - *Both backends' check.* A wait for a point of a submit still orders that submit's
+      commands and everything earlier on its queue, as before. The latest submit of a queue
+      that a submit is ordered after is credited for a timeline only where a wait, of the
+      submit or of one it is ordered after, names that timeline at or above the pending
+      signal. Null and `rhi-vulkan` hold the same rule, each with a records test of the same
+      name, `a_wait_orders_only_the_signal_it_waits_for`, over the same shapes.
+      `rhi-vulkan`'s also refuses a signal beside a submit that the host has seen complete by
+      one of its signals but not by the other.
+    - *The cases* (`timelines.rs`), each skipped where compute shares the graphics queue:
+      - `signal_after_a_wait_for_another_signal_of_its_submit_is_refused` is the pair, refused
+        `timeline` everywhere and accepted once `f = 1` is reached; then, with `f = 1` from
+        the host, the compute submit signalling `c = 1` and `f = 2` and the graphics submit
+        waiting for `c = 1` and `f = 1` and signalling `f = 3`, refused, since a wait below
+        the pending signal orders it no more than none;
+      - `wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline` is the
+        graphics submit waiting for `f = 1`, accepted;
+      - `wait_for_a_signal_orders_the_earlier_submits_of_its_queue` is `f = 1` and `c = 1`
+        as two compute submits in that order and the graphics submit waiting for `c = 1`,
+        accepted.
+
+      Crediting the whole waited submit again fails the first case and both records tests.
+      Dropping the credit of earlier submits fails the third case and both records tests.
+      Crediting a wait below the pending signal, or any wait of its timeline, fails the first
+      case and both records tests (the second review's D1).
+    - *The callers.* No caller on main at 28010ec submits two signals, so none relied on the
+      wider credit. The callers read were rhi-api's suite and tests, rhi-null's and
+      `rhi-vulkan`'s tests and canary, the renderer, the render graph and `lactose-app`'s
+      tests. `graph-impl` at 99659d5 makes the one two-signal submit, a frame's last, and
+      waits for the frame point itself.
+  - *Null keeps a promise pending until the caller has seen it* (the GPU review's second
+    round, G6, on main before this lane). Null took promises from the submits it had not
+    run, so a compute submit with no gate signalling `f = 1`, then a graphics submit
+    signalling `f = 2` with no wait, were accepted whenever null ran the first at once; on a
+    device either may land first (03882). It takes them now from the submits the caller has
+    not seen, as its lifetimes do, in a submit's check and a host signal's.
+    `timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused` holds it, null
+    alone since a device refuses the pair only while the compute submit is in flight, and
+    `rhi-vulkan`'s device test `signal_beside_another_queues_promise_in_flight_is_refused`
+    holds a lagging compute submit in flight and is refused. Either check given back its old
+    set of submits fails the case. Null stays more lenient than a device in two places, both
+    since it keeps no value the caller has seen of a timeline: once the caller has seen one
+    point of a submit, null counts its other promises reached, since they land together
+    there; and it takes the 2^31 limit from the value it has run a timeline to, so a signal
+    2^31 above a point null has run but the caller has not seen is accepted, where a device
+    with that point in flight refuses it (the third round, G14; null's test
+    `a_signal_2_31_above_a_value_the_caller_has_not_seen_is_accepted` states the shape).
+    "Queues by role" now says no backend refuses a call "as a pending submit" once the caller
+    has seen a point the submit signals.
+  - *A failed submit keeps its promises* (the GPU review's second round, G5, on main before
+    this lane; a safe call driven into 03882, which the RHI safety ruling's item 11 closes
+    while `lactose-rhi-api` is unstable). `rhi-vulkan` dropped a failed driver submit's
+    waits and signals in the hold after its call, and the README invited the caller to
+    signal the points from the host. A submit of another queue already credited through
+    either then lost its order: W on compute behind a gate signals `g = 1`; X on compute
+    signals `c = 1`; N on graphics, between X's two holds, waits for `c = 1` and signals
+    `g = 2`; X fails, the host signals `c = 1`, N runs, and W's `g = 1` lands on a semaphore
+    at 2. A failed submit now stays in the records, marked: its promises stay pending and
+    nothing orders them, so every signal of their timelines from a submit is refused, and
+    every host signal of them not below a promise, or below one but meeting none of the
+    failed submit's waits, until its stamp and its waits are known reached; its waits order
+    nothing more; then it leaves, its promises not folded in. A host signal below the
+    promise that meets one of its waits is accepted, as for a live promise, since a failed
+    submit that waits for its own timeline is released by nothing else. The batch with no
+    work already brings the queue's own value to the stamp after the queue's earlier
+    submits. The caller lets the promises go by seeing, through `wait_timeline` or
+    `timeline_value`, each of the failed submit's waits and a point of a later submit to its
+    queue; `signal_timeline` reads only its own timeline, so a host signal alone never
+    learns them, and a call that reads every queue (`submit`, `heap_write`, `host_access`,
+    `create_sampler`, a destroy) learns the stamp once the batch with no work has run.
+    While the failed submit is kept, `destroy_timeline` refuses (`pending`) a timeline it
+    signals, and one it waits for until its stamp is known reached; and `settle` completes
+    nothing through a failed submit's promise, which counts as reached once its timeline is
+    gone. No device test can make a driver call fail; records tests on the README's
+    interleaving model hold the order, through the failed submit's promise and through its
+    wait, and the third round's edges: the caller's recipe, a promise of a removed timeline,
+    the cover and the credit at the top each taking no failed wait, and a failed submit
+    waiting for its own timeline released by the host. Dropping the points at once, letting
+    a failed submit leave before its waits are reached or before its stamp is, ordering
+    through its promise, ordering through its waits in the cover or at the top alone,
+    refusing a host signal below its promise, letting its own queue signal past it, counting
+    its promise of a removed timeline as completing its queue, and keeping it for ever each
+    fail at least one of them.
+  The suite has 183 cases, 155 of them contract cases. The device refusal list in
+  `lactose-rhi-api`'s README has 69 cases, the three repeat cases among them; it read 64
+  where it held 65 before this lane.
 
 **D159. `lactose-platform`: one window whose `Arc` is its lifetime, the two pumps over `lactose-task`'s lanes, a close and a resize as states, and a present thread over the caller's state** (§3, §4, §5.1, §21, `lactose-platform`, `crates/app/README.md`, `crates/task/README.md`)
 - Why: section 4 gives the crate four nouns and section 5.1 two threads, and the milestone 2

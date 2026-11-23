@@ -12,7 +12,10 @@ use crate::resource::kind;
 /// A timeline of a device.
 pub type TimelineHandle = Handle<kind::Timeline>;
 
-/// A value of a timeline: reached once the timeline's value is at least `value`.
+/// A value of a timeline: reached once the timeline's value is at least `value`. A wait
+/// for a point orders the signal that reaches it and what is ordered before that signal,
+/// among it the earlier submits of the signal's queue, and not the other signals of its
+/// submit (`README.md`, "Timelines").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TimelinePoint {
     /// The timeline.
@@ -35,7 +38,10 @@ pub struct Submit<'a> {
     /// The points the device waits for before it runs anything of the submit.
     pub waits: &'a [TimelinePoint],
     /// The points reached when the submit completes: each value greater than any its
-    /// timeline has reached or been promised by another submit or signal
-    /// ([`Rule::Timeline`](crate::Rule::Timeline)).
+    /// timeline has reached or been promised by another submit or signal, and each
+    /// ordered after every other queue's pending signal of its timeline by a wait for that
+    /// signal or for a signal of a later submit of its queue
+    /// ([`Rule::Timeline`](crate::Rule::Timeline)). The points are unordered with one
+    /// another: a wait for one of them orders none of the others.
     pub signals: &'a [TimelinePoint],
 }

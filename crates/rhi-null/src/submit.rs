@@ -120,7 +120,7 @@ pub(crate) fn check(
             );
         }
     }
-    records.check_points(submit.waits, submit.signals, &replay.cover)?;
+    records.check_points(queue, submit.waits, submit.signals, &replay.cover)?;
     Ok(replay.plan)
 }
 

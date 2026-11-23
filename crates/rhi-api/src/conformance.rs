@@ -59,7 +59,7 @@ pub struct Case {
     pub refuses: Option<Rule>,
     /// Whether a device backend runs the case. `false` for a case that provokes a check
     /// the null backend alone makes, whose breach on a device gives a wrong image and
-    /// proves nothing, and for one that holds null's own meaning of a pending submit, one
+    /// proves nothing, and for those that hold null's own meaning of a pending submit, one
     /// whose completion the caller has not yet seen (`README.md`, "Queues by role").
     pub devices: bool,
 }
@@ -264,6 +264,10 @@ pub const CASES: &[Case] = cases! {
     contract "use_after_a_write_without_a_transition_is_refused" => State;
     contract "state_is_kept_for_each_mip_and_layer" => State;
     contract "state_follows_submission_order_not_recording_order" => State;
+    contract "transition_naming_a_subresource_twice_is_refused" => State everywhere;
+    contract "transition_of_overlapping_ranges_is_refused" => State everywhere;
+    contract "transition_naming_a_buffer_twice_is_refused" => State everywhere;
+    contract "transitions_of_disjoint_mips_in_one_call_pass";
     contract "cross_queue_use_without_a_transfer_is_refused" => Queue;
     contract "acquire_without_a_release_is_refused" => Queue;
     contract "release_and_acquire_cross_a_resource";
@@ -355,6 +359,10 @@ pub const CASES: &[Case] = cases! {
     contract "submit_signalling_no_more_than_it_waits_for_is_refused" => Timeline everywhere;
     contract "timeline_value_beyond_the_difference_limit_is_refused" => Timeline everywhere;
     contract "timeline_signalled_from_two_queues_without_a_wait_is_refused" => Timeline everywhere;
+    contract "timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused" => Timeline;
+    contract "signal_after_a_wait_for_another_signal_of_its_submit_is_refused" => Timeline everywhere;
+    contract "wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline";
+    contract "wait_for_a_signal_orders_the_earlier_submits_of_its_queue";
     contract "destroy_under_a_pending_submit_is_refused" => Pending everywhere;
     contract "concurrent_resource_destroyed_while_another_queue_uses_it_is_refused" => Pending everywhere;
     contract "destroy_after_an_unobserved_submit_is_refused" => Pending;

@@ -436,7 +436,10 @@ impl VulkanEncoder {
         Ok(set)
     }
 
-    /// Records a barrier for each change, in one call.
+    /// Records a barrier for each change, in one call. Its elements are separate
+    /// dependencies, none ordered with another, so the transition calls refuse one that
+    /// names a subresource or a buffer twice before they record any of it
+    /// (`lactose-rhi-api`, "States").
     fn barriers(
         &self,
         images: &[vk::ImageMemoryBarrier2<'_>],
@@ -700,7 +703,7 @@ impl Encoder for VulkanEncoder {
             return;
         }
         let mut barriers = Vec::with_capacity(transitions.len());
-        for transition in transitions {
+        for (at, transition) in transitions.iter().enumerate() {
             let Some(object) = self.image(transition.image) else { return };
             let range = transition.range;
             let inside = range.mips > 0
@@ -720,6 +723,13 @@ impl Encoder for VulkanEncoder {
                         transition.to.state
                     ),
                 );
+                return;
+            }
+            let repeats = transitions[..at]
+                .iter()
+                .any(|earlier| earlier.image == transition.image && earlier.range.overlaps(range));
+            if repeats {
+                self.fail(Rule::State, "a transition call that names a subresource twice");
                 return;
             }
             if transition.to.state == ImageState::Undefined {
@@ -764,8 +774,12 @@ impl Encoder for VulkanEncoder {
             return;
         }
         let mut barriers = Vec::with_capacity(transitions.len());
-        for transition in transitions {
+        for (at, transition) in transitions.iter().enumerate() {
             let Some(object) = self.buffer(transition.buffer) else { return };
+            if transitions[..at].iter().any(|earlier| earlier.buffer == transition.buffer) {
+                self.fail(Rule::State, "a transition call that names a buffer twice");
+                return;
+            }
             self.touch(transition.buffer, false, true);
             let change = self.change(
                 buffer_scope(transition.from.state),

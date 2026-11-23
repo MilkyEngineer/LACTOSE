@@ -19,7 +19,7 @@ use lactose_rhi_api::{
     ComputePipelineDesc, ComputePipelineHandle, Constant, ConstantValue, CookedShader, Cull,
     Device, DeviceRequest, Encoder, Extent, Filter, Format, GraphicsPipelineDesc, ImageDesc,
     ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryBlockDesc,
-    MemoryClass, PassReach, QueuePath, QueueRole, Rect, RenderPass, SamplerDesc, Sharing,
+    MemoryClass, PassReach, QueuePath, QueueRole, Rect, RenderPass, Rule, SamplerDesc, Sharing,
     StageDesc, StateOn, Store, Submit, Target, TimelinePoint, WriteMask,
 };
 use lactose_rhi_vulkan::VulkanDevice;
@@ -299,7 +299,7 @@ fn canary_synchronisation_validation_reports_a_race_across_queues() {
             sharing: Sharing::Exclusive,
         })
         .expect("an image");
-    let mut graphics = lagging(&device);
+    let mut graphics = lagging(&device, QueueRole::Graphics);
     graphics.transition_images(&[ImageTransition {
         image,
         range: ImageRange::FIRST,
@@ -360,7 +360,7 @@ fn canary_synchronisation_validation_reports_a_race_across_submits() {
     let source = buffer(&device, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
     let target = buffer(&device, BufferUsage::COPY_DESTINATION, MemoryClass::Device);
     let all = [BufferCopy { source_offset: 0, destination_offset: 0, size: 4096 }];
-    let mut first = lagging(&device);
+    let mut first = lagging(&device, QueueRole::Graphics);
     first.transition_buffers(&[
         BufferTransition {
             buffer: source,
@@ -397,13 +397,14 @@ fn canary_synchronisation_validation_reports_a_race_across_submits() {
     heard_alone(&sink, "SYNC-HAZARD-WRITE-AFTER-WRITE");
 }
 
-/// A graphics encoder whose first command is a dispatch that runs for a while (`store.slang`
-/// with a lag), so that what it records after is in flight when its submit returns.
-fn lagging(device: &VulkanDevice) -> Box<dyn Encoder> {
+/// An encoder of `role` whose first command is a dispatch that runs for a while
+/// (`store.slang` with a lag), so that what it records after is in flight when its submit
+/// returns.
+fn lagging(device: &VulkanDevice, role: QueueRole) -> Box<dyn Encoder> {
     let pipeline = kernel(device, "store.cs_main");
     let scratch = buffer(device, BufferUsage::DEVICE_ADDRESS, MemoryClass::Device);
-    let on = |state| StateOn { state, queue: QueueRole::Graphics };
-    let mut encoder = device.create_encoder(QueueRole::Graphics, "lagging").expect("an encoder");
+    let on = |state| StateOn { state, queue: role };
+    let mut encoder = device.create_encoder(role, "lagging").expect("an encoder");
     encoder.transition_buffers(&[BufferTransition {
         buffer: scratch,
         from: on(BufferState::Undefined),
@@ -423,6 +424,45 @@ fn lagging(device: &VulkanDevice) -> Box<dyn Encoder> {
     encoder.dispatch([1, 1, 1]);
     encoder.end_pass();
     encoder
+}
+
+/// A promise of a compute submit in flight, with no gate, is pending: a graphics signal of
+/// its timeline with no wait is refused, and so is a host signal above it, since nothing
+/// orders either after the promise. The suite's
+/// `timeline_signalled_from_two_queues_before_the_first_is_seen_is_refused` holds null to
+/// the same; a lagging dispatch holds the submit in flight here.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn signal_beside_another_queues_promise_in_flight_is_refused() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    if device.capabilities().queues.compute != QueuePath::Own {
+        eprintln!(
+            "signal_beside_another_queues_promise_in_flight_is_refused: skipped, compute shares \
+             the graphics queue"
+        );
+        return;
+    }
+    let timeline = device.create_timeline(0).expect("a timeline");
+    let at = |value| TimelinePoint { timeline, value };
+    let mut first = [lagging(&device, QueueRole::Compute)];
+    let signals = [at(1)];
+    device
+        .submit(QueueRole::Compute, Submit { encoders: &mut first, waits: &[], signals: &signals })
+        .expect("the lagging submit");
+    let signal = |signals: &[TimelinePoint]| {
+        device.submit(QueueRole::Graphics, Submit { encoders: &mut [], waits: &[], signals })
+    };
+    let refused = signal(&[at(2)]).expect_err("a signal beside the promise in flight");
+    assert_eq!(Rule::of(&refused), Some(Rule::Timeline), "{refused}");
+    let refused = device.signal_timeline(at(2)).expect_err("a host signal above the promise");
+    assert_eq!(Rule::of(&refused), Some(Rule::Timeline), "{refused}");
+    assert!(device.wait_timeline(at(1), PATIENCE).expect("the wait"), "the lag did not end");
+    signal(&[at(2)]).expect("the signal once the promise is seen");
+    assert!(device.wait_timeline(at(2), PATIENCE).expect("the wait"), "the signal did not land");
+    drop(first);
+    drop(device);
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
 }
 
 /// A compute stage whose workgroup is not its module's `LocalSize` is refused before the
@@ -905,7 +945,7 @@ fn a_drop_while_unwinding_with_nothing_pending_destroys_everything() {
             address_v: AddressMode::Repeat,
         };
         device.create_sampler(&desc).expect("a sampler");
-        run(&device, lagging(&device));
+        run(&device, lagging(&device, QueueRole::Graphics));
         panic!("the test's panic, with nothing pending");
     }));
     assert!(unwound.is_err());
