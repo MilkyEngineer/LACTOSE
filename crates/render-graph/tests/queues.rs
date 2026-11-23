@@ -925,28 +925,33 @@ fn a_torn_frame_that_ends_on_the_compute_queue_is_finished_by_the_next_submit() 
     }
 }
 
-/// A frame of one compute submit, whose batch signals the compute queue's point and the
-/// frame point together, then a frame of one graphics submit: that submit waits for the
-/// frame point itself, not only the compute point. The signals of one submit are unordered
-/// with one another on Vulkan, so the wait for the compute point does not order the new
-/// frame point after the old (VUID-VkSubmitInfo2-semaphore-03882); null credits that wait
-/// with the whole batch and refuses neither, so the test reads the waits made.
+/// A frame of one compute submit, held pending, whose batch signals the compute queue's
+/// point and the frame point together, then a frame of one graphics submit: that submit
+/// waits for the frame point itself, not only the compute point. The signals of one submit
+/// are unordered with one another on Vulkan, so the wait for the compute point does not
+/// order the new frame point after the old (VUID-VkSubmitInfo2-semaphore-03882), and null
+/// refuses the new frame point's signal without the wait (`timeline`: a wait orders the
+/// signal it waits for, not the other signals of its submit). The waits made are read too.
 #[test]
 fn a_frame_after_one_that_ended_on_the_compute_queue_waits_for_its_frame_point_itself() {
     let device = device(lactose_rhi_api::QueueLayout::SEVERAL);
     let out = buffer(&*device, "out", Sharing::Exclusive);
     let target = image(&*device, "target", Sharing::Exclusive);
+    let gate = held(&*device);
     let logged = std::sync::Arc::clone(&device);
     in_job(move |ctx| {
         let mut graph = graph(&device, 1, 2);
         let mut decl = FrameDecl::new(1);
-        let id = decl.import_buffer(&fresh_buffer("out", out, C, BufferState::ShaderWrite));
+        let id = decl.import_buffer(&BufferImport {
+            ready: Some(gate),
+            ..fresh_buffer("out", out, C, BufferState::ShaderWrite)
+        });
         decl.compute_pass(
             &ComputePassDecl { label: "write", sampled: &[], buffers: &writes(id), slots: &[] },
             |_| {},
         );
         let first = frame(&mut graph, ctx, decl).expect("the compute frame");
-        assert_eq!(logged.take_waits(), vec![(C, vec![])], "a first frame waits for nothing");
+        assert_eq!(logged.take_waits(), vec![(C, vec![gate])], "the import's `ready` alone");
 
         let mut decl = FrameDecl::new(1);
         let target = decl.import_image(&image_import(
@@ -956,7 +961,9 @@ fn a_frame_after_one_that_ended_on_the_compute_queue_waits_for_its_frame_point_i
             on(ImageState::ColourAttachment, G),
         ));
         decl.render_pass(&draws("draw", &[colour(target, Load::Clear([0.0; 4]))]), |_| {});
-        let second = frame(&mut graph, ctx, decl).expect("the graphics frame");
+        let second = frame(&mut graph, ctx, decl);
+        graph.device().signal_timeline(gate).expect("the host's signal");
+        let second = second.expect("null accepts the frame point's signal");
         let waits = logged.take_waits();
         assert_eq!(waits.len(), 1, "{waits:?}");
         let (queue, waits) = &waits[0];
@@ -967,11 +974,13 @@ fn a_frame_after_one_that_ended_on_the_compute_queue_waits_for_its_frame_point_i
     });
 }
 
-/// A frame of one compute submit, as above, then a frame `[draw, compute, draw]` whose
-/// compute submit is refused for a slot its pass did not declare (`undeclared`): it is torn
-/// with only its graphics work made, and the next call makes its last submit in its place,
-/// on the graphics queue. That replacement waits for the frame point before itself, not
-/// only the compute queue's point its batch signalled, for the reason above.
+/// A frame of one compute submit, held pending as above, then a frame `[draw, compute,
+/// draw]` whose compute submit is refused for a slot its pass did not declare
+/// (`undeclared`): it is torn with only its graphics work made, and the next call makes its
+/// last submit in its place, on the graphics queue, while the first frame is pending. That
+/// replacement waits for the frame point before itself, not only the compute queue's point
+/// its batch signalled, for the reason above: null refuses its signal without the wait
+/// (`timeline`), and the waits made are read too.
 #[test]
 fn a_torn_frames_replacement_waits_for_the_frame_point_before_itself() {
     let device = device(lactose_rhi_api::QueueLayout::SEVERAL);
@@ -979,11 +988,15 @@ fn a_torn_frames_replacement_waits_for_the_frame_point_before_itself() {
     let targets =
         [image(&*device, "a", Sharing::Exclusive), image(&*device, "b", Sharing::Exclusive)];
     let pipeline = compute_pipeline(&*device);
+    let gate = held(&*device);
     let logged = std::sync::Arc::clone(&device);
     in_job(move |ctx| {
         let mut graph = graph(&device, 1, 3);
-        let compute = |decl: &mut FrameDecl<'_>, breach: bool| {
-            let id = decl.import_buffer(&fresh_buffer("out", out, C, BufferState::ShaderWrite));
+        let compute = |decl: &mut FrameDecl<'_>, breach: bool, ready: Option<TimelinePoint>| {
+            let id = decl.import_buffer(&BufferImport {
+                ready,
+                ..fresh_buffer("out", out, C, BufferState::ShaderWrite)
+            });
             decl.compute_pass(
                 &ComputePassDecl { label: "write", sampled: &[], buffers: &writes(id), slots: &[] },
                 move |pass| {
@@ -996,9 +1009,8 @@ fn a_torn_frames_replacement_waits_for_the_frame_point_before_itself() {
             );
         };
         let mut decl = FrameDecl::new(1);
-        compute(&mut decl, false);
+        compute(&mut decl, false, Some(gate));
         let first = frame(&mut graph, ctx, decl).expect("the compute frame");
-        reached(&**graph.device(), first);
         logged.take_waits();
 
         let declare = |breach: bool| {
@@ -1013,7 +1025,7 @@ fn a_torn_frames_replacement_waits_for_the_frame_point_before_itself() {
                 decl.render_pass(&draws(label, &[colour(target, Load::Clear([0.0; 4]))]), |_| {});
             };
             draw(&mut decl, "a", 0);
-            compute(&mut decl, breach);
+            compute(&mut decl, breach, None);
             draw(&mut decl, "b", 1);
             decl
         };
@@ -1022,7 +1034,10 @@ fn a_torn_frames_replacement_waits_for_the_frame_point_before_itself() {
         let made: Vec<QueueRole> = logged.take_waits().iter().map(|(queue, _)| *queue).collect();
         assert_eq!(made, vec![G], "the torn frame's graphics submit alone is made");
 
-        let third = frame(&mut graph, ctx, declare(false)).expect("the frame after");
+        let third = frame(&mut graph, ctx, declare(false));
+        graph.device().signal_timeline(gate).expect("the host's signal");
+        reached(&**graph.device(), first);
+        let third = third.expect("null accepts the replacement's signal");
         reached(&**graph.device(), third);
         let waits = logged.take_waits();
         let (queue, replacement) = &waits[0];

@@ -593,8 +593,8 @@ impl RenderGraph {
                 // Not implied by the wait above, though one submit signalled both points:
                 // the signals of one submit are unordered with one another on Vulkan, so
                 // only a wait for the frame point itself orders this frame's after it
-                // (VUID-VkSubmitInfo2-semaphore-03882). Null credits a wait for one signal
-                // of a submit with all of them, so only the logged waits show its loss.
+                // (VUID-VkSubmitInfo2-semaphore-03882). Null refuses the signal without it
+                // while the frame before is pending (`timeline`, rhi-api's "Timelines").
                 if number == last
                     && let Some((previous, queue)) = self.previous
                     && role_index(queue) != at

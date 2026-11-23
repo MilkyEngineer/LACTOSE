@@ -26,6 +26,9 @@ tracing.workspace = true
 # The backend the proofs run on: its rules refuse a graph that drops a transition, a wait
 # or an alias call (`README.md`, "What `graph-impl` proves on null").
 lactose-rhi-null.workspace = true
+# The device the `device` tests run the graph on, under `cargo xtask gpu`'s drivers and
+# validation (decision 5.17 of the milestone 2 plan); a plain run ignores them.
+lactose-rhi-vulkan.workspace = true
 
 # The integration tests as one test binary, whose root declares the others as modules
 # (D150).

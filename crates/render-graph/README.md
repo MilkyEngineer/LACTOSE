@@ -13,9 +13,10 @@ name this crate; `lactose-app` never does (milestone 2 plan, decision 5.11).
 | Determinism boundary | outside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final for milestone 2's lanes and every body
-that decides anything is `todo!()`. What runs is plain data: the ids, a key's value and
-`History`. This file is the contract `graph-impl` meets, and every sentence under "Behaviour
+**Status: implemented.** Every public signature is final for milestone 2's lanes and every
+body is written (D160's addendum at `graph-impl`). The proofs run on null under both queue
+layouts and on Vulkan under `cargo xtask gpu` ("Proof"). This file is the contract
+`graph-impl` meets, and every sentence under "Behaviour
 the signatures cannot express" is one a dependent crate may rely on. Architecture sections
 12.3, 3 and 5.1 are the design, with the milestone 2 plan's decisions 5.4, 5.6, 5.11 and
 5.17; where this file and the architecture disagree, the architecture wins and this file is
@@ -70,18 +71,20 @@ Three things these consumers must know that no signature shows:
   then acquires a release older than the frame's re-take is refused on null (`no-qfot`:
   an acquire with no equal release submitted), and on Vulkan races the graphics queue's
   writes.
-- **`frame-design` and `frame-impl`: the one lock-free way to hold `&mut RenderGraph` and
-  `&mut JobContext` together** is a system with a `Job` parameter, whose `context()` is
-  the `&mut JobContext` that `record` takes, beside a `ResMut` of a `dyn` trait. The trait
-  belongs to a foundation crate and its method takes `&mut JobContext`;
-  `World::insert_service` holds any `Send + Sync + 'static` type. A `#[system]` is shipped
-  only in a boundary crate or a lint-file carrier (decision 5.18), and none of them may
-  name this crate, a backend crate. Where that system and trait are declared, and which
-  world runs the system once a frame, are `frame-design`'s; any other route takes a lock
-  that section 3 would have to permit. A `GraphNode`'s `run` has `&self` and would need a
-  lock to reach `&mut RenderGraph`, which section 3 does not permit on the per-frame path;
-  a scope child holds a `ChildContext`, not a `JobContext`; and the main thread holds
-  neither.
+- **`frame-design` and `frame-impl`: two lock-free ways to hold `&mut RenderGraph` and
+  `&mut JobContext` together**, of which the client's frame takes the second (D162). One
+  is a system with a `Job` parameter, whose `context()` is the `&mut JobContext` that
+  `record` takes, beside a `ResMut` of a `dyn` trait. The trait belongs to a foundation
+  crate and its method takes `&mut JobContext`; `World::insert_service` holds any `Send +
+  Sync + 'static` type. A `#[system]` is shipped only in a boundary crate or a lint-file
+  carrier (decision 5.18), and none of them may name this crate, a backend crate. The
+  other is a closure that `lactose-task`'s `Executor::run_job` runs as one job, with the
+  graph's owner moved in and handed back in its value: no system, no world and no `Sync`
+  bound. The frame's object is a `lactose_app::RenderSide`, a trait of `lactose-app`'s own
+  (D162); any other route takes a lock that section 3 would have to permit. A
+  `GraphNode`'s `run` has `&self` and would need a lock to reach `&mut RenderGraph`, which
+  section 3 does not permit on the per-frame path; a scope child holds a `ChildContext`,
+  not a `JobContext`; and the main thread holds neither.
 - **`graph-impl`: a frame of another graph.** `record` and `submit` refuse a frame another
   graph made (`InvalidData`, "Errors and drops"). Two `compile`s may precede a `record`,
   since a `CompiledFrame` borrows no graph, so the second may evict the first frame's plan:
@@ -340,8 +343,10 @@ Three things these consumers must know that no signature shows:
   `transition_images` or `transition_buffers` call are not ordered with one another on a
   device (one `vkCmdPipelineBarrier2` on Vulkan), so where a resource has two transitions
   in a row, such as a closing transition and then the release toward `handoff`, or a take
-  from `Undefined` and then a release, each is in a call of its own, in that order. The
-  tests' logging device refuses a submit whose encoder had a call that named one twice.
+  from `Undefined` and then a release, each is in a call of its own, in that order. A call
+  that names a subresource twice is refused on every backend (`state`, rhi-api's
+  "States"); the graph's rule, by resource, is the wider of the two, and the tests' logging
+  device refuses a submit whose encoder had a call that named one twice.
 
 ### What a pass reaches
 
@@ -679,11 +684,13 @@ submit to its own queue signals: null does not refuse that, neither submit compl
 the proof is every frame's point reached within a bounded wait under both capability sets.
 The tests' logging device refuses a submit whose encoder had a transition call that named
 one resource twice, whatever the device under it checks, over the five chains of two
-transitions a frame can give one resource at its end. The waits for the frame point before
-hold by the waits that device records, since null credits a wait for one signal of a
-submit with all of them. Each queue rule's clause holds by the queue a pass
-is given (`PlannedPass::queue`), and a wait inside the graph, such as a pending encoder's
-drop, fails its test at a bound, with a message, rather than at nextest's kill.
+transitions a frame can give one resource at its end; every backend refuses the same call
+(`state`, rhi-api's "States"). The waits for the frame point before hold with the frame
+before held pending, where null refuses a frame point's signal without them (`timeline`: a
+wait orders the signal it waits for, not the other signals of its submit), and by the waits
+the logging device records. Each queue rule's clause holds by the queue a pass is given
+(`PlannedPass::queue`), and a wait inside the graph, such as a pending encoder's drop,
+fails its test at a bound, with a message, rather than at nextest's kill.
 
 ## How each call is honoured
 
@@ -747,33 +754,66 @@ kind section 20 allows, a new field, variant or call, and changes what no call a
 
 ## Proof
 
-There is nothing to run against a facade but `History`. `tests/consumers.rs` compiles what
-each consumer writes: `graph-impl`'s proofs on null (aliasing, culling and null's refusal;
-the key's inputs and the cap, and a use moved between lists; a write in one state across
-the frame's edge; a copy's second call into one destination; both queue paths; encoders
-under a lagging device), the minimal renderer's scatter and triangle passes through a
-pass-provider trait and its readback, the client's frame through a `dyn` object with the
-latch between record and submit and the target's hand-off to the present thread, and a
-history's frame.
+`tests/integration.rs` runs, on null and under both queue layouts, every row of "What
+`graph-impl` proves on null" and the proofs that rest on this surface, through a device that
+wraps null to keep each submit's commands and each destroy (`tests/common/mod.rs`), and the
+tests of recording itself but its spans, which `tests/spans.rs`, a binary of its own, holds.
+Its `device` module runs the graph on Vulkan under `cargo xtask gpu`, below; a plain run
+ignores those tests. `tests/consumers.rs` compiles what each consumer writes: `graph-impl`'s
+proofs on null (aliasing, culling and null's refusal; the key's inputs and the cap, and a
+use moved between lists; a write in one state across the frame's edge; a copy's second
+call into one destination; both queue paths; encoders under a lagging device), the minimal
+renderer's scatter and triangle passes through a pass-provider trait and its readback, the
+client's frame through a `dyn` object with the latch between record and submit and the
+target's hand-off to the present thread, and a history's frame.
 `tests/values.rs` runs the ping-pong and holds this file's surface table to the crate's
 exports. The static assertions in `src/lib.rs` hold `RenderGraph`, `RecordedFrame` and
 `CompiledPlan` to `Send + Sync + 'static`, `FrameDecl` and `CompiledFrame` to `Send + Sync`
 whatever their recorders borrow, and every declaration and report type to plain data.
 
-`graph-impl` owes the rows of "What `graph-impl` proves on null", each with the build that
-fails it. On devices, by class of hazard (decision 5.17), it owes the dropped barrier on a
-tracked attachment or buffer, which synchronisation validation reports; a host write under
-a pending reader, which yields a wrong readback with the GPU made to lag; a host access
-under a pending writer, refused on every backend (`pending`); and the encoder reset held
-back with the GPU made to lag (`VUID-vkResetCommandPool-commandPool-00040`). Every device
-run, the `gpu (lavapipe)` job's included, sets the Khronos layer's
+On devices, by class of hazard (decision 5.17), the `device` tests run under `cargo xtask
+gpu`, each in a process of its own, under the Khronos layer's core, thread-safety and
+synchronisation validation and, under MoltenVK, Metal's API and shader validation, whose
+canaries the run hears first. A test passes only where neither the layer, the driver nor
+Metal speaks, and each test that makes the GPU lag checks that the lag held:
+- Frames on both queues read back what each pass wrote: words written on the compute
+  queue, where it has one of its own, and read on the graphics queue in the next frame,
+  and a target filled and read. A build that drops the barrier on an attachment, or on a
+  buffer between two copies, fails it by the layer's message. The layer tracks no access
+  through a buffer's address, which is every shader's access to a buffer here, nor a
+  missing ownership transfer that a semaphore orders: a build that drops every transition
+  out of `ShaderWrite` passes on the M1, and null's state rule is what fails it.
+- The five chains of two transitions of "Transitions and store actions", each two calls,
+  are clean.
+- A host write under a pending reader is what the reader reads, a wrong readback, and one
+  after the frame's point is not; a host read or invalidate under a pending writer is
+  refused (`pending`).
+- An encoder is reset only after its frame's point
+  (`VUID-vkResetCommandPool-commandPool-00040`, which `rhi-vulkan` refuses as `pending`).
+- Under several queues, a frame after one that ended on the compute queue waits for its
+  point, and a torn frame is finished by the next: the frame timeline's values grow by one
+  a frame, the torn point is reached and its encoders are held until it.
+- A depth transient of one pass orders two triangles as a CPU reference does, `Memoryless`
+  where the device reports it and `Placed` where it places images.
+- Two figures, printed and asserted of nothing: what the waits across queues cost, against
+  the same work on two graphs, one for each queue, that make none; and whether two images
+  placed at one offset of one block share bytes.
+
+Where the compute role shares the graphics queue, as on lavapipe in the `gpu (lavapipe)`
+job, the tests of the several-queue path say they are skipped and why, and the rest run
+with every pass on the graphics queue. A buffer imported to end in `HostRead` on a queue
+other than its last user's is moved by one transfer into `HostRead`, which `rhi-vulkan`
+records as one barrier with the host stage between two families, and the layer refuses it
+(`VUID-VkBufferMemoryBarrier2-srcStageMask-03851`): until that transfer is split, a
+readback ends on its last writer's queue. Every device run, the `gpu (lavapipe)` job's
+included, sets the Khronos layer's
 `VK_KHRONOS_VALIDATION_SYNCVAL_LOAD_OP_AFTER_STORE_OP_VALIDATION=true` beside
 `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`: without it the layer does not report a load
 after a store between two render pass instances, which is the write across the frame's
 edge of "Transitions and store actions" (verification, the row of D160 on the layer).
 
-It owes three tests of recording itself, because none of the above fails a `graph-impl`
-that records its jobs one at a time:
+Three tests hold recording itself, because none of the above fails a `graph-impl` that
+records its jobs one at a time:
 - **Recording runs in parallel.** On at least two frame-critical workers, a recorder of one
   job and a recorder of another each wait, with a bound, for the other, so the test fails
   rather than hangs where the jobs do not run at once, and each job's commands are still

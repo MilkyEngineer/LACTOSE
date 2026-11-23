@@ -750,6 +750,7 @@ dependencies = [
  "lactose-core",
  "lactose-rhi-api",
  "lactose-rhi-null",
+ "lactose-rhi-vulkan",
  "lactose-task",
  "tracing",
 ]
