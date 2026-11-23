@@ -534,9 +534,10 @@ fn record_target(device: &dyn Device, image: ImageHandle) -> Box<dyn Encoder> {
     encoder
 }
 
-/// The present thread's submit held (decision 5.6): it has taken a finished target across
-/// to the present role and presented, the display holds the image (`stall`), and nothing
-/// has seen the present's point, so its submit is pending. Meanwhile each frame submit on
+/// The display's read of a presented image held (`stall`), as a drawable that does not
+/// come back holds it (decision 5.6): the present thread has taken a finished target across
+/// to the present role and presented, and nothing has seen the present's point, so its
+/// submit is pending. No lock is held across it. Meanwhile each frame submit on
 /// the graphics queue, each writing a target the present did not take, completes. A frame
 /// write of the taken target that does not wait for the present's point is refused
 /// (`queue`) where the present role has a queue of its own, and taken where the roles share
@@ -544,9 +545,10 @@ fn record_target(device: &dyn Device, image: ImageHandle) -> Box<dyn Encoder> {
 /// README); once the present's point is seen, a write that waits for it
 /// is taken on every layout. Then a loss with a frame in flight, and the drops after it,
 /// end cleanly. One thread plays both parts: what the records refuse does not depend on
-/// which thread submits.
+/// which thread submits. A present thread held inside its call, its queue's lock taken, is
+/// `src/tests.rs`'s `frame_submits_complete_while_a_present_holds_its_queue`.
 #[test]
-fn a_held_present_lets_the_frame_finish_other_targets_and_refuses_its_own() {
+fn a_present_the_display_holds_lets_the_frame_finish_other_targets_and_refuses_its_own() {
     let (graphics, present) = (QueueRole::Graphics, QueueRole::Present);
     for queues in LAYOUTS {
         let set = Capabilities { queues, ..Capabilities::LEAST };

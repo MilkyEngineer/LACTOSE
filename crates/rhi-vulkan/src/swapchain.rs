@@ -46,7 +46,9 @@ const DRAIN_MOST: usize = 4 * HISTORY;
 
 /// The widest bracket of two `Instant` reads that the host clock's read between them is
 /// paired within, if one of `PAIRING_TRIES` is: the pairing's error is half the bracket.
+#[cfg(target_os = "macos")]
 const PAIRING: Duration = Duration::from_micros(10);
+#[cfg(target_os = "macos")]
 const PAIRING_TRIES: usize = 100;
 
 /// The formats a swapchain takes, the first the surface offers in `SRGB_NONLINEAR`.
@@ -179,6 +181,10 @@ enum Fail {
     Create,
     /// The image of this index is not taken into the chain, as if the image table were full.
     Image(usize),
+    /// `vkQueuePresentKHR` is not called and answers this error, as if the presentation
+    /// engine refused the present with nothing enqueued: its fence never signals, and its
+    /// semaphore stays signalled.
+    Present(vk::Result),
 }
 
 /// The walks a present left undecided, counted for the threaded test that shows another
@@ -388,6 +394,21 @@ impl VulkanSwapchain {
         unsafe { self.presents().swapchain.create_swapchain(info, None) }
     }
 
+    /// `vkQueuePresentKHR` on the present queue, or the failure a unit test injects. The
+    /// caller holds the queue's lock; the image is the one acquired, its submit left it in
+    /// `PRESENT_SRC_KHR` and signals the present semaphore `info` waits for, a binary
+    /// semaphore no other wait is pending on; the fence is unsignalled and no other present
+    /// names it.
+    fn queue_present(&self, info: &vk::PresentInfoKHR<'_>) -> ash::prelude::VkResult<bool> {
+        #[cfg(test)]
+        if let Some(Fail::Present(error)) = self.fail {
+            return Err(error);
+        }
+        let target = self.shared.queue(self.queue);
+        // SAFETY: as the caller promises.
+        unsafe { self.presents().swapchain.queue_present(target.queue, info) }
+    }
+
     /// The images of a new swapchain as handles, each object holding `owner`, and a present
     /// semaphore for each. Where it fails, what it made is let go, and the driver swapchain
     /// with the last count.
@@ -529,7 +550,8 @@ impl VulkanSwapchain {
         for &semaphore in &chain.present_semaphores {
             // SAFETY: each present's wait for it is done (its fence), the empty batch that
             // waited for one a present left signalled has completed (`unsignalled`), and no
-            // submit to come signals it.
+            // submit to come signals it. One given up with its fence is null, which the
+            // call ignores.
             unsafe { self.device().destroy_semaphore(semaphore, None) };
         }
     }
@@ -599,6 +621,13 @@ impl VulkanSwapchain {
                 .collect();
             for fence in given_up {
                 self.pending.retain(|&pending| pending != fence);
+                // The present's wait for the image's present semaphore may yet be pending:
+                // the semaphore is leaked with the fence. The image presents no more, since
+                // the error left the swapchain stale until its chain is replaced.
+                let at = self.chain.last_fence.iter().position(|&last| last == Some(fence));
+                if let Some(at) = at {
+                    self.chain.present_semaphores[at] = vk::Semaphore::null();
+                }
                 self.unname(fence);
             }
         }
@@ -1011,12 +1040,7 @@ impl Swapchain for VulkanSwapchain {
         if self.timing.is_some() {
             info = info.push_next(&mut time_info);
         }
-        let target = self.shared.queue(self.queue);
-        // SAFETY: the queue's lock is held; the image is the one acquired, its submit
-        // left it in `PRESENT_SRC_KHR` and signals the present semaphore the present
-        // waits for, a binary semaphore no other wait is pending on; the fence is
-        // unsignalled and no other present names it.
-        let shown = unsafe { self.presents().swapchain.queue_present(target.queue, &info) };
+        let shown = self.queue_present(&info);
         self.held = None;
         let presented = match shown {
             // `VK_SUBOPTIMAL_KHR` is shown, never stale.
@@ -1633,5 +1657,59 @@ mod tests {
         drop(swapchain);
         drop(device);
         assert_eq!(breaches(&kept), Vec::<String>::new());
+    }
+
+    /// A present the presentation engine refused with nothing enqueued, injected, is
+    /// `Stale` with an id. Out of memory, host or device, gives its fence back and unsignals
+    /// the image's present semaphore with an empty batch, which the `resize` after waits
+    /// for. An error the spec does not list waits for its fence a bound, with the present
+    /// queue idle, then leaks it with the image's present semaphore. A later `resize` makes
+    /// a swapchain that presents; the layer says nothing but, after the unlisted error, the
+    /// leak at the device's destroy.
+    #[test]
+    #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+    fn a_present_refused_with_nothing_enqueued_is_stale_until_a_resize() {
+        const LEAK: &str = "VUID-vkDestroyDevice-device-05137";
+        let errors = [
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_OUT_OF_POOL_MEMORY,
+        ];
+        for error in errors {
+            let kept = Arc::new(Kept::default());
+            let test = "a_present_refused_with_nothing_enqueued_is_stale_until_a_resize";
+            let Some(device) = device(&kept, test) else { return };
+            let mut swapchain = VulkanSwapchain::new(device.shared(), SMALL).expect("a swapchain");
+            let first = image(&mut swapchain);
+            let mut encoders = [presentable(&device, first)];
+            swapchain.fail = Some(Fail::Present(error));
+            let submit = Submit { encoders: &mut encoders, waits: &[], signals: &[] };
+            let refused = swapchain.present(first, submit).expect("the present");
+            assert_eq!(refused, Presented::Stale, "{error}");
+            assert_eq!(swapchain.last_present(), Some(PresentId(1)), "{error}");
+            swapchain.fail = None;
+            assert!(matches!(swapchain.acquire(), Ok(Acquired::Stale)), "{error}");
+            let unlisted = error == vk::Result::ERROR_OUT_OF_POOL_MEMORY;
+            assert_eq!(swapchain.pending.len(), usize::from(unlisted), "{error}");
+            assert_eq!(swapchain.chain.unsignalled > 0, !unlisted, "{error}");
+            swapchain.resize(Extent { width: 96, height: 48 }).expect("the resize");
+            assert!(swapchain.pending.is_empty() && swapchain.doubtful.is_empty(), "{error}");
+            let next = image(&mut swapchain);
+            let mut more = [presentable(&device, next)];
+            let submit = Submit { encoders: &mut more, waits: &[], signals: &[] };
+            assert_eq!(swapchain.present(next, submit).expect("a present"), Presented::Shown);
+            assert_eq!(swapchain.last_present(), Some(PresentId(2)), "{error}");
+            drop(swapchain);
+            drop(encoders);
+            drop(more);
+            drop(device);
+            let breaches = breaches(&kept);
+            if unlisted {
+                assert!(!breaches.is_empty(), "the leak is reported at the device's destroy");
+                assert!(breaches.iter().all(|text| text.contains(LEAK)), "{breaches:?}");
+            } else {
+                assert_eq!(breaches, Vec::<String>::new(), "{error}");
+            }
+        }
     }
 }

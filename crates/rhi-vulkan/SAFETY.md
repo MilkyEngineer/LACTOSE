@@ -78,7 +78,12 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   surface. An AppKit view's layer is made by `raw-window-metal` on the main thread alone
   (`pthread_main_np` is checked first, as `Layer::from_ns_view` requires), and the surface
   keeps the layer. `Raw`'s drop destroys the surface after the device and before the
-  messenger and the instance; a swapchain holds the device, so none outlives it.
+  messenger and the instance; a swapchain holds the device, so none outlives it. After the
+  surface is destroyed, the layer is sent `removeFromSuperlayer` and let go on the main
+  thread alone, where AppKit's view tree is changed: called there at once, or moved to a
+  closure the main queue runs (`raw_window_metal::Layer` is `Send`). A surface never
+  destroyed, on the leak path, leaks its layer with it, since the driver may still present
+  to it.
 - An acquire signals a semaphore no operation is pending on: one never used, or one whose
   waiting submit the present queue's timeline shows complete. A present's submit waits for
   the acquire's semaphore once and signals the image's present semaphore, whose last wait,
@@ -88,12 +93,30 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   decided before the submit was stamped (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
 - An image given up while acquired, at `resize` or the drop, has its semaphore waited for by
   an empty batch, so that no signalled semaphore is destroyed or reused unwaited.
-- The old swapchain is destroyed, and the drop destroys the swapchain, only once every
-  present fence of it has signalled, or after a loss; their semaphores, only once the
-  submits that wait for them are complete. A drop whose waits do not end within three
-  seconds destroys none of them. The images' views, which their objects own, may be destroyed
-  after the swapchain that owns the images: a submit holds the objects of what it names, and
-  a view is not used after its image is destroyed.
+- A driver swapchain is destroyed by the drop of its owner (`SwapchainObj`), which every
+  image object of it holds, so it outlives every view of its images and every encoder and
+  submit that names one. A `resize` and the swapchain's drop forget the images' handles,
+  and hand the objects of those a submit not yet known complete names to the device
+  (`Shared::left`), which lets each go once its stamps are reached, or at the device's last
+  drop. A driver swapchain whose images outlive the swapchain's drop stays the surface's
+  (`Left::unretired`): the next swapchain names it as `oldSwapchain`, so the surface has at
+  most one swapchain that is not retired, as the spec allows a native window.
+  On the leak path no owner destroys anything.
+- A driver swapchain is replaced, by `resize`, and its owner let go, only once every present
+  fence of it has signalled, or after a loss; the present semaphores, only once the submits
+  that wait for them are complete; it is retired whether its replacement's creation
+  succeeds or not. A present fence never signals after an error that enqueued nothing (out
+  of memory): the fence is reused, and the image's present semaphore, left signalled, is
+  waited for by an empty batch before the semaphore is signalled again or destroyed. A fence
+  of a present that failed with an error the spec does not list is waited for a bound after
+  its present with the present queue idle, then leaked with its image's present semaphore,
+  whose wait may be pending; the error leaves the swapchain stale, so that image is not
+  presented again.
+- A drop whose waits do not end within three seconds, or that unwinds a panic with
+  something of the swapchain pending, leaks the device (`Raw::leak`): every object's drop
+  after it, the driver swapchain's and the device's included, destroys nothing, and the
+  records keep the swapchain's mark, so no second swapchain is made on the surface while
+  the leaked one may be in use.
 - `vkGetPastPresentationTimingGOOGLE` is called on the swapchain from the thread that
   acquires and presents, between those calls (`Swapchain` is not `Sync`).
 

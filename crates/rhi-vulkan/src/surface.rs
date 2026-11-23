@@ -296,7 +296,19 @@ impl Drop for Surface {
         // A surface not destroyed is leaked with its device, and may still be presented to:
         // its layer stays in the view, and alive.
         if let Some(layer) = self.layer.take() {
-            core::mem::forget(layer);
+            leak(layer);
         }
     }
+}
+
+/// Lets go of a layer without releasing it.
+#[cfg(target_os = "macos")]
+fn leak(layer: Layer) {
+    core::mem::forget(layer);
+}
+
+/// No layer is made away from macOS.
+#[cfg(not(target_os = "macos"))]
+fn leak(layer: Layer) {
+    match layer {}
 }

@@ -29,7 +29,7 @@ in its rules table, both columns, and this file states only what the contract le
 
 The swapchain has three images of `Bgra8Unorm`. `acquire` and the present's wait for an
 undecided point are bounded at one second. Its present ids count each present taken;
-nothing shows its images, so `display_times` is `None` (D162).
+nothing shows its images, so `display_times` answers `false` and appends nothing (D162).
 
 ## What null counts and runs
 
@@ -103,15 +103,20 @@ walk refuse it `destroyed`, with nothing submitted.
   races from several threads, submits on two queues racing a present, each round of which
   fails with a message past three refusals, and a destroy racing a present's wait; and,
   under each layout, the frame's submits on the graphics queue completing beside a present
-  whose submit is held, a frame write of the target that present took refused (`no-qfot`)
-  where the present role has a queue of its own, and a loss with a frame in flight.
+  whose image the display holds (`stall`), a frame write of the target that present took
+  refused (`no-qfot`) where the present role has a queue of its own, and a loss with a frame
+  in flight.
 - `tests/wakes.rs`: the wakes null alone makes, each bounded by how soon its waiter returns
   (10 s for a 60 s wait, 600 ms for a present or an acquire bounded at a second): a
   timeline's destroy under a wait; a loss, a destroy and a frame submit on its shared queue
   during a present's wait; a present waking a wait; an unstall waking an acquire.
 - `src/tests.rs`: fixed interleavings, a call made in full between another call's two holds
-  through a test-only hook (a host signal, a heap write, a host lend, a present's wait),
-  among them a second heap write started inside a first, which the heap's lock holds back,
+  through a test-only hook (a host signal, a heap write, a host lend, a present's wait, a
+  present holding its queue's lock), among them a second heap write started inside a first,
+  which the heap's lock holds back, another thread's frame submits on the graphics queue,
+  each completing while the present thread is held inside `present` with the present
+  queue's lock taken, where the present role has a queue of its own (where it shares the
+  graphics queue a frame submit waits for that lock, by design),
   and host signals landed inside each other's holds in both orders; a hook cleared while it
   runs, which stays cleared, so a hook run on another thread cannot outlive its test's clear
   and keep the device alive through its twin; the present's walk

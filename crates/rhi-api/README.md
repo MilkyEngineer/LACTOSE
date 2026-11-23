@@ -1022,9 +1022,11 @@ asks of other crates")
   the first and one more for each after it; a `resize` does not restart it, and a present
   that is refused or returns `DeviceLost` takes none. `last_present` reads it after the
   call. A backend gives its driver that id with every present, none left out.
-- `display_times` gives the reports that arrived since its last call, oldest first: for
-  each, the present's id and the `Instant` its image reached the display. Each id is
-  reported once at most, in increasing order. It never waits and reaches no queue. It is
+- `display_times` appends to the caller's buffer the reports that arrived since its last
+  call, oldest first: for each, the present's id and the `Instant` its image reached the
+  display. Each id is reported once at most, in increasing order. What the buffer held
+  stays, and nothing is allocated once it has room, so a caller that clears and reuses one
+  buffer allocates only while it grows. It never waits and reaches no queue. It is
   called on the thread that presents, between that thread's other calls of the swapchain:
   every Vulkan source's read is externally synchronised on the swapchain with the acquire
   and the present (`vkGetPastPresentationTimingGOOGLE`, `vkAcquireNextImageKHR`,
@@ -1032,10 +1034,10 @@ asks of other crates")
   is not `Sync`. A backend whose driver keeps a bounded history drains it within that bound
   at each call; a caller that calls it as each of its presents begins is far inside
   MoltenVK's 60.
-- Whether a swapchain reports is fixed at its creation: `display_times` answers `None` at
-  every call where its device has no source, and `Some` of a list, empty where nothing has
-  arrived, where it has one. So a caller tells "nothing has reached the display yet" from
-  "this device never says".
+- Whether a swapchain reports is fixed at its creation: `display_times` answers `false`
+  at every call where its device has no source, appending nothing, and `true` where it has
+  one, whether or not anything arrived. So a caller tells "nothing has reached the display
+  yet" from "this device never says".
 - A present the display never took (one discarded at a `resize`, or replaced) is either
   left out, a report of a later id covering it, or reported so that the caller can tell it
   apart; where the backend cannot tell them apart its README says so. A caller that takes a
