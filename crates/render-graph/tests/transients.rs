@@ -206,6 +206,53 @@ fn aliasing_transients_stay_on_one_queue() {
     }
 }
 
+/// The byte range a placed transient takes in its block.
+fn range_of(memory: Option<TransientMemory>) -> (u64, u64) {
+    match memory {
+        Some(TransientMemory::Placed { offset, size, .. }) => (offset, offset + size),
+        other => panic!("a placed transient, not {other:?}"),
+    }
+}
+
+/// Two transients whose lifetimes meet in one pass, the last use of one and the first of the
+/// other, overlap and never share bytes ("Aliasing"): the pass attaches both. Null accepts
+/// the frame, twice.
+#[test]
+fn lifetimes_that_meet_in_one_pass_do_not_alias() {
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let readback = buffer(&*device, "out", Sharing::Exclusive);
+        in_job(move |ctx| {
+            let mut graph = graph(&device, 1, 1);
+            for _ in 0..2 {
+                let mut decl = FrameDecl::new(1);
+                let a = decl.transient_image(&SCRATCH);
+                let b = decl.transient_image(&TransientImage { label: "b", ..SCRATCH });
+                let out =
+                    decl.import_buffer(&fresh_buffer("out", readback, G, BufferState::HostRead));
+                decl.render_pass(&draws("write a", &[colour(a, Load::Clear([0.0; 4]))]), |_| {});
+                decl.render_pass(
+                    &draws(
+                        "keep a, clear b",
+                        &[colour(a, Load::Keep), colour(b, Load::Clear([1.0; 4]))],
+                    ),
+                    |_| {},
+                );
+                read_back(&mut decl, "read b", b, out);
+                let compiled = graph.compile(decl).expect("a plan");
+                let (at_a, at_b) = (
+                    range_of(compiled.plan().transient(a)),
+                    range_of(compiled.plan().transient(b)),
+                );
+                assert!(at_a.1 <= at_b.0 || at_b.1 <= at_a.0, "a at {at_a:?}, b at {at_b:?}");
+                let recorded = graph.record(compiled, ctx).expect("a recorded frame");
+                let point = graph.submit(recorded).expect("null accepts the frame");
+                reached(&**graph.device(), point);
+            }
+        });
+    }
+}
+
 const DEPTH: TransientImage<'static> =
     TransientImage { label: "depth", format: Format::Depth32Float, ..SCRATCH };
 

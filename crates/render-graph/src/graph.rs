@@ -8,7 +8,7 @@ use std::time::Duration;
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::{
     Capabilities, Device, Encoder, ImageDesc, ImageHandle, ImageMemory, MemoryBlockDesc,
-    MemoryBlockHandle, QueueRole, Sharing, Submit, TimelineHandle, TimelinePoint,
+    MemoryBlockHandle, QueueRole, Rule, Sharing, Submit, TimelineHandle, TimelinePoint,
 };
 use lactose_task::JobContext;
 
@@ -169,35 +169,54 @@ impl Encoders {
     }
 
     /// Resets `encoders`, none of which is pending, and frees them.
-    fn free_all(&mut self, encoders: impl IntoIterator<Item = Box<dyn Encoder>>) {
+    ///
+    /// A reset the device refuses as `pending` is the graph's own breach of that: a debug
+    /// build stops at it. A release build holds such an encoder as pending in the frame of
+    /// value `value`, for a later reclaim to reset, rather than drop it: a pending
+    /// encoder's drop may wait for its submit, which would block a frame-critical worker.
+    fn free_all(&mut self, value: u64, encoders: impl IntoIterator<Item = Box<dyn Encoder>>) {
         let held = self.held.get_mut();
+        let mut kept = Vec::new();
         for mut encoder in encoders {
             match encoder.reset() {
                 Ok(()) => {
                     held.free[role_index(encoder.queue())].push(encoder);
                     self.count += 1;
                 }
-                Err(error) => log("an encoder's reset", &error),
+                Err(error) => {
+                    let pending = Rule::of(&error) == Some(Rule::Pending);
+                    debug_assert!(!pending, "the graph freed a pending encoder: {error}");
+                    log("an encoder's reset", &error);
+                    if pending {
+                        kept.push(encoder);
+                    }
+                }
             }
+        }
+        if !kept.is_empty() {
+            self.pend(value, kept);
         }
     }
 
     /// Holds `encoders`, submitted in the frame of value `value`, until its point.
     fn pend(&mut self, value: u64, encoders: Vec<Box<dyn Encoder>>) {
         self.count += encoders.len();
-        self.held.get_mut().pending.push_back((value, encoders));
+        let pending = &mut self.held.get_mut().pending;
+        let at = pending.partition_point(|&(held, _)| held <= value);
+        pending.insert(at, (value, encoders));
     }
 
     /// Resets and frees the encoders of every frame whose value is at most `reached`.
     fn reclaim(&mut self, reached: u64) {
-        loop {
-            let pending = &mut self.held.get_mut().pending;
-            if !pending.front().is_some_and(|&(value, _)| value <= reached) {
-                return;
-            }
-            let (_, done) = pending.pop_front().expect("checked above");
-            self.count -= done.len();
-            self.free_all(done);
+        let pending = &mut self.held.get_mut().pending;
+        let mut done = Vec::new();
+        while pending.front().is_some_and(|&(value, _)| value <= reached) {
+            done.push(pending.pop_front().expect("checked above"));
+        }
+        // Freed after the loop, so that one `free_all` holds again goes to the next call.
+        for (value, encoders) in done {
+            self.count -= encoders.len();
+            self.free_all(value, encoders);
         }
     }
 }
@@ -443,7 +462,7 @@ impl RenderGraph {
                 Ok(encoder) => encoders.push(encoder),
                 Err(error) => {
                     // Those taken are free ones, untouched since their reset.
-                    self.encoders.free_all(encoders);
+                    self.encoders.free_all(self.timelines.frame_value, encoders);
                     return Err(error);
                 }
             }
@@ -490,7 +509,7 @@ impl RenderGraph {
         drop(recorders);
 
         if let Some(breach) = breaches.into_iter().flatten().next() {
-            self.encoders.free_all(encoders);
+            self.encoders.free_all(self.timelines.frame_value, encoders);
             return Err(Error::new(ErrorKind::InvalidData, breach));
         }
         let ready = plan
@@ -548,7 +567,7 @@ impl RenderGraph {
             && let Err(error) = self.replace(&torn)
         {
             self.torn = Some(torn);
-            self.encoders.free_all(encoders);
+            self.encoders.free_all(self.timelines.frame_value, encoders);
             return Err(error);
         }
 
@@ -557,10 +576,26 @@ impl RenderGraph {
         let last = plan.submits.len() - 1;
         let mut points: Vec<Option<TimelinePoint>> = Vec::with_capacity(plan.submits.len());
         let mut made: Vec<Box<dyn Encoder>> = Vec::with_capacity(encoders.len());
+        // The last submit made to each queue before this frame. Each submit waits for the
+        // other queue's, which covers every earlier frame's use there, and the frame's last
+        // also for the frame point before where that was signalled from the other queue,
+        // so that the frame timeline's values grow across a wait.
+        let before: Option<[TimelinePoint; 2]> = self.timelines.queues.as_ref().map(|queues| {
+            queues
+                .each_ref()
+                .map(|queue| TimelinePoint { timeline: queue.timeline, value: queue.value })
+        });
         for (number, submit) in plan.submits.iter().enumerate() {
             let mut waits: Vec<TimelinePoint> = Vec::new();
-            if self.timelines.queues.is_some() {
-                waits.extend(self.previous.map(|(previous, _)| previous));
+            if let Some(before) = before {
+                let at = role_index(submit.queue);
+                waits.extend(Some(before[1 - at]).filter(|other| other.value > 0));
+                if number == last
+                    && let Some((previous, queue)) = self.previous
+                    && role_index(queue) != at
+                {
+                    waits.push(previous);
+                }
             }
             waits.extend(submit.waits.iter().filter_map(|&earlier| points[earlier as usize]));
             waits.extend(ready[number].iter().copied());
@@ -579,7 +614,8 @@ impl RenderGraph {
             if let Err(error) = result {
                 // The refused submit's encoders are not pending, nor are those of the
                 // submits not made.
-                self.encoders.free_all(chunk.into_iter().chain(encoders));
+                self.encoders
+                    .free_all(self.timelines.frame_value, chunk.into_iter().chain(encoders));
                 if number > 0 {
                     // Torn: the made submits' encoders and the plan are held until the
                     // point the next call signals in the frame's place.

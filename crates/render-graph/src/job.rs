@@ -63,7 +63,9 @@ fn transition(shared: &Shared<'_>, encoder: &mut dyn Encoder, transitions: &Tran
                 to: planned.to,
             })
             .collect();
-        encoder.transition_images(&images);
+        for call in calls(&images, |transition| transition.image) {
+            encoder.transition_images(call);
+        }
     }
     if !transitions.buffers.is_empty() {
         let buffers: Vec<BufferTransition> = transitions
@@ -75,8 +77,29 @@ fn transition(shared: &Shared<'_>, encoder: &mut dyn Encoder, transitions: &Tran
                 to: planned.to,
             })
             .collect();
-        encoder.transition_buffers(&buffers);
+        for call in calls(&buffers, |transition| transition.buffer) {
+            encoder.transition_buffers(call);
+        }
     }
+}
+
+/// `list` cut into the fewest runs, in order, in which no resource is named twice: the
+/// elements of one transition call are not ordered with one another on a device, so a
+/// resource's chain of two transitions, such as a change and then a release, is two calls
+/// (`README.md`, "Transitions and store actions").
+fn calls<T, R: PartialEq>(list: &[T], resource: impl Fn(&T) -> R) -> Vec<&[T]> {
+    let mut calls = Vec::new();
+    let mut start = 0;
+    for at in 0..list.len() {
+        if list[start..at].iter().any(|earlier| resource(earlier) == resource(&list[at])) {
+            calls.push(&list[start..at]);
+            start = at;
+        }
+    }
+    if start < list.len() {
+        calls.push(&list[start..]);
+    }
+    calls
 }
 
 /// The handle of an image a kept pass uses, which is made.

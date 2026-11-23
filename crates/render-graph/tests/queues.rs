@@ -1,7 +1,8 @@
 //! Queues on null: each pass's queue and the frame's submits under both layouts; a transfer's
 //! two halves and its wait; the waits of every submit that uses an import under another
 //! queue's pending write or change, its `ready` point's among them, a `sampled` read's
-//! included; a frame's change under an earlier frame's pending use; and a torn frame.
+//! included; a frame's change under an earlier frame's pending use, and its use under an
+//! earlier frame's pending write; the queue rule's clauses; and a torn frame.
 //!
 //! A test holds a submit pending by a point the host owes, given as an import's `ready`, or
 //! as its own submit's wait; null judges each submit against what is pending when it is
@@ -18,7 +19,7 @@ use lactose_rhi_api::{
 
 use crate::common::{
     C, G, LAYOUTS, SCRATCH, buffer, clear, colour, compute_pipeline, define_buffer, device, draws,
-    frame, fresh_buffer, graph, held, image, image_import, in_job, lines, on, reached, reads,
+    frame, fresh_buffer, graph, held, home, image, image_import, in_job, lines, on, reached, reads,
     several, submit_after, writes,
 };
 
@@ -507,6 +508,221 @@ fn a_frame_waits_for_an_earlier_frames_pending_use_before_a_change() {
             reached(&**graph.device(), second);
         });
     }
+}
+
+/// A frame's compute pass writes a `Concurrent` buffer while its submit is held pending, and
+/// an independent draw makes the frame's last submit a graphics one; the next frame's draw
+/// reads the buffer on the graphics queue, a use under the compute queue's pending write,
+/// which waits for it in its own submit (`no-qfot`): a wait in an earlier submit of the
+/// queue, the frame before's last among them, discharges no later one.
+#[test]
+fn a_frame_after_one_that_ended_on_graphics_waits_for_its_pending_compute_write() {
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let shared = buffer(&*device, "shared", Sharing::Concurrent);
+        let out = buffer(&*device, "out", Sharing::Exclusive);
+        let targets = [
+            image(&*device, "first", Sharing::Exclusive),
+            image(&*device, "second", Sharing::Exclusive),
+        ];
+        let gate = held(&*device);
+        define_buffer(&*device, shared, on(BufferState::ShaderRead, G));
+        device.take_submitted();
+        let logged = std::sync::Arc::clone(&device);
+        in_job(move |ctx| {
+            let mut graph = graph(&device, 1, 1);
+            let target = |decl: &mut FrameDecl<'_>, at: usize| {
+                decl.import_image(&image_import(
+                    "target",
+                    targets[at],
+                    on(ImageState::Undefined, G),
+                    on(ImageState::ColourAttachment, G),
+                ))
+            };
+            let written = on(BufferState::ShaderWrite, home(&**graph.device()));
+            let mut decl = FrameDecl::new(1);
+            let shared_id = decl.import_buffer(&BufferImport {
+                label: "shared",
+                buffer: shared,
+                sharing: Sharing::Concurrent,
+                initial: on(BufferState::ShaderRead, G),
+                last: written,
+                ready: None,
+            });
+            let out = decl.import_buffer(&BufferImport {
+                ready: Some(gate),
+                ..fresh_buffer("out", out, C, BufferState::ShaderWrite)
+            });
+            let uses = [
+                BufferUse { buffer: shared_id, access: BufferAccess::Write },
+                BufferUse { buffer: out, access: BufferAccess::Write },
+            ];
+            decl.compute_pass(
+                &ComputePassDecl { label: "write", sampled: &[], buffers: &uses, slots: &[] },
+                |_| {},
+            );
+            let first_target = target(&mut decl, 0);
+            decl.render_pass(
+                &draws("draw", &[colour(first_target, Load::Clear([0.0; 4]))]),
+                |_| {},
+            );
+            let first = frame(&mut graph, ctx, decl).expect("the writing frame");
+            let roles: Vec<QueueRole> =
+                logged.take_submitted().iter().map(|(queue, _)| *queue).collect();
+            let expected = if several(&**graph.device()) { vec![C, G] } else { vec![G] };
+            assert_eq!(roles, expected, "the frame ends on the graphics queue");
+
+            let mut decl = FrameDecl::new(1);
+            let shared = decl.import_buffer(&BufferImport {
+                label: "shared",
+                buffer: shared,
+                sharing: Sharing::Concurrent,
+                initial: written,
+                last: on(BufferState::ShaderRead, G),
+                ready: None,
+            });
+            let second_target = target(&mut decl, 1);
+            decl.render_pass(
+                &RenderPassDecl {
+                    buffers: &reads(shared),
+                    ..draws("read", &[colour(second_target, Load::Clear([0.0; 4]))])
+                },
+                |_| {},
+            );
+            let second = frame(&mut graph, ctx, decl);
+            graph.device().signal_timeline(gate).expect("the host's signal");
+            reached(&**graph.device(), first);
+            let second = second.expect("null accepts the read");
+            reached(&**graph.device(), second);
+        });
+    }
+}
+
+/// The queue that `pass` of `plan` runs on.
+fn queue_of(plan: &lactose_render_graph::CompiledPlan, pass: PassId) -> QueueRole {
+    plan.passes().iter().find(|planned| planned.pass == pass).expect("a kept pass").queue
+}
+
+/// The queue of a compute pass that uses a `Concurrent` buffer, imported in `initial`, with a
+/// later render pass, in `compute`'s and `render`'s accesses, on a device whose compute role
+/// has a queue of its own; null accepts the frame.
+fn shared_case(initial: BufferState, compute: BufferAccess, render: BufferAccess) -> QueueRole {
+    let device = device(lactose_rhi_api::QueueLayout::SEVERAL);
+    let shared = buffer(&*device, "shared", Sharing::Concurrent);
+    let out = buffer(&*device, "out", Sharing::Exclusive);
+    let target = image(&*device, "target", Sharing::Exclusive);
+    define_buffer(&*device, shared, on(initial, G));
+    in_job(move |ctx| {
+        let mut graph = graph(&device, 1, 1);
+        let mut decl = FrameDecl::new(1);
+        let shared = decl.import_buffer(&BufferImport {
+            label: "shared",
+            buffer: shared,
+            sharing: Sharing::Concurrent,
+            initial: on(initial, G),
+            last: on(initial, G),
+            ready: None,
+        });
+        let out = decl.import_buffer(&fresh_buffer("out", out, C, BufferState::ShaderWrite));
+        let target = decl.import_image(&image_import(
+            "target",
+            target,
+            on(ImageState::Undefined, G),
+            on(ImageState::ColourAttachment, G),
+        ));
+        let compute_uses = [
+            BufferUse { buffer: shared, access: compute },
+            BufferUse { buffer: out, access: BufferAccess::Write },
+        ];
+        let pass = decl.compute_pass(
+            &ComputePassDecl { label: "compute", sampled: &[], buffers: &compute_uses, slots: &[] },
+            |_| {},
+        );
+        let render_uses = [BufferUse { buffer: shared, access: render }];
+        decl.render_pass(
+            &RenderPassDecl {
+                buffers: &render_uses,
+                ..draws("render", &[colour(target, Load::Clear([0.0; 4]))])
+            },
+            |_| {},
+        );
+        let compiled = graph.compile(decl).expect("a plan");
+        let queue = queue_of(compiled.plan(), pass);
+        let recorded = graph.record(compiled, ctx).expect("a recorded frame");
+        let point = graph.submit(recorded).expect("null accepts the frame");
+        reached(&**graph.device(), point);
+        queue
+    })
+}
+
+/// A `Concurrent` import that a compute pass and a render pass both read in one state is a
+/// dependency where its `initial` is another state, whose transition falls inside the frame,
+/// and is independent where its `initial` is that state ("Queues").
+#[test]
+fn a_concurrent_import_not_in_its_initial_state_is_a_dependency() {
+    let read = BufferAccess::Read;
+    assert_eq!(shared_case(BufferState::CopySource, read, read), G);
+    assert_eq!(shared_case(BufferState::ShaderRead, read, read), C);
+}
+
+/// A `Concurrent` import that either pass writes is a dependency ("Queues").
+#[test]
+fn a_concurrent_import_either_pass_writes_is_a_dependency() {
+    let (read, write) = (BufferAccess::Read, BufferAccess::Write);
+    for (compute, render) in [(write, write), (write, read), (read, write)] {
+        let initial =
+            if render == write { BufferState::ShaderWrite } else { BufferState::ShaderRead };
+        assert_eq!(shared_case(initial, compute, render), G, "{compute:?}, {render:?}");
+    }
+}
+
+/// Compute pass `b` shares a buffer with compute pass `a`, declared after it, which shares
+/// another with a render pass: `a` is the graphics role's by the rule, and so is `b` once the
+/// rule is applied again ("Queues": until nothing changes).
+#[test]
+fn the_queue_rule_is_applied_until_nothing_changes() {
+    let device = device(lactose_rhi_api::QueueLayout::SEVERAL);
+    let x = buffer(&*device, "x", Sharing::Exclusive);
+    let y = buffer(&*device, "y", Sharing::Exclusive);
+    let target = image(&*device, "target", Sharing::Exclusive);
+    let (a, b) = in_job(move |ctx| {
+        let mut graph = graph(&device, 1, 1);
+        let mut decl = FrameDecl::new(1);
+        let x = decl.import_buffer(&fresh_buffer("x", x, G, BufferState::ShaderWrite));
+        let y = decl.import_buffer(&fresh_buffer("y", y, G, BufferState::ShaderWrite));
+        let target = decl.import_image(&image_import(
+            "target",
+            target,
+            on(ImageState::Undefined, G),
+            on(ImageState::ColourAttachment, G),
+        ));
+        let b = decl.compute_pass(
+            &ComputePassDecl { label: "b", sampled: &[], buffers: &writes(y), slots: &[] },
+            |_| {},
+        );
+        decl.render_pass(
+            &RenderPassDecl {
+                buffers: &writes(x),
+                ..draws("render", &[colour(target, Load::Clear([0.0; 4]))])
+            },
+            |_| {},
+        );
+        let a_uses = [
+            BufferUse { buffer: x, access: BufferAccess::Write },
+            BufferUse { buffer: y, access: BufferAccess::Write },
+        ];
+        let a = decl.compute_pass(
+            &ComputePassDecl { label: "a", sampled: &[], buffers: &a_uses, slots: &[] },
+            |_| {},
+        );
+        let compiled = graph.compile(decl).expect("a plan");
+        let queues = (queue_of(compiled.plan(), a), queue_of(compiled.plan(), b));
+        let recorded = graph.record(compiled, ctx).expect("a recorded frame");
+        let point = graph.submit(recorded).expect("null accepts the frame");
+        reached(&**graph.device(), point);
+        queues
+    });
+    assert_eq!((a, b), (G, G));
 }
 
 /// A buffer a compute pass alone uses, declared on the graphics role at both ends, crosses

@@ -339,3 +339,160 @@ fn a_handoff_is_released_for_the_next_user_to_acquire() {
         });
     }
 }
+
+/// The text of one transition from `from` to `to` in a logged line.
+fn step<S: core::fmt::Debug>(from: S, to: S) -> String {
+    format!("from: {from:?}, to: {to:?}")
+}
+
+/// A frame in which one resource takes two transitions in a row at one place.
+#[derive(Clone, Copy, Debug)]
+enum Chain {
+    /// A target drawn, closed into `SampledRead`, then released toward the present role.
+    ClosingChange,
+    /// A target no pass uses, taken from `Undefined` into its `last`, then released.
+    UnusedImage,
+    /// An image sampled on the compute queue, acquired back on graphics, then released.
+    ClosingAcquire,
+    /// A buffer imported `Undefined` on graphics and read on compute: taken, then released.
+    MovedBuffer,
+    /// The same buffer, which no pass uses, left on compute.
+    UnusedBuffer,
+}
+
+/// `chain`'s frame on a fresh device of `queues`, the point it returned, and its lines. On a
+/// device whose compute role has a queue of its own, the two transitions of the chain, in
+/// order.
+fn chain_frame(
+    chain: Chain,
+    queues: lactose_rhi_api::QueueLayout,
+) -> (lactose_core::Result<lactose_rhi_api::TimelinePoint>, Vec<String>, [String; 2]) {
+    use lactose_render_graph::{BufferImport, ImageImport};
+    use lactose_rhi_api::QueueRole::{Compute as C, Present as P};
+    let device = device(queues);
+    let target = image(&*device, "target", Sharing::Exclusive);
+    let data = buffer(&*device, "data", Sharing::Exclusive);
+    let out = buffer(&*device, "out", Sharing::Exclusive);
+    let pipeline = compute_pipeline(&*device);
+    if matches!(chain, Chain::ClosingAcquire) {
+        bring_image(&*device, target, on(ImageState::SampledRead, G));
+    }
+    let sampled = on(ImageState::SampledRead, G);
+    let expected = match chain {
+        Chain::ClosingChange => [
+            step(on(ImageState::ColourAttachment, G), sampled),
+            step(sampled, on(ImageState::SampledRead, P)),
+        ],
+        Chain::UnusedImage => [
+            step(on(ImageState::Undefined, G), on(ImageState::ColourAttachment, G)),
+            step(on(ImageState::ColourAttachment, G), on(ImageState::SampledRead, P)),
+        ],
+        Chain::ClosingAcquire => [
+            step(on(ImageState::SampledRead, C), sampled),
+            step(sampled, on(ImageState::SampledRead, P)),
+        ],
+        Chain::MovedBuffer | Chain::UnusedBuffer => [
+            step(on(BufferState::Undefined, G), on(BufferState::ShaderRead, G)),
+            step(on(BufferState::ShaderRead, G), on(BufferState::ShaderRead, C)),
+        ],
+    };
+    let logged = std::sync::Arc::clone(&device);
+    let point = in_job(move |ctx| {
+        let mut graph = graph(&device, 1, 1);
+        let mut decl = FrameDecl::new(1);
+        let handed = |initial, last| ImageImport {
+            handoff: Some(on(ImageState::SampledRead, P)),
+            ..image_import("target", target, initial, last)
+        };
+        let data_import = BufferImport {
+            label: "data",
+            buffer: data,
+            sharing: Sharing::Exclusive,
+            initial: on(BufferState::Undefined, G),
+            last: on(BufferState::ShaderRead, C),
+            ready: None,
+        };
+        match chain {
+            Chain::ClosingChange => {
+                let image = decl.import_image(&handed(on(ImageState::Undefined, G), sampled));
+                decl.render_pass(&draws("draw", &[colour(image, Load::Clear([0.0; 4]))]), |_| {});
+            }
+            Chain::UnusedImage => {
+                decl.import_image(&handed(
+                    on(ImageState::Undefined, G),
+                    on(ImageState::ColourAttachment, G),
+                ));
+            }
+            Chain::ClosingAcquire => {
+                let image = decl.import_image(&handed(sampled, sampled));
+                let out =
+                    decl.import_buffer(&fresh_buffer("out", out, C, BufferState::ShaderWrite));
+                decl.compute_pass(
+                    &ComputePassDecl {
+                        label: "sample",
+                        sampled: &[image],
+                        buffers: &writes(out),
+                        slots: &[],
+                    },
+                    move |pass| {
+                        pass.bind_pipeline(pipeline);
+                        pass.dispatch([1, 1, 1]);
+                    },
+                );
+            }
+            Chain::MovedBuffer => {
+                let data = decl.import_buffer(&data_import);
+                decl.compute_pass(
+                    &ComputePassDecl {
+                        label: "read",
+                        sampled: &[],
+                        buffers: &crate::common::reads(data),
+                        slots: &[],
+                    },
+                    move |pass| {
+                        pass.bind_pipeline(pipeline);
+                        pass.dispatch([1, 1, 1]);
+                    },
+                );
+            }
+            Chain::UnusedBuffer => {
+                decl.import_buffer(&data_import);
+            }
+        }
+        let point = frame(&mut graph, ctx, decl);
+        if let Ok(point) = point {
+            reached(&**graph.device(), point);
+        }
+        point
+    });
+    (point, lines(&logged.take_submitted()), expected)
+}
+
+/// A resource that takes two transitions in a row, a change or an acquire and then a release,
+/// or a take from `Undefined` and then a release, takes them in two transition calls, in that
+/// order, never in one: a device makes one call one barrier, whose elements are not ordered
+/// with one another. The logging device refuses a submit with a call that names one resource
+/// twice, as it does for every test (`tests/common`). Under one queue no chain arises.
+#[test]
+fn no_transition_call_names_a_resource_twice() {
+    for queues in LAYOUTS {
+        for chain in [
+            Chain::ClosingChange,
+            Chain::UnusedImage,
+            Chain::ClosingAcquire,
+            Chain::MovedBuffer,
+            Chain::UnusedBuffer,
+        ] {
+            let (point, lines, expected) = chain_frame(chain, queues);
+            assert!(point.is_ok(), "{queues:?}, {chain:?}: {point:?}\n{lines:#?}");
+            if queues == lactose_rhi_api::QueueLayout::SEVERAL {
+                let first = lines.iter().rposition(|line| line.contains(&expected[0]));
+                let second = lines.iter().rposition(|line| line.contains(&expected[1]));
+                assert!(
+                    matches!((first, second), (Some(first), Some(second)) if first < second),
+                    "{chain:?}: the chain as two calls, in order\n{lines:#?}"
+                );
+            }
+        }
+    }
+}

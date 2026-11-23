@@ -1,16 +1,16 @@
 //! What the tests on null share: a null device under either queue layout, wrapped so that
 //! every command an encoder records is kept and every submit's commands are read back in
-//! submission order; a job to call the graph from; and the resources and pipelines a frame
-//! names.
+//! submission order; a job to call the graph from, with a bounded wait; and the resources and
+//! pipelines a frame names.
 
 #![allow(dead_code, reason = "each test target uses part of the shared module")]
 
 use std::any::Any;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::Duration;
 
-use lactose_core::Result;
+use lactose_core::{Error, ErrorKind, Result};
 use lactose_render_graph::{
     BufferAccess, BufferId, BufferImport, BufferUse, ColourUse, FrameDecl, GraphDesc, ImageId,
     ImageImport, RenderGraph, RenderPassDecl, TransientImage,
@@ -32,8 +32,13 @@ use lactose_task::{ChaosConfig, Executor, GraphBuilder, GraphNode, JobContext};
 /// The two capability sets every row with a queue in it runs under.
 pub const LAYOUTS: [QueueLayout; 2] = [QueueLayout::ONE, QueueLayout::SEVERAL];
 
-/// The longest a test waits for a point or a job.
+/// The longest a test waits for a point.
 pub const PATIENCE: Duration = Duration::from_secs(20);
+
+/// The longest a test waits for its job: a test body runs many frames, and under Miri one
+/// runs for minutes.
+pub const JOB_PATIENCE: Duration =
+    if cfg!(miri) { Duration::from_secs(3600) } else { Duration::from_secs(40) };
 
 pub const G: QueueRole = QueueRole::Graphics;
 pub const C: QueueRole = QueueRole::Compute;
@@ -109,18 +114,40 @@ pub fn executor(workers: u32, chaos: Option<ChaosConfig>) -> Executor {
 }
 
 /// Runs `body` as a job of `executor`'s and returns what it returned.
+///
+/// A job that has not returned within [`JOB_PATIENCE`] aborts the process with a message, so
+/// that a wait inside the graph fails the test at the bound rather than at nextest's kill.
+/// It aborts rather than panics: a panic drops the executor, whose shutdown joins the worker
+/// that is stuck.
 pub fn in_job_of<R: Send + 'static>(
     executor: &Executor,
     body: impl FnOnce(&mut JobContext<'_>) -> R + Send + 'static,
 ) -> R {
-    let out = Arc::new(Mutex::new(None));
-    let kept = Arc::clone(&out);
-    let body: Body = Box::new(move |ctx| *lock(&kept) = Some(body(ctx)));
+    let (done, returned) = mpsc::channel();
+    let body: Body = Box::new(move |ctx| {
+        // The receiver is gone only where the test thread has aborted.
+        let _ = done.send(body(ctx));
+    });
     let mut builder = GraphBuilder::new();
     builder.add_node(Arc::new(Job(Mutex::new(Some(body)))));
-    let graph = builder.build().expect("one node");
-    executor.block_on(executor.run_graph(graph)).expect("the job runs");
-    lock(&out).take().expect("the job ran")
+    let run = executor.run_graph(builder.build().expect("one node"));
+    match returned.recv_timeout(JOB_PATIENCE) {
+        Ok(out) => {
+            executor.block_on(run).expect("the job runs");
+            out
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "the test's job did not return within {JOB_PATIENCE:?}: a wait inside the graph"
+            );
+            std::process::abort();
+        }
+        // A panic in a job aborts the process; this is the unwind before it.
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("the test's job panicked");
+            std::process::abort();
+        }
+    }
 }
 
 /// Runs `body` as a job of a fresh executor of two frame-critical workers.
@@ -343,6 +370,8 @@ struct LoggedEncoder {
     inner: Option<Box<dyn Encoder>>,
     queue: QueueRole,
     commands: Vec<String>,
+    /// The first transition call since the reset that named one resource twice.
+    twice: Option<String>,
 }
 
 impl LoggedEncoder {
@@ -352,6 +381,15 @@ impl LoggedEncoder {
 
     fn log(&mut self, line: String) {
         self.commands.push(line);
+    }
+
+    /// Logs `line`, the call that transitions `resources`, noting it where one repeats.
+    fn log_transition<R: PartialEq>(&mut self, resources: &[R], line: String) {
+        let twice = (1..resources.len()).any(|at| resources[..at].contains(&resources[at]));
+        if twice && self.twice.is_none() {
+            self.twice = Some(line.clone());
+        }
+        self.log(line);
     }
 }
 
@@ -363,16 +401,19 @@ impl Encoder for LoggedEncoder {
     fn reset(&mut self) -> Result<()> {
         self.inner().reset()?;
         self.commands.clear();
+        self.twice = None;
         Ok(())
     }
 
     fn transition_images(&mut self, transitions: &[ImageTransition]) {
-        self.log(format!("transition_images {transitions:?}"));
+        let images: Vec<ImageHandle> = transitions.iter().map(|each| each.image).collect();
+        self.log_transition(&images, format!("transition_images {transitions:?}"));
         self.inner().transition_images(transitions);
     }
 
     fn transition_buffers(&mut self, transitions: &[BufferTransition]) {
-        self.log(format!("transition_buffers {transitions:?}"));
+        let buffers: Vec<BufferHandle> = transitions.iter().map(|each| each.buffer).collect();
+        self.log_transition(&buffers, format!("transition_buffers {transitions:?}"));
         self.inner().transition_buffers(transitions);
     }
 
@@ -591,8 +632,11 @@ impl Device for Logged {
         self.inner.image_memoryless(image)
     }
 
+    /// Null's placement, one byte longer: null's sizes are multiples of the alignment, which
+    /// would leave every end aligned whether or not the plan rounds it.
     fn image_placement(&self, desc: &ImageDesc<'_>) -> Result<Placement> {
-        self.inner.image_placement(desc)
+        let placement = self.inner.image_placement(desc)?;
+        Ok(Placement { size: placement.size + 1, ..placement })
     }
 
     fn create_memory_block(&self, desc: &MemoryBlockDesc<'_>) -> Result<MemoryBlockHandle> {
@@ -671,11 +715,25 @@ impl Device for Logged {
 
     fn create_encoder(&self, queue: QueueRole, label: &str) -> Result<Box<dyn Encoder>> {
         let inner = self.inner.create_encoder(queue, label)?;
-        Ok(Box::new(LoggedEncoder { inner: Some(inner), queue, commands: Vec::new() }))
+        Ok(Box::new(LoggedEncoder { inner: Some(inner), queue, commands: Vec::new(), twice: None }))
     }
 
+    /// Null's submit, after refusing one whose encoders hold a transition call that names one
+    /// resource twice: a device makes one call one barrier, whose elements are not ordered
+    /// with one another.
     fn submit(&self, queue: QueueRole, submit: Submit<'_>) -> Result<()> {
         let Submit { encoders, waits, signals } = submit;
+        for encoder in encoders.iter_mut() {
+            let logged = (&mut **encoder as &mut dyn Any)
+                .downcast_mut::<LoggedEncoder>()
+                .expect("an encoder of the logging device");
+            if let Some(line) = &logged.twice {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("one transition call names a resource twice: {line}"),
+                ));
+            }
+        }
         let mut inner = Vec::with_capacity(encoders.len());
         let mut recorded = Vec::with_capacity(encoders.len());
         for encoder in encoders.iter_mut() {

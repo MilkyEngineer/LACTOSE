@@ -1,5 +1,6 @@
-//! Recording on null: a recorder's breach, the encoders under a lagging device, a frame of
-//! another graph, recording in parallel, and the same commands under chaos.
+//! Recording on null: a recorder's breach, the first in graph order of two, the encoders
+//! under a lagging device and `record`'s own read of the timeline, a frame of another graph,
+//! recording in parallel, and the same commands under chaos.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -485,5 +486,121 @@ fn chaos_changes_no_command() {
                 );
             }
         }
+    }
+}
+
+/// `record` reads the frame timeline itself: a frame compiled while the frame before is
+/// pending, and recorded once that frame's point is reached, takes that frame's encoders
+/// rather than making its own, which `GraphStats::encoders` shows.
+#[test]
+fn record_frees_the_encoders_of_a_frame_reached_since_compile() {
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let target = image(&*device, "target", Sharing::Exclusive);
+        let gate = held(&*device);
+        in_job(move |ctx| {
+            let mut graph = graph(&device, 1, 1);
+            let declare = |ready| {
+                let mut decl = FrameDecl::new(1);
+                let target = decl.import_image(&lactose_render_graph::ImageImport {
+                    ready,
+                    ..image_import(
+                        "target",
+                        target,
+                        on(ImageState::Undefined, G),
+                        on(ImageState::ColourAttachment, G),
+                    )
+                });
+                decl.render_pass(&draws("draw", &[colour(target, Load::Clear([0.0; 4]))]), |_| {});
+                decl
+            };
+            let first = frame(&mut graph, ctx, declare(Some(gate))).expect("a frame");
+            assert_eq!(graph.stats().encoders, 1, "the first frame's, pending");
+            let compiled = graph.compile(declare(None)).expect("a plan");
+            assert_eq!(graph.stats().encoders, 1, "still pending at compile");
+            graph.device().signal_timeline(gate).expect("the host's signal");
+            reached(&**graph.device(), first);
+            let recorded = graph.record(compiled, ctx).expect("a recorded frame");
+            assert_eq!(graph.stats().encoders, 0, "the second frame took the first's encoder");
+            let second = graph.submit(recorded).expect("a frame");
+            assert_eq!(graph.stats().encoders, 1);
+            reached(&**graph.device(), second);
+        });
+    }
+}
+
+/// Two jobs breach, the later in graph order first: the later job's recorder breaches and
+/// then lets the earlier job's go on, which waits for it with a bound and breaches too.
+/// `record` names the earlier job's pass, the first breach in graph order, not the first to
+/// happen. The bounded wait is the test's own breach of "Recording"'s rule that a recorder
+/// does not wait, made to order the two; it fails rather than hangs where the jobs do not
+/// run at once.
+#[test]
+fn the_first_breach_in_graph_order_is_reported_when_a_later_job_breaches_first() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let pipeline = compute_pipeline(&*device);
+        let handles =
+            [buffer(&*device, "a", Sharing::Exclusive), buffer(&*device, "b", Sharing::Exclusive)];
+        let executor = executor(4, None);
+        let saw_later = in_job_of(&executor, move |ctx| {
+            let queue = home(&*device);
+            let mut graph = graph(&device, 2, 1);
+            let later_breached = Arc::new(AtomicBool::new(false));
+            let saw_later = Arc::new(Mutex::new(None));
+            let mut decl = FrameDecl::new(1);
+            let [a, b] = handles.map(|handle| {
+                decl.import_buffer(&fresh_buffer(
+                    "written",
+                    handle,
+                    queue,
+                    BufferState::ShaderWrite,
+                ))
+            });
+            let (flag, saw) = (Arc::clone(&later_breached), Arc::clone(&saw_later));
+            decl.compute_pass(
+                &ComputePassDecl {
+                    label: "earlier",
+                    sampled: &[],
+                    buffers: &[BufferUse { buffer: a, access: BufferAccess::Write }],
+                    slots: &[],
+                },
+                move |pass| {
+                    pass.bind_pipeline(pipeline);
+                    let start = Instant::now();
+                    while !flag.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(10)
+                    {
+                        std::thread::yield_now();
+                    }
+                    *lock(&saw) = Some(flag.load(Ordering::Acquire));
+                    // `b` is the other pass's.
+                    pass.push_address(0, b, 0);
+                },
+            );
+            let flag = Arc::clone(&later_breached);
+            decl.compute_pass(
+                &ComputePassDecl {
+                    label: "later",
+                    sampled: &[],
+                    buffers: &[BufferUse { buffer: b, access: BufferAccess::Write }],
+                    slots: &[],
+                },
+                move |pass| {
+                    pass.bind_pipeline(pipeline);
+                    pass.push_address(0, a, 0);
+                    flag.store(true, Ordering::Release);
+                },
+            );
+            let compiled = graph.compile(decl).expect("a plan");
+            assert_eq!(compiled.plan().jobs(), 2);
+            let error = graph.record(compiled, ctx).err().expect("a breach");
+            assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+            assert!(error.to_string().contains("`earlier`"), "{error}");
+            *lock(&saw_later)
+        });
+        executor.shutdown();
+        assert_eq!(saw_later, Some(true), "{queues:?}: the later job breached first");
     }
 }

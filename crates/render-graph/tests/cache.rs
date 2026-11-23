@@ -2,10 +2,18 @@
 //! same declaration again, over other handles, does not; the cap evicts; and a use moved
 //! from one of a pass's lists to another is a key input.
 
-use lactose_render_graph::{CopyPassDecl, FrameDecl, GraphKey, ImageId, ImageImport};
-use lactose_rhi_api::{ImageHandle, ImageState, Load, QueueLayout, Sharing};
+use lactose_render_graph::{
+    BufferAccess, BufferImport, BufferUse, ColourUse, CopyPassDecl, DepthUse, FrameDecl, GraphKey,
+    ImageId, ImageImport, RenderPassDecl, TransientImage,
+};
+use lactose_rhi_api::{
+    BufferHandle, BufferState, Device, Extent, Format, ImageDesc, ImageHandle, ImageMemory,
+    ImageState, ImageUsage, Load, QueueLayout, Sharing,
+};
 
-use crate::common::{G, colour, device, draws, graph, image, image_import, on};
+use crate::common::{
+    C, G, LAYOUTS, SCRATCH, buffer, colour, device, draws, graph, image, image_import, on,
+};
 
 fn declare(
     views: u32,
@@ -110,4 +118,251 @@ fn the_key_tells_a_passs_lists_apart() {
     assert!(kept.fresh());
     assert!(!kept.plan().is_culled(pass));
     assert_ne!(kept.plan().key(), culled.plan().key());
+}
+
+/// One input of the key's base declaration changed alone, or none.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Input {
+    None,
+    Views,
+    ImportLabel,
+    ImportMips,
+    ImportLayers,
+    ImportSharing,
+    ImportInitialState,
+    ImportInitialQueue,
+    ImportLast,
+    ImportHandoff,
+    TransientLabel,
+    TransientFormat,
+    TransientExtent,
+    TransientMips,
+    TransientLayers,
+    BufferLabel,
+    BufferSharing,
+    BufferInitial,
+    BufferLast,
+    PassLabel,
+    ColourImage,
+    ColourMip,
+    ColourLayer,
+    ColourLoad,
+    LocalRead,
+    DepthLoad,
+    Sampled,
+    BufferAccessOf,
+}
+
+const INPUTS: [Input; 28] = [
+    Input::None,
+    Input::Views,
+    Input::ImportLabel,
+    Input::ImportMips,
+    Input::ImportLayers,
+    Input::ImportSharing,
+    Input::ImportInitialState,
+    Input::ImportInitialQueue,
+    Input::ImportLast,
+    Input::ImportHandoff,
+    Input::TransientLabel,
+    Input::TransientFormat,
+    Input::TransientExtent,
+    Input::TransientMips,
+    Input::TransientLayers,
+    Input::BufferLabel,
+    Input::BufferSharing,
+    Input::BufferInitial,
+    Input::BufferLast,
+    Input::PassLabel,
+    Input::ColourImage,
+    Input::ColourMip,
+    Input::ColourLayer,
+    Input::ColourLoad,
+    Input::LocalRead,
+    Input::DepthLoad,
+    Input::Sampled,
+    Input::BufferAccessOf,
+];
+
+/// The key's base declaration, with `input` changed: an import, a sampled import, a colour
+/// and a depth transient and a buffer, drawn by one render pass and read back by a copy.
+fn declare_with(
+    input: Input,
+    target: ImageHandle,
+    texture: ImageHandle,
+    out: BufferHandle,
+) -> FrameDecl<'static> {
+    let changed = |which: Input| input == which;
+    let mut decl = FrameDecl::new(if changed(Input::Views) { 2 } else { 1 });
+    let initial = match input {
+        Input::ImportInitialState => on(ImageState::SampledRead, G),
+        Input::ImportInitialQueue => on(ImageState::ColourAttachment, C),
+        _ => on(ImageState::ColourAttachment, G),
+    };
+    let target = decl.import_image(&ImageImport {
+        label: if changed(Input::ImportLabel) { "target, renamed" } else { "target" },
+        image: target,
+        mips: if changed(Input::ImportMips) { 3 } else { 2 },
+        layers: if changed(Input::ImportLayers) { 3 } else { 2 },
+        sharing: if changed(Input::ImportSharing) {
+            Sharing::Concurrent
+        } else {
+            Sharing::Exclusive
+        },
+        initial,
+        last: on(
+            if changed(Input::ImportLast) {
+                ImageState::SampledRead
+            } else {
+                ImageState::ColourAttachment
+            },
+            G,
+        ),
+        handoff: changed(Input::ImportHandoff).then_some(on(ImageState::SampledRead, C)),
+        ready: None,
+    });
+    let sampled = on(ImageState::SampledRead, G);
+    let texture = decl.import_image(&image_import("texture", texture, sampled, sampled));
+    let scratch = decl.transient_image(&TransientImage {
+        label: if changed(Input::TransientLabel) { "scratch, renamed" } else { "scratch" },
+        format: if changed(Input::TransientFormat) {
+            Format::Rgba16Float
+        } else {
+            Format::Rgba8Unorm
+        },
+        extent: if changed(Input::TransientExtent) {
+            Extent { width: 32, height: 32 }
+        } else {
+            SCRATCH.extent
+        },
+        mips: if changed(Input::TransientMips) { 2 } else { 1 },
+        layers: if changed(Input::TransientLayers) { 2 } else { 1 },
+    });
+    let depth = decl.transient_image(&TransientImage {
+        label: "depth",
+        format: Format::Depth32Float,
+        ..SCRATCH
+    });
+    let out = decl.import_buffer(&BufferImport {
+        label: if changed(Input::BufferLabel) { "out, renamed" } else { "out" },
+        buffer: out,
+        sharing: if changed(Input::BufferSharing) {
+            Sharing::Concurrent
+        } else {
+            Sharing::Exclusive
+        },
+        initial: on(
+            if changed(Input::BufferInitial) {
+                BufferState::ShaderWrite
+            } else {
+                BufferState::ShaderRead
+            },
+            G,
+        ),
+        last: on(
+            if changed(Input::BufferLast) {
+                BufferState::CopyDestination
+            } else {
+                BufferState::HostRead
+            },
+            G,
+        ),
+        ready: None,
+    });
+    let mut colour = [
+        ColourUse {
+            image: target,
+            mip: if changed(Input::ColourMip) { 1 } else { 0 },
+            layer: if changed(Input::ColourLayer) { 1 } else { 0 },
+            load: if changed(Input::ColourLoad) { Load::Keep } else { Load::Clear([0.0; 4]) },
+            local_read: false,
+        },
+        ColourUse {
+            image: scratch,
+            mip: 0,
+            layer: 0,
+            load: Load::Clear([0.0; 4]),
+            local_read: changed(Input::LocalRead),
+        },
+    ];
+    if changed(Input::ColourImage) {
+        colour.swap(0, 1);
+    }
+    let sampled: &[ImageId] = if changed(Input::Sampled) { &[] } else { &[texture] };
+    let buffers = [BufferUse {
+        buffer: out,
+        access: if changed(Input::BufferAccessOf) {
+            BufferAccess::Write
+        } else {
+            BufferAccess::Read
+        },
+    }];
+    decl.render_pass(
+        &RenderPassDecl {
+            label: if changed(Input::PassLabel) { "draw, renamed" } else { "draw" },
+            colour: &colour,
+            depth: Some(DepthUse {
+                image: depth,
+                mip: 0,
+                layer: 0,
+                load: if changed(Input::DepthLoad) { Load::DontCare } else { Load::Clear(1.0) },
+            }),
+            sampled,
+            buffers: &buffers,
+            slots: &[],
+        },
+        |_| {},
+    );
+    decl.copy_pass(
+        &CopyPassDecl {
+            label: "read",
+            image_sources: &[scratch],
+            image_destinations: &[],
+            buffer_sources: &[],
+            buffer_destinations: &[out],
+        },
+        |_| {},
+    );
+    decl
+}
+
+/// Every input the key hashes ("Compile and its cache"), changed alone from one base
+/// declaration, compiles a plan of its own, and the same declaration again is a hit: an
+/// input left out of the key would make the two share a plan, with its load, size, format or
+/// closing transitions. The queue layout is the test above's.
+#[test]
+fn every_input_of_the_key_changed_alone_compiles_a_plan_of_its_own() {
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let target = device
+            .create_image(&ImageDesc {
+                label: "target",
+                format: Format::Rgba8Unorm,
+                extent: SCRATCH.extent,
+                mips: 3,
+                layers: 3,
+                usage: ImageUsage::COLOUR.union(ImageUsage::SAMPLED),
+                memory: ImageMemory::Own,
+                sharing: Sharing::Exclusive,
+            })
+            .expect("an image");
+        let texture = image(&*device, "texture", Sharing::Exclusive);
+        let out = buffer(&*device, "out", Sharing::Exclusive);
+        let mut graph = graph(&device, 1, 64);
+        let mut shared = Vec::new();
+        for input in INPUTS {
+            let first = graph.compile(declare_with(input, target, texture, out)).expect("a plan");
+            if !first.fresh() {
+                shared.push(input);
+            }
+            drop(first);
+            let again = graph.compile(declare_with(input, target, texture, out)).expect("a plan");
+            assert!(!again.fresh(), "{queues:?}, {input:?}: compiled twice");
+        }
+        assert!(
+            shared.is_empty(),
+            "{queues:?}: changed alone, these hit another's plan: {shared:?}"
+        );
+        assert_eq!(graph.stats().compiles, INPUTS.len() as u64);
+    }
 }

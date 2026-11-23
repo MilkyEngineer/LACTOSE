@@ -286,14 +286,21 @@ Three things these consumers must know that no signature shows:
   of their first kept use, declaration order breaking a tie, each at the lowest offset of
   the lowest-numbered block where its bytes, at its alignment, overlap those of no
   transient whose lifetime overlaps its own, and makes a block where none has room. How
-  large it makes a block is its choice. So a transient takes the bytes of one that has
-  ended wherever those are the lowest that fit, and in a frame whose kept passes use two
-  placed transients and no more, of equal format, extent, mips, layers and usage, whose
-  lifetimes do not overlap, the two have one placement.
+  large it makes a block is its choice: at milestone 2 a plan has one block, sized to the
+  high-water mark of its placements, and a device refuses a block past its largest
+  allocation (`ResourceExhausted`), which `compile` returns. So a transient takes the
+  bytes of one that has ended wherever those are the lowest that fit, and in a frame whose
+  kept passes use two placed transients and no more, of equal format, extent, mips, layers
+  and usage, whose lifetimes do not overlap, the two have one placement. Two whose
+  lifetimes meet in one pass, the last use of one and the first of the other, overlap.
 - Before the first use, in each frame, of a placed transient whose range another's
   overlaps, the graph records `Encoder::alias` for it. That covers the first frame, where
   rhi-api accepts the call though nothing came before, and every later frame, where the
   transient that last used the bytes is one of the frame before.
+- On native Metal the one block is suspected to cost order: D158 fences placed images by
+  block, so every encoder that uses a placed transient would wait for every earlier one
+  that did, whether or not their bytes overlap. `rhi-metal` measures it; a block for each
+  run of transients that never alias is the remedy where it is so.
 - **The graph does not judge a read before the first write.** A declaration whose pass
   keeps, copies from or locally reads a transient no earlier pass wrote compiles and
   records. Null refuses its submit (`undefined-read`); a device reads undefined bytes.
@@ -329,6 +336,12 @@ Three things these consumers must know that no signature shows:
 - The graph records no transition the declaration does not imply and omits none it does.
   On null a missing or a wrong one is refused (`state`), which is how `graph-impl` shows a
   build that drops one.
+- **The graph never names a resource twice in one transition call.** The elements of one
+  `transition_images` or `transition_buffers` call are not ordered with one another on a
+  device (one `vkCmdPipelineBarrier2` on Vulkan), so where a resource has two transitions
+  in a row, such as a closing transition and then the release toward `handoff`, or a take
+  from `Undefined` and then a release, each is in a call of its own, in that order. The
+  tests' logging device refuses a submit whose encoder had a call that named one twice.
 
 ### What a pass reaches
 
@@ -485,11 +498,19 @@ Three things these consumers must know that no signature shows:
   each frame submitted, so a point reached means that frame's submits, and every earlier
   frame's, have completed: those on the last submit's queue by submission order, and those
   on another queue by these waits.
-- One point a frame serialises the frame's end. The last submit waits for the frame's
-  compute-queue work before any of its own passes run, so compute work overlaps only the
-  graphics submits made before the last one, and no compute work overlaps graphics across
-  the frame's end at milestone 2. A trailing submit with no encoder that signals the point
-  is for a later milestone ("Not in this crate yet").
+- Across frames, under several queues, each submit of a frame waits for the last submit
+  the graph made to the other queue before the frame, where it has made one: that covers
+  every earlier frame's use, write and change there, and is how the graph makes the
+  cross-frame waits of "Imports" (null credits a submit with its own waits alone). The
+  frame's last submit also waits for the frame point before where that was signalled from
+  the other queue.
+- The two cost the frame's ends. The last submit waits for the frame's work on the other
+  queue before any of its own passes run, so the other queue's work overlaps only the
+  submits made before the last one; and a frame's first submit on a queue starts after
+  the other queue's last submit of the frame before, so no work overlaps across the
+  frame's end at milestone 2. A frame all of whose work is on one queue, on a graph that
+  has used no other, makes neither wait. A trailing submit with no encoder that signals
+  the point is for a later milestone ("Not in this crate yet").
 - `submit` waits for nothing and returns an error from `Device::submit` unchanged. A
   refusal of the frame's first submit changes nothing (rhi-api, "Timelines"): every import
   is as the declaration found it, and the frame's encoders are reset and free. An error
@@ -650,6 +671,11 @@ A copy pass's second call into one destination fails `record`. Two transients al
 honour is not refused, it is given memory). No submit waits for a point that only a later
 submit to its own queue signals: null does not refuse that, neither submit completes, so
 the proof is every frame's point reached within a bounded wait under both capability sets.
+Null applies one transition call's elements in order, so it cannot refuse a call that names
+a resource twice; the tests' logging device does, over the five chains of two transitions a
+frame can give one resource at its end. Each queue rule's clause holds by the queue a pass
+is given (`PlannedPass::queue`), and a wait inside the graph, such as a pending encoder's
+drop, fails its test at a bound, with a message, rather than at nextest's kill.
 
 ## How each call is honoured
 
