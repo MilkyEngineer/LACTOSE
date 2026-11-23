@@ -254,9 +254,9 @@ attachments and nothing else, and nothing that ships turns it on.
   the last reported left out and repeats dropped, and appended to the caller's buffer, which
   the swapchain's own buffers, kept for their capacity, reach without allocating once they
   have room. Unit tests hold the widening across the 32-bit wrap, the watermark, unsorted and
-  repeated entries, a backlog followed by a new read, and the read's guard. It never waits: the bound,
-  5 ms, held at every call of `lactose-platform`'s window run, whose presents each waited for
-  an image, and the longest call measured was 0.04 ms.
+  repeated entries, a backlog followed by a new read, and the read's guard. It never waits:
+  the bound, 5 ms, held at every call of `lactose-platform`'s window run, whose presents each
+  waited for an image, and the longest call measured was 0.04 ms.
 - **The delay:** in that run under MoltenVK 1.4.2 at 60 Hz, a present was shown a median
   48 ms after its call returned (three refreshes, the FIFO queue full), and reported a median
   2 ms after it was shown, at most 16 ms. A replaced swapchain's history is drained before it
