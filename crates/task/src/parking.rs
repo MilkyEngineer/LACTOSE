@@ -67,3 +67,54 @@ impl Signal {
         self.thread.unpark();
     }
 }
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    /// Long enough for a loaded machine, and for Miri; a lost wake fails with a message.
+    const BOUND: Duration = Duration::from_secs(if cfg!(miri) { 3600 } else { 30 });
+
+    /// The loom model's case on real threads: a call parks its thread until the next call
+    /// is queued, takes that call's unpark, and the thread then waits for the next call
+    /// without losing it.
+    #[test]
+    fn a_call_queued_while_a_call_parks_runs_after_it() {
+        let (lanes, lent) = mpsc::channel();
+        let (ran, done) = mpsc::channel();
+        let pumping = std::thread::spawn(move || {
+            let (lane, mut pump) = super::parking_lane::<usize>("parking::tests");
+            lanes.send(lane).expect("the test waits for the lane");
+            let mut count = 0;
+            loop {
+                pump.drain(&mut count);
+                if count == 2 {
+                    break;
+                }
+                pump.wait();
+            }
+            ran.send(count).expect("the test waits for the count");
+        });
+        let lane = lent.recv_timeout(BOUND).expect("the lane is made");
+        let second = Arc::new(AtomicBool::new(false));
+        let (entered, inside) = mpsc::channel();
+        let parking = {
+            let second = second.clone();
+            lane.run(move |count: &mut usize| {
+                entered.send(()).expect("the test waits for the call");
+                while !second.load(Ordering::SeqCst) {
+                    std::thread::park();
+                }
+                *count += 1;
+            })
+        };
+        inside.recv_timeout(BOUND).expect("the parking call started");
+        second.store(true, Ordering::SeqCst);
+        drop(lane.run(|count: &mut usize| *count += 1));
+        assert_eq!(done.recv_timeout(BOUND).expect("the call behind the parking one ran"), 2);
+        pumping.join().expect("the pump ends");
+        drop(parking);
+    }
+}

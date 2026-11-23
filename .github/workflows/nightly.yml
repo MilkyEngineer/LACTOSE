@@ -97,9 +97,10 @@ jobs:
             key: rhi-vulkan-lib
             args: -p lactose-rhi-vulkan --lib
             miriflags: -Zmiri-many-seeds=0..4
-          # The platform crate's tests that open no window: the present thread's stop under a
-          # queuing task and its wake under a call that parks, and the torn-size read, whose
-          # atomics Miri's weak-memory emulation checks. Its window tests are a binary of their
+          # The platform crate's tests that open no window: the present thread's stop and drop
+          # under queuing threads, its lane's close before the hand-back and its wake under a
+          # call that parks, and the torn-size read, whose atomics Miri's weak-memory emulation
+          # checks. Its window tests are a binary of their
           # own, which this does not select; each needs the process's main thread and a display.
           - name: platform
             key: platform
