@@ -711,14 +711,17 @@ writes its report.
      `target/gpu/layers/` that names its library by its absolute path, with `VK_LAYER_PATH`
      set to an empty directory: a layer forced through `VK_INSTANCE_LAYERS` or
      `VK_LOADER_LAYERS_ENABLE`, or found twice, makes the loader warn, and the warning reaches
-     the debug messenger, which counts it. Before the run sets its own, it removes every
-     inherited variable the loader, the layer or the tests read (`CLEARED` and
-     `CLEARED_PREFIXES` in `src/vulkan.rs`): `VK_KHRONOS_VALIDATION_*`, `VK_LOADER_*`,
+     the debug messenger, which counts it. Before the run sets its own, it removes these
+     inherited variables (`CLEARED` and `CLEARED_PREFIXES` in `src/vulkan.rs`): the
+     families `VK_KHRONOS_VALIDATION_*` and `VK_LAYER_*` (the layer's settings under both
+     the names its manifest gives, and the layer paths), `VK_LOADER_*`, MoltenVK's `MVK_*`,
+     Mesa's `MESA_*` (KosmicKrisp's and lavapipe's) and Metal's `MTL_*`, and by name
      `VK_INSTANCE_LAYERS`, `VK_ICD_FILENAMES`, `VK_DRIVER_FILES`, `VK_ADD_DRIVER_FILES`,
-     `VK_LAYER_PATH`, `VK_ADD_LAYER_PATH`, `VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_SETTINGS_PATH`,
-     `DYLD_LIBRARY_PATH`, `LACTOSE_VALIDATION_OFF`, `LACTOSE_GPU_ADAPTER`,
-     `LACTOSE_GPU_SHADERS` and Metal's `MTL_*`, and names each it removed in its file; what a
-     run needs of them it takes as an argument;
+     `VK_ADD_LAYER_PATH`, `VK_IMPLICIT_LAYER_PATH`, `DYLD_LIBRARY_PATH`,
+     `METAL_DEVICE_WRAPPER_TYPE` (which turns Metal's API validation on, as `MTL_DEBUG_LAYER`
+     does), `LACTOSE_VALIDATION_OFF`, `LACTOSE_GPU_ADAPTER` and `LACTOSE_GPU_SHADERS`. It
+     names each it removed in its file. A driver's other variables are not cleared. What a
+     run needs of them it takes as an argument, or sets itself after the removal;
    - the driver is `VK_DRIVER_FILES`: lavapipe's manifest in `/usr/share/vulkan/icd.d/`,
      MoltenVK's or KosmicKrisp's in the SDK's `share/vulkan/icd.d/`; under `system` the
      loader's own search, and `--adapter <name>` selects the device by a part of its name
@@ -733,7 +736,7 @@ writes its report.
      no message about a call;
    - under MoltenVK, Metal API and shader validation, set as the Metal step sets them
      (`METAL_VALIDATION` in `src/vulkan.rs`); under any other driver, none.
-5. Each binary's canaries go first. The canaries (`Validators::canaries` in `src/vulkan.rs`) are
+5. Each binary's canaries go first. The canaries (`Run`'s `canaries` in `src/vulkan.rs`) are
    thread-safety validation's (the graphics queue waited idle through `ash` with no lock under
    a lagging dispatch while another thread submits to it,
    `UNASSIGNED-Threading-MultipleThreads-Write`; a unit test in `src/canary.rs`, since no
@@ -744,8 +747,14 @@ writes its report.
    which the layer sends only with `syncval_load_op_after_store_op_validation` on), its
    hazard across queues (a target a lagging graphics submit stores and a compute submit takes
    from `Undefined` with no semaphore, `SYNC-HAZARD-WRITE-RACING-WRITE`, which says `skipped,
-   compute shares the graphics queue` on a device with one queue) and the suite's
-   `each_validator_reports_its_canary`, which provokes core's and synchronisation's; with
+   compute shares the graphics queue` on a device with one queue), its hazard across two
+   submits of one queue, which every device runs (a buffer a lagging submit copies into and
+   a second submit takes from a state it is not in and copies into again,
+   `SYNC-HAZARD-WRITE-AFTER-WRITE`), the suite's `each_validator_reports_its_canary`, which
+   provokes core's and synchronisation's, and under Metal's validation Metal's shader
+   validation's (`METAL_CANARY`: a dispatch's read past a buffer, which must write `Invalid
+   load in 'device' or 'constant' address space` from the test's own process, and which the
+   layer hears nothing of); with
    `--gpu-assisted`, GPU-assisted validation's alone (a shader's read past a buffer through
    its address, `VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819`, and a draw that samples
    slot `heap_slots`, one past the heap, by an index in push bytes,
@@ -755,13 +764,17 @@ writes its report.
    passes, its sinks printed no message and the driver wrote no line of its errors or
    warnings: MoltenVK's `[mvk-error]` and `[mvk-warn]`, Mesa's `MESA: error`, `MESA:
    warning` and any `WARNING: ` line. Under Metal's validation Metal must also write no
-   report of shader validation's (`Invalid Metal usage`), no assertion of API validation's
+   report of shader validation's (`Invalid Metal usage`) but the Metal canary's, no assertion of API validation's
    (`failed assertion`) and no other line of the system log, which is where API validation's
    warnings go; and every test, canaries included, must print both validators' banners to
    the system log (`Metal API Validation Enabled`, `Metal GPU Validation Enabled`), which
    shows them loaded in its process, unless it says it skipped: a case of the null backend's
-   alone skips before it makes a device, so Metal never loads. The Metal step's canaries
-   show what the two report.
+   alone skips before it makes a device, so Metal never loads, and a case may skip after
+   making one (14 of MoltenVK's 44 skips do). The Metal step's canaries
+   show what the two report, and the Vulkan step's Metal canary that a report reaches the
+   judge from a test's process. The thread-safety canary's race may hang a driver: its
+   watchdog ends its process with a failure after 30 seconds, which the file records as
+   the canary failed (`the test failed`).
 6. It writes `target/gpu/<driver>-vulkan.txt`, or `<driver>-vulkan-gpu-assisted.txt`: the
    driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
    cleared:`, or `none`), every variable it set, the canaries heard or skipped, the

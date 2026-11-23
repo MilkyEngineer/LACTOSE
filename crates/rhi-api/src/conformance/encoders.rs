@@ -360,8 +360,10 @@ fn command_outside_its_scope_is_refused(ctx: &Ctx<'_>) -> Applies {
 /// A render pass, a graphics bind, a draw and a copy into or out of a depth image, each
 /// recorded on a `Compute` encoder, are refused on every layout: the compute role's queue may
 /// be of a family that does not draw. The same commands on a graphics encoder pass. Every
-/// resource a refused recording reaches is `Concurrent` or taken from `Undefined`, so that
-/// the role is the one rule it breaks.
+/// resource a refused recording reaches is `Concurrent` or taken from `Undefined`. The render
+/// pass and the copies break the role's rule alone, so a build without that check fails this
+/// case; a bind and a draw need a render pass, which none begins on a `Compute` encoder, so
+/// the scope rule refuses them, with the role's check or without it.
 fn graphics_on_a_compute_encoder_is_refused(ctx: &Ctx<'_>) -> Applies {
     const C: QueueRole = QueueRole::Compute;
     let device = ctx.device();

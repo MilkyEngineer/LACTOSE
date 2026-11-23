@@ -18,14 +18,22 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
    an attachment not marked) reaches the driver unchecked. It breaks a valid-usage rule whose
    effect the specification leaves undefined; what both spikes saw of it is a wrong image.
    rhi-null refuses each in every consumer's tests. On a GPU (`cargo xtask gpu`) core
-   validation reports a resource in another state, and synchronisation validation a hazard
-   within a submit and across submits and queues: the device learns that a submit has
-   completed only through a wait that succeeds (`Shared::reached`), as the layer (1.4.363)
-   takes any read of a timeline's counter as the host seeing every batch it was given
-   complete, and then hears nothing across submits. The canaries show it live within one
-   command buffer, and across two queues with no semaphore between them. A cross-queue use
-   with the semaphore and without the family transfer is a hazard of neither validator, and
-   no canary shows it reported.
+   validation reports an image in another layout, and synchronisation validation a hazard
+   of a copy, a clear, an attachment or a layout transition within a submit and across
+   submits and queues: the device learns that a submit has completed only through a wait
+   that succeeds (`Shared::reached`), as the layer (1.4.363) takes any read of a timeline's
+   counter as the host seeing every batch it was given complete, and then hears nothing
+   across submits. The canaries show it live within one command buffer, across two submits
+   of one queue, and across two queues with no semaphore between them. Synchronisation
+   validation does not track a shader's access through an address or the heap, or an
+   indirect or index read, and core validation keeps no state for a buffer: a buffer
+   written through its device address and then transitioned from a state it is not in is
+   reported by neither, under MoltenVK or KosmicKrisp, so a consumer must not rely on a
+   clean GPU run there. For those uses rhi-null is the check, and a GPU test of them needs a
+   lagging writer and a mutation that drops the barrier, as
+   `dispatches_of_one_pass_see_each_others_writes` and `dispatch_indirect_reads_its_counts`
+   have. A cross-queue use with the semaphore and without the family transfer is a hazard
+   of neither validator, and no canary shows it reported.
 2. **A shader's code, and what a shader reaches through data alone.** A module's header and
    its `OpCapability` and `OpExtension` instructions are checked; the rest of its code is the
    cook's and is trusted. An address, a slot or sampler index in push bytes or a buffer, an
@@ -34,7 +42,9 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
    --gpu-assisted`, whose canaries are a read past a buffer through its address and a sample
    of slot `heap_slots`, one past the heap, by an index in push bytes), and on the M1 Metal
    shader validation reports one past a buffer in every run under MoltenVK (`cargo xtask
-   gpu`, whose Metal step's canary is a store past a buffer).
+   gpu`, whose Metal step's canary is a store past a buffer, and whose Vulkan step under
+   MoltenVK hears Metal's report of a read past a buffer from the test's own process,
+   `canary_metal_shader_validation_reports_a_read_past_a_buffer`).
 
 ## The sites, by kind
 
@@ -138,18 +148,21 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   sink nor the loader the leaked messengers reach. Nothing is destroyed under the GPU's use,
   at the cost of the device's memory. With nothing pending, the unwinding last holder tears
   the device down as any last holder does.
-- The holders' count is decremented with `Release` and the last holder takes an `Acquire`
-  fence, as `Arc`'s drop does, so every queue call another holder made happens before the
-  last holder's wait for idle.
+- The holders' count (`Holders`, `holders.rs`) is decremented with `Release` and the last
+  holder takes an `Acquire` fence, as `Arc`'s drop does, so every queue call another holder
+  made happens before the last holder's wait for idle. Its unit test has each holder write
+  plain memory that the last reads, so Miri reports a data race where the ordering is
+  weakened: each holder's cell is an `UnsafeCell` shared through a test-only
+  `unsafe impl Sync`, written by its holder and read only by the last, after `let_go`.
 
 ## What Miri covers
 
 Nightly runs the crate's unit tests under Miri with four seeds: the records' fixed
 interleavings, a race of host signals and reads on threads over them, the handle table's
-drops outside its entry lock and a race of its generations on threads, and the conversions
-and module reads. Those are this crate's state that has no driver in it. Miri cannot load a
-driver, so nothing that reaches `ash` runs under it: `Raw`, `Mapping`, `on_message`, the
-holders' count, `leaking` and `lost`, and the encoders. Those run on devices in `cargo xtask
+drops outside its entry lock and a race of its generations on threads, the holders' count
+on threads, and the conversions and module reads. Those are this crate's state that has no
+driver in it. Miri cannot load a driver, so nothing that reaches `ash` runs under it: `Raw`,
+`Mapping`, `on_message`, `leaking` and `lost`, and the encoders. Those run on devices in `cargo xtask
 gpu`, the unwinding drops included, where a data race between two of this crate's threads is
 seen only if a validator or a test's assertion meets it.
 
@@ -162,4 +175,7 @@ dispatch that runs for about two seconds, and submits to the queue through the s
 another 300 ms later. The wait lasts until the dispatch ends, so both calls are inside the
 layer at once, and the layer reports `UNASSIGNED-Threading-MultipleThreads-Write` at the
 submit, under MoltenVK and KosmicKrisp. It is compiled into the unit tests alone, and ignored
-there: only `cargo xtask gpu` runs it, in a process of its own.
+there: only `cargo xtask gpu` runs it, in a process of its own. The race is undefined
+behaviour for the driver, which may deadlock instead: a watchdog thread ends the process
+with a failure after 30 seconds, which the run records as the canary failed (`the test
+failed`), with the watchdog's line on its standard error.

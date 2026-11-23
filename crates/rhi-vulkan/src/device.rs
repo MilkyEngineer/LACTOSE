@@ -3,7 +3,7 @@
 
 use core::ptr::NonNull;
 use core::time::Duration;
-use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -21,6 +21,7 @@ use lactose_rhi_api::{
 use crate::convert::{self, aspect, buffer_usage, image_usage};
 use crate::encoder::VulkanEncoder;
 use crate::heap::Heap;
+use crate::holders::Holders;
 use crate::pipeline::{self, Cache};
 use crate::raw::{self, Raw, Want, driver, image_info};
 use crate::records::{
@@ -125,7 +126,9 @@ impl BufferObj {
                 self.raw.device.invalidate_mapped_memory_ranges(&[range])
             }
         };
-        done.map_err(|e| driver(e, "vkFlushMappedMemoryRanges"))
+        let call =
+            if flush { "vkFlushMappedMemoryRanges" } else { "vkInvalidateMappedMemoryRanges" };
+        done.map_err(|e| driver(e, call))
     }
 }
 
@@ -306,7 +309,7 @@ pub(crate) struct Shared {
     pub(crate) records: Mutex<Records>,
     lost: AtomicBool,
     /// The device objects and encoders that hold the device (`hold`).
-    holders: AtomicUsize,
+    holders: Holders,
     pub(crate) buffers: Table<BufferObj>,
     pub(crate) images: Table<ImageObj>,
     blocks: Table<BlockObj>,
@@ -326,9 +329,7 @@ impl Shared {
 
     /// A new holder of the device: an encoder.
     pub(crate) fn hold(self: &Arc<Self>) -> Arc<Self> {
-        // Relaxed: a new holder is made from one that lives, as `Arc::clone` is; the
-        // decrement orders what each holder did before the last one's teardown.
-        self.holders.fetch_add(1, Ordering::Relaxed);
+        self.holders.hold();
         Arc::clone(self)
     }
 
@@ -343,13 +344,12 @@ impl Shared {
     /// while the thread unwinds a panic with a submit pending leaks the device instead, and
     /// one made so with none pending tears down as any other.
     pub(crate) fn let_go(&self) {
-        // Release, and Acquire at the last, as `Arc`'s drop: every queue call another
-        // holder made before its drop happens before the last holder's wait for idle,
-        // which needs every queue of the device externally synchronised.
-        if self.holders.fetch_sub(1, Ordering::Release) != 1 {
+        // Every queue call another holder made before its drop happens before the last
+        // holder's wait for idle, which needs every queue of the device externally
+        // synchronised (`Holders::let_go`).
+        if !self.holders.let_go() {
             return;
         }
-        atomic::fence(Ordering::Acquire);
         if std::thread::panicking() {
             let read = self.read_queues();
             let pending = {
@@ -605,7 +605,7 @@ impl VulkanDevice {
             heap,
             records: Mutex::new(Records::new(caps.heap_slots, caps.samplers, start)),
             lost: AtomicBool::new(false),
-            holders: AtomicUsize::new(1),
+            holders: Holders::new(),
             buffers: Table::new(),
             images: Table::new(),
             blocks: Table::new(),
@@ -993,7 +993,7 @@ impl Device for VulkanDevice {
         len: u64,
         fill: &mut dyn FnMut(&mut [u8]),
     ) -> Result<()> {
-        let (object, end) = self.lend(buffer, offset, len, Access::Write)?;
+        let (object, end) = self.host_access(buffer, offset, len, Access::Write)?;
         let lend = Lend { shared: &self.shared, buffer, start: offset, end };
         let mut bytes = vec![0; usize::try_from(len).unwrap_or(usize::MAX)];
         fill(&mut bytes);
@@ -1009,7 +1009,7 @@ impl Device for VulkanDevice {
         len: u64,
         read: &mut dyn FnMut(&[u8]),
     ) -> Result<()> {
-        let (object, end) = self.lend(buffer, offset, len, Access::Read)?;
+        let (object, end) = self.host_access(buffer, offset, len, Access::Read)?;
         let lend = Lend { shared: &self.shared, buffer, start: offset, end };
         let bytes = object.read(offset, len);
         if let Ok(bytes) = &bytes {
@@ -1020,21 +1020,17 @@ impl Device for VulkanDevice {
     }
 
     fn flush_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()> {
-        // A lend for the driver's call, rounded out to the atom: no host access of the
-        // range starts or is in progress while it runs.
-        let (object, end) = self.lend(buffer, offset, len, Access::Flush)?;
-        let lend = Lend { shared: &self.shared, buffer, start: offset, end };
-        let flushed = object.sync(offset, end, true);
-        drop(lend);
-        flushed
+        // Checked under the records' lock, as null checks it, and no range held for the
+        // driver's call: the host only writes an `Upload` buffer, and the resolved count
+        // keeps the memory through a destroy made meanwhile.
+        let (object, end) = self.host_access(buffer, offset, len, Access::Flush)?;
+        object.sync(offset, end, true)
     }
 
     fn invalidate_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()> {
-        let (object, end) = self.lend(buffer, offset, len, Access::Invalidate)?;
-        let lend = Lend { shared: &self.shared, buffer, start: offset, end };
-        let invalidated = object.sync(offset, end, false);
-        drop(lend);
-        invalidated
+        // As a flush's: the host only reads a `Readback` buffer.
+        let (object, end) = self.host_access(buffer, offset, len, Access::Invalidate)?;
+        object.sync(offset, end, false)
     }
 
     fn create_image(&self, desc: &ImageDesc<'_>) -> Result<ImageHandle> {
@@ -1528,8 +1524,9 @@ impl Device for VulkanDevice {
 }
 
 impl VulkanDevice {
-    /// The first hold of a host lend: its checks, and its range held.
-    fn lend(
+    /// The first hold of a host access: its checks, and for a write or a read its range
+    /// held, which a [`Lend`] clears. A flush or an invalidate holds none.
+    fn host_access(
         &self,
         buffer: BufferHandle,
         offset: u64,
@@ -1561,12 +1558,14 @@ impl VulkanDevice {
             )));
         }
         let object = self.shared.buffers.resolve(buffer).ok_or_else(|| stale("a buffer"))?;
-        records.buffers.live_mut(buffer, "a buffer")?.host.add(offset, end);
+        if matches!(access, Access::Write | Access::Read) {
+            records.buffers.live_mut(buffer, "a buffer")?.host.add(offset, end);
+        }
         Ok((object, end))
     }
 }
 
-/// What a host lend is for.
+/// What a host access is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Access {
     /// `write_buffer`, of an `Upload` buffer.

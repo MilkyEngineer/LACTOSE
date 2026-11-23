@@ -1033,4 +1033,49 @@ mod tests {
         let known = records.lock().unwrap().timeline(t).unwrap().known;
         assert_eq!((known, driver.lock().unwrap().value(t)), (greatest, greatest));
     }
+
+    /// A read made before a host signal, folded at a hold after it, names a value below the
+    /// one the signal made known: the fold keeps the greater, so a signal or a submit's
+    /// signal below the timeline's value is still refused (`fold_timeline`'s `max`).
+    #[test]
+    fn a_stale_read_folded_at_a_late_hold_lowers_no_timeline() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let t = timeline(&mut records, &mut driver, 0);
+        let none = read(&records, &driver, &[]);
+        let promised = submit(&mut records, &driver, &none, 0, &[], &[at(t, 2)], false).unwrap();
+        driver.complete(0, promised, &[at(t, 2)]);
+        // Two reads made now, each of the promise reached, held back past the signal below.
+        let stale = driver.read_timeline(&records, t);
+        let stale_submit = read(&records, &driver, &[at(t, 3)]);
+        assert_eq!(stale, Some((t, 2)), "the reads carry the reached promise");
+        let reached = driver.read_timeline(&records, t).expect("the promise reached");
+        records.fold_timeline(t, reached.1);
+        records.settle();
+        host_signal(&mut records, &mut driver, at(t, 4));
+        let below = begin(&mut records, &driver, stale, at(t, 3)).unwrap_err();
+        assert_eq!(rule(&below), Some(Rule::Timeline), "{below:?}");
+        let below =
+            submit(&mut records, &driver, &stale_submit, 0, &[], &[at(t, 3)], false).unwrap_err();
+        assert_eq!(rule(&below), Some(Rule::Timeline), "{below:?}");
+    }
+
+    /// Two submits of one queue whose signals one read finds reached: the settle completes
+    /// the later, and the earlier with it, so a destroy at once after the wait that found them
+    /// of what the later one uses is accepted (`settle`'s `max`; the rhi-api README's fourth
+    /// interleaving).
+    #[test]
+    fn a_wait_that_reaches_two_submits_completes_the_later() {
+        let (mut records, mut driver) = (records(), Driver::new());
+        let t = timeline(&mut records, &mut driver, 0);
+        let none = read(&records, &driver, &[]);
+        let first = submit(&mut records, &driver, &none, 0, &[], &[at(t, 1)], false).unwrap();
+        let none = read(&records, &driver, &[]);
+        let later = submit(&mut records, &driver, &none, 0, &[], &[at(t, 2)], false).unwrap();
+        assert!(later > first);
+        driver.signal(at(t, 2));
+        records.fold_timeline(t, 2);
+        records.settle();
+        behind(&records, &driver);
+        assert!(!records.pending(&[later, 0, 0]), "the destroy's check, accepted");
+    }
 }

@@ -47,9 +47,9 @@ contract leaves to the backend.
   Compute has a queue of its own in a family that computes and does not draw, else in another
   family that computes, else as a second queue of the graphics family; with none it shares the
   graphics queue (`QueueLayout`). Present shares the graphics queue until the swapchain gives
-  it one. The compute family may not draw, so a `Compute` encoder's render pass, graphics
-  bind, draw and depth image copy are refused (`encoding`) on every layout, as the contract
-  says. Every queue has a timeline semaphore that each submit to it signals to the submit's
+  it one. The compute family may not draw, so a `Compute` encoder's render pass and depth
+  image copy are refused (`encoding`) on every layout, as the contract says; its graphics
+  bind and draw, which need a render pass, are refused by the scope rule. Every queue has a timeline semaphore that each submit to it signals to the submit's
   stamp after its last command. Before each check the device learns how far a queue or a
   timeline has run with a wait of no time on each value it awaits, never a read of the
   counter, so what it counts as pending is completion: synchronization validation takes a
@@ -73,9 +73,11 @@ contract leaves to the backend.
   contract's two holds, under the heap's lock. The device asks the driver whether it
   supports the set's layout (`vkGetDescriptorSetLayoutSupport`), and the input attachments',
   before it makes them, and refuses a request it does not (`Unsupported`): a driver may
-  support fewer descriptors in one set than its per-type limits name. MoltenVK 1.4.2's
-  `maxPerSetDescriptors` is 1212, so beside the default 64 samplers its heap holds at most
-  1148 slots; KosmicKrisp supports a million. The renderer's heap must fit the smaller. A
+  support fewer descriptors in one set than its per-type limits name. MoltenVK 1.4.2
+  supports at most 1211 slots and samplers in the set, one below its `maxPerSetDescriptors`
+  of 1212, so beside the default 64 samplers its heap holds at most 1147 slots (the device
+  test `heap_past_the_drivers_support_is_refused` holds it to that boundary); KosmicKrisp
+  supports a million. The renderer's heap must fit the smaller. A
   sampler that would make the device's live samplers, the placeholder and those retired
   under a pending submit included, reach `maxSamplerAllocationCount` is refused
   `ResourceExhausted`.
@@ -122,9 +124,10 @@ contract leaves to the backend.
 heap's, never both and never two queues'; then the records'; then one entry's, a handle's in a
 table or a heap slot's. Recording takes one entry's lock alone, once for each handle between
 resets, and never the records'. No lock but a queue's or the heap's is held across a driver
-call, and none across a wait or the caller's closure: a host access, a flush and an
-invalidate lend their range under the records' lock, call or copy with none held, and clear
-the range in a second hold. A destroying call is a driver call too: a table's replaced or
+call, and none across a wait or the caller's closure: a write and a read lend their range
+under the records' lock, copy with none held, and clear the range in a second hold; a flush
+and an invalidate are checked under the records' lock and call the driver with none held,
+holding no range, as null's hold none. A destroying call is a driver call too: a table's replaced or
 removed count, a slot's replaced image and a reaped sampler are dropped or destroyed once the
 records', entry and slot locks are given up, so a message the layer sends from one reaches
 the sink under a queue's or the heap's lock at most.
@@ -165,11 +168,15 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   copies into one range; its load-after-store check, a target stored by one render pass and
   kept by the next with no transition; synchronisation across queues, a target a lagging
   graphics submit stores and a compute submit takes from `Undefined` with no semaphore, skipped
-  where compute shares the graphics queue; GPU-assisted, a shader's read past a buffer, and a
-  draw that samples slot `heap_slots` through push bytes, both run by `--gpu-assisted` alone.
-  In `src/canary.rs`, a unit test since its misuse is a driver call no safe call makes: thread
-  safety, the graphics queue waited idle with no lock on one thread under a lagging dispatch
-  while another submits to it.
+  where compute shares the graphics queue; synchronisation across two submits of one queue,
+  which every device runs, a buffer a lagging submit copies into and a second submit takes
+  from a state it is not in; GPU-assisted, a shader's read past a buffer, and a draw that
+  samples slot `heap_slots` through push bytes, both run by `--gpu-assisted` alone; and
+  Metal's shader validation under MoltenVK, the same read past a buffer, whose report on
+  standard error `cargo xtask gpu` must hear. In `src/canary.rs`, a unit test since its
+  misuse is a driver call no safe call makes: thread safety, the graphics queue waited idle
+  with no lock on one thread under a lagging dispatch while another submits to it, with a
+  watchdog that fails the process after 30 seconds should the driver hang.
 - Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, no size,
   two sizes or the built-in state no workgroup, an entry declared by its name and its stage's
   execution model, a `Bool` widened to four bytes and `Int64Atomics` refused unless enabled.
@@ -183,10 +190,12 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   read and its hold, each fixed in order against a model driver (a host signal or a dropped
   promise between a read and its hold, a pass begun during a slot write, a destroy at once
   after a wait with the queue behind, a failed submit's point signalled from the host, a
-  wait-only submit 2^31 below a marked host signal), and host signals racing on threads over
-  one timeline, which stays behind the driver. In `src/table.rs`: a replaced or removed value
+  wait-only submit 2^31 below a marked host signal, a stale read folded at a late hold, a
+  wait that reaches two submits of one queue), and host signals racing on threads over one
+  timeline, which stays behind the driver. In `src/table.rs`: a replaced or removed value
   dropped after its entry's lock, and a handle resolving to its own value or none across
-  threads. Nightly runs these under Miri ("What Miri covers" in `SAFETY.md`).
+  threads. In `src/holders.rs`: the last holder sees every other holder's writes to plain
+  memory. Nightly runs these under Miri ("What Miri covers" in `SAFETY.md`).
 
 ## Records
 
@@ -196,13 +205,15 @@ MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choos
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2, under Metal API and shader validation | 148 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363) | 142 | 50: 30 null alone, 8 no window, 4 no loss, 5 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
+| MoltenVK 1.4.2, under Metal API and shader validation | 150 | 44: 30 null alone, 8 no window, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363) | 143 | 50: 30 null alone, 8 no window, 4 no loss, 5 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
 | KosmicKrisp under GPU-assisted validation | 138 | 50: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit | 0 |
 
 The counts are of the device tests: the suite's 175 cases, 147 contract and 28 output, and the
-device's own. Each driver passes 27 of the 28 output cases: MoltenVK skips the count draw, and
-KosmicKrisp the ownership transfer, since compute shares its one queue.
+device's own; the Metal canary runs under MoltenVK alone. Each driver passes 27 of the 28
+output cases: MoltenVK skips the count draw, and KosmicKrisp the ownership transfer, since
+compute shares its one queue. Under Metal's validation every case that does not skip prints
+both banners; a skipped case is exempt, 14 of MoltenVK's 44 having made a device first.
 
 GPU-assisted validation does not run under MoltenVK 1.4.2: its instrumented shaders fail in
 SPIRV-Cross (a `uint` to `ulong` `reinterpret_cast`). On an Apple GPU the device reports

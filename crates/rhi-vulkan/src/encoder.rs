@@ -184,7 +184,9 @@ impl VulkanEncoder {
 
     /// Whether the encoder may record `what`, which the graphics role alone takes: the
     /// compute role's queue may be of a family that does not draw, so a `Compute` encoder
-    /// records none on any layout (`lactose-rhi-api`, "Queues by role").
+    /// records none on any layout (`lactose-rhi-api`, "Queues by role"). A render pass and a
+    /// depth image's copy ask; a graphics bind and a draw need a render pass, which none
+    /// begins on a `Compute` encoder, so the scope rule refuses them there.
     fn draws(&mut self, what: &str) -> bool {
         if self.role == QueueRole::Compute {
             self.fail(Rule::Encoding, format!("{what} on a compute encoder"));
@@ -471,9 +473,6 @@ impl VulkanEncoder {
 
     /// The checks a draw makes of its render pass, then the push-constant bytes it sees.
     fn draw_checks(&mut self, indexed: bool) -> bool {
-        if !self.draws("a draw") {
-            return false;
-        }
         let checked = match &self.scope {
             Scope::Render(pass) => draw_checks(pass, indexed),
             _ => Err((Rule::Encoding, "a draw outside a render pass".to_owned())),
@@ -1242,7 +1241,7 @@ impl Encoder for VulkanEncoder {
     }
 
     fn bind_graphics_pipeline(&mut self, pipeline: GraphicsPipelineHandle) {
-        if !self.recording() || !self.draws("a graphics pipeline bound") {
+        if !self.recording() {
             return;
         }
         if !matches!(self.scope, Scope::Render(_)) {

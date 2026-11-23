@@ -18,6 +18,7 @@ mod convert;
 mod device;
 mod encoder;
 mod heap;
+mod holders;
 mod pipeline;
 mod raw;
 mod records;

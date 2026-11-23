@@ -64,20 +64,24 @@ pub(super) fn woken<T: Send>(
 }
 
 /// Which call of a race goes first in a round. In a `Free` round the two are made at once
-/// on two threads; in a led round the one named returns before the other is made, so that
-/// each order a race can take is reached on every run, however rarely the free rounds
-/// reach it.
+/// on two threads, the second's spawned first where `second_first` says so, since the
+/// thread spawned first wins most rounds; in a led round the one named returns before the
+/// other is made, so that each order a race can take is reached on every run, however
+/// rarely the free rounds reach it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Lead {
-    Free,
+    Free { second_first: bool },
     First,
     Second,
 }
 
 impl Lead {
-    /// A race case's rounds: one led each way, then `free` rounds that race.
+    /// A race case's rounds: one led each way, then `free` rounds that race, the second
+    /// call's thread spawned first in every other one.
     pub(super) fn rounds(free: usize) -> impl Iterator<Item = Self> {
-        [Self::First, Self::Second].into_iter().chain(core::iter::repeat_n(Self::Free, free))
+        [Self::First, Self::Second]
+            .into_iter()
+            .chain((0..free).map(|round| Self::Free { second_first: round % 2 == 1 }))
     }
 }
 
@@ -98,9 +102,14 @@ pub(super) fn race<A: Send, B: Send>(
             let second = second();
             (first(), second)
         }
-        Lead::Free => std::thread::scope(|scope| {
-            let first = scope.spawn(first);
-            let second = scope.spawn(second);
+        Lead::Free { second_first } => std::thread::scope(|scope| {
+            let (first, second) = if second_first {
+                let second = scope.spawn(second);
+                (scope.spawn(first), second)
+            } else {
+                let first = scope.spawn(first);
+                (first, scope.spawn(second))
+            };
             (
                 first.join().unwrap_or_else(|_| ctx.fail("a racer panicked")),
                 second.join().unwrap_or_else(|_| ctx.fail("a racer panicked")),
@@ -128,7 +137,7 @@ impl<const N: usize> Orders<N> {
         match lead {
             Lead::First => ctx.check(order == 0, self.names[0]),
             Lead::Second => ctx.check(order == 1, self.names[1]),
-            Lead::Free => self.free[order] += 1,
+            Lead::Free { .. } => self.free[order] += 1,
         }
     }
 

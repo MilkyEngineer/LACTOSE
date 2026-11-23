@@ -156,6 +156,15 @@ pub const METAL_VALIDATION: [(&str, &str); 4] = [
 pub const METAL_BANNERS: [&str; 2] =
     ["Metal API Validation Enabled", "Metal GPU Validation Enabled"];
 
+/// The canary of Metal's shader validation in a run under it: a device test whose dispatch
+/// reads past a buffer, and the words of the report it must be heard to write from the test's
+/// own process. The banners show the validators loaded; this shows a report reaching the
+/// judge, which `MTL_SHADER_VALIDATION_REPORT_TO_STDERR` unset would silence.
+pub const METAL_CANARY: (&str, &str) = (
+    "device::canary_metal_shader_validation_reports_a_read_past_a_buffer",
+    "Invalid load in 'device' or 'constant' address space",
+);
+
 /// Which validators a run turns on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Validators {
@@ -209,6 +218,10 @@ impl Validators {
                     &["SYNC-HAZARD-WRITE-RACING-WRITE"],
                 ),
                 (
+                    "device::canary_synchronisation_validation_reports_a_race_across_submits",
+                    &[SYNC],
+                ),
+                (
                     "canary::canary_thread_safety_validation_reports_a_queue_used_on_two_threads",
                     &["UNASSIGNED-Threading-MultipleThreads-Write"],
                 ),
@@ -228,13 +241,14 @@ impl Validators {
     }
 }
 
-/// Whether a device test is a canary of some run's validators: those of another run's are
-/// not run.
+/// Whether a device test is a canary of some run's validators, or Metal's: those of another
+/// run's are not run.
 #[must_use]
 pub fn is_canary(test: &str) -> bool {
-    [Validators::Plain, Validators::GpuAssisted]
-        .iter()
-        .any(|validators| validators.canaries().iter().any(|(name, _)| *name == test))
+    test == METAL_CANARY.0
+        || [Validators::Plain, Validators::GpuAssisted]
+            .iter()
+            .any(|validators| validators.canaries().iter().any(|(name, _)| *name == test))
 }
 
 /// The SDK's files a run loads.
@@ -412,28 +426,37 @@ pub struct Run {
     pub cleared: Vec<String>,
     /// Whether the run sets Metal's validation, whose banners each test must then print.
     pub metal: bool,
+    /// The canaries the run must each hear, by test and the layer's identifiers: its
+    /// validators', and with the plain ones under Metal's validation [`METAL_CANARY`], of
+    /// which the layer hears nothing.
+    pub canaries: Vec<(&'static str, &'static [&'static str])>,
 }
 
 /// Variables a run removes from the environment it inherits, before it sets its own: each
-/// would change which layers or drivers load, the layer's settings, or the tests' device.
-const CLEARED: [&str; 12] = [
+/// would change which layers or drivers load, Metal's validation, or the tests' device.
+/// `METAL_DEVICE_WRAPPER_TYPE`, which Xcode sets, turns Metal's API validation on as
+/// `MTL_DEBUG_LAYER` does.
+const CLEARED: [&str; 11] = [
     "DYLD_LIBRARY_PATH",
     "VK_INSTANCE_LAYERS",
     "VK_ICD_FILENAMES",
     "VK_DRIVER_FILES",
     "VK_ADD_DRIVER_FILES",
-    "VK_LAYER_PATH",
     "VK_ADD_LAYER_PATH",
     "VK_IMPLICIT_LAYER_PATH",
-    "VK_LAYER_SETTINGS_PATH",
+    "METAL_DEVICE_WRAPPER_TYPE",
     "LACTOSE_VALIDATION_OFF",
     "LACTOSE_GPU_ADAPTER",
     "LACTOSE_GPU_SHADERS",
 ];
 
-/// Every family of variables a run removes: the layer's settings, the loader's own and
-/// Metal's, which a run under MoltenVK sets and any other runs without.
-const CLEARED_PREFIXES: [&str; 3] = ["VK_KHRONOS_VALIDATION_", "VK_LOADER_", "MTL_"];
+/// Every family of variables a run removes: the layer's settings under both their names
+/// (`VK_KHRONOS_VALIDATION_*`, and the `VK_LAYER_*` its manifest names, with the layer
+/// paths), the loader's own, MoltenVK's (`MVK_*`), Mesa's (`MESA_*`, KosmicKrisp's and
+/// lavapipe's), and Metal's, which a run under MoltenVK sets and any other runs without. A
+/// driver's variables outside these are not cleared.
+const CLEARED_PREFIXES: [&str; 6] =
+    ["VK_KHRONOS_VALIDATION_", "VK_LAYER_", "VK_LOADER_", "MVK_", "MESA_", "MTL_"];
 
 /// The names among `inherited` a run removes, sorted.
 #[must_use]
@@ -507,7 +530,11 @@ impl Run {
             set.push(("LACTOSE_GPU_ADAPTER".to_owned(), adapter.to_owned()));
         }
         let names = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok());
-        Ok(Self { set, cleared: cleared(names), metal })
+        let mut canaries = validators.canaries().to_vec();
+        if metal && validators == Validators::Plain {
+            canaries.push((METAL_CANARY.0, &[]));
+        }
+        Ok(Self { set, cleared: cleared(names), metal, canaries })
     }
 
     /// Applies the run's environment to `command`: the inherited variables it clears
@@ -553,6 +580,8 @@ pub struct Verdict {
     /// Every line in which the driver, or Metal's validation under it, reported an error or
     /// a warning.
     pub driver: Vec<String>,
+    /// Every line of the report [`METAL_CANARY`] must be heard to write, in its run.
+    pub reports: Vec<String>,
     /// Why the test fails the rule, or `None` where it passes.
     pub failure: Option<String>,
 }
@@ -583,6 +612,7 @@ fn logged(line: &str) -> bool {
 /// else. Under Metal's validation (`metal`), it wrote no report, assertion or other line of
 /// the log, and each of its validators printed its banner, unless the case says it skipped:
 /// a case of the null backend's alone skips before it makes a device, and Metal never loads.
+/// There [`METAL_CANARY`]'s test must write its report, and its report alone.
 #[must_use]
 pub fn judge(
     test: &str,
@@ -595,11 +625,16 @@ pub fn judge(
         .lines()
         .filter_map(|line| line.find("message: Message {").map(|at| line[at..].to_owned()))
         .collect();
+    let report = (metal && test == METAL_CANARY.0).then_some(METAL_CANARY.1);
+    let reported = |line: &str| report.is_some_and(|words| line.contains(words));
     let metal_line = |line: &str| {
         metal
+            && !reported(line)
             && (METAL_LINES.iter().any(|mark| line.contains(mark))
                 || logged(line) && !METAL_BANNERS.iter().any(|banner| line.ends_with(banner)))
     };
+    let reports: Vec<String> =
+        output.lines().filter(|line| reported(line)).map(str::to_owned).collect();
     let driver: Vec<String> = output
         .lines()
         .filter(|line| DRIVER_LINES.iter().any(|mark| line.contains(mark)) || metal_line(line))
@@ -621,6 +656,8 @@ pub fn judge(
         Some(format!("{} line(s) of the driver's or Metal's errors or warnings", driver.len()))
     } else if let Some(banner) = unloaded {
         Some(format!("Metal's validation did not print `{banner}`: is it loaded?"))
+    } else if let Some(words) = report.filter(|_| reports.is_empty()) {
+        Some(format!("Metal's report `{words}` was not heard: does it reach standard error?"))
     } else {
         match expected {
             None | Some(_) if skipped && !messages.is_empty() => {
@@ -644,7 +681,7 @@ pub fn judge(
             }
         }
     };
-    Verdict { said, messages, driver, failure }
+    Verdict { said, messages, driver, reports, failure }
 }
 
 /// The SHA-256 of a file's bytes, in lowercase hexadecimal.
@@ -829,6 +866,27 @@ mod tests {
     }
 
     #[test]
+    fn metals_canary_passes_on_its_report_alone_and_fails_without_it() {
+        let (test, words) = METAL_CANARY;
+        let clean = format!("{BANNERS}{CLEAN}");
+        let report = format!(
+            "{clean}Invalid Metal usage: {words} at offset 256, executing compute function:              \"cs_main\" \n"
+        );
+        let heard = judge(test, true, &report, Some(&[]), true);
+        assert_eq!(heard.failure, None);
+        assert_eq!((heard.reports.len(), heard.driver.len()), (1, 0));
+        let silent = judge(test, true, &clean, Some(&[]), true).failure.unwrap();
+        assert!(silent.contains("was not heard"), "{silent}");
+        // Another case's report fails it, and another report fails the canary.
+        assert!(judge("device::a_case", true, &report, None, true).failure.is_some());
+        let other = format!("{report}Invalid Metal usage: Invalid device store at offset 8\n");
+        assert!(judge(test, true, &other, Some(&[]), true).failure.is_some());
+        // The layer hears nothing of it.
+        let sent = format!("{report}{}", message("VUID-x"));
+        assert!(judge(test, true, &sent, Some(&[]), true).failure.is_some());
+    }
+
+    #[test]
     fn a_log_line_is_known_by_its_shape() {
         assert!(logged(BANNERS.lines().next().unwrap()));
         assert!(!logged("2026-11-19 04:55:04.377 no process"));
@@ -859,16 +917,28 @@ mod tests {
             "MVK_CONFIG_LOG_LEVEL",
             "VK_KHRONOS_VALIDATION_ENABLES",
             "MTL_DEBUG_LAYER",
+            "VK_LAYER_MESSAGE_ID_FILTER",
+            "VK_LAYER_SETTINGS_PATH",
+            "MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS",
+            "MESA_DEBUG",
+            "METAL_DEVICE_WRAPPER_TYPE",
+            "HOME",
         ];
         assert_eq!(
             cleared(inherited.map(str::to_owned)),
             [
                 "LACTOSE_VALIDATION_OFF",
+                "MESA_DEBUG",
+                "METAL_DEVICE_WRAPPER_TYPE",
                 "MTL_DEBUG_LAYER",
+                "MVK_CONFIG_LOG_LEVEL",
+                "MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS",
                 "VK_ADD_LAYER_PATH",
                 "VK_DRIVER_FILES",
                 "VK_KHRONOS_VALIDATION_ENABLES",
                 "VK_KHRONOS_VALIDATION_MESSAGE_ID_FILTER",
+                "VK_LAYER_MESSAGE_ID_FILTER",
+                "VK_LAYER_SETTINGS_PATH",
                 "VK_LOADER_DEBUG",
             ]
         );
@@ -901,7 +971,9 @@ mod tests {
             let listed = [Validators::Plain, Validators::GpuAssisted]
                 .iter()
                 .flat_map(|validators| validators.canaries())
-                .filter(|(name, _)| name.starts_with(module))
+                .map(|(name, _)| *name)
+                .chain([METAL_CANARY.0])
+                .filter(|name| name.starts_with(module))
                 .count();
             assert_eq!(named.len(), listed, "a listed canary is not in {file}: {named:?}");
         }

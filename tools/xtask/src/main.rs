@@ -520,7 +520,7 @@ fn run_vulkan(
         tests.retain(|test| test.starts_with(prefix));
         // The run's canaries first: a layer that did not load reports nothing, and every
         // verdict after would pass for clean.
-        let canaries = args.validators.canaries();
+        let canaries = &run.canaries;
         let order = canaries
             .iter()
             .map(|(name, _)| *name)
@@ -558,12 +558,17 @@ fn run_vulkan(
                 answered.push(test.to_owned());
                 heard.push(match &verdict.said {
                     Some(said) if said.starts_with("skipped, ") => format!("{test} {said}"),
-                    _ => format!("{test} heard {}", verdict.messages.len()),
+                    _ => format!("{test} heard {}", verdict.messages.len() + verdict.reports.len()),
                 });
             }
             lines.push(format!("{package} {test}: {word}\n"));
             lines.extend(
-                verdict.messages.iter().chain(&verdict.driver).map(|line| format!("  {line}\n")),
+                verdict
+                    .messages
+                    .iter()
+                    .chain(&verdict.reports)
+                    .chain(&verdict.driver)
+                    .map(|line| format!("  {line}\n")),
             );
             if verdict.failure.is_some() {
                 eprintln!("gpu: {test}: {word}\n{text}");
@@ -573,7 +578,7 @@ fn run_vulkan(
     }
     // Decision 5.10's "one case for each validator" holds of the run, not of the test
     // binary: a listed canary the binaries do not hold, or that ran and was not heard, fails.
-    for (canary, _) in args.validators.canaries() {
+    for (canary, _) in &run.canaries {
         if !answered.iter().any(|test| test == canary) && !failed.iter().any(|test| test == canary)
         {
             lines.push(format!("{canary}: FAILED, a listed canary no test binary holds\n"));

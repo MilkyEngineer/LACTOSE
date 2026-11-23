@@ -346,6 +346,57 @@ fn canary_synchronisation_validation_reports_a_race_across_queues() {
 /// What the cross-queue canary must say.
 const CROSS_QUEUE_CANARY: &str = "SYNC-HAZARD-WRITE-RACING-WRITE";
 
+/// Synchronisation validation's canary across two submits of one queue, which a device with
+/// one queue runs too: a lagging submit copies into a buffer, and a second submit, made while
+/// the first is in flight, takes the buffer from `CopySource` (it is in `CopyDestination`) and
+/// copies into it again, a race of the "Null alone" column. As across queues, the layer hears
+/// it only while it does not know the first submit complete (verification row 211).
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn canary_synchronisation_validation_reports_a_race_across_submits() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    let on = |state| StateOn { state, queue: QueueRole::Graphics };
+    let source = buffer(&device, BufferUsage::COPY_SOURCE, MemoryClass::Upload);
+    let target = buffer(&device, BufferUsage::COPY_DESTINATION, MemoryClass::Device);
+    let all = [BufferCopy { source_offset: 0, destination_offset: 0, size: 4096 }];
+    let mut first = lagging(&device);
+    first.transition_buffers(&[
+        BufferTransition {
+            buffer: source,
+            from: on(BufferState::Undefined),
+            to: on(BufferState::CopySource),
+        },
+        BufferTransition {
+            buffer: target,
+            from: on(BufferState::Undefined),
+            to: on(BufferState::CopyDestination),
+        },
+    ]);
+    first.copy_buffer(source, target, &all);
+    let mut second = device.create_encoder(QueueRole::Graphics, "canary").expect("an encoder");
+    second.transition_buffers(&[BufferTransition {
+        buffer: target,
+        from: on(BufferState::CopySource),
+        to: on(BufferState::CopyDestination),
+    }]);
+    second.copy_buffer(source, target, &all);
+    let timeline = device.create_timeline(0).expect("a timeline");
+    let done = TimelinePoint { timeline, value: 1 };
+    let mut first = [first];
+    device
+        .submit(QueueRole::Graphics, Submit { encoders: &mut first, waits: &[], signals: &[] })
+        .expect("the first submit");
+    let mut second = [second];
+    device
+        .submit(QueueRole::Graphics, Submit { encoders: &mut second, waits: &[], signals: &[done] })
+        .expect("the second submit");
+    assert!(device.wait_timeline(done, PATIENCE).expect("the wait"), "the work did not complete");
+    drop((first, second));
+    drop(device);
+    heard_alone(&sink, "SYNC-HAZARD-WRITE-AFTER-WRITE");
+}
+
 /// A graphics encoder whose first command is a dispatch that runs for a while (`store.slang`
 /// with a lag), so that what it records after is in flight when its submit returns.
 fn lagging(device: &VulkanDevice) -> Box<dyn Encoder> {
@@ -440,28 +491,40 @@ fn entry_point_the_module_does_not_declare_is_refused() {
 #[test]
 #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
 fn heap_past_the_drivers_support_is_refused() {
-    // MoltenVK 1.4.2 supports 1148 slots beside 64 samplers in one set and 1024 samplers
-    // live, so it makes the first and refuses the rest; KosmicKrisp makes all six.
+    // MoltenVK 1.4.2 supports at most 1211 slots and samplers in one set, below its
+    // `maxPerSetDescriptors` of 1212, and 1024 samplers live: so it makes the first and
+    // refuses the rest. KosmicKrisp makes all seven.
+    let sink = Arc::new(Counting::default());
+    let driver = device(&sink).info().driver.clone();
+    let mut made = Vec::new();
     for (slots, samplers) in
-        [(1148, 64), (1149, 64), (4096, 64), (1_000_000, 64), (1024, 256), (1024, 1024)]
+        [(1147, 64), (1148, 64), (1149, 64), (4096, 64), (1_000_000, 64), (1024, 256), (1024, 1024)]
     {
         let sink = Arc::new(Counting::default());
-        let made = VulkanDevice::new(DeviceRequest {
+        let device = VulkanDevice::new(DeviceRequest {
             heap_slots: slots,
             samplers,
             ..request(Arc::clone(&sink) as _)
         });
-        match &made {
-            Ok(_) => eprintln!("{slots} slots and {samplers} samplers: made"),
+        match &device {
+            Ok(_) => {
+                eprintln!("{slots} slots and {samplers} samplers: made");
+                made.push((slots, samplers));
+            }
             Err(refused) => {
                 eprintln!("{slots} slots and {samplers} samplers: {refused}");
                 assert_eq!(refused.kind(), ErrorKind::Unsupported, "{refused}");
             }
         }
-        drop(made);
+        drop(device);
         // A device made past its support is one the layer reports.
         assert_eq!(sink.count(), 0, "{slots} slots, {samplers} samplers: {:?}", sink.texts());
     }
+    // The boundary the crate's README states: a driver that moves it moves the README.
+    if driver.starts_with("MoltenVK") {
+        assert_eq!(made, [(1147, 64)], "{driver}");
+    }
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
 }
 
 #[test]
@@ -637,10 +700,30 @@ fn unwritable_cache_directory_is_reported_and_the_run_goes_on() {
 #[test]
 #[ignore = "needs GPU-assisted validation: cargo xtask gpu --gpu-assisted"]
 fn canary_gpu_assisted_validation_reports_a_read_past_a_buffer() {
-    const WORDS: u32 = 64;
     let sink = Arc::new(Counting::default());
     let device = device(&sink);
-    let pipeline = kernel(&device, "copy.cs_main");
+    read_past_a_buffer(&device);
+    drop(device);
+    heard_alone(&sink, GPU_ASSISTED_CANARY);
+}
+
+/// Metal's shader validation's canary, in a run under MoltenVK: the same read past a buffer,
+/// which Metal reports on standard error, where `cargo xtask gpu` must hear it
+/// (`METAL_CANARY`). The layer, without GPU-assisted validation, hears nothing of it.
+#[test]
+#[ignore = "needs Metal's shader validation: cargo xtask gpu --driver moltenvk"]
+fn canary_metal_shader_validation_reports_a_read_past_a_buffer() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    read_past_a_buffer(&device);
+    drop(device);
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+/// Runs a dispatch of `copy.slang` that reads one word past the end of a buffer of 64 words.
+fn read_past_a_buffer(device: &VulkanDevice) {
+    const WORDS: u32 = 64;
+    let pipeline = kernel(device, "copy.cs_main");
     let desc = |size| BufferDesc {
         label: "canary",
         size,
@@ -680,9 +763,7 @@ fn canary_gpu_assisted_validation_reports_a_read_past_a_buffer() {
     encoder.push_bytes(20, &0u32.to_le_bytes());
     encoder.dispatch([2, 1, 1]);
     encoder.end_pass();
-    run(&device, encoder);
-    drop(device);
-    heard_alone(&sink, GPU_ASSISTED_CANARY);
+    run(device, encoder);
 }
 
 /// What GPU-assisted validation's canary must say.
@@ -746,11 +827,12 @@ fn canary_gpu_assisted_validation_reports_a_slot_past_the_heap() {
         reach: PassReach::NOTHING,
     });
     encoder.bind_graphics_pipeline(pipeline);
-    // `sample.slang`'s block: the slot, then the left and the right half's sampler.
+    // `sample.slang`'s block: the slot, the left and the right half's sampler, the side.
     let past = device.capabilities().heap_slots;
     encoder.push_bytes(0, &past.to_le_bytes());
     encoder.push_bytes(4, &sampler.0.to_le_bytes());
     encoder.push_bytes(8, &sampler.0.to_le_bytes());
+    encoder.push_bytes(12, &4u32.to_le_bytes());
     encoder.draw(0..3, 0..1);
     encoder.end_pass();
     run(&device, encoder);

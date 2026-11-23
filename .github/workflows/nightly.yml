@@ -90,9 +90,9 @@ jobs:
           - name: rhi-null, doc
             key: rhi-null-doc
             args: -p lactose-rhi-null --doc
-          # The Vulkan backend's unit tests: its records' fixed interleavings and their race,
-          # its handle table and its shader module reads. Nothing here reaches a driver, which
-          # Miri cannot load; the device's own paths run in `cargo xtask gpu`.
+          # The Vulkan backend's unit tests: its records' fixed interleavings and their race, its
+          # holders' count, its handle table and its shader module reads. Nothing here reaches a
+          # driver, which Miri cannot load; the device's own paths run in `cargo xtask gpu`.
           - name: rhi-vulkan, unit tests
             key: rhi-vulkan-lib
             args: -p lactose-rhi-vulkan --lib
@@ -300,10 +300,11 @@ jobs:
   # 2 plan): every device test under GPU-assisted validation, with its own canary
   # (tools/xtask/README.md, "GPU runs"). Assumed from the layer's documentation until the
   # `gpu-probe` below records it: GPU-assisted validation loads on lavapipe, whose features
-  # cover what its instrumentation needs, as it does under KosmicKrisp on the M1.
+  # cover what its instrumentation needs, as it does under KosmicKrisp on the M1. On the image
+  # the pull request's job pins.
   gpu-assisted:
     name: gpu (lavapipe, GPU-assisted)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -329,10 +330,10 @@ jobs:
   # docs/plans/milestone-2.md section 3, `gpu-probe`: what lavapipe on the Linux runner offers,
   # for lane `vulkan` (docs/verification.md, the row on lavapipe). It records and never fails.
   # The macOS runners' facts, the oldest image's included, are the `shaders` jobs' own
-  # (tools/xtask/runner-facts.sh).
+  # (tools/xtask/runner-facts.sh). On the image `gpu (lavapipe)` pins.
   gpu-probe:
     name: gpu probe (lavapipe)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     continue-on-error: true
     steps:

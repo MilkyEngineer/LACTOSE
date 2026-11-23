@@ -156,7 +156,9 @@ impl NullEncoder {
 
     /// Whether the encoder may record `what`, which the graphics role alone takes: the
     /// compute role's queue may be of a family that does not draw, so a `Compute` encoder
-    /// records none on any layout (`lactose-rhi-api`, "Queues by role").
+    /// records none on any layout (`lactose-rhi-api`, "Queues by role"). A render pass and a
+    /// depth image's copy ask; a graphics bind and a draw need a render pass, which none
+    /// begins on a `Compute` encoder, so the scope rule refuses them there.
     fn draws(&mut self, what: &str) -> bool {
         if self.role == QueueRole::Compute {
             self.fail(Rule::Encoding, format!("{what} on a compute encoder"));
@@ -283,9 +285,6 @@ impl NullEncoder {
 
     /// The checks a draw makes of what its pass holds, then the command.
     fn draw_command(&mut self, indexed: bool, indirect: Vec<BufferHandle>) {
-        if !self.draws("a draw") {
-            return;
-        }
         let survives = self.shared.caps.memoryless_survives_local_read;
         let checked = match &mut self.scope {
             Scope::Render(pass) => draw_checks(pass, indexed, survives),
@@ -723,7 +722,7 @@ impl Encoder for NullEncoder {
     }
 
     fn bind_graphics_pipeline(&mut self, pipeline: GraphicsPipelineHandle) {
-        if !self.recording() || !self.draws("a graphics pipeline bound") {
+        if !self.recording() {
             return;
         }
         if !matches!(self.scope, Scope::Render(_)) {

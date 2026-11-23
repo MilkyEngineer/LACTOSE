@@ -931,7 +931,7 @@ fn sampled_image(ctx: &Ctx<'_>, device: &dyn Device, extent: Extent, texels: &[u
 }
 
 /// Draws `sample.slang` from `slot`, the left half by sampler `left` and the right by
-/// `right`, and returns the pixels.
+/// `right`, at each pixel's centre over the target's side, and returns the pixels.
 fn sample(
     ctx: &Ctx<'_>,
     device: &dyn Device,
@@ -948,6 +948,7 @@ fn sample(
     encoder.push_slot(0, slot);
     encoder.push_bytes(4, &left.to_le_bytes());
     encoder.push_bytes(8, &right.to_le_bytes());
+    encoder.push_bytes(12, &W.to_le_bytes());
     encoder.draw(0..3, 0..1);
     encoder.end_pass();
     let out = image_out(ctx, device, &mut *encoder, image, ImageState::ColourAttachment);
@@ -978,10 +979,11 @@ fn heap_is_sampled_past_slot_zero(ctx: &Ctx<'_>) -> Applies {
 
 fn sampler_filters_as_described(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
-    // Eight texels in a row, red rising by 32 from zero; the rest of each texel fixed. Over
-    // eight texels the centre of the target's pixel x falls at texel coordinate
-    // (2x - 7) / 16: every filter weight is a multiple of 1/16, which the least sub-texel
-    // precision Vulkan allows, 4 bits, holds exactly, and every filtered red is whole.
+    // Eight texels in a row, red rising by 32 from zero; the rest of each texel fixed. The
+    // shader samples at the centre of the target's pixel x over its 64 pixels, exactly, so
+    // over eight texels at texel coordinate (2x - 7) / 16: every filter weight is a multiple
+    // of 1/16, which the least sub-texel precision Vulkan allows, 4 bits, holds, and every
+    // filtered red is whole.
     let reds = [0u8, 32, 64, 96, 128, 160, 192, 224];
     let texels: Vec<u8> = reds.iter().flat_map(|&red| [red, 7, 9, 255]).collect();
     let extent = Extent { width: 8, height: 1 };

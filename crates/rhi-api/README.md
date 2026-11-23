@@ -145,9 +145,10 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   the same calls on every layout; the layout decides only whether a change of state between
   two roles is an ownership transfer.
 - The compute role's queue may be of a family that does not draw, so a `Compute` encoder
-  records no render pass, no graphics pipeline bind, no draw and no copy into or out of a
-  depth image, on every layout, `Shared` included (`encoding`, every backend): a caller that
-  is refused where compute shares the graphics queue is refused where it does not.
+  records no render pass and no copy into or out of a depth image, on every layout, `Shared`
+  included (`encoding`, every backend): a caller that is refused where compute shares the
+  graphics queue is refused where it does not. A graphics pipeline bind and a draw need a
+  render pass, so the scope rule refuses them on a `Compute` encoder.
 - Submits to one queue run in the order the calls return. A backend serialises the calls
   itself with a lock for each queue, the queue that serves the role (architecture section 3
   permits the lock): a submit takes it before its walk of the records and keeps it through
@@ -384,10 +385,12 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   3). On a device that reports it `false`, null refuses a submit that declares, binds or
   copies from a buffer with a written range not flushed since, and a `read_buffer` of a
   range a submit wrote with no invalidate since (`unflushed`). A flush is of an `Upload`
-  buffer and an invalidate of a `Readback` one (`usage`), and neither may overlap a host
-  access in progress (`host-overlap`), on every backend: a device backend rounds both out
-  to the driver's atom, so an invalidate racing a write of memory that is not coherent
-  would discard the bytes the write has not flushed.
+  buffer and an invalidate of a `Readback` one (`usage`), and neither may overlap a write or
+  a read in progress (`host-overlap`), on every backend. Neither is itself a host access in
+  progress: each is checked when it is called and holds no range after, so no write, read,
+  flush, invalidate, destroy or submit is refused for one running, on every backend. The
+  host only writes what it flushes and only reads what it invalidates, and a backend keeps
+  the buffer's memory through a destroy made during either.
 - A host write is seen by every submit made after its flush returns. The host does not
   write a range a pending submit reads; null cannot see every such read and does not check
   it. A breach gives that submit a torn read, a wrong image, which is the residual "The
@@ -1044,7 +1047,7 @@ stale number into a wrong image ("The heap and the sampler table").
 | `PresentQueue` | `present-queue` | `Device::submit` to `Present` | a swapchain image on another role's encoder |
 | `Swapchain` | `swapchain` | a second acquire; a present of another image; a second swapchain | a swapchain image used outside its acquire and its present |
 | `Timeline` | `timeline` | a submit's signal that does not grow past the timeline's value, its host signals and promises and the values the submit waits for, or that another queue's pending signal could pass; a host signal not below every pending promise, or one a promise whose wait it does not alone release or another host signal could pass; a value 2^31 or more from the timeline's, a host signal's in progress, or a pending wait or signal | |
-| `Encoding` | `encoding` | a foreign, wrong-role or pending encoder in a submit; one submitted again with no reset; a command outside its scope; a render pass, graphics bind, draw or depth image copy on a `Compute` encoder; a draw or dispatch with nothing bound to it; a pass left open | |
+| `Encoding` | `encoding` | a foreign, wrong-role or pending encoder in a submit; one submitted again with no reset; a command outside its scope (so a graphics bind or a draw on a `Compute` encoder, where no render pass begins); a render pass or depth image copy on a `Compute` encoder; a draw or dispatch with nothing bound to it; a pass left open | |
 
 **What a device backend keeps**
 
@@ -1192,8 +1195,9 @@ column, one or more for each of its clauses, 64 in all: `unreported_capability_i
   something falls between them. Every race case but the one of submits to one queue, whose
   order no call can see, leads one round each way, the second call made once the first has
   returned (or, for the host write, once its `fill` has begun), and fails where a led round
-  ends in another order; its free rounds then race, and it prints how many reached each
-  order, as a device's free rounds can meet one order in nearly every round. A device
+  ends in another order; its free rounds then race, the second call's thread spawned first
+  in every other one, and it prints how many reached each order, as a device's free rounds
+  can meet one order in nearly every round. A device
   backend's records are a type of its own that makes no driver call, and its tests run the
   same interleavings under Miri with many seeds and under stress, with fixed interleavings
   among them: a host signal made in full between
@@ -1304,15 +1308,17 @@ Some output cases count as evidence only in the shape, or on the device, named h
   submit before the next is made, silences it.
 - `sampler_filters_as_described` picks among two or more samplers by a non-uniform index
   past zero, in the draw that indexes the image array past slot zero, and compares exactly
-  where filtering is exact. A linear sample falls where each weight is a multiple of 1/16,
-  which a device with Vulkan's least `subTexelPrecisionBits`, 4, computes exactly, over
-  texels 32 apart, and is within 1.5 of the reference: a weight 1/16 off is 2 away.
+  where filtering is exact. The shader samples at each pixel's centre over the target's side
+  (`SV_Position`), which is exact, not at an interpolated coordinate; so a linear sample
+  falls where each weight is a multiple of 1/16, which Vulkan's least
+  `subTexelPrecisionBits`, 4, holds, over texels 32 apart, and is within 1.5 of the
+  reference: a weight 1/16 off is 2 away.
 - `dispatch_indirect_reads_its_counts` has a dispatch write the counts, at an offset that
   is not zero and all three different, through a `ShaderWrite` to `Indirect` transition,
-  with a lagging writer; a mutation that drops the transition shows on a discrete GPU
-  alone, since lavapipe runs each dispatch to completion before the next command,
-  synchronisation validation does not track indirect buffers and Metal's tracking hides the
-  miss on the M1.
+  with a lagging writer; a mutation that drops the transition fails it under KosmicKrisp on
+  the M1 (3 runs of 3), and so fails the M1's gate. It passes under MoltenVK, whose Metal
+  tracking orders the two, and under lavapipe, which runs each dispatch to completion
+  before the next command; synchronisation validation does not track indirect buffers.
 - `dispatches_of_one_pass_see_each_others_writes` has a lagging first dispatch; a mutation
   that drops Vulkan's barrier between the two fails it under KosmicKrisp on the M1, and so
   fails the M1's gate. It passes under MoltenVK, whose serial Metal compute encoder orders

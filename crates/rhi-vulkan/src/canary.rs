@@ -3,6 +3,7 @@
 //! call can make: the canary reaches the queue through the crate's own fields.
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -23,6 +24,10 @@ const PAUSE: Duration = Duration::from_millis(300);
 /// What the canary must say.
 const THREAD_SAFETY_CANARY: &str = "UNASSIGNED-Threading-MultipleThreads-Write";
 
+/// How long the canary may take, its device's making and teardown included, before its
+/// watchdog ends the process: about two seconds on the M1.
+const WATCHDOG: Duration = Duration::from_secs(30);
+
 /// The messages a device sends, each printed as `cargo xtask gpu` reads them.
 #[derive(Default)]
 struct Heard(Mutex<Vec<String>>);
@@ -38,10 +43,23 @@ impl MessageSink for Heard {
 /// no lock, under a dispatch that runs for about two seconds, while another thread submits
 /// to it through the safe API, a breach of the queue's external synchronisation. The wait
 /// lasts until the dispatch ends, so the two calls are inside the layer at once; a driver
-/// that serialises its queue holds the submit until then.
+/// that serialises its queue holds the submit until then. The misuse is undefined behaviour
+/// for the driver, which may instead deadlock: after [`WATCHDOG`] a watchdog thread says so
+/// and ends the process with a failure, which `cargo xtask gpu` records as the canary
+/// failed, rather than waiting on it for ever.
 #[test]
 #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
 fn canary_thread_safety_validation_reports_a_queue_used_on_two_threads() {
+    let (done, watched) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        if watched.recv_timeout(WATCHDOG) == Err(mpsc::RecvTimeoutError::Timeout) {
+            eprintln!(
+                "canary_thread_safety_validation_reports_a_queue_used_on_two_threads: the \
+                 canary's misuse hung the driver for {WATCHDOG:?}"
+            );
+            std::process::exit(1);
+        }
+    });
     let heard = Arc::new(Heard::default());
     let device = VulkanDevice::new(DeviceRequest {
         adapter: std::env::var("LACTOSE_GPU_ADAPTER").ok(),
@@ -116,6 +134,8 @@ fn canary_thread_safety_validation_reports_a_queue_used_on_two_threads() {
     });
     drop(held);
     drop(device);
+    // A send fails only where the watchdog has already ended the process.
+    let _ = done.send(());
     let texts = heard.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
     eprintln!("the canary heard: {texts:?}");
     assert!(!texts.is_empty(), "the canary {THREAD_SAFETY_CANARY} was not heard");

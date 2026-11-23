@@ -309,14 +309,16 @@ jobs:
 
   # Decision 5.10 of the milestone 2 plan: every device test under lavapipe, the pinned Khronos
   # validation layer and its canaries (`cargo xtask gpu`, tools/xtask/README.md, "GPU runs").
-  # Assumed from Mesa's documentation until the nightly `gpu-probe` records them: Ubuntu's
-  # `mesa-vulkan-drivers` installs lavapipe's manifest in /usr/share/vulkan/icd.d/, lavapipe
-  # offers Vulkan 1.3 with dynamic rendering, synchronization2, timeline semaphores and buffer
-  # device addresses, and has one queue family, so compute shares the graphics queue. The
+  # The image is pinned, since a runner image change is a driver change. On ubuntu-26.04 the
+  # nightly `gpu-probe` recorded (22 November 2026): Ubuntu's `mesa-vulkan-drivers` is Mesa
+  # 26.0.8, whose lavapipe offers Vulkan 1.4.335 with `VK_KHR_dynamic_rendering_local_read`,
+  # synchronization2 and timeline semaphores, and installs one manifest, `lvp_icd.json` in
+  # /usr/share/vulkan/icd.d/; it has one queue family of one queue, so compute shares the
+  # graphics queue. Still assumed from Mesa's documentation: buffer device addresses. The
   # loader and the layer are the pinned SDK's, whose archive is cached by the pin.
   gpu-lavapipe:
     name: gpu (lavapipe)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
