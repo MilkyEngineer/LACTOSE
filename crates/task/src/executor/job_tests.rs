@@ -442,15 +442,24 @@ fn a_range_in_a_job_splits_to_a_second_worker() {
 /// parks while a holder still runs its part; each half that holder splits off then reaches
 /// the opener only through its look after the wake. With that look the holder runs about as
 /// many units as the opener takes milliseconds to wake; without it, the opener stays parked
-/// and the holder runs at least the half it took.
+/// and the holder runs at least the half it took. A round in which no other worker took a
+/// part never parks the opener behind a holder, so rounds run until `SPLIT` of them did.
 #[test]
 #[cfg_attr(miri, ignore = "times units in real time")]
 fn an_opener_takes_a_half_queued_after_it_parked() {
     const UNITS: u32 = 256;
+    /// The rounds in which a part ran off the opener that the test waits for.
+    const SPLIT: u32 = 5;
     let executor = executor(3);
     assert_eq!(executor.run_job_width(), 2);
-    let mut most = 0;
-    for _ in 0..20 {
+    let (mut most, mut split, mut rounds) = (0, 0, 0);
+    let begun = Instant::now();
+    while split < SPLIT {
+        assert!(
+            begun.elapsed() < LIMIT,
+            "{split} of {rounds} rounds sent a part off the opener in {LIMIT:?}, not {SPLIT}"
+        );
+        rounds += 1;
         let run = executor.run_job(move |ctx| {
             let own = ctx.slot();
             let elsewhere = AtomicU32::new(0);
@@ -469,7 +478,9 @@ fn an_opener_takes_a_half_queued_after_it_parked() {
             elsewhere.into_inner()
         });
         let blocking = executor.clone();
-        most = most.max(within("the job", move || blocking.block_on(run)).unwrap());
+        let off = within("the job", move || blocking.block_on(run)).unwrap();
+        split += u32::from(off > 0);
+        most = most.max(off);
     }
     assert!(most < UNITS / 4, "{most} of {UNITS} units ran off the opener: it stayed parked");
     executor.shutdown();

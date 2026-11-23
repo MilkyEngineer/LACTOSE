@@ -7,7 +7,10 @@
 //! store-buffering pattern, so each has a `SeqCst` fence between its write and its read, and one
 //! of the two always sees the other's write. Either the sweep finds the entry, or the submitter
 //! sees the flag and sweeps the queues itself. With either fence gone both could read the old
-//! values, and the entry would stay queued, its future unresolved, until its queue was dropped.
+//! values of the model's queue, and the entry would stay queued, its future unresolved, until its
+//! queue was dropped; `crossbeam-deque`'s injector and the stand-in deque order the pair on their
+//! own, by a `SeqCst` push and a fence or a lock in the steal, so against them the fences are
+//! margin.
 
 use crate::sync::{AtomicBool, Ordering, fence};
 
@@ -17,6 +20,11 @@ pub(crate) struct ShutdownFlag {
     /// The one change a weakened loom model makes.
     #[cfg(all(test, feature = "loom"))]
     pub(crate) weakened: Option<Weakened>,
+    /// Sets the flag between [`ShutdownFlag::queue`]'s push and its read, as a shutdown that
+    /// lands in that gap does, for the tests of the sweep after queueing. Each executor has
+    /// its own, so a test that turns it on reaches no other test's executor.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) sets_after_queueing: core::sync::atomic::AtomicBool,
 }
 
 /// The weakened variants the models fail. Each changes one thing in this file.
@@ -37,6 +45,8 @@ impl ShutdownFlag {
             set: AtomicBool::new(false),
             #[cfg(all(test, feature = "loom"))]
             weakened: None,
+            #[cfg(all(test, not(feature = "loom")))]
+            sets_after_queueing: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -65,6 +75,10 @@ impl ShutdownFlag {
             refuse(entry);
         } else {
             push(entry);
+            #[cfg(all(test, not(feature = "loom")))]
+            if self.sets_after_queueing.load(Ordering::SeqCst) {
+                self.set();
+            }
             if self.seen_after_queueing() {
                 sweep();
             }

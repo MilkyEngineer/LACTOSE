@@ -11,8 +11,8 @@
 //! What a model supplies is only what loom does not model: a deque is a counter, a worker is a
 //! loom thread, and a scope's children are a number.
 //!
-//! Four call sites of `run_job`'s are copies in the models, because loom cannot run the types
-//! they live in (`WorkerLocal`, `Shared`), and each is held by a native test instead:
+//! Five terms are copies in the models, because loom cannot run the types they live in
+//! (`WorkerLocal`, `Shared`), and each is held by a native test instead:
 //! - `idle`'s look (`pool.rs`) counts the two queues only while `Width::admits` says so; the
 //!   model's `Pool::work` calls `Width::admits` itself
 //!   (`jobs::a_job_queued_as_the_workers_go_idle_is_taken` in `tests/jobs.rs`);
@@ -25,7 +25,13 @@
 //!   (`executor::job_tests::an_opener_parks_beside_a_full_width_and_the_next_job_waits`);
 //! - `JobCell::run` (`job_run.rs`) hands `JobSlot::take` the shutdown flag; the model hands it
 //!   `ShutdownFlag::is_set` itself
-//!   (`pool::tests::a_job_taken_after_shutdown_began_never_starts`).
+//!   (`pool::tests::a_job_taken_after_shutdown_began_never_starts`);
+//! - what `submit_job`, `submit_task` and `submit_range` hand `ShutdownFlag::queue`, and the
+//!   sweep `discard_queued` makes; the `submissions` model's `submit` and `sweep` are copies
+//!   of them (`pool::tests::a_job_queued_as_shutdown_begins_is_cancelled`,
+//!   `a_task_queued_as_shutdown_begins_is_cancelled` and
+//!   `a_range_queued_as_shutdown_begins_is_dropped`, each with shutdown set between the push
+//!   and the read).
 //!
 //! A lost wake-up shows as a deadlock, which loom reports. The models are exhaustive
 //! except where a preemption bound is named; `LOOM_MAX_PREEMPTIONS` overrides the bounds.
@@ -1577,7 +1583,8 @@ mod jobs {
     }
 
     impl Submissions {
-        /// What `Shared::submit_job` and `Shared::submit_task` do: `ShutdownFlag::queue`.
+        /// A copy of what `Shared::submit_job`, `submit_task` and `submit_range` do: the
+        /// shipped `ShutdownFlag::queue`, handed a push and this sweep.
         fn submit(&self, queue: &AtomicUsize) {
             self.flag.queue(
                 1,
@@ -1589,7 +1596,7 @@ mod jobs {
             );
         }
 
-        /// What `Shared::discard_queued` does, in its order: the tasks' queue, then the
+        /// A copy of what `Shared::discard_queued` does, in its order: the tasks' queue, then the
         /// jobs'. A queue that looks empty is not written, as a `crossbeam-deque` steal from
         /// an empty injector writes nothing.
         fn sweep(&self) {

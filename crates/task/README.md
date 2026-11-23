@@ -383,9 +383,10 @@ Correctness:
   workers are queued before their workers start, which keeps those searches within minutes.
   Each model counts only beside weakened variants that fail it, which run with it
   (`weakened_*`), each at the model's bound: under loom 0.7.2 a model whose reader is the main
-  thread may explore one execution. Four terms of `run_job`'s are copies in the models, since
-  loom cannot run the types they live in; the module's doc names each and the native test
-  that holds it.
+  thread may explore one execution. Five terms are copies in the models, since loom cannot run
+  the types they live in: four of `run_job`'s, and what the pool's three submissions hand
+  `ShutdownFlag::queue` with the sweep they hand it. The module's doc names each and the
+  native test that holds it.
 - `src/executor/job_tests.rs` holds the width by order and never by a time, each wait bounded
   by a thread of the test's own: with children of a `run_job` job held where they begin, a
   task's `sleep_until` resolves and a graph run completes beside them, on four
@@ -398,7 +399,9 @@ Correctness:
   the reservation, who drops the value, a job queued as the one frame-critical worker goes
   idle, 5,000 times with the gaps swept across the window before it sleeps, and a child that
   crosses to another worker, which the Miri runs check too. `src/pool.rs` holds a job taken
-  at a closed gate and one taken after shutdown began. `tests/job_alloc.rs` counts a call's
+  at a closed gate and one taken after shutdown began, and a job, a task and a graph's range
+  each queued as shutdown begins, the flag set between the push and the read by a hook that
+  only its tests compile, and swept by the submission itself. `tests/job_alloc.rs` counts a call's
   allocations, in a binary of its own because it installs a global allocator.
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it

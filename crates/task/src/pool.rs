@@ -1199,11 +1199,15 @@ pub(crate) fn spin_until(limit: Duration, done: impl Fn() -> bool) -> bool {
 mod tests {
     use core::ops::Range;
     use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{Context, Poll, Waker};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use super::{Arenas, Entry, Wide, execute, with_local};
+    use lactose_core::ErrorKind;
+
+    use super::{Arenas, Entry, Shared, Wide, execute, with_local};
     use crate::job_run::{self, JobRun};
-    use crate::{Executor, GraphBuilder, GraphNode, JobContext};
+    use crate::{Executor, GraphBuilder, GraphNode, JobContext, WorkerClass};
 
     /// On the one frame-critical worker, while a `block_in_place` would want that worker
     /// parked, takes the job it queues out of the pool's queue, as a worker does that found
@@ -1294,5 +1298,133 @@ mod tests {
         executor.block_on(run).unwrap();
         assert!(node.started.load(Ordering::SeqCst));
         executor.shutdown();
+    }
+
+    /// How long a test waits for the held worker's job to begin.
+    const LIMIT: Duration = Duration::from_secs(60);
+
+    /// Polls `future` once, with a waker that does nothing.
+    fn poll_now<F: Future>(future: F) -> Poll<F::Output> {
+        core::pin::pin!(future).poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// An executor whose one frame-critical worker is held inside a job of `run_job`, with
+    /// shutdown set between the push and the read of every queueing from then on: whatever
+    /// is queued next sees the flag after its push and must sweep itself, and no worker can
+    /// take it first. The worker is released when this is dropped.
+    struct ShutdownInTheGap {
+        executor: Executor,
+        shared: Arc<Shared>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl ShutdownInTheGap {
+        fn new() -> Self {
+            let executor =
+                Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
+            let release = Arc::new(AtomicBool::new(false));
+            let (began, shared) = std::sync::mpsc::channel();
+            let held = release.clone();
+            drop(executor.run_job(move |_| {
+                began.send(with_local(|local| local.expect("on a worker").shared.clone())).unwrap();
+                while !held.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }));
+            let shared: Arc<Shared> = shared.recv_timeout(LIMIT).expect("the holding job began");
+            shared.shutdown.sets_after_queueing.store(true, Ordering::SeqCst);
+            Self { executor, shared, release }
+        }
+    }
+
+    impl Drop for ShutdownInTheGap {
+        fn drop(&mut self) {
+            self.release.store(true, Ordering::SeqCst);
+            self.executor.clone().shutdown();
+        }
+    }
+
+    /// A job of `run_job` queued as shutdown begins, which sees the flag after its push, is
+    /// swept by its own submission: its future has resolved `Cancelled` by the time
+    /// `run_job` returns.
+    #[test]
+    fn a_job_queued_as_shutdown_begins_is_cancelled() {
+        let gap = ShutdownInTheGap::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        let run = {
+            let ran = ran.clone();
+            gap.executor.run_job(move |_| ran.store(true, Ordering::SeqCst))
+        };
+        assert!(gap.shared.is_shut_down());
+        match poll_now(run) {
+            Poll::Ready(Err(error)) => assert_eq!(error.kind(), ErrorKind::Cancelled),
+            Poll::Ready(Ok(())) => panic!("a job queued as shutdown began ran"),
+            Poll::Pending => panic!("a job queued as shutdown began stayed queued"),
+        }
+        drop(gap);
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// A task queued as shutdown begins, which sees the flag after its push, is swept by its
+    /// own submission: it has been cancelled by the time `spawn` returns.
+    #[test]
+    fn a_task_queued_as_shutdown_begins_is_cancelled() {
+        let gap = ShutdownInTheGap::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        let task = {
+            let ran = ran.clone();
+            gap.executor.spawn(WorkerClass::FrameCritical, async move {
+                ran.store(true, Ordering::SeqCst);
+            })
+        };
+        assert!(gap.shared.is_shut_down());
+        match poll_now(task) {
+            Poll::Ready(Err(error)) => assert_eq!(error.kind(), ErrorKind::Cancelled),
+            Poll::Ready(Ok(())) => panic!("a task queued as shutdown began ran"),
+            Poll::Pending => panic!("a task queued as shutdown began stayed queued"),
+        }
+        drop(gap);
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// A graph node that records whether it ran.
+    #[derive(Default)]
+    struct Runs {
+        ran: AtomicBool,
+    }
+
+    impl GraphNode for Runs {
+        fn name(&self) -> &'static str {
+            "pool::tests::runs"
+        }
+
+        fn units(&self) -> u32 {
+            1
+        }
+
+        fn run(&self, _units: Range<u32>, _ctx: &mut JobContext<'_>) {
+            self.ran.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A graph's range queued as shutdown begins, which sees the flag after its push, is
+    /// swept by its own submission: the queue is empty by the time `run_graph` returns, the
+    /// node never runs, and the run resolves `Cancelled` once shutdown has run.
+    #[test]
+    fn a_range_queued_as_shutdown_begins_is_dropped() {
+        let gap = ShutdownInTheGap::new();
+        let node = Arc::new(Runs::default());
+        let mut builder = GraphBuilder::new();
+        builder.add_node(node.clone());
+        let run = gap.executor.run_graph(builder.build().unwrap());
+        assert!(gap.shared.is_shut_down());
+        assert!(gap.shared.frame.injector.is_empty(), "a range queued as shutdown began stayed");
+        let executor = gap.executor.clone();
+        drop(gap);
+        match executor.block_on(run) {
+            Err(error) => assert_eq!(error.kind(), ErrorKind::Cancelled),
+            Ok(_) => panic!("a run whose range was swept completed"),
+        }
+        assert!(!node.ran.load(Ordering::SeqCst));
     }
 }
