@@ -1,0 +1,51 @@
+[package]
+name = "lactose-presentation"
+description = "The presentation schedule: a frame on the snapshot, interpolation between two snapshots, the camera rig's orbit and boom, the remote sample and upload, the frame's events delivered once."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+autotests = false
+
+[dependencies]
+lactose-core.workspace = true
+# `PresentEmission` and `PresentEventKey`, what the event sink is handed; types only.
+lactose-ecs.workspace = true
+# `RawSample`: the yaw and pitch the camera rig orbits at (architecture section 13).
+lactose-input-host.workspace = true
+# The interpolation is in `Scalar`, `Vec3` and `Quat`; the camera's pivot leaves as a
+# `render::RenderPosition`.
+lactose-math.workspace = true
+# `RemoteSlot`: which interpolation slot a remote row is sampled from.
+lactose-net-api.workspace = true
+# The interpolation buffer's reader and `sample_batch`, the batch call of architecture
+# section 5.3.
+lactose-net-host.workspace = true
+# `Transform`, what two snapshots are interpolated between.
+lactose-physics-api.workspace = true
+# The snapshot channel's reader the schedule runs on, `CameraRig`, `MeshInstance`, and the
+# `InstanceRow` the remote upload writes.
+lactose-present-api.workspace = true
+# `JobContext`: the upload forks its writes from the frame's job.
+lactose-task.workspace = true
+
+[dev-dependencies]
+# The tests' meshes are `AssetRef`s.
+lactose-asset-api.workspace = true
+# `PlayerInput::aim` and `Yaw::rotation`, which the camera rig's orbit is held to.
+lactose-input.workspace = true
+# The upload's documentation writes through `RemoteWriter`, so its example compiles against
+# the facade; nothing of the library names the renderer.
+lactose-renderer.workspace = true
+# The tests build worlds of each kind with extract placed, as `app` does.
+lactose-sim.workspace = true
+
+# The integration tests as one test binary, whose root declares the files of tests/ as
+# modules (D150).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true
