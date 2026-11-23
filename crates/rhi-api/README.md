@@ -856,7 +856,17 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   A submit's `signals` give a value greater than any the timeline has reached, been given by
   a host signal or been promised, and greater than any value the same submit waits for on
   it. A submit signals a timeline only where every pending signal of it is from the submit's
-  own queue or from a submit it waits for. No value is 2^31 or more away from the timeline's
+  own queue, from a submit whose signal of that timeline it waits for, or from an earlier
+  submit of that submit's queue. Waits count in turn: a submit a wait orders before the new
+  one orders what it waits for, and so does a signal the host has seen reached. A wait
+  orders the signal it waits for and every signal of an earlier submit of that signal's
+  queue, whose first scope holds them, but not the other signals of its submit:
+  "Semaphore signal operations defined by a single VkSubmitInfo or VkSubmitInfo2 or
+  VkBindSparseInfo structure are unordered with respect to other semaphore signal
+  operations defined within the same structure" (Vulkan, "Implicit Synchronization
+  Guarantees"). A submit that waits for one timeline's signal and signals another timeline
+  of the same submit could land below that submit's pending signal of it
+  (`VUID-VkSubmitInfo2-semaphore-03882`). No value is 2^31 or more away from the timeline's
   value, from a host signal's in progress, or from a value a pending submit waits for or
   signals on it (`timeline`, every backend). A device keeps, for each timeline, the greatest
   value it knows the timeline has reached, and one list of the submits that wait for or
@@ -1064,7 +1074,7 @@ stale number into a wrong image ("The heap and the sampler table").
 | `UndefinedRead` | `undefined-read` | | a read of undefined contents |
 | `PresentQueue` | `present-queue` | `Device::submit` to `Present` | a swapchain image on another role's encoder |
 | `Swapchain` | `swapchain` | a second acquire; a present of another image; a second swapchain | a swapchain image used outside its acquire and its present |
-| `Timeline` | `timeline` | a submit's signal that does not grow past the timeline's value, its host signals and promises and the values the submit waits for, or that another queue's pending signal could pass; a host signal not below every pending promise, or one a promise whose wait it does not alone release or another host signal could pass; a value 2^31 or more from the timeline's, a host signal's in progress, or a pending wait or signal | |
+| `Timeline` | `timeline` | a submit's signal that does not grow past the timeline's value, its host signals and promises and the values the submit waits for, or that another queue's pending signal could pass, one no wait orders before it (a wait orders the signal it waits for and the earlier submits of its queue, not the other signals of its submit); a host signal not below every pending promise, or one a promise whose wait it does not alone release or another host signal could pass; a value 2^31 or more from the timeline's, a host signal's in progress, or a pending wait or signal | |
 | `Encoding` | `encoding` | a foreign, wrong-role or pending encoder in a submit; one submitted again with no reset; a command outside its scope (so a graphics bind or a draw on a `Compute` encoder, where no render pass begins); a render pass or depth image copy on a `Compute` encoder; a draw or dispatch with nothing bound to it; a pass left open | |
 
 **What a device backend keeps**
@@ -1129,7 +1139,7 @@ and `conformance::run` runs one against a `Harness`. The contract cases' bodies 
 with `rhi-null` and the output cases' with `vulkan`; the output cases' Slang sources are the
 repository's `shaders/conformance/`, cooked before a run by `ricotta --shaders` and read
 through `Harness::shader` by the name `<source>.<entry>`. A backend's tests carry one test for
-each case, named after it. There are 179: 151 contract cases and 28 output cases.
+each case, named after it. There are 182: 154 contract cases and 28 output cases.
 
 - A **contract** case asserts what the contract says of calls and results. It needs no
   shader to run and no pixel, so null passes it as a device does. A case that names a rule
@@ -1142,7 +1152,7 @@ each case, named after it. There are 179: 151 contract cases and 28 output cases
   and its refusal there depends on timing.
 
 The refusal cases a device backend also runs are those of the rules table's "Every backend"
-column, one or more for each of its clauses, 64 in all: `unreported_capability_is_refused`,
+column, one or more for each of its clauses, 66 in all: `unreported_capability_is_refused`,
 `submit_to_the_present_role_is_refused`, `overlapping_host_access_is_refused`,
 `destroy_during_host_access_is_refused`, `host_range_outside_the_buffer_is_refused`,
 `host_access_outside_the_memory_class_is_refused`,
@@ -1178,6 +1188,7 @@ column, one or more for each of its clauses, 64 in all: `unreported_capability_i
 `submit_signalling_no_more_than_it_waits_for_is_refused`,
 `timeline_value_beyond_the_difference_limit_is_refused`,
 `timeline_signalled_from_two_queues_without_a_wait_is_refused`,
+`signal_after_a_wait_for_another_signal_of_its_submit_is_refused`,
 `destroy_under_a_pending_submit_is_refused`,
 `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`,
 `use_after_destruction_is_refused`, `destroyed_after_recording_is_refused_at_submit`,
@@ -1244,6 +1255,14 @@ column, one or more for each of its clauses, 64 in all: `unreported_capability_i
   element for each mip, then one for each mip but the last and each layer of the last, each
   from its own state, then one back, and a whole-image transition from the state the calls
   left, which is accepted only where each took effect; one call of two buffers beside them.
+- `signal_after_a_wait_for_another_signal_of_its_submit_is_refused` holds a compute submit
+  pending by a gate, signalling `c = 1` and `f = 1`, and refuses a graphics submit that
+  waits for `c = 1` and signals `f = 2`; once the gate is signalled and `f = 1` reached, the
+  same submit is accepted. `wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline`
+  accepts the graphics submit where it waits for `f = 1`, and
+  `wait_for_a_signal_orders_the_earlier_submits_of_its_queue` where `f = 1` and `c = 1` are
+  two compute submits in that order and it waits for `c = 1`. All three skip where compute
+  shares the graphics queue.
 - `destroy_at_once_after_the_wait_is_accepted` holds a device to "Queues by role": a lagging
   submit, a wait for its point, then at once a destroy and a reset, repeated, each accepted.
 - `dispatch_beyond_the_group_limit_is_refused` and `viewport_outside_its_rules_is_refused`
@@ -1389,7 +1408,7 @@ Some output cases count as evidence only in the shape, or on the device, named h
 | The heap, samplers, declarations | `heap_slot_outside_the_heap_is_refused`, `declared_slot_empty_is_refused`, `slot_written_after_its_pass_began_is_refused`, `declared_slot_not_in_sampled_read_is_refused`, `heap_write_under_a_pending_reader_is_refused`, `heap_write_after_its_reader_completes_passes`, `heap_write_racing_a_submit_refuses_one`, `destroy_of_an_image_a_slot_holds_is_refused`, `sampler_destroyed_under_a_pending_submit_is_refused`, `undeclared_slot_argument_is_refused`, `undeclared_address_argument_is_refused`, `declared_buffer_in_another_state_is_refused`, `buffer_declared_in_two_states_is_refused`, `sampler_table_is_bounded` | `heap_is_sampled_past_slot_zero`, `address_is_read_in_a_shader`, `declared_reader_follows_a_lagging_writer`, `sampler_filters_as_described` |
 | Cooked shaders, pipelines, the cache | `cooked_shader_round_trips`, `cooked_shader_of_another_version_is_refused`, `cooked_shader_corrupt_or_truncated_is_refused`, `cooked_shader_forged_under_a_valid_checksum_is_refused`, `shader_for_another_heap_is_refused`, `shader_target_the_backend_does_not_run_is_unsupported`, `constant_the_shader_does_not_declare_is_refused`, `constant_of_another_type_is_refused`, `workgroup_outside_its_stage_or_bounds_is_refused`, `varying_the_vertex_stage_does_not_write_is_refused`, `shader_needing_an_unenabled_capability_is_refused`, `pipeline_of_other_formats_than_its_pass_is_refused`, `sealed_cache_round_trips`, `cache_corrupt_truncated_or_foreign_starts_empty` | `specialised_constant_changes_the_output`, `specialised_constant_of_each_type_is_read_back`, `write_mask_keeps_a_channel`, `depth_state_orders_two_triangles`, `warm_cache_hits_every_stage`, `dispatch_runs_workgroups_of_the_shaders_size` |
 | Encoders and submits | `encoder_recorded_on_another_thread_submits`, `encoder_reset_while_pending_is_refused`, `pending_encoder_drop_waits_for_its_submit`, `drop_that_is_not_the_last_returns_at_once`, `encoder_in_two_submits_is_refused`, `encoder_resubmitted_without_reset_is_refused`, `recording_while_pending_records_nothing`, `encoder_of_another_role_or_device_is_refused`, `command_outside_its_scope_is_refused`, `graphics_on_a_compute_encoder_is_refused`, `draw_with_nothing_bound_is_refused`, `pass_left_open_is_refused`, `push_outside_the_block_is_refused`, `copy_region_outside_its_resource_is_refused`, `copy_regions_overlapping_in_the_destination_are_refused`, `refused_submit_changes_nothing`, `submit_of_no_encoders_waits_and_signals`, `submit_is_pending_until_its_wait_is_reached`, `empty_draws_and_dispatches_record_nothing` | `two_threads_record_at_once` |
-| Timelines, destroys and races | `timeline_is_signalled_waited_and_read_by_the_host`, `timeline_wait_times_out`, `waits_are_woken_by_the_submit_that_reaches_them`, `wait_is_woken_by_a_host_signal`, `timeline_value_that_does_not_grow_is_refused`, `host_signal_above_a_pending_signal_is_refused`, `host_signal_below_a_promise_that_does_not_wait_for_it_is_refused`, `host_signal_below_a_pending_signal_releases_its_waiter`, `host_signal_below_a_promise_whose_wait_is_met_is_refused`, `submit_signalling_no_more_than_it_waits_for_is_refused`, `timeline_value_beyond_the_difference_limit_is_refused`, `timeline_signalled_from_two_queues_without_a_wait_is_refused`, `destroy_under_a_pending_submit_is_refused`, `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`, `destroy_after_an_unobserved_submit_is_refused`, `destroy_at_once_after_the_wait_is_accepted`, `destroy_racing_a_submit_refuses_one`, `submits_racing_on_one_queue_keep_their_order`, `host_signals_racing_on_one_timeline_keep_it_growing`, `use_after_destruction_is_refused`, `destroyed_after_recording_is_refused_at_submit`, `handle_of_another_device_is_refused` | |
+| Timelines, destroys and races | `timeline_is_signalled_waited_and_read_by_the_host`, `timeline_wait_times_out`, `waits_are_woken_by_the_submit_that_reaches_them`, `wait_is_woken_by_a_host_signal`, `timeline_value_that_does_not_grow_is_refused`, `host_signal_above_a_pending_signal_is_refused`, `host_signal_below_a_promise_that_does_not_wait_for_it_is_refused`, `host_signal_below_a_pending_signal_releases_its_waiter`, `host_signal_below_a_promise_whose_wait_is_met_is_refused`, `submit_signalling_no_more_than_it_waits_for_is_refused`, `timeline_value_beyond_the_difference_limit_is_refused`, `timeline_signalled_from_two_queues_without_a_wait_is_refused`, `signal_after_a_wait_for_another_signal_of_its_submit_is_refused`, `wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline`, `wait_for_a_signal_orders_the_earlier_submits_of_its_queue`, `destroy_under_a_pending_submit_is_refused`, `concurrent_resource_destroyed_while_another_queue_uses_it_is_refused`, `destroy_after_an_unobserved_submit_is_refused`, `destroy_at_once_after_the_wait_is_accepted`, `destroy_racing_a_submit_refuses_one`, `submits_racing_on_one_queue_keep_their_order`, `host_signals_racing_on_one_timeline_keep_it_growing`, `use_after_destruction_is_refused`, `destroyed_after_recording_is_refused_at_submit`, `handle_of_another_device_is_refused` | |
 | Render passes and the local read | `input_read_without_a_local_read_is_refused`, `input_read_of_another_attachment_is_refused`, `attachments_of_unequal_extent_are_refused`, `scissor_outside_the_attachments_is_refused`, `viewport_outside_its_rules_is_refused` | `triangle_matches_the_reference`, `local_read_sees_what_the_pass_wrote`, `clear_and_keep_load_as_described`, `viewport_and_scissor_place_the_triangles`, `draw_parameters_reach_the_shader` |
 | Indirect draws and dispatches | `index_buffer_offset_outside_or_unaligned_is_refused`, `indexed_draw_past_its_index_buffer_is_refused`, `indirect_arguments_outside_or_unaligned_are_refused`, `dispatch_beyond_the_group_limit_is_refused` | `indexed_indirect_draw_matches_the_reference`, `indirect_count_draws_where_reported`, `dispatch_writes_through_an_address`, `dispatches_of_one_pass_see_each_others_writes`, `dispatch_indirect_reads_its_counts` |
 | The swapchain and the present role | `second_acquire_before_a_present_is_refused`, `present_of_an_image_not_acquired_is_refused`, `present_behind_an_unmet_wait_is_refused`, `present_of_an_image_not_in_present_is_refused`, `swapchain_image_on_a_frame_encoder_is_refused`, `swapchain_image_used_outside_its_acquire_is_refused`, `second_swapchain_is_refused`, `swapchain_extent_with_a_zero_dimension_is_refused`, `resize_with_a_present_pending_is_refused`, `image_of_before_a_resize_is_refused`, `frame_submits_complete_while_a_present_is_pending` | |

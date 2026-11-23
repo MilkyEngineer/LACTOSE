@@ -393,9 +393,8 @@ impl Records {
     /// "Timelines"): each wait's and signal's timeline lives; no value is 2^31 or more from
     /// those it is compared with; each signal grows past the timeline's known value, its
     /// host signal in progress, every pending promise and the submit's own waits and
-    /// earlier signals on it; every pending promise of it is from a submit the new one is
-    /// ordered after; and while a host signal of it is in progress, the submit waits for
-    /// that signal's value.
+    /// earlier signals on it; every pending promise of it is ordered before the signal; and
+    /// while a host signal of it is in progress, the submit waits for that signal's value.
     pub(crate) fn check_points(
         &self,
         queue: usize,
@@ -406,6 +405,11 @@ impl Records {
             self.within_limit(point)?;
         }
         let cover = if signals.is_empty() { [0; QUEUES] } else { self.cover(queue, waits) };
+        let mut through = waits.to_vec();
+        for (at, rec) in self.queues.iter().enumerate() {
+            let taken = rec.submits.iter().filter(|submit| submit.seq <= cover[at]);
+            through.extend(taken.flat_map(|submit| submit.waits.iter().copied()));
+        }
         for (at, &signal) in signals.iter().enumerate() {
             let timeline = self.timeline(signal.timeline)?;
             let refuse =
@@ -440,9 +444,17 @@ impl Records {
                         if promise.value >= signal.value {
                             return Err(refuse("not above a pending promise"));
                         }
-                        if submit.seq > cover[other] {
+                        // Ordered: an earlier batch of the submit's own queue; an earlier
+                        // batch of a queue than a submit whose signal it waits for or the
+                        // host has seen reached; or that submit, where it waits for this
+                        // timeline.
+                        let ordered = other == queue
+                            || submit.seq < cover[other]
+                            || submit.seq == cover[other] && waited_through(promise, &through);
+                        if !ordered {
                             return Err(refuse(
-                                "while another queue's signal of it is pending, with no wait for it",
+                                "while another queue's signal of it is pending, with no wait that \
+                                 orders it",
                             ));
                         }
                     }
@@ -621,6 +633,20 @@ impl Records {
     }
 }
 
+/// Whether a point of `through` is on `promise`'s timeline at or above it: a wait, of a new
+/// submit or of one it is ordered after, that orders the promise before the new submit's
+/// signal of that timeline although the promise's submit is the latest of its queue the new
+/// one is ordered after. A wait orders the one signal it waits for and every signal of an
+/// earlier batch of that signal's queue, and not the other signals of its batch:
+/// "Semaphore signal operations defined by a single VkSubmitInfo or VkSubmitInfo2 or
+/// VkBindSparseInfo structure are unordered with respect to other semaphore signal
+/// operations defined within the same structure" (Vulkan, "Implicit Synchronization
+/// Guarantees"). `lactose-rhi-null`'s records hold the same rule, and the suite's timeline
+/// cases hold both to it.
+fn waited_through(promise: &TimelinePoint, through: &[TimelinePoint]) -> bool {
+    through.iter().any(|point| point.timeline == promise.timeline && promise.value <= point.value)
+}
+
 #[cfg(test)]
 mod tests {
     use lactose_rhi_api::{CacheStart, ImageHandle, Rule, TimelineHandle, TimelinePoint};
@@ -675,6 +701,39 @@ mod tests {
         let refused = records.check_points(0, &[], &[two]).unwrap_err();
         assert_eq!(rule(&refused), Some(Rule::Timeline));
         records.check_points(0, &[one], &[two]).unwrap();
+    }
+
+    /// The shapes `lactose-rhi-null`'s `a_wait_orders_only_the_signal_it_waits_for` holds
+    /// null to, on queue 1 for compute and 0 for graphics; and one of a device alone, a
+    /// submit the host has seen complete by one of its signals and not the other.
+    #[test]
+    fn a_wait_orders_only_the_signal_it_waits_for() {
+        let two_timelines = || {
+            let mut records = records();
+            let mut timeline = || records.timelines.insert(TimelineRec { known: 0, mark: None });
+            let (c, f) = (timeline().unwrap(), timeline().unwrap());
+            (records, c, f)
+        };
+        let at = |timeline, value| TimelinePoint { timeline, value };
+
+        let (mut records, c, f) = two_timelines();
+        records.stamp(1, &[], &[at(c, 1), at(f, 1)]);
+        let refused = records.check_points(0, &[at(c, 1)], &[at(f, 2)]).unwrap_err();
+        assert_eq!(rule(&refused), Some(Rule::Timeline), "a wait for another signal of the batch");
+        records.check_points(0, &[at(f, 1)], &[at(f, 2)]).expect("a wait for the signal itself");
+        records.stamp(0, &[at(f, 1)], &[]);
+        records.check_points(0, &[], &[at(f, 2)]).expect("an earlier submit's wait for it");
+
+        let (mut records, c, f) = two_timelines();
+        records.stamp(1, &[], &[at(f, 1)]);
+        records.stamp(1, &[], &[at(c, 1)]);
+        records.check_points(0, &[at(c, 1)], &[at(f, 2)]).expect("an earlier batch's signal");
+
+        let (mut records, c, f) = two_timelines();
+        let seq = records.stamp(1, &[], &[at(c, 1), at(f, 1)]);
+        records.fold(&[None, Some(seq), None], &[(c, 1)]);
+        let refused = records.check_points(0, &[], &[at(f, 2)]).unwrap_err();
+        assert_eq!(rule(&refused), Some(Rule::Timeline), "a batch seen complete by `c` alone");
     }
 
     #[test]

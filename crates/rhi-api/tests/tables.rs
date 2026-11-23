@@ -77,7 +77,7 @@ fn indirect_record_is_five_little_endian_words() {
 
 /// The refusal cases a device backend runs: one or more for each clause of the rules
 /// table's "Every backend" column.
-const EVERYWHERE: [&str; 65] = [
+const EVERYWHERE: [&str; 66] = [
     "unreported_capability_is_refused",
     "submit_to_the_present_role_is_refused",
     "overlapping_host_access_is_refused",
@@ -126,6 +126,7 @@ const EVERYWHERE: [&str; 65] = [
     "submit_signalling_no_more_than_it_waits_for_is_refused",
     "timeline_value_beyond_the_difference_limit_is_refused",
     "timeline_signalled_from_two_queues_without_a_wait_is_refused",
+    "signal_after_a_wait_for_another_signal_of_its_submit_is_refused",
     "destroy_under_a_pending_submit_is_refused",
     "concurrent_resource_destroyed_while_another_queue_uses_it_is_refused",
     "use_after_destruction_is_refused",

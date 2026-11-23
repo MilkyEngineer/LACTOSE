@@ -559,20 +559,26 @@ impl Records {
         }
     }
 
-    /// The timeline checks of a submit ordered after the submits `cover` names: each
-    /// wait's and signal's timeline lives; no value is 2^31 or more from those it is
+    /// The timeline checks of a submit to `queue` ordered after the submits `cover` names:
+    /// each wait's and signal's timeline lives; no value is 2^31 or more from those it is
     /// compared with; each signal grows past the timeline's value, its host signal in
     /// progress, every pending promise and the submit's own waits and earlier signals on
-    /// it; every pending promise of it is from a submit `cover` names; and while a host
-    /// signal of it is in progress, the submit waits for that signal's value.
+    /// it; every pending promise of it is ordered before the signal; and
+    /// while a host signal of it is in progress, the submit waits for that signal's value.
     pub(crate) fn check_points(
         &self,
+        queue: usize,
         waits: &[TimelinePoint],
         signals: &[TimelinePoint],
         cover: &Stamps,
     ) -> Result<()> {
         for &point in waits.iter().chain(signals) {
             self.within_limit(point)?;
+        }
+        let mut through = waits.to_vec();
+        for (at, rec) in self.queues.iter().enumerate() {
+            let taken = rec.after(rec.observed).take_while(|submit| submit.seq <= cover[at]);
+            through.extend(taken.flat_map(|submit| submit.waits.iter().copied()));
         }
         for (at, &signal) in signals.iter().enumerate() {
             let timeline = self.timeline(signal.timeline)?;
@@ -605,9 +611,16 @@ impl Records {
                         if promise.value >= signal.value {
                             return Err(refuse("not above a pending promise"));
                         }
-                        if submit.seq > cover[other] {
+                        // Ordered: an earlier batch of the submit's own queue; an earlier
+                        // batch of a queue than a submit whose signal it waits for; or that
+                        // submit, where it waits for this timeline.
+                        let ordered = other == queue
+                            || submit.seq < cover[other]
+                            || submit.seq == cover[other] && waited_through(promise, &through);
+                        if !ordered {
                             return Err(refuse(
-                                "while another queue's signal of it is pending, with no wait for it",
+                                "while another queue's signal of it is pending, with no wait that \
+                                 orders it",
                             ));
                         }
                     }
@@ -781,6 +794,20 @@ impl Records {
 struct Walk {
     decided: Stamps,
     deciding: [Option<u64>; QUEUES],
+}
+
+/// Whether a point of `through` is on `promise`'s timeline at or above it: a wait, of a new
+/// submit or of one it is ordered after, that orders the promise before the new submit's
+/// signal of that timeline although the promise's submit is the latest of its queue the new
+/// one is ordered after. A wait orders the one signal it waits for and every signal of an
+/// earlier batch of that signal's queue, and not the other signals of its batch:
+/// "Semaphore signal operations defined by a single VkSubmitInfo or VkSubmitInfo2 or
+/// VkBindSparseInfo structure are unordered with respect to other semaphore signal
+/// operations defined within the same structure" (Vulkan, "Implicit Synchronization
+/// Guarantees"). rhi-vulkan's records hold the same rule, and the suite's timeline cases
+/// hold both to it.
+fn waited_through(promise: &TimelinePoint, through: &[TimelinePoint]) -> bool {
+    through.iter().any(|point| point.timeline == promise.timeline && promise.value <= point.value)
 }
 
 fn signals_at_or_below(submit: &SubmitRec, point: TimelinePoint) -> bool {

@@ -696,3 +696,34 @@ fn a_host_signal_landed_between_another_host_signals_holds_keeps_the_timeline_gr
     }
     assert_eq!(landings, [ROUNDS; 2], "a landing in every round of each order");
 }
+
+/// A wait orders the one signal it waits for, every signal of an earlier submit of that
+/// signal's queue, and what an earlier submit of the new one's own queue waits for; not the
+/// other signals of the waited submit. `lactose-rhi-vulkan`'s records test of the same name
+/// holds its records to the same shapes.
+#[test]
+fn a_wait_orders_only_the_signal_it_waits_for() {
+    let two_timelines = || {
+        let device = device(QueueLayout::SEVERAL, false);
+        let c = device.create_timeline(0).expect("a timeline");
+        let f = device.create_timeline(0).expect("a timeline");
+        lag(&device, true);
+        (device, c, f)
+    };
+
+    let (device, c, f) = two_timelines();
+    submit(&device, C, &[], &[at(c, 1), at(f, 1)]).expect("the pair's first submit");
+    let refused = submit(&device, G, &[at(c, 1)], &[at(f, 2)]);
+    assert_eq!(rule(&refused), Some(Rule::Timeline), "a wait for another signal of the batch");
+    submit(&device, G, &[at(f, 1)], &[]).expect("a wait for the signal itself");
+    submit(&device, G, &[], &[at(f, 2)]).expect("an earlier submit's wait for it");
+    lag(&device, false);
+    assert!(device.wait_timeline(at(f, 2), PATIENCE).expect("a wait"));
+
+    let (device, c, f) = two_timelines();
+    submit(&device, C, &[], &[at(f, 1)]).expect("the earlier batch");
+    submit(&device, C, &[], &[at(c, 1)]).expect("the later batch");
+    submit(&device, G, &[at(c, 1)], &[at(f, 2)]).expect("an earlier batch's signal");
+    lag(&device, false);
+    assert!(device.wait_timeline(at(f, 2), PATIENCE).expect("a wait"));
+}

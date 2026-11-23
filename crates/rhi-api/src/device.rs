@@ -284,7 +284,10 @@ pub trait Device: Send + Sync {
     /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)); its signals are refused by the
     /// rules of `README.md`, "Timelines" ([`Rule::Timeline`](crate::Rule::Timeline)),
     /// among them a signal not greater than a value the same submit waits for on the
-    /// timeline. Both on every backend.
+    /// timeline, and one of a timeline another queue's submit has a pending signal of,
+    /// where no wait orders that signal first: a wait for one signal of a submit orders
+    /// the earlier submits of its queue and not the submit's other signals. Both on every
+    /// backend.
     ///
     /// # Errors
     ///

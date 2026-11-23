@@ -359,6 +359,9 @@ pub const CASES: &[Case] = cases! {
     contract "submit_signalling_no_more_than_it_waits_for_is_refused" => Timeline everywhere;
     contract "timeline_value_beyond_the_difference_limit_is_refused" => Timeline everywhere;
     contract "timeline_signalled_from_two_queues_without_a_wait_is_refused" => Timeline everywhere;
+    contract "signal_after_a_wait_for_another_signal_of_its_submit_is_refused" => Timeline everywhere;
+    contract "wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline";
+    contract "wait_for_a_signal_orders_the_earlier_submits_of_its_queue";
     contract "destroy_under_a_pending_submit_is_refused" => Pending everywhere;
     contract "concurrent_resource_destroyed_while_another_queue_uses_it_is_refused" => Pending everywhere;
     contract "destroy_after_an_unobserved_submit_is_refused" => Pending;

@@ -194,7 +194,9 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   takes a family that does not draw first, and viewport bounds rounded inward to what an Apple
   GPU honours. In `src/records.rs`: a reached point completing its submit and the earlier ones
   of its queue, a failed submit's promise dropped and its point retried, another queue's
-  pending signal needing a wait, a host signal below a promise; the interleavings of a driver
+  pending signal needing a wait, a wait ordering only the signal it waits for and the earlier
+  submits of that signal's queue (the shapes null's test of the same name holds null to), a
+  host signal below a promise; the interleavings of a driver
   read and its hold, each fixed in order against a model driver (a host signal or a dropped
   promise between a read and its hold, a pass begun during a slot write, a destroy at once
   after a wait with the queue behind, a failed submit's point signalled from the host, a

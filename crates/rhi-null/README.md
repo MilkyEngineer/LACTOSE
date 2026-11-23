@@ -236,6 +236,8 @@ a row for each place and a third that removes both.
 | `swapchain` | both of them | `conformance::swapchain_image_used_outside_its_acquire_is_refused` |
 | `timeline` | a host signal not below a pending promise | `conformance::host_signal_above_a_pending_signal_is_refused` |
 | `timeline` | a timeline signalled from two queues with no wait between | `conformance::timeline_signalled_from_two_queues_without_a_wait_is_refused` |
+| `timeline` | the narrowing of a wait's credit to the signal it waits for, so that the waited submit's other signals count | `conformance::signal_after_a_wait_for_another_signal_of_its_submit_is_refused`, `tests::a_wait_orders_only_the_signal_it_waits_for` |
+| `timeline`, its credit | the credit of an earlier submit of the waited signal's queue, so that only the waited submit counts | `conformance::wait_for_a_signal_orders_the_earlier_submits_of_its_queue`, `tests::a_wait_orders_only_the_signal_it_waits_for` |
 | `timeline` | a signal that does not wait for a host signal in progress | `tests::a_host_signal_between_another_host_signals_holds_is_refused` |
 | `timeline` | two host signals at once | `tests::a_host_signal_between_another_host_signals_holds_is_refused`, `a_host_signal_landed_between_another_host_signals_holds_keeps_the_timeline_growing` |
 | `timeline`, the 2^31 limit | a difference of exactly 2^31 | `conformance::timeline_value_beyond_the_difference_limit_is_refused`, `tests::a_wait_only_submit_2_31_below_a_marked_host_signal_is_refused` |

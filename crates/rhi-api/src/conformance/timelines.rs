@@ -54,6 +54,18 @@ pub(super) const BODIES: &[(&str, Body)] = &[
         "timeline_signalled_from_two_queues_without_a_wait_is_refused",
         timeline_signalled_from_two_queues_without_a_wait_is_refused,
     ),
+    (
+        "signal_after_a_wait_for_another_signal_of_its_submit_is_refused",
+        signal_after_a_wait_for_another_signal_of_its_submit_is_refused,
+    ),
+    (
+        "wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline",
+        wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline,
+    ),
+    (
+        "wait_for_a_signal_orders_the_earlier_submits_of_its_queue",
+        wait_for_a_signal_orders_the_earlier_submits_of_its_queue,
+    ),
     ("destroy_under_a_pending_submit_is_refused", destroy_under_a_pending_submit_is_refused),
     (
         "concurrent_resource_destroyed_while_another_queue_uses_it_is_refused",
@@ -383,6 +395,60 @@ fn timeline_signalled_from_two_queues_without_a_wait_is_refused(ctx: &Ctx<'_>) -
     ctx.submit(&*device, C, &mut [], &[at(timeline, 2)], &[at(timeline, 3)]);
     ctx.ok(device.signal_timeline(gate), "the gate's host signal");
     ctx.reached(&*device, at(timeline, 3));
+    Ok(())
+}
+
+/// A wait orders the one signal it waits for: the other signals of its submit are unordered
+/// with it (Vulkan, "Implicit Synchronization Guarantees"), so a signal of `f` after a wait
+/// for `c` could land below the pending `f` (VUID-VkSubmitInfo2-semaphore-03882).
+fn signal_after_a_wait_for_another_signal_of_its_submit_is_refused(ctx: &Ctx<'_>) -> Applies {
+    if ctx.set.queues.compute != QueuePath::Own {
+        return Err("compute shares the graphics queue");
+    }
+    let device = ctx.device();
+    let (c, f) = (ctx.timeline(&*device, 0), ctx.timeline(&*device, 0));
+    let gate = ctx.point(&*device, 1);
+    ctx.submit(&*device, C, &mut [], &[gate], &[at(c, 1), at(f, 1)]);
+    ctx.refused(
+        submit(&*device, G, &mut [], &[at(c, 1)], &[at(f, 2)]),
+        "a signal ordered by a wait for another timeline of the pending signal's submit",
+    );
+    ctx.ok(device.signal_timeline(gate), "the gate's host signal");
+    ctx.reached(&*device, at(f, 1));
+    ctx.submit(&*device, G, &mut [], &[at(c, 1)], &[at(f, 2)]);
+    ctx.reached(&*device, at(f, 2));
+    Ok(())
+}
+
+fn wait_for_a_signal_orders_its_submit_before_a_signal_of_that_timeline(ctx: &Ctx<'_>) -> Applies {
+    if ctx.set.queues.compute != QueuePath::Own {
+        return Err("compute shares the graphics queue");
+    }
+    let device = ctx.device();
+    let (c, f) = (ctx.timeline(&*device, 0), ctx.timeline(&*device, 0));
+    let gate = ctx.point(&*device, 1);
+    ctx.submit(&*device, C, &mut [], &[gate], &[at(c, 1), at(f, 1)]);
+    ctx.submit(&*device, G, &mut [], &[at(f, 1)], &[at(f, 2)]);
+    ctx.ok(device.signal_timeline(gate), "the gate's host signal");
+    ctx.reached(&*device, at(c, 1));
+    ctx.reached(&*device, at(f, 2));
+    Ok(())
+}
+
+/// A signal's first scope holds every signal of an earlier batch of its queue, so a wait
+/// for `c` orders the earlier compute submit's `f`.
+fn wait_for_a_signal_orders_the_earlier_submits_of_its_queue(ctx: &Ctx<'_>) -> Applies {
+    if ctx.set.queues.compute != QueuePath::Own {
+        return Err("compute shares the graphics queue");
+    }
+    let device = ctx.device();
+    let (c, f) = (ctx.timeline(&*device, 0), ctx.timeline(&*device, 0));
+    let gate = ctx.point(&*device, 1);
+    ctx.submit(&*device, C, &mut [], &[gate], &[at(f, 1)]);
+    ctx.submit(&*device, C, &mut [], &[], &[at(c, 1)]);
+    ctx.submit(&*device, G, &mut [], &[at(c, 1)], &[at(f, 2)]);
+    ctx.ok(device.signal_timeline(gate), "the gate's host signal");
+    ctx.reached(&*device, at(f, 2));
     Ok(())
 }
 
