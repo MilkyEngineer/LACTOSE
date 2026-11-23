@@ -984,6 +984,8 @@ name = "lactose-platform"
 version = "0.0.0"
 dependencies = [
  "lactose-core",
+ "lactose-rhi-api",
+ "lactose-rhi-vulkan",
  "lactose-task",
  "libc",
  "objc2",

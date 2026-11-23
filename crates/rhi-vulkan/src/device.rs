@@ -195,11 +195,13 @@ pub(crate) struct ImageObj {
 
 impl ImageObj {
     /// The object of one of a swapchain's images, with its attachment view: a colour
-    /// attachment of one mip and one layer, owned by the present queue's family.
+    /// attachment of one mip and one layer, owned by the present queue's family, made for
+    /// `usage`.
     pub(crate) fn swapchain_image(
         raw: &Arc<Raw>,
         image: vk::Image,
         format: Format,
+        usage: ImageUsage,
         extent: Extent,
     ) -> Result<Self> {
         let mut object = Self {
@@ -211,7 +213,7 @@ impl ImageObj {
             extent,
             mips: 1,
             layers: 1,
-            usage: ImageUsage::COLOUR,
+            usage,
             memoryless_request: false,
             memoryless: false,
             placed: false,

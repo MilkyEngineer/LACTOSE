@@ -9,6 +9,14 @@ license.workspace = true
 # D150: the integration tests are one binary, whose root declares the others as modules.
 autotests = false
 
+[features]
+# A swapchain's images also copy, from and to, where the surface allows it: for window tests
+# that read a swapchain image back and copy a target into one, which the contract's swapchain
+# images, colour attachments alone, do not allow. For `[dev-dependencies]` only: nothing that
+# ships turns it on. `cargo xtask tiers` holds it there once `[dev_only_features]` in
+# crate-tiers.toml lists it.
+swapchain-copies = []
+
 [dependencies]
 # The loader, opened at run time (`Entry::load`), and every driver call.
 ash.workspace = true

@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use lactose_core::{Error, Result};
 use lactose_rhi_api::{
-    Acquired, DisplayTime, Extent, Format, ImageHandle, PresentId, Presented, QueueRole, Rule,
-    Submit, Swapchain, TimelinePoint,
+    Acquired, DisplayTime, Extent, Format, ImageHandle, ImageUsage, PresentId, Presented,
+    QueueRole, Rule, Submit, Swapchain, TimelinePoint,
 };
 
 use crate::device::{ImageObj, Shared, alive, lost};
@@ -31,6 +31,10 @@ const BOUND: Duration = Duration::from_secs(1);
 /// The images a swapchain asks for, within what the surface allows.
 const IMAGES: u32 = 3;
 
+/// The entries of `VK_GOOGLE_display_timing`'s history one call reads: more than MoltenVK
+/// 1.4.2 keeps, 60.
+const HISTORY: usize = 64;
+
 /// The formats a swapchain takes, the first the surface offers in `SRGB_NONLINEAR`.
 const FORMATS: [(vk::Format, Format); 4] = [
     (vk::Format::B8G8R8A8_UNORM, Format::Bgra8Unorm),
@@ -38,6 +42,20 @@ const FORMATS: [(vk::Format, Format); 4] = [
     (vk::Format::B8G8R8A8_SRGB, Format::Bgra8Srgb),
     (vk::Format::R8G8B8A8_SRGB, Format::Rgba8Srgb),
 ];
+
+/// What the images are made for: colour attachments alone, which the contract names, and
+/// with the `swapchain-copies` feature, for tests that read an image back, copies from and to
+/// as well where the surface allows both.
+fn usage(supported: vk::ImageUsageFlags) -> (vk::ImageUsageFlags, ImageUsage) {
+    let copies = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+    if cfg!(feature = "swapchain-copies") && supported.contains(copies) {
+        let usage =
+            ImageUsage::COLOUR.union(ImageUsage::COPY_SOURCE).union(ImageUsage::COPY_DESTINATION);
+        (vk::ImageUsageFlags::COLOR_ATTACHMENT | copies, usage)
+    } else {
+        (vk::ImageUsageFlags::COLOR_ATTACHMENT, ImageUsage::COLOUR)
+    }
+}
 
 /// Where an acquire semaphore of the pool is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -212,6 +230,7 @@ impl VulkanSwapchain {
         .find(|alpha| caps.supported_composite_alpha.contains(*alpha))
         .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
         let family = [self.shared.queue(self.queue).family];
+        let (vk_usage, usage) = usage(caps.supported_usage_flags);
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(count)
@@ -219,7 +238,7 @@ impl VulkanSwapchain {
             .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
             .image_extent(made)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(vk_usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .queue_family_indices(&family)
             .pre_transform(caps.current_transform)
@@ -233,7 +252,7 @@ impl VulkanSwapchain {
         // always offered, and the format was among the surface's.
         let swapchain = unsafe { swapchain_fns.create_swapchain(&info, None) }
             .map_err(|e| self.failed(e, "vkCreateSwapchainKHR"))?;
-        let made_chain = self.chain_of(swapchain, format, made);
+        let made_chain = self.chain_of(swapchain, format, usage, made);
         let chain = match made_chain {
             Ok(chain) => chain,
             Err(error) => {
@@ -256,6 +275,7 @@ impl VulkanSwapchain {
         &self,
         swapchain: vk::SwapchainKHR,
         format: Format,
+        usage: ImageUsage,
         made: vk::Extent2D,
     ) -> Result<Chain> {
         let extent = Extent { width: made.width, height: made.height };
@@ -265,7 +285,7 @@ impl VulkanSwapchain {
         let mut chain = Chain { swapchain, ..Chain::default() };
         let mut failure = None;
         for &image in &images {
-            let made = ImageObj::swapchain_image(&self.shared.raw, image, format, extent)
+            let made = ImageObj::swapchain_image(&self.shared.raw, image, format, usage, extent)
                 .and_then(|object| {
                     let rec =
                         ImageRec { stamps: [0; QUEUES], slots: 0, placed: None, swapchain: true };
@@ -479,11 +499,35 @@ impl VulkanSwapchain {
         if swapchain == vk::SwapchainKHR::null() {
             return;
         }
-        // SAFETY: the swapchain is live, and this thread's alone between its acquire and
-        // its present (`Swapchain` is not `Sync`).
-        let Ok(reports) = (unsafe { google.get_past_presentation_timing(swapchain) }) else {
-            return;
-        };
+        // The history is taken by each call that writes it (MoltenVK takes off every entry
+        // it writes), so a call's entries are kept as it wrote them, and the call is made
+        // again while more are held: ash's wrapper counts first and throws a fill away on
+        // `VK_INCOMPLETE`, which would lose the entries that fill took.
+        let mut reports = Vec::new();
+        let mut buffer = [vk::PastPresentationTimingGOOGLE::default(); HISTORY];
+        loop {
+            let mut count = HISTORY as u32;
+            // SAFETY: the swapchain is live, and this thread's alone between its acquire and
+            // its present (`Swapchain` is not `Sync`); the buffer holds `count` entries.
+            let result = unsafe {
+                (google.fp().get_past_presentation_timing_google)(
+                    google.device(),
+                    swapchain,
+                    &mut count,
+                    buffer.as_mut_ptr(),
+                )
+            };
+            if result != vk::Result::SUCCESS && result != vk::Result::INCOMPLETE {
+                break;
+            }
+            let written = (count as usize).min(HISTORY);
+            reports.extend_from_slice(&buffer[..written]);
+            // A driver that keeps its history would give the same entries again: one that
+            // wrote none, or a history longer than any driver keeps, ends the drain.
+            if result == vk::Result::SUCCESS || written == 0 || reports.len() >= 4 * HISTORY {
+                break;
+            }
+        }
         let mut drained: Vec<DisplayTime> = reports
             .iter()
             .filter_map(|report| {

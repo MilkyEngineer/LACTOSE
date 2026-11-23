@@ -14,10 +14,11 @@ tests on a device through it (decision 5.12 of the milestone 2 plan).
 | Determinism boundary | outside; a boundary crate's test may not name it (`cargo xtask boundary`) |
 | Unsafe | yes, FFI to the Vulkan driver (architecture section 21); see `SAFETY.md` |
 
-**Status: implemented.** The swapchain is run on a headless surface alone so far: the window
-cases (MoltenVK's blocking drawable, a readback of a swapchain image, the display-time report's
-run) are owed ("The swapchain"). `crates/rhi-api/README.md` is the contract, and this file
-states only what the contract leaves to the backend.
+**Status: implemented.** The swapchain runs on a headless surface here and on a window in
+`lactose-platform`'s window cases, which make the device in a main-lane call and the
+swapchain, its resize and its drop on the present thread ("The swapchain").
+`crates/rhi-api/README.md` is the contract, and this file states only what the contract
+leaves to the backend.
 
 ## The public items
 
@@ -27,6 +28,11 @@ states only what the contract leaves to the backend.
 | `VulkanDevice::headless(DeviceRequest)` | As `new`, presenting to a surface no window shows (`VK_EXT_headless_surface`), for tests that need a swapchain; `Unsupported` for a request that names a window, and on a driver with no headless surface |
 
 `VulkanDevice` is a `Device`; its encoders are `Box<dyn Encoder>`.
+
+One feature, `swapchain-copies`, is for dev-dependency edges alone: with it a swapchain's
+images are made for copies from and to as well, where the surface allows both, so that a
+window test reads a swapchain image back. The contract's swapchain images are colour
+attachments and nothing else, and nothing that ships turns it on.
 
 ## What the device makes
 
@@ -142,7 +148,8 @@ states only what the contract leaves to the backend.
   `vkReleaseSwapchainImagesEXT`, which the `KHR` form names otherwise.
 - **The images** are `FIFO`, of the first of `B8G8R8A8_UNORM`, `R8G8B8A8_UNORM` and their
   `SRGB` forms the surface offers in `SRGB_NONLINEAR`, three where the surface allows,
-  exclusive to the present queue's family, colour attachments alone. Their handles are the
+  exclusive to the present queue's family, colour attachments alone (and copies, under the
+  `swapchain-copies` feature). Their handles are the
   device's images, with a colour attachment view each; a destroy of one is refused
   (`swapchain`). A swapchain image's transition to `Present` is to `PRESENT_SRC_KHR`; any
   other image moved to `Present` is in `GENERAL`.
@@ -176,6 +183,16 @@ states only what the contract leaves to the backend.
   `crates/rhi-api/README.md` states, and on other drivers unmeasured here.
 - **Headless.** MoltenVK 1.4.2 and lavapipe offer `VK_EXT_headless_surface`, so the headless
   tests run under lavapipe in CI; KosmicKrisp offers none, and they skip there.
+- **On a window under MoltenVK 1.4.2** (`lactose-platform`'s window cases, on the M1): an
+  acquire returns at once, a window's resize makes a present `SUBOPTIMAL` and never
+  `OUT_OF_DATE`, which the contract's `Shown` hides, so a caller rebuilds at the window's
+  reported size; and a minimised window's drawable did not block, in 8 s of presents, each
+  shown. A drawable MoltenVK cannot get, after about a second per image, is
+  `VK_ERROR_OUT_OF_POOL_MEMORY` and so `Stale`; no run here made one.
+- **On a window under KosmicKrisp** (SDK 1.4.363): present shares the graphics queue, an
+  acquire waits for its image (a median 14 ms of a 16.7 ms refresh), which reads as the drawable
+  taken there rather than inside a submit, a present returns within a millisecond, a minimised
+  window's drawable did not block either, and there is no display-time source.
 
 ## The display-time report
 
@@ -193,10 +210,16 @@ states only what the contract leaves to the backend.
 - **A present the display never took** cannot be told apart: MoltenVK 1.4.2 reports one with
   the time its handler ran, not zero. A caller takes a present as displayed once its id or a
   later one is reported.
-- **The delay and the bound** were not measured by this crate's runs: a report arrives once
-  MoltenVK's presented handler has run, and a call makes the driver's two calls of the
-  history, which MoltenVK keeps at 60 reports, with no wait. A replaced swapchain's history is
-  drained before it is destroyed; a report of it that arrives later is lost.
+- **The call** reads the driver's history into a buffer of 64 entries, more than the 60
+  MoltenVK keeps, and again while the driver says more are held; MoltenVK takes off every
+  entry it writes, so each call's entries are kept as written. It never waits: the bound,
+  5 ms, held at every call of `lactose-platform`'s window run, whose presents each waited for
+  an image, and the longest call measured was 0.04 ms.
+- **The delay:** in that run under MoltenVK 1.4.2 at 60 Hz, a present was shown a median
+  48 ms after its call returned (three refreshes, the FIFO queue full), and reported a median
+  2 ms after it was shown, at most 16 ms. A replaced swapchain's history is drained before it
+  is destroyed, and none of the run's two replaced swapchains lost a report; a report that
+  arrives after the drain would be lost.
 
 ## Locks
 
@@ -269,6 +292,13 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   acquire semaphore taken again while a batch's wait for it is held, which the layer must
   report (`VUID-vkAcquireNextImageKHR-semaphore-01779`), heard by a sink that prints nothing;
   a core validation check, so the GPU-assisted run, which turns core validation off, skips it.
+- On a window, in `lactose-platform`'s `tests/window.rs` (`tests/swapchain.rs` there), run on
+  the M1 under MoltenVK, with Metal API and shader validation, and under KosmicKrisp, each
+  with the layer: 131 frames across a resize to half the window and a rebuild right after a
+  present, every present's image read back equal to its target, which the
+  `swapchain-copies` feature allows; each id reported once and in order, the call's bound
+  held at every call; and frames presented to a minimised window for 8 s while workers draw.
+  `cargo xtask gpu` does not run them; the window run does, on the driver the loader finds.
 - Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, no size,
   two sizes or the built-in state no workgroup, an entry declared by its name and its stage's
   execution model, a `Bool` widened to four bytes and `Int64Atomics` refused unless enabled.

@@ -502,8 +502,6 @@ No other kind comes from this crate, and no request of the window is an error.
   and occlusion, more than one window.** No milestone 2 row reads one. The frame's pacing
   needs no display's refresh at milestone 2: the timer root paces it at the tick's deadline
   (D162), and the change that gives the frame a deadline between ticks asks for one here.
-- **The tests with a device.** `swapchain` writes them here, with `lactose-rhi-vulkan` as
-  a test-support dev-dependency, as subprocesses.
 - **The crash hook** is `lactose-app`'s (D155), not this crate's.
 
 ## Proof
@@ -539,7 +537,9 @@ the `exit` guard of "Shutdown" from its start, so a check that fails ends the pu
 `ThreadHandle::join` discards a panic, so the driver sends its result on a channel as its
 last act and the subprocess's exit status carries it; the parent checks the status and that
 the last stage printed is the final one, or, for a case that must fail or abort, the stage
-and the text it must end with.
+and the text it must end with. A line of a case's stderr fails it too where it holds a
+validation layer's or Metal's report, or MoltenVK's or Mesa's error or warning, unless the
+case names that line as expected (decision 5.10's rule).
 
 - A window opens, events are pumped, one call runs on the main thread and one on the
   present thread, and the process closes: `run` returns and the exit status is zero.
@@ -621,6 +621,23 @@ and the text it must end with.
   park, and a call that panics ends the thread with the stop `Cancelled`. (`integration`:
   each of `present::`; `window`:
   `a_present_call_that_blocks_holds_only_the_calls_behind_it`.)
+- A swapchain on the window: the device is refused `Unsupported` off the main thread and
+  made in a main-lane call, the only call that moves there; the swapchain is made, resized
+  and dropped on the present thread, and the device, its surface and its `CAMetalLayer` are
+  dropped on the main thread. 131 frames are presented across a resize to half the window
+  and a rebuild right after a present, each image read back equal to its target, and the
+  display-time report gives each id once and in order within its call's bound, where the
+  driver has a source. (`window`:
+  `a_swapchain_on_the_window_is_made_resized_and_dropped_on_the_present_thread`, with
+  `lactose-rhi-vulkan` as a dev-dependency; each case passes, saying it skipped, where the
+  device is `Unsupported`.)
+- Frames are presented to a window `set_minimised` minimised, for 8 s, while workers draw
+  targets the present thread does not hold and each of their submits completes; after the
+  restore a present is shown. Where a call blocks for a second or more (verification row
+  182), MoltenVK's "could not be acquired" is the case's one expected driver line, and the
+  stale swapchain is rebuilt; on the M1 under macOS 27.2.1 no call blocked, under MoltenVK or
+  KosmicKrisp, which the case prints. (`window`:
+  `a_minimised_window_is_presented_to_and_the_frame_goes_on`.)
 - `ClientPlatform` reports `StdPlatform`'s topology and hardware threads, and enters the
   class of each thread it makes. (`integration`: `threads::`; the present class read back,
   in `opens_pumps_and_closes`.)

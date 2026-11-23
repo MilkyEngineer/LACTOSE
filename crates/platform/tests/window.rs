@@ -18,6 +18,7 @@
 // clock, allow it (`SAFETY.md`).
 #![deny(unsafe_code)]
 
+mod swapchain;
 mod thread_cpu;
 
 use core::fmt::Debug;
@@ -138,6 +139,17 @@ const CASES: &[Case] = &[
         child: a_present_call_that_blocks_holds_only_the_calls_behind_it,
         expect: Expect::Done,
     },
+    Case {
+        name: "a_swapchain_on_the_window_is_made_resized_and_dropped_on_the_present_thread",
+        child:
+            swapchain::a_swapchain_on_the_window_is_made_resized_and_dropped_on_the_present_thread,
+        expect: Expect::Done,
+    },
+    Case {
+        name: "a_minimised_window_is_presented_to_and_the_frame_goes_on",
+        child: swapchain::a_minimised_window_is_presented_to_and_the_frame_goes_on,
+        expect: Expect::Done,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -210,11 +222,25 @@ fn harness() -> ExitCode {
     if failed == 0 { ExitCode::SUCCESS } else { ExitCode::from(101) }
 }
 
+/// The lines a driver and Metal's validation write to standard error for their errors and
+/// warnings, as `cargo xtask gpu`'s rule counts them (decision 5.10): MoltenVK's, Mesa's
+/// log, Metal shader validation's reports and API validation's assertions.
+const DRIVER_LINES: [&str; 7] = [
+    "[mvk-error]",
+    "[mvk-warn]",
+    "MESA: error",
+    "MESA: warning",
+    "WARNING: ",
+    "Invalid Metal usage",
+    "failed assertion",
+];
+
 /// Runs `case`'s child under its deadline. It reads the child's output while it waits, so a
 /// child that writes more than a pipe holds is not blocked into a false hang; past the
 /// deadline it kills the child and fails, naming the last stage the child printed. It
 /// takes the output within a bound too, since a process the child started may keep the
-/// pipe, and then checks the child's status and its last stage against `case.expect`.
+/// pipe, and then checks the child's status and its last stage against `case.expect`, and
+/// that no driver line is on its standard error but those the case expects.
 fn parent(case: &Case) {
     const DEADLINE: Duration = Duration::from_secs(60);
     let mut child = Command::new(std::env::current_exe().expect("this binary's path"))
@@ -252,6 +278,13 @@ fn parent(case: &Case) {
     print!("{stdout}");
     eprint!("{stderr}");
     let stage = stdout.lines().rev().find_map(|line| line.strip_prefix("stage: "));
+    let expected = swapchain::expected_driver_lines(case.name);
+    let driver: Vec<&str> = stderr
+        .lines()
+        .filter(|line| DRIVER_LINES.iter().any(|words| line.contains(words)))
+        .filter(|line| !expected.iter().any(|words| line.contains(words)))
+        .collect();
+    assert!(driver.is_empty(), "the driver or Metal's validation said: {driver:?}");
     let Some(status) = status else {
         panic!(
             "the subprocess passed its deadline of {DEADLINE:?} after the stage {:?}",
@@ -360,6 +393,11 @@ fn failed(message: impl Into<String>) -> Error {
 /// Polls `future` on the calling thread until it resolves, and panics past [`BOUND`]. The
 /// driver is no worker, so it may wait.
 fn wait<F: Future>(future: F) -> F::Output {
+    wait_within(BOUND, future)
+}
+
+/// [`wait`] with a bound of its own.
+fn wait_within<F: Future>(bound: Duration, future: F) -> F::Output {
     struct Unpark(std::thread::Thread);
     impl Wake for Unpark {
         fn wake(self: Arc<Self>) {
@@ -369,13 +407,13 @@ fn wait<F: Future>(future: F) -> F::Output {
     let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
     let mut context = Context::from_waker(&waker);
     let mut future = pin!(future);
-    let until = Instant::now() + BOUND;
+    let until = Instant::now() + bound;
     loop {
         if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
             return output;
         }
         let now = Instant::now();
-        assert!(now < until, "a wait passed its bound of {BOUND:?}");
+        assert!(now < until, "a wait passed its bound of {bound:?}");
         std::thread::park_timeout(until - now);
     }
 }
