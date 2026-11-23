@@ -97,14 +97,31 @@ fn install_crash_hook() {
     std::panic::set_hook(Box::new(|info| {
         let thread = std::thread::current();
         let backtrace = std::backtrace::Backtrace::force_capture();
-        let mut stderr = std::io::stderr().lock();
-        // Nothing is left to report a failed write to: the process aborts either way.
-        let _ = writeln!(
-            stderr,
-            "ricotta crashed\nthread: {}\n{info}\nbacktrace:\n{backtrace}",
+        let report = format!(
+            "ricotta crashed\nthread: {}\n{info}\nbacktrace:\n{backtrace}\n",
             thread.name().unwrap_or("<unnamed>"),
         );
-        let _ = stderr.flush();
+        // Nothing is left to report a failed write to: the process aborts either way.
+        let _ = write_stderr(&report);
         std::process::abort();
     }));
+}
+
+/// Writes `text` to stderr through a duplicate of its handle, which takes none of `std`'s
+/// locks, as `lactose-app`'s hook does: a thread that holds the stderr lock inside
+/// `eprintln!` and panics, or waits there on a lock the panicking thread holds, cannot hold
+/// the report back. Where the handle cannot be duplicated, the locked stderr.
+fn write_stderr(text: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let handle = std::os::fd::AsFd::as_fd(&std::io::stderr()).try_clone_to_owned();
+    #[cfg(windows)]
+    let handle = std::os::windows::io::AsHandle::as_handle(&std::io::stderr()).try_clone_to_owned();
+    match handle {
+        Ok(handle) => std::fs::File::from(handle).write_all(text.as_bytes()),
+        Err(_) => {
+            let mut stderr = std::io::stderr().lock();
+            stderr.write_all(text.as_bytes())?;
+            stderr.flush()
+        }
+    }
 }

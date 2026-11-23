@@ -2,8 +2,9 @@
 //! installs first in `main`. A panic writes a text report to stderr and then to a file, and
 //! aborts.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -11,35 +12,47 @@ use std::time::{Duration, SystemTime};
 
 /// Held from the first panic's report to the abort, so that a panic on another thread
 /// waits for the abort and the report is of the process's first panic. It is never
-/// released, so it is never poisoned.
+/// released, so it is never poisoned. No other lock is taken while it is held: stderr is
+/// written through a handle of its own ([`write_stderr`]).
 static REPORTING: Mutex<()> = Mutex::new(());
 
-/// Installs the process's panic hook (`README.md`, "The crash hook"). A panic then writes a
-/// text report, `binary` and "crashed" on its first line, the thread, the panic's location
-/// and message, and a forced backtrace, to stderr; then, when `dir` is `Some`, the same
-/// text to a new file in `dir`, created with its parents if missing, named
+/// Installs the process's panic hook (`README.md`, "The crash hook"). A panic then writes to
+/// stderr `binary` and "crashed" on its first line, the thread, and the panic's location
+/// and message; then a forced backtrace; then, when `dir` is `Some`, the whole report to a
+/// new file in `dir`, created with its parents if missing, named
 /// `<binary>-<UTC time>-<process id>.txt`; then one line on stderr naming the file, or
-/// saying why it was not written; then calls `std::process::abort`, in every profile.
+/// saying why there is none; then calls `std::process::abort`, in every profile.
 ///
-/// `binary` is a file name's prefix, so it holds no path separator. `None` writes stderr
-/// alone. A file that cannot be created or written costs the file and nothing else: the
-/// hook does not panic, and it aborts either way. The hook handles panics only: a hardware
-/// fault or a signal is the operating system's to report (D155).
+/// `None` writes stderr alone. A file that cannot be created or written costs the file and
+/// nothing else: a file whose write failed is removed, the hook does not panic, and it
+/// aborts either way. The hook handles panics only: a hardware fault or a signal is the
+/// operating system's to report (D155).
 ///
 /// Called by a binary's `main` before anything else, once. A test never calls it (D16): a
 /// test that expects an abort runs a binary in a subprocess.
+///
+/// # Panics
+///
+/// If `binary` is not one non-empty path component, since it names the report's file: a
+/// separator, `..` or an absolute path would put the file outside `dir`.
 pub fn install_crash_hook(binary: &'static str, dir: Option<PathBuf>) {
+    assert!(is_file_name(binary), "the crash hook's binary name {binary:?} is not a file name");
     std::panic::set_hook(Box::new(move |info| {
         let _first = REPORTING.lock();
         let thread = std::thread::current();
         let backtrace = std::backtrace::Backtrace::force_capture();
-        let report = format!(
-            "{binary} crashed\nthread: {}\n{info}\nbacktrace:\n{backtrace}\n",
+        // Stderr first, and the panic before its backtrace, whose symbols are read from the
+        // executable's files: neither a symbol lookup nor a file system that hangs or fails
+        // can cost the thread and the message. Nothing is left to report a failed stderr
+        // write to.
+        let mut report = format!(
+            "{binary} crashed\nthread: {}\n{info}\n",
             thread.name().unwrap_or("<unnamed>"),
         );
-        // Stderr first, so that a file system that hangs or fails cannot cost it.
-        // Nothing is left to report a failed stderr write to.
         let _ = write_stderr(&report);
+        let start = report.len();
+        let _ = write!(report, "backtrace:\n{backtrace}\n");
+        let _ = write_stderr(&report[start..]);
         if let Some(dir) = &dir {
             let line = match write_file(binary, dir, &report) {
                 Ok(path) => format!("{binary}: the crash report is in {}\n", path.display()),
@@ -53,10 +66,38 @@ pub fn install_crash_hook(binary: &'static str, dir: Option<PathBuf>) {
     }));
 }
 
+/// Whether `binary` is one path component that names a file: no separator, no root or
+/// prefix, not `.` or `..`, not empty.
+fn is_file_name(binary: &str) -> bool {
+    !binary.is_empty() && Path::new(binary).file_name() == Some(OsStr::new(binary))
+}
+
+/// Writes `text` to stderr through a duplicate of its handle, which takes none of `std`'s
+/// locks. A thread that holds the stderr lock, inside `eprintln!`, and then panics, or
+/// waits there on a lock the panicking thread holds, would otherwise hold the report back
+/// for ever. The cost: what other threads write to stderr meanwhile can interleave with the
+/// report; the file is written whole. Where the handle cannot be duplicated, the locked
+/// stderr.
 fn write_stderr(text: &str) -> std::io::Result<()> {
-    let mut stderr = std::io::stderr().lock();
-    stderr.write_all(text.as_bytes())?;
-    stderr.flush()
+    match duplicate_stderr() {
+        Ok(mut stderr) => stderr.write_all(text.as_bytes()),
+        Err(_) => {
+            let mut stderr = std::io::stderr().lock();
+            stderr.write_all(text.as_bytes())?;
+            stderr.flush()
+        }
+    }
+}
+
+/// A file over a new handle to the process's stderr; `std`'s `Stderr` is unbuffered, so
+/// nothing written through it is still in `std`'s hands.
+fn duplicate_stderr() -> std::io::Result<File> {
+    #[cfg(unix)]
+    let handle = std::os::fd::AsFd::as_fd(&std::io::stderr()).try_clone_to_owned()?;
+    #[cfg(windows)]
+    let handle =
+        std::os::windows::io::AsHandle::as_handle(&std::io::stderr()).try_clone_to_owned()?;
+    Ok(File::from(handle))
 }
 
 /// Writes `report` to a file of its own in `dir`. Gives the file's path, or the path that
@@ -85,11 +126,19 @@ fn file_name(binary: &str, since_epoch: Duration, process: u32) -> String {
 /// Creates `path` and writes `text` to it, and refuses a path that exists, so that no
 /// report replaces another.
 fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    write_or_remove(file, path, text)
+}
+
+/// Writes `text` to `file`, the file at `path`; when the write fails (a full disk), closes
+/// and removes it, so that no file a failure line names is left empty or cut short.
+fn write_or_remove(mut file: File, path: &Path, text: &str) -> std::io::Result<()> {
+    let written = file.write_all(text.as_bytes());
+    if written.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    written
 }
 
 /// `since_epoch` as UTC, `YYYYMMDDTHHMMSS.mmmZ`: sorted by name, the files are in time
@@ -136,6 +185,20 @@ mod tests {
         assert_eq!(file_name("binary", at, 42), "binary-20261123T164900.120Z-42.txt");
     }
 
+    #[test]
+    fn a_binary_name_is_one_file_name() {
+        for name in ["lactose-app-headless", "ricotta", "a.b", "..x"] {
+            assert!(is_file_name(name), "{name}");
+        }
+        for name in ["", ".", "..", "../escaped", "a/b", "a/", "/tmp/abs", "./a"] {
+            assert!(!is_file_name(name), "{name}");
+        }
+        #[cfg(windows)]
+        for name in ["a\\b", "C:", "C:a", "\\\\server\\share"] {
+            assert!(!is_file_name(name), "{name}");
+        }
+    }
+
     /// A directory of the temporary directory's own, for one test in one process.
     fn scratch(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lactose-app-{test}-{}", std::process::id()));
@@ -164,6 +227,21 @@ mod tests {
         fs::write(&file, "").unwrap();
         let (failed, _) = write_file("binary", &file.join("crash"), "the report\n").unwrap_err();
         assert_eq!(failed, file.join("crash"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A write that fails after the file was created leaves no file. The failure is a handle
+    /// opened for reading, which every system refuses a write through, standing in for a
+    /// full disk.
+    #[test]
+    fn a_file_whose_write_failed_is_removed() {
+        let dir = scratch("crash-unwritten");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.txt");
+        fs::write(&path, "").unwrap();
+        let read_only = File::open(&path).unwrap();
+        assert!(write_or_remove(read_only, &path, "the report\n").is_err());
+        assert!(!path.exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

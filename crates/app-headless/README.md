@@ -37,7 +37,7 @@ report, the app still shuts down in order (the policy's response to `Source::Sav
 | Variable | Effect |
 |---|---|
 | `LACTOSE_CRASH_DIR` | The crash directory: where a panic's report file goes, created when a panic needs it. Unset or empty, it is `crash` in the working directory. A run that does not panic creates nothing there |
-| `LACTOSE_TEST_PANIC` | A test hook. Set to any value, the run's first frame panics on the frame worker that runs the timer root, before any tick, and the crash hook reports and aborts. Unset, the run is unchanged |
+| `LACTOSE_TEST_PANIC` | A test hook (`src/test_hook.rs`). Set and not empty, the run's first frame panics on the frame worker that runs the timer root, before any tick, and the crash hook reports and aborts. `stderr-held` panics while another thread is inside `eprintln!` and panics there a second later; `stderr-blocked` panics holding a lock another thread waits on inside `eprintln!`; any other value panics plainly. Unset or empty, the run is unchanged |
 
 ## Rules a caller should know
 

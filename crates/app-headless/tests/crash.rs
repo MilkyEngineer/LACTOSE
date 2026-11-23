@@ -1,15 +1,22 @@
 //! The crash hook's abort path (README, "Rules a caller should know"; D155): the binary run
 //! in a subprocess with its test hook set panics on a frame worker, writes the report to
 //! stderr and to a file in the directory it names, and aborts; a directory that cannot be
-//! written costs the file alone. No test installs the hook (D16).
+//! written costs the file alone; another thread that holds stderr's lock, or waits inside
+//! `eprintln!`, does not hold the report back. No test installs the hook (D16).
 
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_lactose-app-headless");
+
+/// How long a run may take before it counts as hung and is killed: far above the second a
+/// one-tick run takes on a loaded machine, and inside nextest's own timeout.
+const BOUND: Duration = Duration::from_secs(30);
 
 /// A directory of the temporary directory's own for `test`, empty.
 fn scratch(test: &str) -> PathBuf {
@@ -20,30 +27,62 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
-/// The binary run for one tick in `cwd`, its test hook set or not, the crash directory
-/// named or not; its output and its process ID.
-fn run(cwd: &Path, panic: bool, crash_dir: Option<&Path>) -> (Output, u32) {
+/// What a run gave.
+struct Run {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+    id: u32,
+}
+
+/// The binary run for one tick in `cwd`, with `LACTOSE_TEST_PANIC` set to `hook` or unset,
+/// and the crash directory named or not. A run that has not exited within [`BOUND`] is
+/// killed, and the test fails: a hook that hangs is the failure.
+fn run(cwd: &Path, hook: Option<&str>, crash_dir: Option<&Path>) -> Run {
     let mut command = Command::new(BINARY);
-    command.arg("1").current_dir(cwd).env_remove("LACTOSE_TEST_PANIC");
-    command.env_remove("LACTOSE_CRASH_DIR");
-    if panic {
-        command.env("LACTOSE_TEST_PANIC", "1");
+    command.arg("1").current_dir(cwd);
+    command.env_remove("LACTOSE_TEST_PANIC").env_remove("LACTOSE_CRASH_DIR");
+    if let Some(hook) = hook {
+        command.env("LACTOSE_TEST_PANIC", hook);
     }
     if let Some(dir) = crash_dir {
         command.env("LACTOSE_CRASH_DIR", dir);
     }
-    let child = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let id = child.id();
-    (child.wait_with_output().unwrap(), id)
+    // Read on threads of their own, so that a full pipe cannot stall the child.
+    let read = |mut pipe: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    };
+    let stdout = read(Box::new(child.stdout.take().unwrap()));
+    let stderr = read(Box::new(child.stderr.take().unwrap()));
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > BOUND {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (stdout, stderr) = (stdout.join().unwrap(), stderr.join().unwrap());
+    let Some(status) = status else {
+        panic!("the run did not exit within {BOUND:?} and was killed\n{stderr}");
+    };
+    Run { status, stdout, stderr, id }
 }
 
 /// The exit of `std::process::abort`: SIGABRT on unix, and on Windows the fast-fail status
 /// Rust's abort raises, `STATUS_STACK_BUFFER_OVERRUN`.
-fn assert_aborted(status: ExitStatus, stderr: &str) {
+fn assert_aborted(run: &Run) {
+    let (status, stderr) = (run.status, &run.stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt as _;
@@ -53,28 +92,37 @@ fn assert_aborted(status: ExitStatus, stderr: &str) {
     assert_eq!(status.code(), Some(0xC000_0409_u32 as i32), "{status:?}\n{stderr}");
 }
 
-/// The report on stderr, from its first line to the line after it: the thread, the panic's
-/// location and message, and a backtrace with frames.
-fn report_of(stderr: &str) -> &str {
+/// The report on stderr, from its first line to the line after it, with its thread and its
+/// message: the thread, the panic's location and message, and a backtrace with frames.
+fn report_in(stderr: &str) -> (&str, &str, &str) {
     let start = stderr.find("lactose-app-headless crashed\n").expect(stderr);
     let report = &stderr[start..];
     let end = report.find("\nlactose-app-headless: ").map_or(report.len(), |end| end + 1);
     let report = &report[..end];
     let mut lines = report.lines();
     assert_eq!(lines.next(), Some("lactose-app-headless crashed"));
-    let thread = lines.next().unwrap();
-    assert!(thread.starts_with("thread: whisk-frame-"), "{report}");
+    let thread = lines.next().unwrap().strip_prefix("thread: ").expect(report);
     assert!(lines.next().unwrap().starts_with("panicked at "), "{report}");
-    assert_eq!(lines.next(), Some("LACTOSE_TEST_PANIC is set: the first frame panics"));
+    let message = lines.next().unwrap();
     assert_eq!(lines.next(), Some("backtrace:"), "{report}");
     let frames = lines.filter(|line| line.trim_start().split_once(": ").is_some()).count();
     assert!(frames > 0, "{report}");
+    (report, thread, message)
+}
+
+/// The report of the first frame's panic, with `message`.
+fn frame_report<'a>(stderr: &'a str, message: &str) -> &'a str {
+    let (report, thread, said) = report_in(stderr);
+    assert!(thread.starts_with("whisk-frame-"), "{report}");
+    assert_eq!(said, message, "{report}");
     // The panic is the timer root's, which a frame names. Frames are named where the build
     // has symbols; a Windows build's are not asserted.
     #[cfg(unix)]
     assert!(report.contains("timer_root"), "{report}");
     report
 }
+
+const PLAIN: &str = "LACTOSE_TEST_PANIC is set: the first frame panics";
 
 /// The files in `dir`.
 fn files_in(dir: &Path) -> Vec<PathBuf> {
@@ -84,37 +132,39 @@ fn files_in(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// The one file in `dir`, which holds `report`.
+fn assert_one_file(dir: &Path, report: &str) -> PathBuf {
+    let files = files_in(dir);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(fs::read_to_string(&files[0]).unwrap(), report);
+    files[0].clone()
+}
+
 #[test]
 fn a_panic_writes_the_report_to_stderr_then_a_file_and_aborts() {
     let cwd = scratch("named");
     let dir = cwd.join("reports").join("crash");
-    let (output, id) = run(&cwd, true, Some(&dir));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_aborted(output.status, &stderr);
-    let report = report_of(&stderr);
-    let files = files_in(&dir);
-    assert_eq!(files.len(), 1, "{files:?}");
-    let name = files[0].file_name().unwrap().to_str().unwrap();
-    assert!(name.starts_with("lactose-app-headless-"), "{name}");
-    assert!(name.ends_with(&format!("Z-{id}.txt")), "{name}");
+    let run = run(&cwd, Some("1"), Some(&dir));
+    assert_aborted(&run);
+    let report = frame_report(&run.stderr, PLAIN);
     // The file is the stderr report's text, and the line after it names the file.
-    assert_eq!(fs::read_to_string(&files[0]).unwrap(), report);
-    let named = format!("lactose-app-headless: the crash report is in {}", files[0].display());
-    assert!(stderr.contains(&named), "{stderr}");
-    assert!(output.stdout.is_empty(), "{}", String::from_utf8_lossy(&output.stdout));
+    let file = assert_one_file(&dir, report);
+    let name = file.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("lactose-app-headless-"), "{name}");
+    assert!(name.ends_with(&format!("Z-{}.txt", run.id)), "{name}");
+    let named = format!("lactose-app-headless: the crash report is in {}", file.display());
+    assert!(run.stderr.contains(&named), "{}", run.stderr);
+    assert!(run.stdout.is_empty(), "{}", run.stdout);
     fs::remove_dir_all(&cwd).unwrap();
 }
 
 #[test]
 fn the_report_file_is_in_crash_of_the_working_directory_by_default() {
     let cwd = scratch("default");
-    let (output, _) = run(&cwd, true, None);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_aborted(output.status, &stderr);
-    let report = report_of(&stderr);
-    let files = files_in(&cwd.join("crash"));
-    assert_eq!(files.len(), 1, "{files:?}");
-    assert_eq!(fs::read_to_string(&files[0]).unwrap(), report);
+    let run = run(&cwd, Some("1"), None);
+    assert_aborted(&run);
+    let report = frame_report(&run.stderr, PLAIN);
+    assert_one_file(&cwd.join("crash"), report);
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -125,12 +175,11 @@ fn a_directory_that_cannot_be_made_costs_the_file_alone() {
     let file = cwd.join("a file");
     fs::write(&file, "").unwrap();
     let dir = file.join("crash");
-    let (output, _) = run(&cwd, true, Some(&dir));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_aborted(output.status, &stderr);
-    report_of(&stderr);
+    let run = run(&cwd, Some("1"), Some(&dir));
+    assert_aborted(&run);
+    frame_report(&run.stderr, PLAIN);
     let refused = format!("lactose-app-headless: no crash report file at {}: ", dir.display());
-    assert!(stderr.contains(&refused), "{stderr}");
+    assert!(run.stderr.contains(&refused), "{}", run.stderr);
     assert_eq!(files_in(&cwd), vec![file]);
     fs::remove_dir_all(&cwd).unwrap();
 }
@@ -148,29 +197,63 @@ fn a_directory_that_cannot_be_written_costs_the_file_alone() {
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
     let writable = fs::write(dir.join("probe"), "").is_ok();
     if !writable {
-        let (output, _) = run(&cwd, true, Some(&dir));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_aborted(output.status, &stderr);
-        report_of(&stderr);
+        let run = run(&cwd, Some("1"), Some(&dir));
+        assert_aborted(&run);
+        frame_report(&run.stderr, PLAIN);
         let refused = "lactose-app-headless: no crash report file at ";
-        assert!(stderr.contains(refused), "{stderr}");
+        assert!(run.stderr.contains(refused), "{}", run.stderr);
         assert!(files_in(&dir).is_empty());
     }
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
     fs::remove_dir_all(&cwd).unwrap();
 }
 
-/// The test hook unset, the run is the binary's normal one: it reports and exits 0, and a
-/// run that does not panic creates no crash directory.
+/// The frame panics while another thread is inside `eprintln!`, holding stderr's lock, and
+/// panics there a second later. A hook that took that lock would wait for the thread, whose
+/// own hook waits for the first: the run would hang. The report is the first panic's, or the
+/// second's if the frame's hook started after it, and the process aborts.
+#[test]
+fn a_panic_while_another_thread_holds_stderr_is_reported_and_aborts() {
+    let cwd = scratch("stderr-held");
+    let dir = cwd.join("crash");
+    let run = run(&cwd, Some("stderr-held"), Some(&dir));
+    assert_aborted(&run);
+    let (report, thread, message) = report_in(&run.stderr);
+    let first = "LACTOSE_TEST_PANIC=stderr-held: the first frame panics while another thread \
+                 holds stderr";
+    let reported = (thread.starts_with("whisk-frame-") && message == first)
+        || (thread == "stderr-holder" && message == "the second panic, inside eprintln!");
+    assert!(reported, "{report}");
+    assert_one_file(&dir, report);
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+/// The frame panics holding a lock that another thread waits on inside `eprintln!`, so that
+/// thread holds stderr's lock until the abort. A hook that took that lock would never write.
+#[test]
+fn a_panic_while_stderr_waits_on_the_panicking_thread_is_reported_and_aborts() {
+    let cwd = scratch("stderr-blocked");
+    let dir = cwd.join("crash");
+    let run = run(&cwd, Some("stderr-blocked"), Some(&dir));
+    assert_aborted(&run);
+    let message = "LACTOSE_TEST_PANIC=stderr-blocked: the first frame panics holding what \
+                   stderr waits on";
+    let report = frame_report(&run.stderr, message);
+    assert_one_file(&dir, report);
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+/// The test hook unset, or set to the empty value, the run is the binary's normal one: it
+/// reports and exits 0, and a run that does not panic creates no crash directory.
 #[test]
 fn without_the_test_hook_the_run_is_unchanged() {
-    let cwd = scratch("normal");
-    let (output, _) = run(&cwd, false, None);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{:?}\n{stderr}", output.status);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("1 ticks in "), "{stdout}");
-    assert!(!stderr.contains("crashed"), "{stderr}");
-    assert!(files_in(&cwd).is_empty());
-    fs::remove_dir_all(&cwd).unwrap();
+    for hook in [None, Some("")] {
+        let cwd = scratch("normal");
+        let run = run(&cwd, hook, None);
+        assert!(run.status.success(), "{hook:?}: {:?}\n{}", run.status, run.stderr);
+        assert!(run.stdout.starts_with("1 ticks in "), "{}", run.stdout);
+        assert!(!run.stderr.contains("crashed"), "{}", run.stderr);
+        assert!(files_in(&cwd).is_empty());
+        fs::remove_dir_all(&cwd).unwrap();
+    }
 }

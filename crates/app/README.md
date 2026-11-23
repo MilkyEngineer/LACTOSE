@@ -2693,35 +2693,51 @@ Without the third no frame is shed and `frame-pace` has no age at the display.
 `install_crash_hook(binary, dir)` installs the process's panic hook (architecture section
 5.1, D155). Every engine binary calls it first in `main`, before its subscriber and before
 anything that can panic; RICOTTA keeps a hook of its own, since a tool does not link the
-assembly. It is safe code over `std` alone: no signal handler, no minidump, no second
-process. On a panic, on any thread, the hook:
+assembly, and writes stderr the same way. It is safe code over `std` alone: no signal
+handler, no minidump, no second process. `binary` names the report's file, so the call
+asserts, at startup, that it is one non-empty path component: no separator, no root, not
+`.` or `..`. On a panic, on any thread, the hook:
 
 1. takes a lock it never releases, so that a panic on another thread waits for the abort
-   and the report is the process's first panic's;
-2. formats the report once, as text: `<binary> crashed`, `thread: <name>` (`<unnamed>` for
-   a thread without one), the panic's location and message as `std` prints them,
-   `backtrace:`, and a backtrace captured with `Backtrace::force_capture`, whatever
-   `RUST_BACKTRACE` says;
-3. writes it to stderr and flushes, before any file system call, so that a file system
-   that hangs or fails cannot cost it;
-4. when `dir` is `Some`, creates the directory with its parents and writes the same text to
-   a new file in it, `<binary>-<YYYYMMDD>T<HHMMSS>.<mmm>Z-<process id>.txt`, in UTC, so
-   that two crashes in one directory never share a name and the files sort by time; the
-   file is opened with `create_new`, so no report replaces another;
-5. writes one line to stderr: `<binary>: the crash report is in <path>`, or `<binary>: no
+   and the report is the process's first panic's. It takes no other lock while it holds
+   this one: a panic inside the hook makes `std` abort before the hook runs again;
+2. captures a backtrace with `Backtrace::force_capture`, whatever `RUST_BACKTRACE` says;
+3. writes to stderr `<binary> crashed`, `thread: <name>` (`<unnamed>` for a thread without
+   one) and the panic's location and message as `std` prints them, before anything else
+   that can stall: formatting the backtrace reads its symbols from the executable's files;
+4. writes to stderr `backtrace:` and the backtrace;
+5. when `dir` is `Some`, creates the directory with its parents and writes the whole report,
+   the same bytes as steps 3 and 4, to a new file in it,
+   `<binary>-<YYYYMMDD>T<HHMMSS>.<mmm>Z-<process id>.txt`, in UTC, so that two crashes in
+   one directory never share a name and the files sort by time; the file is opened with
+   `create_new`, so no report replaces another, and a file whose write failed is removed;
+6. writes one line to stderr: `<binary>: the crash report is in <path>`, or `<binary>: no
    crash report file at <path>: <error>` naming the directory or the file that failed;
-6. calls `std::process::abort`, in every profile.
+7. calls `std::process::abort`, in every profile.
 
-A directory that cannot be created or written, or a file that cannot be written, costs the
-file alone: the failure is that one line, never a second panic, and the abort follows
-(`docs/verification.md`, the writable disk). `None` writes stderr alone. The directory is
-the binary's to choose (`crates/app-headless/README.md` gives the headless binary's), and
-the hook does not resolve it: a relative path is taken against the working directory at the
-panic. `binary` names the file, so it holds no path separator. A hardware fault, a signal
-and a stack overflow never reach a panic hook; they are read from the operating system's
-own report (D155). Tests never install the hook (D16), so `#[should_panic]` and a property
-test's shrinking keep unwinding; a test that expects an abort runs a binary in a subprocess,
-as `crates/app-headless/tests/crash.rs` does.
+Stderr is written through a duplicate of its handle, never through `std`'s stderr lock: a
+thread that panics inside `eprintln!` holds that lock while its own hook waits for the
+first, and a thread waiting inside `eprintln!` on a lock the panicking thread holds would
+hold it until the abort, so a hook that took it would hang. The cost: what other threads
+write to stderr while the hook runs can interleave with the report on the terminal; the file
+is written whole. Where the handle cannot be duplicated (a Windows process with no console),
+the hook falls back to the locked stderr. A directory that cannot be created or written, or a
+file that cannot be written, costs the file alone: the failure is that one line, never a
+second panic, and the abort follows (`docs/verification.md`, the writable disk). `None`
+writes stderr alone. The directory is the binary's to choose (`crates/app-headless/README.md`
+gives the headless binary's), and the hook does not resolve it: a relative path is taken
+against the working directory at the panic, so a binary that changes its working directory
+passes an absolute one.
+
+Limits. A hardware fault, a signal and a stack overflow never reach a panic hook; they are
+read from the operating system's own report (D155). A panic whose payload's `Display`
+panics aborts in `std` before the hook runs. The hook names the thread through
+`std::thread::current`; on Linux, a panic in a foreign library's thread-exit destructor
+after `std`'s thread cleanup may make that call panic inside the hook, which `std` then
+aborts with no report: unverified, and not built around. Tests never install the hook
+(D16), so `#[should_panic]` and a property test's shrinking keep unwinding; a test that
+expects an abort runs a binary in a subprocess, as `crates/app-headless/tests/crash.rs`
+does.
 
 ## The saved-type record
 

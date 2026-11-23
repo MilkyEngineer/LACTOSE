@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_code)]
 
+mod test_hook;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -166,11 +168,6 @@ impl Args {
 /// `crash` in the working directory.
 const CRASH_DIR: &str = "LACTOSE_CRASH_DIR";
 
-/// The test hook (README, "Rules a caller should know"): set, the first frame's callback
-/// panics, on the frame worker that runs the timer root, so that a test sees the crash
-/// hook's report and the abort. Unset, the run is unchanged.
-const TEST_PANIC: &str = "LACTOSE_TEST_PANIC";
-
 /// Where a crash report's file goes: [`CRASH_DIR`]'s value, or `crash`.
 fn crash_dir() -> PathBuf {
     std::env::var_os(CRASH_DIR)
@@ -205,8 +202,8 @@ fn main() -> Result<ExitCode> {
     };
     let mut app = Headless::start(&GAME, config, Arc::clone(&cooked) as Arc<dyn Cooked>)?;
     let mut frames = frames(cooked)?;
-    if std::env::var_os(TEST_PANIC).is_some() {
-        frames = Box::new(|_| panic!("{TEST_PANIC} is set: the first frame panics"));
+    if let Some(panics) = test_hook::frames() {
+        frames = panics;
     }
     let report: RunReport = app.run(ticks, frames)?;
     println!(
