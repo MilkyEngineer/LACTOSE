@@ -232,6 +232,43 @@ fn encoders_are_reused_only_after_their_frames_point() {
     }
 }
 
+/// A frame's encoders are reused once its point is reached though a later frame is still
+/// pending: the graph holds pending encoders in frame order and frees every frame reached.
+#[test]
+fn a_reached_frames_encoders_are_reused_while_a_later_frame_is_pending() {
+    for queues in LAYOUTS {
+        let device = device(queues);
+        let target = image(&*device, "target", Sharing::Exclusive);
+        let gates = [held(&*device), held(&*device)];
+        in_job(move |ctx| {
+            let mut graph = graph(&device, 1, 1);
+            let declare = |ready| {
+                let mut decl = FrameDecl::new(1);
+                let target = decl.import_image(&lactose_render_graph::ImageImport {
+                    ready,
+                    ..image_import(
+                        "target",
+                        target,
+                        on(ImageState::Undefined, G),
+                        on(ImageState::ColourAttachment, G),
+                    )
+                });
+                decl.render_pass(&draws("draw", &[colour(target, Load::Clear([0.0; 4]))]), |_| {});
+                decl
+            };
+            let first = frame(&mut graph, ctx, declare(Some(gates[0]))).expect("a frame");
+            let second = frame(&mut graph, ctx, declare(Some(gates[1]))).expect("a frame");
+            assert_eq!(graph.stats().encoders, 2, "both frames pending");
+            graph.device().signal_timeline(gates[0]).expect("the host's signal");
+            reached(&**graph.device(), first);
+            let third = frame(&mut graph, ctx, declare(None)).expect("a frame");
+            assert_eq!(graph.stats().encoders, 2, "the third took the first's encoder");
+            graph.device().signal_timeline(gates[1]).expect("the host's signal");
+            reached(&**graph.device(), second);
+            reached(&**graph.device(), third);
+        });
+    }
+}
 /// A frame compiled by one graph is refused by another's `record`, and a frame recorded by
 /// one by another's `submit`.
 #[test]

@@ -68,7 +68,12 @@ pub fn device_of(set: Capabilities) -> Arc<Logged> {
         messages: Arc::new(Silent),
     };
     let inner = NullDevice::new(request, set).expect("a null device");
-    Arc::new(Logged { inner, submitted: Mutex::new(Vec::new()), destroyed: Mutex::new(Vec::new()) })
+    Arc::new(Logged {
+        inner,
+        submitted: Mutex::new(Vec::new()),
+        waits: Mutex::new(Vec::new()),
+        destroyed: Mutex::new(Vec::new()),
+    })
 }
 
 /// A null device of the least capabilities under `queues`.
@@ -341,10 +346,12 @@ pub struct Recorded {
 }
 
 /// A null device whose encoders keep a line for each command they record, and which keeps,
-/// for each submit it accepted, its role and its encoders' lines in slice order.
+/// for each submit it accepted, its role and its encoders' lines in slice order, and apart
+/// from those its role and its waits.
 pub struct Logged {
     pub inner: NullDevice,
     submitted: Mutex<Vec<(QueueRole, Vec<Recorded>)>>,
+    waits: Mutex<Vec<(QueueRole, Vec<TimelinePoint>)>>,
     destroyed: Mutex<Vec<(&'static str, bool)>>,
 }
 
@@ -352,6 +359,12 @@ impl Logged {
     /// The submits accepted so far, in the order they were made, and forgets them.
     pub fn take_submitted(&self) -> Vec<(QueueRole, Vec<Recorded>)> {
         core::mem::take(&mut *lock(&self.submitted))
+    }
+
+    /// The role and the waits of each submit accepted so far, in the order they were made,
+    /// and forgets them.
+    pub fn take_waits(&self) -> Vec<(QueueRole, Vec<TimelinePoint>)> {
+        core::mem::take(&mut *lock(&self.waits))
     }
 
     /// Each destroy of an image, a memory block or a timeline so far, and whether the device
@@ -752,6 +765,7 @@ impl Device for Logged {
         }
         if result.is_ok() {
             lock(&self.submitted).push((queue, recorded));
+            lock(&self.waits).push((queue, waits.to_vec()));
         }
         result
     }

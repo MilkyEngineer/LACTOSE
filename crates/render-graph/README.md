@@ -300,7 +300,7 @@ Three things these consumers must know that no signature shows:
 - On native Metal the one block is suspected to cost order: D158 fences placed images by
   block, so every encoder that uses a placed transient would wait for every earlier one
   that did, whether or not their bytes overlap. `rhi-metal` measures it; a block for each
-  run of transients that never alias is the remedy where it is so.
+  group of transients that share bytes is the remedy where it is so.
 - **The graph does not judge a read before the first write.** A declaration whose pass
   keeps, copies from or locally reads a transient no earlier pass wrote compiles and
   records. Null refuses its submit (`undefined-read`); a device reads undefined bytes.
