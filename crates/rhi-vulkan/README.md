@@ -191,9 +191,11 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   layout change, the transfer between families as a release and an acquire of equal values,
   no barrier between two families naming the host, the host's barrier after an acquire into
   `HostRead` on the acquiring family alone, a family without `GRAPHICS`, and two writes in
-  one writing state. In `src/encoder.rs`: a transition call's host barrier after an acquire
-  into `HostRead` between two families, in a call after the acquire's, and none after a
-  release or a change within one family. In `src/raw.rs`: compute
+  one writing state. In `src/encoder.rs`: `buffer_calls` puts the host barrier after an
+  acquire into `HostRead` between two families in its second list, on the acquiring side
+  alone, and none after a release or a change within one family; that `transition_buffers`
+  records the two lists in that order, as two calls, is held by reading. In `src/raw.rs`:
+  compute
   takes a family that does not draw first, and viewport bounds rounded inward to what an Apple
   GPU honours. In `src/records.rs`: a reached point completing its submit and the earlier ones
   of its queue, a failed submit's promise kept until its stamp and its wait are known
