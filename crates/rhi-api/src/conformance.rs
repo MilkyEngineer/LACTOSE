@@ -264,9 +264,9 @@ pub const CASES: &[Case] = cases! {
     contract "use_after_a_write_without_a_transition_is_refused" => State;
     contract "state_is_kept_for_each_mip_and_layer" => State;
     contract "state_follows_submission_order_not_recording_order" => State;
-    contract "transition_naming_a_subresource_twice_is_refused" => State;
-    contract "transition_of_overlapping_ranges_is_refused" => State;
-    contract "transition_naming_a_buffer_twice_is_refused" => State;
+    contract "transition_naming_a_subresource_twice_is_refused" => State everywhere;
+    contract "transition_of_overlapping_ranges_is_refused" => State everywhere;
+    contract "transition_naming_a_buffer_twice_is_refused" => State everywhere;
     contract "transitions_of_disjoint_mips_in_one_call_pass";
     contract "cross_queue_use_without_a_transfer_is_refused" => Queue;
     contract "acquire_without_a_release_is_refused" => Queue;

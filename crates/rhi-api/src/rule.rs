@@ -21,7 +21,7 @@ pub enum Rule {
     /// a state the subresource is not in, or a resource an earlier pass or copy wrote is
     /// used with no transition since, in submission order; or one transition call names
     /// an image's subresource, or a buffer, in two of its elements, which take effect
-    /// together and in no order.
+    /// together and in no order. Every backend checks the last, at the call.
     State,
     /// `no-qfot`: a use on a queue other than the owning one with no release and acquire
     /// between, an acquire with no release submitted, a change of a resource's state or

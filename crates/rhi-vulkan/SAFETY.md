@@ -37,13 +37,7 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
    lagging writer and a mutation that drops the barrier, as
    `dispatches_of_one_pass_see_each_others_writes` and `dispatch_indirect_reads_its_counts`
    have. A cross-queue use with the semaphore and without the family transfer is a hazard
-   of neither validator, and no canary shows it reported. A transition call that names one
-   subresource or one buffer twice is sent as one barrier command whose elements are
-   unordered: core validation reads them in order and hears nothing, synchronisation
-   validation reads them together and hears only a later element's layout change racing an
-   earlier write, and neither hears a release that follows a change or a take
-   (`transition_call_naming_a_resource_twice_is_sent_and_not_heard`); rhi-null's `state`
-   rule is the check.
+   of neither validator, and no canary shows it reported.
 2. **A shader's code, and what a shader reaches through data alone.** A module's header and
    its `OpCapability` and `OpExtension` instructions are checked; the rest of its code is the
    cook's and is trusted. An address, a slot or sampler index in push bytes or a buffer, an

@@ -108,9 +108,9 @@ contract leaves to the backend.
   can be refused by while recording; the first breach stops the recording, and its submit is
   refused with the breach's rule. A transition is recorded as one `vkCmdPipelineBarrier2` on
   the recording queue, its scopes from the two states (`lactose-rhi-api`'s README, "States");
-  its elements are unordered, and a call that names one subresource or one buffer twice is
-  rhi-null's to refuse (`state`), which this crate leaves to it as it does a wrong `from`;
-  a family without `GRAPHICS` gets no graphics stage. A re-take from `Undefined` carries
+  its elements are unordered, so a call that names one subresource or one buffer twice is
+  refused `state` at the call, before any of it is recorded, by `ImageRange::overlaps` as
+  null compares; a family without `GRAPHICS` gets no graphics stage. A re-take from `Undefined` carries
   `ALL_COMMANDS` and `MEMORY_WRITE` as its source scope. Two roles on two queues of one family
   are one layout change on the releasing queue and a semaphore (D160). A local read is a
   by-region barrier from colour attachment output to fragment shader input reads inside the
@@ -164,12 +164,7 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   which the run reports and goes past; and the drops while a thread unwinds: a last holder
   with a submit pending leaks the device and keeps its messengers' sink, one with nothing
   pending destroys everything, and an encoder dropped with its submit pending hands its pools
-  to the last holder; and a transition call that names one subresource or one buffer twice,
-  sent and heard by no validator: a take and then a change of a new image, and, where compute
-  has its own queue, a change or a take and then a release of an image and of a buffer.
-  Synchronisation validation hears a change and then another of an image a copy wrote (one
-  `SYNC-HAZARD-WRITE-AFTER-WRITE`, on the second element, under MoltenVK and KosmicKrisp),
-  which the test leaves out.
+  to the last holder.
 - Each validator's canary, a misuse whose message alone the run must hear. In
   `tests/device.rs`: core, an image declared in a state it is not in; synchronisation, two
   copies into one range; its load-after-store check, a target stored by one render pass and

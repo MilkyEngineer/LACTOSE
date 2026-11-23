@@ -397,19 +397,29 @@ fn state_follows_submission_order_not_recording_order(ctx: &Ctx<'_>) -> Applies 
 
 /// One call of each chain a frame's end can make of one subresource, each element valid
 /// alone: a change and then another, a change and then a release, a take from `Undefined`
-/// and then a release, and a change to the state the image is in and then a change. Under a
-/// set whose compute role shares the graphics queue the release is an ordinary change, and
-/// the call is refused all the same.
+/// and then a release, a change to the state the image is in and then a change, a change to
+/// `Undefined` and then a take, and a change and then one to `Undefined`, which a device
+/// records nothing for. Under a set whose compute role shares the
+/// graphics queue the release is an ordinary change, refused all the same, and one more
+/// chain starts on the compute role, as an acquire does where compute has a queue of its
+/// own. Then a change and another with another image's element between them.
 fn transition_naming_a_subresource_twice_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
+    let undefined = (ImageState::Undefined, G);
     let copied = (ImageState::CopyDestination, G);
     let sampled = (ImageState::SampledRead, G);
-    let chains: [[_; 2]; 4] = [
-        [(copied, sampled), (sampled, (ImageState::CopySource, G))],
+    let source = (ImageState::CopySource, G);
+    let mut chains = vec![
+        [(copied, sampled), (sampled, source)],
         [(copied, sampled), (sampled, (ImageState::SampledRead, C))],
-        [((ImageState::Undefined, G), copied), (copied, (ImageState::CopyDestination, C))],
+        [(undefined, copied), (copied, (ImageState::CopyDestination, C))],
         [(copied, copied), (copied, sampled)],
+        [(copied, undefined), (undefined, copied)],
+        [(copied, sampled), (sampled, undefined)],
     ];
+    if ctx.set.queues.compute != QueuePath::Own {
+        chains.push([((ImageState::CopyDestination, C), sampled), (sampled, source)]);
+    }
     for chain in chains {
         let image = copyable(ctx, &*device);
         let mut encoder = ctx.encoder(&*device, G);
@@ -421,26 +431,42 @@ fn transition_naming_a_subresource_twice_is_refused(ctx: &Ctx<'_>) -> Applies {
             "one transition call that names a subresource twice",
         );
     }
+    let (image, other) = (copyable(ctx, &*device), copyable(ctx, &*device));
+    let mut encoder = ctx.encoder(&*device, G);
+    fill(&mut *encoder, texels(ctx, &*device), image);
+    encoder.transition_images(&[
+        image_across(image, ImageRange::FIRST, copied, sampled),
+        image_across(other, ImageRange::FIRST, undefined, copied),
+        image_across(image, ImageRange::FIRST, sampled, source),
+    ]);
+    ctx.refused(
+        submit(&*device, G, &mut [encoder]),
+        "one transition call that names a subresource twice, another image's element between",
+    );
     Ok(())
 }
 
 /// Two elements of one call over ranges of one image that share a subresource: a range and
-/// one inside it, and two that cross, a mip of every layer and a layer of every mip.
+/// one inside it; two that cross, a mip of every layer and a layer of every mip; and two
+/// that share a part of one axis, neither holding the other, the first two mips and the
+/// last two.
 fn transition_of_overlapping_ranges_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let usage = ImageUsage::COPY_DESTINATION.union(ImageUsage::SAMPLED);
     let image = ctx.image(
         &*device,
-        &ImageDesc { mips: 2, layers: 2, ..image_desc(Format::Rgba8Unorm, EXTENT, usage) },
+        &ImageDesc { mips: 3, layers: 2, ..image_desc(Format::Rgba8Unorm, EXTENT, usage) },
     );
-    let all = ImageRange { mip: 0, mips: 2, layer: 0, layers: 2 };
-    let last = ImageRange { mip: 1, mips: 1, layer: 1, layers: 1 };
+    let all = ImageRange { mip: 0, mips: 3, layer: 0, layers: 2 };
+    let last = ImageRange { mip: 2, mips: 1, layer: 1, layers: 1 };
     let mip = ImageRange { mip: 1, mips: 1, layer: 0, layers: 2 };
-    let layer = ImageRange { mip: 0, mips: 2, layer: 0, layers: 1 };
+    let layer = ImageRange { mip: 0, mips: 3, layer: 0, layers: 1 };
+    let low = ImageRange { mip: 0, mips: 2, layer: 0, layers: 2 };
+    let high = ImageRange { mip: 1, mips: 2, layer: 0, layers: 2 };
     let take = |range| {
         image_across(image, range, (ImageState::Undefined, G), (ImageState::CopyDestination, G))
     };
-    for pair in [[all, last], [mip, layer]] {
+    for pair in [[all, last], [mip, layer], [low, high]] {
         let mut encoder = ctx.encoder(&*device, G);
         encoder.transition_images(&pair.map(take));
         ctx.refused(
@@ -452,21 +478,26 @@ fn transition_of_overlapping_ranges_is_refused(ctx: &Ctx<'_>) -> Applies {
 }
 
 /// One buffer named by two elements of one call: a take from `Undefined` and then a change,
-/// and a take and then a release.
+/// and a take and then a release; under a set whose compute role shares the graphics queue,
+/// a take on the compute role and then a change. Then a take and a change with another
+/// buffer's element between them.
 fn transition_naming_a_buffer_twice_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
+    let undefined = (BufferState::Undefined, G);
     let read = (BufferState::ShaderRead, G);
-    let chains = [
-        [
-            ((BufferState::Undefined, G), (BufferState::CopySource, G)),
-            ((BufferState::CopySource, G), (BufferState::CopyDestination, G)),
-        ],
-        [((BufferState::Undefined, G), read), (read, (BufferState::ShaderRead, C))],
+    let source = (BufferState::CopySource, G);
+    let destination = (BufferState::CopyDestination, G);
+    let mut chains = vec![
+        [(undefined, source), (source, destination)],
+        [(undefined, read), (read, (BufferState::ShaderRead, C))],
     ];
+    if ctx.set.queues.compute != QueuePath::Own {
+        chains.push([((BufferState::Undefined, C), source), (source, destination)]);
+    }
+    let usage = BufferUsage::COPY_SOURCE
+        .union(BufferUsage::COPY_DESTINATION)
+        .union(BufferUsage::DEVICE_ADDRESS);
     for chain in chains {
-        let usage = BufferUsage::COPY_SOURCE
-            .union(BufferUsage::COPY_DESTINATION)
-            .union(BufferUsage::DEVICE_ADDRESS);
         let buffer = ctx.buffer(&*device, SIZE, usage, MemoryClass::Device);
         let mut encoder = ctx.encoder(&*device, G);
         encoder.transition_buffers(&chain.map(|(from, to)| buffer_across(buffer, from, to)));
@@ -475,21 +506,32 @@ fn transition_naming_a_buffer_twice_is_refused(ctx: &Ctx<'_>) -> Applies {
             "one transition call that names a buffer twice",
         );
     }
+    let buffer = ctx.buffer(&*device, SIZE, usage, MemoryClass::Device);
+    let other = ctx.buffer(&*device, SIZE, usage, MemoryClass::Device);
+    let mut encoder = ctx.encoder(&*device, G);
+    encoder.transition_buffers(&[
+        buffer_across(buffer, undefined, source),
+        buffer_across(other, undefined, source),
+        buffer_across(buffer, source, destination),
+    ]);
+    ctx.refused(
+        submit(&*device, G, &mut [encoder]),
+        "one transition call that names a buffer twice, another buffer's element between",
+    );
     Ok(())
 }
 
-/// One call that takes each mip of an image from `Undefined`; one that moves the first two
-/// mips and each layer of the last to two other states; one that moves them back, each
-/// element from the state the call before left it in; then a transition of the whole image,
-/// which is accepted only where every element took effect. One call of two buffers beside.
+/// One call that takes each mip of an image from `Undefined`, and the first mip of a second
+/// image over the same range; one that moves the first two mips and each layer of the last
+/// to two other states; one that moves them back in another order, each element from the
+/// state the call before left it in; then a transition of the whole image, which is
+/// accepted only where every element took effect. One call of two buffers beside.
 fn transitions_of_disjoint_mips_in_one_call_pass(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let usage =
         ImageUsage::COPY_DESTINATION.union(ImageUsage::COPY_SOURCE).union(ImageUsage::SAMPLED);
-    let image = ctx.image(
-        &*device,
-        &ImageDesc { mips: 3, layers: 2, ..image_desc(Format::Rgba8Unorm, EXTENT, usage) },
-    );
+    let desc = ImageDesc { mips: 3, layers: 2, ..image_desc(Format::Rgba8Unorm, EXTENT, usage) };
+    let (image, other) = (ctx.image(&*device, &desc), ctx.image(&*device, &desc));
     let level = |mip| ImageRange { mip, mips: 1, layer: 0, layers: 2 };
     let cell = |layer| ImageRange { mip: 2, mips: 1, layer, layers: 1 };
     let copied = (ImageState::CopyDestination, G);
@@ -502,6 +544,7 @@ fn transitions_of_disjoint_mips_in_one_call_pass(ctx: &Ctx<'_>) -> Applies {
         image_across(image, level(0), (ImageState::Undefined, G), copied),
         image_across(image, level(1), (ImageState::Undefined, G), copied),
         image_across(image, level(2), (ImageState::Undefined, G), copied),
+        image_across(other, level(0), (ImageState::Undefined, G), copied),
     ]);
     encoder.transition_images(&[
         image_across(image, level(0), copied, sampled),
@@ -510,8 +553,8 @@ fn transitions_of_disjoint_mips_in_one_call_pass(ctx: &Ctx<'_>) -> Applies {
         image_across(image, cell(1), copied, source),
     ]);
     encoder.transition_images(&[
-        image_across(image, level(0), sampled, copied),
         image_across(image, level(1), source, copied),
+        image_across(image, level(0), sampled, copied),
         image_across(image, cell(1), source, copied),
         image_across(image, cell(0), sampled, copied),
     ]);

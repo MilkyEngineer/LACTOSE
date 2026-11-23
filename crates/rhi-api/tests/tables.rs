@@ -1,14 +1,14 @@
 //! The bodies the facade does have: the rule names, the refusal's round trip, the queue
-//! layout, the indirect record, the varyings rule's message, a constant value's equality and
-//! the conformance table's own consistency.
+//! layout, the indirect record, the varyings rule's message, a constant value's equality, an
+//! image range's overlap and the conformance table's own consistency.
 
 use std::collections::BTreeSet;
 
 use lactose_core::{Error, ErrorKind};
 use lactose_rhi_api::conformance::{CASES, CaseKind};
 use lactose_rhi_api::{
-    ComponentType, ConstantType, ConstantValue, CookedShader, IndexedIndirectArgs, QueueLayout,
-    QueuePath, QueueRole, Rule, ShaderStage, ShaderTarget, Varying, check_varyings,
+    ComponentType, ConstantType, ConstantValue, CookedShader, ImageRange, IndexedIndirectArgs,
+    QueueLayout, QueuePath, QueueRole, Rule, ShaderStage, ShaderTarget, Varying, check_varyings,
 };
 
 #[test]
@@ -77,7 +77,7 @@ fn indirect_record_is_five_little_endian_words() {
 
 /// The refusal cases a device backend runs: one or more for each clause of the rules
 /// table's "Every backend" column.
-const EVERYWHERE: [&str; 66] = [
+const EVERYWHERE: [&str; 69] = [
     "unreported_capability_is_refused",
     "submit_to_the_present_role_is_refused",
     "overlapping_host_access_is_refused",
@@ -105,6 +105,9 @@ const EVERYWHERE: [&str; 66] = [
     "undeclared_slot_argument_is_refused",
     "undeclared_address_argument_is_refused",
     "buffer_declared_in_two_states_is_refused",
+    "transition_naming_a_subresource_twice_is_refused",
+    "transition_of_overlapping_ranges_is_refused",
+    "transition_naming_a_buffer_twice_is_refused",
     "shader_needing_an_unenabled_capability_is_refused",
     "pipeline_of_other_formats_than_its_pass_is_refused",
     "encoder_reset_while_pending_is_refused",
@@ -199,6 +202,32 @@ fn constant_values_are_equal_by_type_and_bits() {
     for (value, ty) in types {
         assert_eq!(value.ty(), ty);
     }
+}
+
+#[test]
+fn image_ranges_overlap_by_a_mip_and_a_layer_in_both() {
+    let range = |mip, mips, layer, layers| ImageRange { mip, mips, layer, layers };
+    let cases = [
+        (range(0, 2, 0, 2), range(1, 1, 1, 1), true),
+        (range(0, 1, 0, 3), range(0, 3, 2, 1), true),
+        // Ends that touch share nothing, on either axis.
+        (range(0, 1, 0, 1), range(1, 1, 0, 1), false),
+        (range(0, 1, 0, 1), range(0, 1, 1, 1), false),
+        // A mip in both and no layer in both.
+        (range(0, 2, 0, 1), range(1, 1, 1, 1), false),
+        // A range of no mips or no layers shares none, inside the other or not.
+        (range(1, 0, 0, 1), range(0, 3, 0, 1), false),
+        (range(0, 1, 1, 0), range(0, 1, 0, 3), false),
+        // Ends past `u32::MAX` do not wrap.
+        (range(u32::MAX, u32::MAX, 0, 1), range(0, 1, 0, 1), false),
+        (range(u32::MAX, 1, u32::MAX, 1), range(u32::MAX, 2, 0, u32::MAX), false),
+        (range(u32::MAX, 1, u32::MAX, 1), range(1, u32::MAX, 1, u32::MAX), true),
+    ];
+    for (one, other, shared) in cases {
+        assert_eq!(one.overlaps(other), shared, "{one:?} and {other:?}");
+        assert_eq!(other.overlaps(one), shared, "{other:?} and {one:?}");
+    }
+    assert!(ImageRange::FIRST.overlaps(ImageRange::FIRST));
 }
 
 #[test]

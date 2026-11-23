@@ -9,9 +9,9 @@ use std::sync::Arc;
 use lactose_rhi_api::{
     BufferCopy, BufferHandle, BufferImageCopy, BufferReach, BufferState, BufferTransition,
     BufferUsage, ComputePass, ComputePipelineHandle, Encoder, Extent, Format,
-    GraphicsPipelineHandle, HeapSlot, ImageHandle, ImageRange, ImageState, ImageTransition,
-    ImageUsage, IndexedIndirectArgs, Load, PUSH_BYTES_MAX, PassReach, QueueRole, Rect, RenderPass,
-    Rule, Store, Target, Viewport,
+    GraphicsPipelineHandle, HeapSlot, ImageHandle, ImageState, ImageTransition, ImageUsage,
+    IndexedIndirectArgs, Load, PUSH_BYTES_MAX, PassReach, QueueRole, Rect, RenderPass, Rule, Store,
+    Target, Viewport,
 };
 
 use crate::device::{BufferObj, ComputeObj, GraphicsObj, ImageObj, Shared, range};
@@ -433,7 +433,7 @@ impl Encoder for NullEncoder {
             }
             let repeats = transitions[..at]
                 .iter()
-                .any(|earlier| earlier.image == transition.image && share(earlier.range, range));
+                .any(|earlier| earlier.image == transition.image && earlier.range.overlaps(range));
             if repeats {
                 self.fail(Rule::State, "a transition call that names a subresource twice");
                 return;
@@ -1064,15 +1064,6 @@ const fn state_usage(state: ImageState) -> ImageUsage {
         ImageState::CopySource => ImageUsage::COPY_SOURCE,
         ImageState::CopyDestination => ImageUsage::COPY_DESTINATION,
     }
-}
-
-/// Whether two ranges of one image share a subresource. Both are inside the image, so
-/// neither end overflows.
-const fn share(one: ImageRange, other: ImageRange) -> bool {
-    one.mip < other.mip + other.mips
-        && other.mip < one.mip + one.mips
-        && one.layer < other.layer + other.layers
-        && other.layer < one.layer + one.layers
 }
 
 /// Whether two of `ranges`, each a start and an end past it, share a byte.
