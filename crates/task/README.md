@@ -189,9 +189,13 @@ and list what changed, because `lactose-ecs` is written against this surface.
   future's waker, under `AllocTag::Task` on the calling thread; where std's mutex allocates on
   its first lock, as on Apple targets, the cell's mutex is a second allocation, made there too.
   Beyond those, a share of a block of the jobs' queue, and a child a share of a block of the
-  children's queue: one block per 63 entries. It takes the completion slot's lock at its
-  start, at its end and at each poll of the future, and no other. A fan-out that would fill W
-  workers takes W/(W − 1) as long.
+  children's queue: one block per 63 entries. It takes no lock but the completion slot's,
+  and that one twice at its start, on the calling thread and on the worker that takes the
+  closure; once at its end; at each poll of the future; once when the future is dropped
+  unresolved; and, for a job shutdown cancels, once if a worker has taken it and twice if not.
+  A fan-out cut for W − 1 workers takes W/(W − 1) as long as one cut for W; one that is not
+  takes as many rounds as its pieces need on W − 1 workers (four equal children on four
+  workers take twice as long).
 
 **Workers**
 
@@ -290,10 +294,12 @@ and list what changed, because `lactose-ecs` is written against this surface.
   and a push onto the worker's own list. The log grows by 28 bytes per job for the life of
   the executor.
 - A recorded `ExecutionLog` replays the same job-to-worker order. The log lists every call of
-  `GraphNode::run` and `finalize` and every scope child in the order they started, with the
-  worker that ran each. Replay hands each worker exactly the job the log names next. It needs
-  the frame-critical worker count the log was recorded with and a program that starts the
-  same graph runs in the same order. Tasks are not recorded.
+  `GraphNode::run` and `finalize`, every scope child and every closure of `run_job` in the
+  order they started, with the worker that ran each. Replay hands each worker exactly the job
+  the log names next. It needs the frame-critical worker count the log was recorded with and a
+  program that starts the same graph runs and `run_job` calls in the same order. Tasks are not
+  recorded. A replay does not keep the width of `run_job`: it hands out such work by the log
+  and leaves the count alone, so it runs as the recorded run did and no narrower.
 - A log the program cannot follow aborts the process with a diagnostic, two seconds after the
   replay has work waiting, nothing running, and the job the log names next not among it. A
   log whose next job belongs to a graph run the program has not started yet is not stuck:
@@ -365,22 +371,35 @@ Correctness:
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
   Eleven models are explored exhaustively. The three with three threads are bounded at five
   preemptions, the idle-release one at four (`LOOM_MAX_PREEMPTIONS` overrides the bounds).
-  Five more hold `run_job`: the completion slot against a dropped `JobRun`, exhaustively; a
-  worker taking the job against shutdown beginning, at five preemptions; and the width in
-  three configurations with the sleep protocol, at two: a width of one, two workers beside a
-  main thread that queues two jobs; a width of two with two jobs on three workers; and a width
-  of two with one job on three workers whose scope forks a range, the worker that puts a half
-  back held until that half has run. The jobs of the last two are queued before their workers
-  start, which keeps those searches within minutes. Each model counts only beside weakened
-  variants that fail it, which run with it (`weakened_*`): under loom 0.7.2 a model whose
-  reader is the main thread may explore one execution.
+  Eight more hold `run_job`: the completion slot against a dropped `JobRun`, exhaustively; a
+  worker taking the job against shutdown beginning, at five preemptions; the width in three
+  configurations with the sleep protocol, at two: a width of one, two workers beside a main
+  thread that queues two jobs; a width of two with two jobs on three workers; and a width of
+  two with one job on three workers whose scope forks a range, the worker that puts a half
+  back held until that half has run; a job queued at a width of two while a worker gives back
+  a child's place it took for nothing, at two; a child that only the wake of a holder's
+  `leave` can deliver, at one; and a job and a task queued through `ShutdownFlag::queue`
+  against shutdown's flag and sweep, at one. The jobs of the width's configurations of three
+  workers are queued before their workers start, which keeps those searches within minutes.
+  Each model counts only beside weakened variants that fail it, which run with it
+  (`weakened_*`), each at the model's bound: under loom 0.7.2 a model whose reader is the main
+  thread may explore one execution. Four terms of `run_job`'s are copies in the models, since
+  loom cannot run the types they live in; the module's doc names each and the native test
+  that holds it.
 - `src/executor/job_tests.rs` holds the width by order and never by a time, each wait bounded
   by a thread of the test's own: with children of a `run_job` job held where they begin, a
   task's `sleep_until` resolves and a graph run completes beside them, on four
   frame-critical workers, on two, where every child runs on the job's own worker, and with
-  the opener parked on its latch and a second job waiting behind it. `tests/jobs.rs` holds
-  where a job runs, shutdown, the gate and who drops the value; `tests/job_alloc.rs` counts a
-  call's allocations, in a binary of its own because it installs a global allocator.
+  the opener parked on its latch, its place kept, and a second job waiting behind it. There
+  too: a second job waits beside a first that leaves room in the width, by the flag alone; a
+  job queued while the gate holds the other worker is still queued once that worker, woken
+  for it, sleeps again; a range in a job splits to a second worker; and an opener that parked
+  takes the halves queued after it parked. `tests/jobs.rs` holds where a job runs, shutdown,
+  the reservation, who drops the value, a job queued as the one frame-critical worker goes
+  idle, 5,000 times with the gaps swept across the window before it sleeps, and a child that
+  crosses to another worker, which the Miri runs check too. `src/pool.rs` holds a job taken
+  at a closed gate and one taken after shutdown began. `tests/job_alloc.rs` counts a call's
+  allocations, in a binary of its own because it installs a global allocator.
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it
   would run on loom primitives, which panic outside a loom model.
