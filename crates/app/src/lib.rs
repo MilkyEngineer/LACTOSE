@@ -21,6 +21,7 @@
 
 mod assemble;
 mod client;
+mod crash;
 mod game;
 mod headless;
 mod policy;
@@ -31,6 +32,7 @@ mod shown;
 mod world;
 
 pub use client::{Client, ClientError, ClientFrame, ClientOutput, build_client};
+pub use crash::install_crash_hook;
 pub use game::{CrateRegistration, Game};
 pub use headless::{Headless, HeadlessConfig, RunReport};
 pub use policy::{ErrorPolicy, LOG_TARGET, Response, Source};
