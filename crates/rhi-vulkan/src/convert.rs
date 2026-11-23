@@ -182,8 +182,8 @@ pub(crate) const fn image_scope(state: ImageState) -> Scope {
         ImageState::CopyDestination => {
             scope(S::COPY, A::TRANSFER_WRITE, A::TRANSFER_WRITE, L::TRANSFER_DST_OPTIMAL)
         }
-        // No swapchain here: a device made with no surface has no image a present takes,
-        // and `PRESENT_SRC_KHR` needs the swapchain's extension. The swapchain's lane maps it.
+        // `PRESENT_SRC_KHR` needs the swapchain's extension: the encoder gives a swapchain's
+        // image that layout, and any other image moved to `Present` is in this one.
         ImageState::Present => scope(S::ALL_COMMANDS, A::NONE, A::NONE, L::GENERAL),
     }
 }

@@ -14,7 +14,7 @@ use crate::device::{Shared, TimelineObj, alive, lost};
 use crate::encoder::VulkanEncoder;
 use crate::lock;
 use crate::raw::driver;
-use crate::records::{Records, stale};
+use crate::records::{Records, Release, stale};
 
 /// The encoders of `submit` as Vulkan's, `None` for one of another backend.
 fn encoders<'a>(submit: &'a Submit<'_>) -> impl Iterator<Item = Option<&'a VulkanEncoder>> {
@@ -134,6 +134,47 @@ pub(crate) fn submit(shared: &Shared, role: QueueRole, submit: Submit<'_>) -> Re
     let mut submit = submit;
     let queue = shared.queue_of(role);
     let _queue = lock(&shared.queues[queue]);
+    match stage(shared, queue, role, &mut submit, false)? {
+        Staging::Staged(staged) => send(shared, staged, &submit, Binary::default()),
+        Staging::Undecided(point) => {
+            unreachable!("a submit is staged without a walk, yet {point:?} was left undecided")
+        }
+    }
+}
+
+/// A submit checked and stamped, with its points' semaphores held through the driver's call.
+pub(crate) struct Staged {
+    queue: usize,
+    pub(crate) seq: u64,
+    waits: Vec<(Arc<TimelineObj>, u64)>,
+    signals: Vec<(Arc<TimelineObj>, u64)>,
+}
+
+/// What [`stage`] made of a submit.
+pub(crate) enum Staging {
+    Staged(Staged),
+    /// A present's walk left this point undecided: nothing is stamped.
+    Undecided(TimelinePoint),
+}
+
+/// The binary semaphores a present's submit adds to its batch: the acquire's to wait for,
+/// where no batch has waited for it yet, and the image's present semaphore to signal.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Binary {
+    pub(crate) wait: Option<vk::Semaphore>,
+    pub(crate) signal: Option<vk::Semaphore>,
+}
+
+/// The checks of a submit to `queue` for `role`, under that queue's lock, which the caller
+/// holds, and its stamp; for a present (`walk`), its release walk first, and nothing is
+/// stamped where the walk leaves a point undecided.
+pub(crate) fn stage(
+    shared: &Shared,
+    queue: usize,
+    role: QueueRole,
+    submit: &mut Submit<'_>,
+    walk: bool,
+) -> Result<Staging> {
     let read = shared.read_queues();
     let points: Vec<_> = submit
         .waits
@@ -141,22 +182,37 @@ pub(crate) fn submit(shared: &Shared, role: QueueRole, submit: Submit<'_>) -> Re
         .chain(submit.signals)
         .filter_map(|point| shared.read_timeline(point.timeline))
         .collect();
-    let (seq, waits, signals) = {
-        let mut records = shared.records();
-        alive(&records)?;
-        records.fold(&read, &points);
-        check(shared, &records, role, &submit)?;
-        records.check_points(queue, submit.waits, submit.signals)?;
-        let waits = semaphores(shared, submit.waits)?;
-        let signals = semaphores(shared, submit.signals)?;
-        let seq = records.stamp(queue, submit.waits, submit.signals);
-        commit(&mut records, queue, seq, &mut submit);
-        (seq, waits, signals)
-    };
+    let mut records = shared.records();
+    alive(&records)?;
+    records.fold(&read, &points);
+    check(shared, &records, role, submit)?;
+    records.check_points(queue, submit.waits, submit.signals)?;
+    if walk && let Release::Undecided(point) = records.release(queue, submit.waits)? {
+        return Ok(Staging::Undecided(point));
+    }
+    let waits = semaphores(shared, submit.waits)?;
+    let signals = semaphores(shared, submit.signals)?;
+    let seq = records.stamp(queue, submit.waits, submit.signals);
+    commit(&mut records, queue, seq, submit);
+    Ok(Staging::Staged(Staged { queue, seq, waits, signals }))
+}
+
+/// The driver's call of a staged submit, under its queue's lock, which the caller holds,
+/// with `binary`'s semaphores; then the hold that records it received. Where the call
+/// fails and the device is not lost, an empty batch takes the stamp, waiting for
+/// `binary`'s wait, so that the acquire's semaphore is spent either way, and signalling no
+/// present semaphore.
+pub(crate) fn send(
+    shared: &Shared,
+    staged: Staged,
+    submit: &Submit<'_>,
+    binary: Binary,
+) -> Result<()> {
+    let Staged { queue, seq, waits, signals } = staged;
     let raw = &shared.raw;
     let target = shared.queue(queue);
     let mut ended = Ok(());
-    for encoder in encoders(&submit).flatten() {
+    for encoder in encoders(submit).flatten() {
         ended = ended.and_then(|()| {
             // SAFETY: the command buffer is recording, outside any pass (checked), and this
             // submit's alone: its encoder is borrowed by the submit.
@@ -164,7 +220,7 @@ pub(crate) fn submit(shared: &Shared, role: QueueRole, submit: Submit<'_>) -> Re
                 .map_err(|e| driver(e, "vkEndCommandBuffer"))
         });
     }
-    let buffers: Vec<_> = encoders(&submit)
+    let buffers: Vec<_> = encoders(submit)
         .flatten()
         .map(|encoder| {
             vk::CommandBufferSubmitInfo::default().command_buffer(encoder.command_buffer)
@@ -176,10 +232,17 @@ pub(crate) fn submit(shared: &Shared, role: QueueRole, submit: Submit<'_>) -> Re
             .value(value)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
     };
-    let wait_infos: Vec<_> =
-        waits.iter().map(|(object, value)| point(object.semaphore, *value)).collect();
-    let mut signal_infos: Vec<_> =
-        signals.iter().map(|(object, value)| point(object.semaphore, *value)).collect();
+    let acquired: Vec<_> = binary.wait.map(|semaphore| point(semaphore, 0)).into_iter().collect();
+    let wait_infos: Vec<_> = waits
+        .iter()
+        .map(|(object, value)| point(object.semaphore, *value))
+        .chain(acquired.iter().copied())
+        .collect();
+    let mut signal_infos: Vec<_> = signals
+        .iter()
+        .map(|(object, value)| point(object.semaphore, *value))
+        .chain(binary.signal.map(|semaphore| point(semaphore, 0)))
+        .collect();
     signal_infos.push(point(target.timeline, seq));
     let submitted = ended.and_then(|()| {
         let info = vk::SubmitInfo2::default()
@@ -190,7 +253,10 @@ pub(crate) fn submit(shared: &Shared, role: QueueRole, submit: Submit<'_>) -> Re
         // buffer is executable and in no other pending submit (`Encoding`); every resource
         // and pipeline it names is held by its encoder and was live at the checks; every
         // signal grows past its timeline's values and pending signals (`Timeline`), and the
-        // queue's own timeline grows by one.
+        // queue's own timeline grows by one. A binary wait is an acquire's semaphore, which
+        // the acquire signalled and no batch has waited for; a binary signal is the image's
+        // present semaphore, whose last wait, by the image's last present, is done (that
+        // present's fence has signalled).
         unsafe { raw.device.queue_submit2(target.queue, &[info], vk::Fence::null()) }
             .map_err(|e| driver(e, "vkQueueSubmit2"))
     });
@@ -201,7 +267,9 @@ pub(crate) fn submit(shared: &Shared, role: QueueRole, submit: Submit<'_>) -> Re
             // The stamp is taken: the queue's timeline reaches it with an empty batch, so
             // that the submits after it are not held back and what it named is let go.
             let own = [point(target.timeline, seq)];
-            let info = vk::SubmitInfo2::default().signal_semaphore_infos(&own);
+            let info = vk::SubmitInfo2::default()
+                .wait_semaphore_infos(&acquired)
+                .signal_semaphore_infos(&own);
             // SAFETY: as above, with no command buffer and no caller's point.
             let retried =
                 unsafe { raw.device.queue_submit2(target.queue, &[info], vk::Fence::null()) };

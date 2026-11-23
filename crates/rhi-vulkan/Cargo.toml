@@ -16,6 +16,15 @@ ash.workspace = true
 lactose-core.workspace = true
 # The interface this crate implements, and `Rule::refuse` for each refusal.
 lactose-rhi-api.workspace = true
+# The window's handles a surface is made from.
+raw-window-handle.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `pthread_main_np` before a layer is made for an AppKit view, and the host clock
+# `VK_GOOGLE_display_timing`'s times are on (`CLOCK_UPTIME_RAW`).
+libc.workspace = true
+# The `CAMetalLayer` a surface is made on for an AppKit view.
+raw-window-metal.workspace = true
 
 [dev-dependencies]
 # The suite's cases, run against a driver by `tests/conformance.rs` when `cargo xtask gpu`

@@ -4,8 +4,10 @@ Every `unsafe` block carries a `// SAFETY:` comment. This file states the invari
 comments rely on. Architecture section 21 lists the reason for unsafe here: FFI to the Vulkan
 driver, through `ash`, whose every driver call is an `unsafe fn`. No `unsafe` of this crate
 is anything else: it has no `unsafe` data structure, and its integration tests forbid `unsafe`.
-The one `unsafe` block of its unit tests is the thread-safety canary's (below), a driver call
-that breaks the queue's external synchronisation on purpose.
+Two of its unit tests have `unsafe` blocks, each a driver call that breaks a rule on purpose:
+the thread-safety canary's (below), which breaks the queue's external synchronisation, and the
+injected reuse of an acquire semaphore (`src/swapchain.rs`), whose batch waits for the
+semaphore under the queue's lock before the test takes it as free.
 
 The methods of `VulkanDevice` and its encoders are safe, and their callers forbid `unsafe`, so
 no call they make may reach undefined behaviour through this crate's code. Each driver call is
@@ -68,6 +70,32 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   is destroyed before the instance, and the sink is freed and the loader released after the
   instance, never before: the loader is a `ManuallyDrop` and the sink a pointer with no drop
   of its own, so neither goes with the fields. On the leak path neither is freed.
+
+### The surface and the swapchain (`surface.rs`, `swapchain.rs`)
+
+- A window's surface is made from the handles its `SurfaceSource` lends, read once on the
+  constructor's thread; the surface keeps the source, so the handles live as long as the
+  surface. An AppKit view's layer is made by `raw-window-metal` on the main thread alone
+  (`pthread_main_np` is checked first, as `Layer::from_ns_view` requires), and the surface
+  keeps the layer. `Raw`'s drop destroys the surface after the device and before the
+  messenger and the instance; a swapchain holds the device, so none outlives it.
+- An acquire signals a semaphore no operation is pending on: one never used, or one whose
+  waiting submit the present queue's timeline shows complete. A present's submit waits for
+  the acquire's semaphore once and signals the image's present semaphore, whose last wait,
+  that image's last present, has its present fence signalled first. `vkQueuePresentKHR` is
+  called under the present queue's lock, which every submit to that queue takes, after the
+  submit; every signal its semaphore depends on has been submitted, as the present's walk
+  decided before the submit was stamped (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
+- An image given up while acquired, at `resize` or the drop, has its semaphore waited for by
+  an empty batch, so that no signalled semaphore is destroyed or reused unwaited.
+- The old swapchain is destroyed, and the drop destroys the swapchain, only once every
+  present fence of it has signalled, or after a loss; their semaphores, only once the
+  submits that wait for them are complete. A drop whose waits do not end within three
+  seconds destroys none of them. The images' views, which their objects own, may be destroyed
+  after the swapchain that owns the images: a submit holds the objects of what it names, and
+  a view is not used after its image is destroyed.
+- `vkGetPastPresentationTimingGOOGLE` is called on the swapchain from the thread that
+  acquires and presents, between those calls (`Swapchain` is not `Sync`).
 
 ### The messenger's callback (`raw.rs`, `on_message`)
 

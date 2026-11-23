@@ -83,6 +83,9 @@ rapier3d-f64 = { version = "=0.36.0", default-features = false, features = [
 # Pinned exactly, with its features named: the types a surface is made from
 # (crates/rhi-api/README.md), which the platform crate hands over and each backend reads.
 raw-window-handle = { version = "=0.6.2", default-features = false, features = ["std"] }
+# Pinned exactly: the `CAMetalLayer` a Vulkan surface is made on for an AppKit view, kept the
+# view's size and scale on the main thread (crates/rhi-api/README.md, "The swapchain").
+raw-window-metal = "=1.0.0"
 rayon = "1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

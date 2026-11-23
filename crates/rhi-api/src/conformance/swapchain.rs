@@ -140,7 +140,8 @@ fn present_behind_an_unmet_wait_is_refused(ctx: &Ctx<'_>) -> Applies {
     let unmet = ctx.point(&*device, 1);
     let done = ctx.point(&*device, 1);
     let mut encoders = [frame(ctx, &*device, &[image])];
-    let waits: &[TimelinePoint] = if ctx.set.queues.present == QueuePath::Shared {
+    // The device's own path: a surface may give the present role a queue the set's lacks.
+    let waits: &[TimelinePoint] = if device.capabilities().queues.present == QueuePath::Shared {
         ctx.submit(&*device, G, &mut [], &[unmet], &[]);
         &[]
     } else {

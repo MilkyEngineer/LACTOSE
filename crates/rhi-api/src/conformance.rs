@@ -86,7 +86,8 @@ pub trait Harness {
 
     /// A new device that reports exactly `set`, one of [`sets`](Self::sets), with
     /// `messages` as its sink. With `presents` it has a surface to make a swapchain for:
-    /// null's is its own, and needs no window.
+    /// null's is its own, and needs no window; its present path is then the one the
+    /// surface gives, which may be `Own` where the set's is `Shared`.
     ///
     /// # Errors
     ///

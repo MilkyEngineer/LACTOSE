@@ -8,6 +8,7 @@
 
 mod conformance;
 mod device;
+mod swapchain;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

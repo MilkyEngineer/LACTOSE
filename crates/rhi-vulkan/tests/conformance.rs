@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use lactose_core::{Error, ErrorKind, Result};
+use lactose_core::Result;
 use lactose_rhi_api::conformance::{self, CASES, Case, CaseKind, Harness, Outcome};
 use lactose_rhi_api::{
     Capabilities, CookedShader, Device, DeviceRequest, Message, MessageSink, ShaderStage,
@@ -51,13 +51,13 @@ impl Harness for Vulkan {
         messages: Arc<dyn MessageSink>,
         presents: bool,
     ) -> Result<Box<dyn Device>> {
+        let request = request(Arc::new(Shown(messages)));
+        // A run has no window: the swapchain's cases present to a headless surface, and
+        // are skipped on a driver that offers none (`Unsupported`).
         if presents {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "a Vulkan device with a surface: this run has no window",
-            ));
+            return Ok(Box::new(VulkanDevice::headless(request)?));
         }
-        Ok(Box::new(VulkanDevice::new(request(Arc::new(Shown(messages))))?))
+        Ok(Box::new(VulkanDevice::new(request)?))
     }
 
     fn device_with_cache(

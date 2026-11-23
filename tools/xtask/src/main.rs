@@ -289,10 +289,14 @@ const SHADERS: &str = "shaders";
 const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
 /// The device tests the Vulkan step runs: each package, its test target (`None` for its
 /// library's unit tests) and the prefix of the names taken, whose ignored tests are the ones
-/// that need a device. The library's are its `canary` module's alone: the thread-safety
-/// canary, whose unlocked driver call no safe call can make.
-const DEVICE_TESTS: [(&str, Option<&str>, &str); 2] =
-    [("lactose-rhi-vulkan", None, "canary::"), ("lactose-rhi-vulkan", Some("integration"), "")];
+/// that need a device. The library's are its `canary` module's, the thread-safety canary,
+/// whose unlocked driver call no safe call can make, and its `swapchain` module's, the
+/// injected reuse of an acquire semaphore, which no safe call can make either.
+const DEVICE_TESTS: [(&str, Option<&str>, &str); 3] = [
+    ("lactose-rhi-vulkan", None, "canary::"),
+    ("lactose-rhi-vulkan", None, "swapchain::"),
+    ("lactose-rhi-vulkan", Some("integration"), ""),
+];
 
 /// What `gpu` was asked to run.
 struct GpuArgs<'a> {
@@ -1044,13 +1048,13 @@ mod tests {
     }
 
     #[test]
-    fn the_librarys_unit_tests_run_as_device_tests_by_the_canary_module_alone() {
+    fn the_librarys_unit_tests_run_as_device_tests_by_the_canary_and_swapchain_modules() {
         let library: Vec<&str> = DEVICE_TESTS
             .iter()
             .filter(|(_, target, _)| target.is_none())
             .map(|(_, _, prefix)| *prefix)
             .collect();
-        assert_eq!(library, ["canary::"]);
+        assert_eq!(library, ["canary::", "swapchain::"]);
     }
 
     #[test]

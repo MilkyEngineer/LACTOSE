@@ -1,9 +1,10 @@
 # lactose-rhi-vulkan
 
-The Vulkan backend of `lactose-rhi-api`, with no window: a device made against the contract's
+The Vulkan backend of `lactose-rhi-api`: a device made against the contract's
 required set on a Vulkan 1.3 driver with `VK_KHR_dynamic_rendering_local_read`, reporting what
 it offers of the optional set, that checks every rule of the contract's "Every backend" column
-before the driver call the rule guards. It runs on Linux and Windows drivers, lavapipe in CI,
+before the driver call the rule guards, with a swapchain where the request names a window or a
+test asks for a headless surface. It runs on Linux and Windows drivers, lavapipe in CI,
 and on macOS through MoltenVK or KosmicKrisp. Test support: the render crates may run their
 tests on a device through it (decision 5.12 of the milestone 2 plan).
 
@@ -13,16 +14,17 @@ tests on a device through it (decision 5.12 of the milestone 2 plan).
 | Determinism boundary | outside; a boundary crate's test may not name it (`cargo xtask boundary`) |
 | Unsafe | yes, FFI to the Vulkan driver (architecture section 21); see `SAFETY.md` |
 
-**Status: implemented, without the swapchain.** A request with a surface is refused
-`Unsupported`; the swapchain, the present and the mapping of present errors are lane
-`swapchain`'s. `crates/rhi-api/README.md` is the contract, and this file states only what the
-contract leaves to the backend.
+**Status: implemented.** The swapchain is run on a headless surface alone so far: the window
+cases (MoltenVK's blocking drawable, a readback of a swapchain image, the display-time report's
+run) are owed ("The swapchain"). `crates/rhi-api/README.md` is the contract, and this file
+states only what the contract leaves to the backend.
 
 ## The public items
 
 | Item | What it is |
 |---|---|
-| `VulkanDevice::new(DeviceRequest)` | A device on the adapter whose name contains the request's `adapter`, or on the loader's first; its sink takes every warning and error of the validation layer, the loader and the driver through the debug messenger; its pipeline cache starts from the request's bytes, empty, loaded or rejected |
+| `VulkanDevice::new(DeviceRequest)` | A device on the adapter whose name contains the request's `adapter`, or on the loader's first; its sink takes every warning and error of the validation layer, the loader and the driver through the debug messenger; its pipeline cache starts from the request's bytes, empty, loaded or rejected; with the request's `surface`, a surface of that window and the present queue |
+| `VulkanDevice::headless(DeviceRequest)` | As `new`, presenting to a surface no window shows (`VK_EXT_headless_surface`), for tests that need a swapchain; `Unsupported` for a request that names a window, and on a driver with no headless surface |
 
 `VulkanDevice` is a `Device`; its encoders are `Box<dyn Encoder>`.
 
@@ -46,8 +48,11 @@ contract leaves to the backend.
 - **Queues by role.** The graphics queue is the first of a family that draws and computes.
   Compute has a queue of its own in a family that computes and does not draw, else in another
   family that computes, else as a second queue of the graphics family; with none it shares the
-  graphics queue (`QueueLayout`). Present shares the graphics queue until the swapchain gives
-  it one. The compute family may not draw, so a `Compute` encoder's render pass and depth
+  graphics queue (`QueueLayout`). On a device with a surface, present has a queue of its own
+  in a family other than the graphics family that draws and can present to the surface, else
+  a further queue of the graphics family, else it shares the graphics queue where that family
+  presents, and the device is `Unsupported` where no family presents; on a device with no
+  surface it shares the graphics queue. The compute family may not draw, so a `Compute` encoder's render pass and depth
   image copy are refused (`encoding`) on every layout, as the contract says; its graphics
   bind and draw, which need a render pass, are refused by the scope rule. Every queue has a timeline semaphore that each submit to it signals to the submit's
   stamp after its last command. Before each check the device learns how far a queue or a
@@ -122,6 +127,77 @@ contract leaves to the backend.
   refused by, stamps the submit, gives the records' lock up and calls `vkQueueSubmit2` with
   the caller's waits and signals and the queue's own timeline signal last.
 
+## The swapchain
+
+- **The surface** is made from the window's handles as the constructor reads them: an
+  AppKit view's through a `CAMetalLayer` that `raw-window-metal` makes as the view's
+  sublayer and keeps at the view's bounds and `contentsScale` on the main thread
+  (`VK_EXT_metal_surface`; the constructor runs on the main thread there, as AppKit asks, or
+  is `Unsupported`), a Win32, Xlib, XCB or Wayland window's through its `VK_KHR_*_surface`.
+  The instance takes `VK_KHR_surface`, `VK_KHR_get_surface_capabilities2` and every surface
+  maintenance extension offered; the device `VK_KHR_swapchain` and
+  `VK_EXT_swapchain_maintenance1`, else its `KHR` form by name, with the
+  `swapchainMaintenance1` feature. `ash` 0.38 names neither `KHR` form; their structures and
+  values are the `EXT` form's, which the backend uses for both. The backend calls no
+  `vkReleaseSwapchainImagesEXT`, which the `KHR` form names otherwise.
+- **The images** are `FIFO`, of the first of `B8G8R8A8_UNORM`, `R8G8B8A8_UNORM` and their
+  `SRGB` forms the surface offers in `SRGB_NONLINEAR`, three where the surface allows,
+  exclusive to the present queue's family, colour attachments alone. Their handles are the
+  device's images, with a colour attachment view each; a destroy of one is refused
+  (`swapchain`). A swapchain image's transition to `Present` is to `PRESENT_SRC_KHR`; any
+  other image moved to `Present` is in `GENERAL`.
+- **An acquire** signals a semaphore of a pool, taken again only once the submit that waited
+  for it is known complete by the present queue's own timeline. Each image has its own
+  present semaphore, which the present's submit signals and its present waits for; before it
+  is signalled again, the image's last present fence (`VkSwapchainPresentFenceInfoEXT`,
+  chained to every present) has signalled. An acquire's timeout, `VK_TIMEOUT` or
+  `VK_NOT_READY`, is `None`; `VK_ERROR_OUT_OF_DATE_KHR` and `VK_ERROR_OUT_OF_POOL_MEMORY` are
+  `Stale`, and the swapchain stays stale until a `resize`.
+- **A present** walks the records under the present queue's lock and stamps its submit once
+  the walk finds it released, then makes the submit, with the acquire's semaphore among its
+  waits and the image's present semaphore among its signals, and `vkQueuePresentKHR` under
+  the same lock. Where the submit's driver call fails and the device is not lost, the stamp
+  is reached by an empty batch that waits for the acquire's semaphore, and the image stays
+  acquired for a retry that waits for nothing. A present's failure after its submit is taken
+  is `DeviceLost` for `VK_ERROR_DEVICE_LOST` and `Presented::Stale`, with an id, for every
+  other (6(i) of the frame's design).
+- **`resize`** waits for every pending present fence within the bound and is refused
+  `pending` past it; it spends an acquired image's semaphore with an empty batch, makes the
+  new swapchain from the old (`oldSwapchain`), drains the old one's display times, destroys
+  it and forgets its images' handles, which are then `destroyed`. An extent is clamped to the
+  surface's minimum and maximum as queried just before.
+- **The drop** waits, for at most three seconds, for the pending present fences and for the
+  submits that waited for the acquires' semaphores; where either does not end, it destroys
+  none of the swapchain's objects, the swapchain included, rather than destroy them under the
+  presentation engine's or the queue's use. After a loss it destroys them at once.
+- **The bound** of the contract is one second: an acquire's timeout, a present's wait for its
+  submit's release, and `resize`'s wait for the presents. The driver's own calls, the
+  present's included, are bounded by the driver alone: under MoltenVK as
+  `crates/rhi-api/README.md` states, and on other drivers unmeasured here.
+- **Headless.** MoltenVK 1.4.2 and lavapipe offer `VK_EXT_headless_surface`, so the headless
+  tests run under lavapipe in CI; KosmicKrisp offers none, and they skip there.
+
+## The display-time report
+
+- **Source:** `VK_GOOGLE_display_timing`'s `vkGetPastPresentationTimingGOOGLE`, on a device
+  with a window on macOS whose driver offers the extension, which is MoltenVK; every present
+  chains `VkPresentTimesInfoGOOGLE` with its id's low 32 bits and `desiredPresentTime` zero,
+  and a report's id is widened back from the last present's. Every other device answers
+  `None`: a headless surface, KosmicKrisp and lavapipe, which offer no source, and a device on
+  another system, where no clock pairing is built. `VK_EXT_present_timing` is not in `ash`
+  0.38, and no device here offers it.
+- **The instant:** `actualPresentTime`, which MoltenVK 1.4.2 takes from the drawable's
+  `presentedTime`, in nanoseconds of the host clock `CLOCK_UPTIME_RAW` that `Instant` reads on
+  macOS. The swapchain reads both clocks at its creation and moves each time onto `Instant` by
+  that pairing, so the error is the gap between the two reads.
+- **A present the display never took** cannot be told apart: MoltenVK 1.4.2 reports one with
+  the time its handler ran, not zero. A caller takes a present as displayed once its id or a
+  later one is reported.
+- **The delay and the bound** were not measured by this crate's runs: a report arrives once
+  MoltenVK's presented handler has run, and a call makes the driver's two calls of the
+  history, which MoltenVK keeps at 60 reports, with no wait. A replaced swapchain's history is
+  drained before it is destroyed; a report of it that arrives later is lost.
+
 ## Locks
 
 `Shared::records` holds every record (`src/records.rs`). The order is: a queue's lock or the
@@ -146,7 +222,7 @@ anything under the GPU's use; with nothing pending it tears down as any last hol
 ## Tests
 
 Every test that makes a device is ignored by a plain run, which may have no driver;
-`cargo xtask gpu` runs each ignored test of the library's `canary` module and of the
+`cargo xtask gpu` runs each ignored test of the library's `canary` and `swapchain` modules and of the
 `integration` binary in a process of its own, under the pinned Khronos validation layer, by
 decision 5.10's rule (`tools/xtask/README.md`, "GPU runs"). On the M1 the gate is both
 drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp without.
@@ -184,6 +260,14 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   with no lock on one thread under a lagging dispatch while another submits to it, made only
   while the dispatch is pending (its lag doubled up to four times where it ended first), with
   a watchdog that aborts the process after 30 seconds should the driver hang.
+- `tests/swapchain.rs`, on a headless surface: 48 frames, two in flight, presented across a
+  resize, each clearing a target on the graphics queue that crosses to the present queue,
+  exclusively by a release and an acquire where present has its own queue and concurrently,
+  and is read back there against the frame's colour, each present shown with the next id;
+  and a shutdown with three frames in flight, again with an image acquired and never
+  presented. In `src/swapchain.rs`, a unit test since no safe call makes its misuse: an
+  acquire semaphore taken again while a batch's wait for it is held, which the layer must
+  report (`VUID-vkAcquireNextImageKHR-semaphore-01779`), heard by a sink that prints nothing.
 - Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, no size,
   two sizes or the built-in state no workgroup, an entry declared by its name and its stage's
   execution model, a `Bool` widened to four bytes and `Int64Atomics` refused unless enabled.
