@@ -106,9 +106,10 @@ pub enum Rule {
     /// a pending submit waits for or signals on it. The timeline's value is the greatest
     /// the device knows it has reached (`README.md`, "Timelines").
     Timeline,
-    /// `encoding`: a command outside the scope it belongs to, a draw or dispatch with
-    /// nothing bound to it, a pass left open, an encoder of another device or role, or an
-    /// encoder submitted again with no reset.
+    /// `encoding`: a command outside the scope it belongs to, a render pass, graphics bind,
+    /// draw or depth image copy on a `Compute` encoder, a draw or dispatch with nothing bound
+    /// to it, a pass left open, an encoder of another device or role, or an encoder
+    /// submitted again with no reset.
     Encoding,
 }
 

@@ -99,17 +99,23 @@ pub trait Device: Send + Sync {
         read: &mut dyn FnMut(&[u8]),
     ) -> Result<()>;
 
-    /// Makes the host's writes to a range visible to the device. Called after every
-    /// write and before the submit that reads it; it does nothing where
-    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported.
+    /// Makes the host's writes to a range of an `Upload` buffer visible to the device.
+    /// Called after every write and before the submit that reads it; it does nothing where
+    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported. A buffer
+    /// of another class is refused ([`Rule::Usage`](crate::Rule::Usage)), and so is a range
+    /// that overlaps a host access in progress
+    /// ([`Rule::HostOverlap`](crate::Rule::HostOverlap)), on every backend: a device
+    /// backend's flush is rounded out to the driver's atom.
     fn flush_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()>;
 
-    /// Makes the device's writes to a range visible to the host. Called after the submit
-    /// that wrote it completes and before the read; it does nothing where
-    /// [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported. A call
-    /// while a pending submit writes the buffer or changes its state is refused on every
-    /// backend ([`Rule::Pending`](crate::Rule::Pending)): it would be taken for the
-    /// invalidate after the write.
+    /// Makes the device's writes to a range of a `Readback` buffer visible to the host.
+    /// Called after the submit that wrote it completes and before the read; it does nothing
+    /// where [`coherent_host_memory`](Capabilities::coherent_host_memory) is reported. A
+    /// call while a pending submit writes the buffer or changes its state is refused on
+    /// every backend ([`Rule::Pending`](crate::Rule::Pending)): it would be taken for the
+    /// invalidate after the write. Class and overlap are as
+    /// [`flush_buffer`](Self::flush_buffer)'s: an invalidate of memory the host writes
+    /// would discard what it has not flushed.
     fn invalidate_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<()>;
 
     /// Makes an image, every subresource

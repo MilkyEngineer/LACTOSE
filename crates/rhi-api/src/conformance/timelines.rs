@@ -4,7 +4,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::kit::{Body, Ctx, HEAD, LONG, PATIENCE, WOKEN, buffer_to, clear, image_desc, woken};
+use super::kit::{
+    Body, Ctx, HEAD, LONG, Lead, Orders, PATIENCE, WOKEN, buffer_to, clear, image_desc, race, woken,
+};
 use crate::{
     BufferCopy, BufferHandle, BufferState, BufferUsage, Device, Encoder, Format, ImageUsage,
     MemoryClass, QueuePath, QueueRole, Rule, Sharing, Submit, TimelineHandle, TimelinePoint,
@@ -538,32 +540,33 @@ fn rule<T>(result: &lactose_core::Result<T>) -> Option<Rule> {
 
 fn destroy_racing_a_submit_refuses_one(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
-    for _ in 0..ROUNDS {
+    let mut orders = Orders::new(["the destroy first", "the submit first"]);
+    for lead in Lead::rounds(ROUNDS) {
         let (encoder, source, _) = copier(ctx, &*device, G);
         let gate = ctx.gate(&*device);
         let mut encoders = [encoder];
         let racer: &dyn Device = &*device;
-        let (destroy, submitted) = thread::scope(|scope| {
-            let destroy = scope.spawn(move || racer.destroy_buffer(source));
-            let encoders = &mut encoders;
-            let submitted =
-                scope.spawn(move || submit(racer, G, encoders, &[gate.wait], &[gate.done]));
-            (
-                destroy.join().unwrap_or_else(|_| ctx.fail("the destroyer panicked")),
-                submitted.join().unwrap_or_else(|_| ctx.fail("the submitter panicked")),
-            )
-        });
-        match (rule(&destroy), rule(&submitted)) {
+        let encoders = &mut encoders;
+        let (destroy, submitted) = race(
+            ctx,
+            lead,
+            move || racer.destroy_buffer(source),
+            move || submit(racer, G, encoders, &[gate.wait], &[gate.done]),
+        );
+        let order = match (rule(&destroy), rule(&submitted)) {
             (Some(Rule::Pending), None) if submitted.is_ok() => {
                 gate.open(ctx, &*device);
                 ctx.ok(device.destroy_buffer(source), "the destroy once the submit is seen");
+                1
             }
-            (None, Some(Rule::Destroyed)) if destroy.is_ok() => {}
+            (None, Some(Rule::Destroyed)) if destroy.is_ok() => 0,
             _ => ctx.fail(format_args!(
                 "not exactly one refused: the destroy {destroy:?}, the submit {submitted:?}"
             )),
-        }
+        };
+        orders.reached(ctx, lead, order);
     }
+    orders.report(ctx);
     Ok(())
 }
 
@@ -656,18 +659,18 @@ fn wait_is_woken_by_a_host_signal(ctx: &Ctx<'_>) -> Applies {
 /// backend's driver call widens that window, and its own unit tests fix it ("Threads").
 fn host_signals_racing_on_one_timeline_keep_it_growing(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
-    for round in 0..ROUNDS as u64 {
+    let mut orders =
+        Orders::new(["both accepted", "the low refused", "the high refused, during the low"]);
+    for (round, lead) in (0..).zip(Lead::rounds(ROUNDS)) {
         let timeline = ctx.timeline(&*device, round);
         let (low, high) = (at(timeline, round + 3), at(timeline, round + 5));
         let racer: &dyn Device = &*device;
-        let (low_signal, high_signal) = thread::scope(|scope| {
-            let low_signal = scope.spawn(move || racer.signal_timeline(low));
-            let high_signal = scope.spawn(move || racer.signal_timeline(high));
-            (
-                low_signal.join().unwrap_or_else(|_| ctx.fail("a signaller panicked")),
-                high_signal.join().unwrap_or_else(|_| ctx.fail("a signaller panicked")),
-            )
-        });
+        let (low_signal, high_signal) = race(
+            ctx,
+            lead,
+            move || racer.signal_timeline(low),
+            move || racer.signal_timeline(high),
+        );
         for result in [&low_signal, &high_signal] {
             if result.is_err() && rule(result) != Some(Rule::Timeline) {
                 ctx.fail(format_args!(
@@ -675,17 +678,20 @@ fn host_signals_racing_on_one_timeline_keep_it_growing(ctx: &Ctx<'_>) -> Applies
                 ));
             }
         }
-        let expected = match (low_signal.is_ok(), high_signal.is_ok()) {
-            (_, true) => high.value,
-            (true, false) => low.value,
+        let (expected, order) = match (low_signal.is_ok(), high_signal.is_ok()) {
+            (true, true) => (high.value, 0),
+            (false, true) => (high.value, 1),
+            (true, false) => (low.value, 2),
             (false, false) => ctx.fail("both racing host signals were refused"),
         };
+        orders.reached(ctx, lead, order);
         ctx.check(
             ctx.ok(device.timeline_value(timeline), "a read") == expected,
             "the timeline ends at the greater accepted value",
         );
         ctx.ok(device.destroy_timeline(timeline), "a destroy");
     }
+    orders.report(ctx);
     Ok(())
 }
 

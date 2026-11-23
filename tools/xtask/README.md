@@ -26,7 +26,7 @@ of a manifest it writes under the target directory.
 | `heavy` | nothing: it bounds how many heavy commands run at once on one machine (below) |
 | `measure` | nothing: it runs the milestone measurements and writes their result files (below) |
 | `slang` | nothing: it installs the pinned Slang release under the target directory and prints its `slangc` (below) |
-| `gpu --driver <name> [--cooked <dir>]` | the GPU run's rule of decision 5.10 of the milestone 2 plan, so far its Metal step alone (below) |
+| `gpu [--driver <name>] [--adapter <name>] [--only <metal\|vulkan>] [--gpu-assisted] [--cooked <dir>]` | the GPU run's rule of decision 5.10 of the milestone 2 plan: the Metal step on macOS and the Vulkan step (below); with no `--driver`, the M1's gate, under MoltenVK and KosmicKrisp |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
 is printed there. The exit status is 0 for none, 1 for findings and 2 when a check could not
@@ -636,15 +636,31 @@ another version, the SDK's among them, is refused by the cook too.
 
 ## GPU runs
 
-`cargo xtask gpu --driver <lavapipe|moltenvk|kosmickrisp|system> [--cooked <dir>]` is the
-command decision 5.10 of the milestone 2 plan names. So far it has its Metal step alone, which
-runs on macOS and is the same under each driver name, since the driver selects a Vulkan
-loader's environment and the Metal step uses none; on another host it exits 2.
+`cargo xtask gpu [--driver <lavapipe|moltenvk|kosmickrisp|system>] [--adapter <name>] [--only
+<metal|vulkan>] [--gpu-assisted] [--cooked <dir>]` is the command decision 5.10 of the
+milestone 2 plan names. It cooks, then runs the Metal step on macOS and the Vulkan step on
+every host the layer's pin names; `--only` runs one of them, and the Metal step asked for on
+another host than macOS exits 2. The Metal step is the same under each driver name, since the
+driver selects a Vulkan loader's environment and the Metal step uses none.
+
+With no `--driver`, on macOS, it is the M1's gate (the owner's ruling of 19 November 2026):
+the Metal step once, then the Vulkan step under MoltenVK, with Metal API and shader
+validation, and under KosmicKrisp, without them, one after the other, and a failure under
+either fails the run. Each catches a missing barrier the other misses: MoltenVK the local
+read's, by its pixels, and KosmicKrisp the one between two dispatches, which Metal's serial
+compute encoder hides under MoltenVK. KosmicKrisp runs without Metal's validation because
+its queue aborts under API validation and its heap's textures are not resident under shader
+validation, defects of that driver. `gpu --gpu-assisted` with no `--driver` runs KosmicKrisp
+alone, since the layer's instrumented shaders fail in MoltenVK's SPIRV-Cross. On another host
+a run names its driver. `--driver <name>` runs one driver, for development, and `--adapter`
+goes with `--driver system` alone. Every step runs before a failure fails the run, so each
+writes its report.
 
 1. It installs the pinned Slang as `slang` does, and cooks `shaders/` with `ricotta --slangc
-   <it> --code target/gpu/code` into `target/gpu/shaders.pack`, removing the code of an
-   earlier run first. With `--cooked <dir>` it cooks nothing and takes the code in `<dir>`,
-   which `ricotta --code` wrote on another runner.
+   <it> --code target/gpu/code --shaders target/gpu/shaders` into
+   `target/gpu/shaders.pack`, removing the code and shaders of an earlier run first. With
+   `--cooked <dir>` it cooks nothing and takes the code in `<dir>`, which `ricotta --code`
+   wrote on another runner; that is the Metal step's alone, so it needs `--only metal`.
 2. It runs `swift tools/xtask/metal/pipelines.swift`, the command-line tools' `swift`, under
    Metal API validation (`MTL_DEBUG_LAYER=1`, warnings to the log) and Metal shader validation
    (`MTL_SHADER_VALIDATION=1`, reports to standard error), as the Metal spike set them:
@@ -677,10 +693,105 @@ loader's environment and the Metal step uses none; on another host it exits 2.
    was heard to say, as the validator wrote it, so a run shows a runner's wording, the
    device's facts, the system's version, one line per pipeline state, and the messages
    counted.
+4. The Vulkan step runs every device test: each ignored test of the test targets
+   `DEVICE_TESTS` in `src/main.rs` lists, which are `lactose-rhi-vulkan`'s library's unit
+   tests, of its `canary` module alone, so that no other ignored unit test runs as a device
+   test, and its `integration` binary, each in a process of its own, built with `cargo test
+   --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
+   - the layer is the Khronos validation layer of the Vulkan SDK that
+     `tools/xtask/vulkan-layer.toml` pins, refused unless its library's SHA-256 and its
+     manifest's version are the pin's. On Linux the SDK's archive is fetched into
+     `target/vulkan-sdk/`, refused unless its SHA-256 is the pin's (LunarG's published
+     digest), and its loader, layer and manifest unpacked; on the Mac the SDK is the one the
+     installer put at `VULKAN_SDK`, or at `~/VulkanSDK/<version>/macOS`. The loader is the
+     SDK's (`LD_LIBRARY_PATH`, or on macOS `DYLD_FALLBACK_LIBRARY_PATH`, since
+     `DYLD_LIBRARY_PATH` would also load the SDK's copy of a driver the loader opens by its
+     absolute path, and the loader reports the difference);
+   - the layer is loaded as an implicit layer, from a copy of its manifest under
+     `target/gpu/layers/` that names its library by its absolute path, with `VK_LAYER_PATH`
+     set to an empty directory: a layer forced through `VK_INSTANCE_LAYERS` or
+     `VK_LOADER_LAYERS_ENABLE`, or found twice, makes the loader warn, and the warning reaches
+     the debug messenger, which counts it. Before the run sets its own, it removes these
+     inherited variables (`CLEARED` and `CLEARED_PREFIXES` in `src/vulkan.rs`): the
+     families `VK_KHRONOS_VALIDATION_*` and `VK_LAYER_*` (the layer's settings under both
+     the names its manifest gives, and the layer paths), `VK_LOADER_*`, MoltenVK's `MVK_*`,
+     Mesa's `MESA_*` (KosmicKrisp's and lavapipe's) and Metal's `MTL_*`, and by name
+     `VK_INSTANCE_LAYERS`, `VK_ICD_FILENAMES`, `VK_DRIVER_FILES`, `VK_ADD_DRIVER_FILES`,
+     `VK_ADD_LAYER_PATH`, `VK_IMPLICIT_LAYER_PATH`, `DYLD_LIBRARY_PATH`,
+     `METAL_DEVICE_WRAPPER_TYPE` (which turns Metal's API validation on, as `MTL_DEBUG_LAYER`
+     does), `LACTOSE_VALIDATION_OFF`, `LACTOSE_GPU_ADAPTER` and `LACTOSE_GPU_SHADERS`. It
+     names each it removed in its file. A driver's other variables are not cleared. What a
+     run needs of them it takes as an argument, or sets itself after the removal;
+   - the driver is `VK_DRIVER_FILES`: lavapipe's manifest in `/usr/share/vulkan/icd.d/`,
+     MoltenVK's or KosmicKrisp's in the SDK's `share/vulkan/icd.d/`; under `system` the
+     loader's own search, and `--adapter <name>` selects the device by a part of its name
+     (`LACTOSE_GPU_ADAPTER`, which the tests' request reads);
+   - the validators are core, synchronisation (with its check of a load after a store) and
+     thread-safety validation; with `--gpu-assisted`, GPU-assisted validation and
+     thread-safety validation, with core and synchronisation validation off, as the layer
+     advises beside it, and its note of the features it turns on for its instrumentation
+     filtered (`WARNING-Setting-Limit-Adjusted`);
+   - MoltenVK writes its warnings and errors (`MVK_CONFIG_LOG_LEVEL=2`), and Mesa's banner for
+     a driver that is not conformant is off (`MESA_VK_IGNORE_CONFORMANCE_WARNING=1`): it is
+     no message about a call;
+   - under MoltenVK, Metal API and shader validation, set as the Metal step sets them
+     (`METAL_VALIDATION` in `src/vulkan.rs`); under any other driver, none.
+5. Each binary's canaries go first. The canaries (`Run`'s `canaries` in `src/vulkan.rs`) are
+   thread-safety validation's (the graphics queue waited idle through `ash` with no lock under
+   a lagging dispatch while another thread submits to it,
+   `UNASSIGNED-Threading-MultipleThreads-Write`; a unit test in `src/canary.rs`, since no
+   safe call can race a queue), core validation's (an image declared in a state it is not in,
+   `VUID-vkCmdDraw-None-09600`), synchronisation validation's (two copies into one range,
+   `SYNC-HAZARD-WRITE-AFTER-WRITE`), its check of a load after a store (a target stored by
+   one render pass and kept by the next with no transition, `SYNC-HAZARD-READ-AFTER-WRITE`,
+   which the layer sends only with `syncval_load_op_after_store_op_validation` on), its
+   hazard across queues (a target a lagging graphics submit stores and a compute submit takes
+   from `Undefined` with no semaphore, `SYNC-HAZARD-WRITE-RACING-WRITE`, which says `skipped,
+   compute shares the graphics queue` on a device with one queue), its hazard across two
+   submits of one queue, which every device runs (a buffer a lagging submit copies into and
+   a second submit takes from a state it is not in and copies into again,
+   `SYNC-HAZARD-WRITE-AFTER-WRITE`), the suite's `each_validator_reports_its_canary`, which
+   provokes core's and synchronisation's, and under Metal's validation Metal's shader
+   validation's (`METAL_CANARY`: a dispatch's read past a buffer, which must write `Invalid
+   load in 'device' or 'constant' address space` from the test's own process, and which the
+   layer hears nothing of); with
+   `--gpu-assisted`, GPU-assisted validation's alone (a shader's read past a buffer through
+   its address, `VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819`, and a draw that samples
+   slot `heap_slots`, one past the heap, by an index in push bytes,
+   `VUID-vkCmdDraw-None-10068`). A canary passes when its test passes and every message it
+   sent is one of its identifiers, each heard, or when it says why it is skipped. After every
+   test, a listed canary that no binary holds fails the run. Every other test passes when it
+   passes, its sinks printed no message and the driver wrote no line of its errors or
+   warnings: MoltenVK's `[mvk-error]` and `[mvk-warn]`, Mesa's `MESA: error`, `MESA:
+   warning` and any `WARNING: ` line. Under Metal's validation Metal must also write no
+   report of shader validation's (`Invalid Metal usage`) but the Metal canary's, no
+   assertion of API validation's (`failed assertion`) and no other line of the system log,
+   which is where API validation's warnings go; and every test, canaries included, must
+   print both validators' banners to the system log (`Metal API Validation Enabled`, `Metal GPU Validation Enabled`), which
+   shows them loaded in its process, unless it says it skipped: a case of the null backend's
+   alone skips before it makes a device, so Metal never loads, and a case may skip after
+   making one (14 of MoltenVK's 44 skips do). The Metal step's canaries show what the two
+   report, and the Vulkan step's Metal canary that a report reaches the judge from a test's
+   process. Each test's process has a deadline (`DEADLINE`, 120 seconds): one still running
+   then is killed and recorded failed, `past its deadline of 120 s`, so that a hung driver
+   ends the test and not the run. The thread-safety canary's race may hang a driver: its
+   watchdog aborts its process after 30 seconds, inside the deadline, which the file
+   records as the canary failed (`the test failed`); an abort, since an exit runs the
+   layer's teardown of the live device, which hangs where a stuck thread holds the layer's
+   lock.
+6. It writes `target/gpu/<driver>-vulkan.txt`, or `<driver>-vulkan-gpu-assisted.txt`: the
+   driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
+   cleared:`, or `none`), every variable it set, the canaries heard or skipped, the
+   device's `DeviceInfo` and `Capabilities`, and each test with `passed`, the suite's
+   `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed. A failed
+   test fails the run, under every driver.
 
-The `shaders` CI job runs `gpu --driver system` on the macOS runner that cooks, and the
-`shaders-oldest` job runs `gpu --driver system --cooked` on the oldest macOS image, on the
-code the first cooked: the same canaries and count on both.
+The `shaders` CI job runs `gpu --driver system --only metal` on the macOS runner that cooks,
+and the `shaders-oldest` job runs `gpu --driver system --only metal --cooked` on the oldest
+macOS image, on the code the first cooked: the same canaries and count on both. The `gpu
+(lavapipe)` job runs `gpu --driver lavapipe --only vulkan` on every pull request, and the
+nightly runs `gpu --driver lavapipe --only vulkan --gpu-assisted`. On the M1, `gpu` and
+`gpu --driver kosmickrisp --gpu-assisted` are run by hand: no runner has the M1's drivers.
 
 Before either, `bash tools/xtask/runner-facts.sh [--metal-optional] <file>` records the
 runner's facts in `<file>` and in the job's summary: its system, and on macOS its Xcode, its

@@ -174,7 +174,7 @@ base = [
   "lactose-ecs-macros", "lactose-ecs", "lactose-bundle", "lactose-asset-api", "lactose-io",
   "lactose-asset", "lactose-input", "lactose-input-host", "lactose-sim", "lactose-net-api",
   "lactose-net-host", "lactose-persist", "lactose-xtask", "game-sim", "lactose-rhi-api",
-  "lactose-platform", "lactose-render-graph", "lactose-rhi-null",
+  "lactose-platform", "lactose-render-graph", "lactose-rhi-null", "lactose-rhi-vulkan",
 ]
 physics = [
   "lactose-physics-api", "lactose-physics-rapier", "lactose-anim", "lactose-predict",

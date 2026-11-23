@@ -6791,6 +6791,22 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   that the Mac is upgraded at milestone 1's exit; on 17 November, that its system is macOS 27.2.1.
 - Replaced: sections 2 and 12.1, which leave the interim path open between the two; revision
   3.5 names it.
+- Addendum (the owner's ruling, 19 November 2026, at `vulkan`'s review): **the M1's gate is
+  both drivers.** On the M1, `cargo xtask gpu` with no `--driver` runs the Vulkan step under
+  MoltenVK, with Metal API and shader validation, and under KosmicKrisp, without them, and a
+  failure under either fails it; the rule of "A case that fails under it is recorded and fails
+  no merge" ends. KosmicKrisp passed every output case it runs at `vulkan`'s merge and runs
+  GPU-assisted validation, which brought the question. The reasons, from reviewer-gpu's review
+  of `vulkan`, section 2: each driver catches a removed barrier the other misses, MoltenVK the
+  local read's by its pixels and KosmicKrisp the one between two dispatches, which Metal's
+  serial compute encoder orders under MoltenVK; KosmicKrisp is not clean under Metal's
+  validation, its queue aborting under API validation and its heap's textures not resident
+  under shader validation, where MoltenVK is; so gating on both, KosmicKrisp without Metal's
+  validation, catches the most, and KosmicKrisp alone would lose the local read's catch and the
+  run under Metal's validation. MoltenVK stays the interim path and runs on macOS 14 and 15;
+  GPU-assisted validation runs under KosmicKrisp alone (`gpu --gpu-assisted`), since it fails
+  in MoltenVK's SPIRV-Cross. Rules out: KosmicKrisp alone as the gate; KosmicKrisp under
+  Metal's validation.
 
 **D155. Crash reporting until a build leaves the owner's machines is the panic hook's text report, shared by every engine binary through `lactose-app`; minidumps and symbol upload are decided at milestone 5** (§3, §5.1, §19, §21, §22.1, `lactose-app`, `lactose-app-headless`, `lactose-app-client`)
 - Why: section 22.1 asks for crash reporting, minidumps and symbol upload, by milestone 2, and
@@ -7520,6 +7536,45 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   constant's `MTLDataType` from the MSL: it is given the code `ricotta --code` writes, which
   `--cooked` carries between runners, not the pack, and the cook holds the MSL's types to
   the format's.
+- Addendum (lane `vulkan`, fix rounds 1, 1b and 2, 2026-11-23): amended at `vulkan`'s review.
+  - *Graphics on the `Compute` role is refused on every layout* (`Rule::Encoding`, "Every
+    backend"): a render pass and a copy of a depth or stencil image recorded on a `Compute`
+    encoder, where compute shares the graphics queue (`Shared`) included; a graphics
+    pipeline's bind and a draw need a render pass, so the scope rule refuses them there. A
+    caller writes the same calls on every layout, so null and CI, where no compute-only
+    family exists, refuse what a desktop device's compute-only family cannot run. The
+    contract case is `graphics_on_a_compute_encoder_is_refused`, run by every backend, whose
+    render pass and copies fail it where the role's check is removed; the roles row says Vulkan's compute queue is a family that computes and does not
+    draw where one exists, else another family that computes, else a second queue of the
+    graphics family. A backend may still choose a family that does not draw for compute.
+  - *A flush and an invalidate are checked as a write and a read are* ("Every backend"):
+    `flush_buffer` of a buffer that is not `Upload` and `invalidate_buffer` of one that is not
+    `Readback` are refused `Rule::Usage`, and either over a range a write or a read in
+    progress holds is refused `Rule::HostOverlap`. Neither is itself a host access in
+    progress: each is checked under the records' lock and holds no range for its driver
+    call, so nothing is refused for one running, on null and on a device alike. The cases are
+    `host_access_outside_the_memory_class_is_refused` and `overlapping_host_access_is_refused`,
+    extended.
+  - *A stage's code must declare its entry point.* A backend refuses (`InvalidData`) a stage
+    whose module declares no entry point of the stage's name and execution model.
+    `CookedShader::check` stays of the format's fields alone, since code is per target.
+  - *The race cases lead one round each way* (`Lead`, `Orders` in the suite's kit): each case
+    whose two outcomes depend on which call wins forces each order once, then runs free rounds
+    and prints the orders they reached, the second call's thread spawned first in every other
+    free round. The led rounds check both outcomes on every run; the free rounds of
+    `submit_racing_a_host_access_refuses_one` may stay with the write first on KosmicKrisp
+    for a whole run, whichever thread starts first: in five runs of its 24 free rounds, the
+    submit came first in 17 of 120 on KosmicKrisp, in none in two of the runs, and in 18 of
+    120 on MoltenVK, in every run.
+  - *Output cases.* `dispatch_runs_workgroups_of_the_shaders_size` dispatches (3, 2, 2) groups
+    over bounds of (24, 8, 4), so a larger size in y or z than the module's shows;
+    `sampler_filters_as_described` samples eight texels 32 apart at each pixel's centre over
+    the target's side (`SV_Position` in the shader, exact, not an interpolated varying), so
+    every linear weight is a multiple of 1/16, which the least `subTexelPrecisionBits` Vulkan
+    allows, 4 bits, holds, and holds each sample within 1.5;
+    the triangle cases leave out half a pixel at each edge, as
+    their doc says, not a whole one.
+  The suite has 175 cases, 147 of them contract cases.
 
 **D159. `lactose-platform`: one window whose `Arc` is its lifetime, the two pumps over `lactose-task`'s lanes, a close and a resize as states, and a present thread over the caller's state** (§3, §4, §5.1, §21, `lactose-platform`, `crates/app/README.md`, `crates/task/README.md`)
 - Why: section 4 gives the crate four nouns and section 5.1 two threads, and the milestone 2
@@ -8075,6 +8130,148 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
 - Replaced: section 12.4's "keyed by `StableKey`", where it is read as the key alone, and its
   "freed from the structural change log", where it is read as the renderer reading the log;
   this merge amends the sentence. Nothing of D157, D158 or D160 is replaced.
+
+**D163. `lactose-rhi-vulkan` without a window, and the Vulkan step of `cargo xtask gpu`** (§12.1, §20, §21, `lactose-rhi-vulkan`, `lactose-rhi-api`, `tools/xtask`, `crate-tiers.toml`)
+- Why: the milestone 2 plan's lane `vulkan`, under its decisions 5.7, 5.10, 5.12 and D158.
+  - *The loader is opened at run time* (`ash` =0.38.0 with `loaded`, which brings `libloading`
+    0.8.9): a process with no loader gets `Unsupported` from `VulkanDevice::new`, and CI's
+    check job builds and lints the crate on hosts with no Vulkan SDK.
+  - *One `VkDeviceMemory` per resource* not placed in a block, of the type its class prefers.
+    No suballocator until a measurement asks for one. An allocation past its type's heap or
+    `maxMemoryAllocationSize`, and a buffer past `maxBufferSize`, are refused
+    `ResourceExhausted` before the driver, as null refuses a buffer past its bound. An alias
+    call records a global memory barrier, every command's writes to every later access: an
+    image's barrier from `Undefined` is scoped to its own range and leaves the ending image's
+    writes unordered against the new one's, where the aliasing rule wants a memory dependency.
+  - *The heap is held to the driver's support.* At creation the device asks
+    `vkGetDescriptorSetLayoutSupport` of the heap's set and of the input attachments', and
+    checks `maxPerStageUpdateAfterBindResources` and the sampler table with its placeholder
+    against `maxSamplerAllocationCount`; a request past them is `Unsupported`, and a sampler
+    that would reach the device's count, those retired under a pending submit included, is
+    `ResourceExhausted`. MoltenVK 1.4.2 on the M1 supports at most 1211 slots and samplers in
+    the set, one below its `maxPerSetDescriptors` of 1212, so 1147 slots beside 64 samplers,
+    which a device test holds it to; KosmicKrisp a million: the renderer's heap must fit the
+    first.
+  - *Completion is learned through waits.* A queue's or a timeline's progress is read with a
+    wait of no time on each value the records await, never `vkGetSemaphoreCounterValue`:
+    synchronisation validation of layer 1.4.363 takes a counter read as the host seeing every
+    batch complete, and then hears no hazard across submits or queues (row 211).
+  - *Teardown.* The messengers' sink is a leaked box freed after the instance is destroyed,
+    and the loader is released after it. The last holder of a device, unwinding with work
+    pending, leaks the device whole, sink and loader included; with nothing pending it tears
+    down as any last holder does. An encoder dropped while unwinding with its submit pending
+    hands its pools to the device, whose last holder destroys them once the device is idle.
+    No destroying driver call is made under the records', an entry's or a slot's lock.
+  - *The records are tested without a driver.* Their interleavings of a driver read and its
+    hold are unit tests against a model driver, fixed in order, with a race of host signals on
+    threads and the handle table's drops and generations, run under Miri nightly with four
+    seeds. A stale read folded at a late hold and a wait that reaches two submits of one
+    queue fix the two folds that keep the greater value. The holders' count is a type of its
+    own (`Holders`), whose test on threads has each holder store `Relaxed` to a cell of its
+    own and the last load the other's, so that only the count orders them: with the decrement
+    weakened to `Relaxed`, or the fence removed, Miri's weak memory fails it on 16 seeds of
+    16. The test has no `unsafe`, so the crate's is its FFI and the thread-safety canary's
+    driver call alone. Nothing that reaches `ash` runs under Miri.
+  - *Compute's own queue* is a family that computes and does not draw, else another family that
+    computes, else a second queue of the graphics family. Present shares the graphics queue
+    until the swapchain gives it one.
+  - *`memoryless_survives_local_read` is reported `false`* on every driver: no query answers it,
+    and MoltenVK loses depth there. `false` costs a caller a split, never a wrong image.
+  - *An Apple GPU's viewport bounds* are clamped to -16384 to 16383 by vendor id (row 183).
+  - *Pipelines take the cooked format's version 2* (D158's `shader-format` addendum): each
+    stage is held to `CookedShader::check` and a graphics pair to `check_varyings` before the
+    driver sees it, and its module must declare an `OpEntryPoint` of the stage's name and
+    execution model, or the stage is `InvalidData`; each given constant is a four-byte map entry, a `Bool` widened to a
+    `VkBool32` of 0 or 1, which an unwidened one-byte entry shows only through the layer's
+    VUID-VkSpecializationMapEntry-constantID-00776 (it reads back right on MoltenVK); and a
+    compute stage whose `workgroup` is not the one `LocalSize` its module states for its entry
+    point is refused `InvalidData`, since Vulkan runs workgroups of the module's size alone.
+  - *The validation layer is loaded as an implicit layer*, from a copy of its manifest that names
+    its library by its absolute path, with `VK_LAYER_PATH` set to an empty directory. A layer
+    forced through `VK_INSTANCE_LAYERS` or `VK_LOADER_LAYERS_ENABLE`, or found twice, makes the
+    loader warn through the debug messenger, which decision 5.10's rule counts. Its settings are
+    `VK_KHRONOS_VALIDATION_*` variables, each written into the run's file. Before setting its
+    own, a run removes the inherited families `VK_KHRONOS_VALIDATION_*`, `VK_LAYER_*` (the
+    layer's settings under its manifest's other names, and the layer paths), `VK_LOADER_*`,
+    `MVK_*`, `MESA_*` and `MTL_*`, and by name the loader's driver and layer variables,
+    `DYLD_LIBRARY_PATH`, `METAL_DEVICE_WRAPPER_TYPE` and the tests' `LACTOSE_*` three, and
+    writes the names it removed into its file; a driver's other variables are not cleared. A
+    listed canary the run does not answer fails it, and a canary may say it is skipped and
+    why.
+  - *The pin* is `tools/xtask/vulkan-layer.toml`, SDK 1.4.363.1: on Linux the archive by LunarG's
+    published SHA-256 and the layer's library by its own, unpacked into `target/vulkan-sdk/`; on
+    the Mac the installed SDK, refused unless its layer library's SHA-256 is the pin's.
+  - *The GPU-assisted form* turns core and synchronisation validation off, as the layer advises
+    beside it, and filters `WARNING-Setting-Limit-Adjusted`, the layer's note of the features it
+    turns on for its instrumentation. It has two canaries: a shader's read past a buffer through
+    its address, and a draw that samples slot `heap_slots`, one past the heap, by an index in
+    push bytes. It does not run under MoltenVK 1.4.2, whose SPIRV-Cross fails on the layer's
+    instrumented shaders; it runs under KosmicKrisp.
+  - *A driver's own lines are counted*: MoltenVK's `[mvk-error]` and `[mvk-warn]` at
+    `MVK_CONFIG_LOG_LEVEL=2`, Mesa's `MESA: error` and `MESA: warning`, and any `WARNING: ` line.
+    Mesa's banner for a driver that is not conformant is turned off: it is about no call.
+  - *The load-after-store check has a canary* (row 211): a target stored by one render pass and
+    kept by the next with no transition, heard as `SYNC-HAZARD-READ-AFTER-WRITE` and silent with
+    `syncval_load_op_after_store_op_validation` off. *Synchronisation across queues has one*: a
+    target a lagging graphics submit stores, taken from `Undefined` on the compute queue with no
+    semaphore, heard as `SYNC-HAZARD-WRITE-RACING-WRITE`, and skipped, saying so, where compute
+    shares the graphics queue. *Across two submits of one queue*, which every device runs, so
+    lavapipe's one queue too: a buffer a lagging submit copies into, taken from a state it is
+    not in and copied into again by a second submit made while the first is in flight, heard
+    as `SYNC-HAZARD-WRITE-AFTER-WRITE`. Both are silent with a counter read restored.
+  - *Thread-safety validation's canary is a unit test* (`src/canary.rs`): no safe call can race
+    a queue, so it waits the graphics queue idle through `ash` with no lock on one thread, under
+    a dispatch of about two seconds, and submits through the safe API from another 300 ms
+    later, heard as `UNASSIGNED-Threading-MultipleThreads-Write` under MoltenVK and
+    KosmicKrisp. The submit is made only while the dispatch is pending, checked by a wait of
+    no time on the point it signals; where the dispatch ended before the pause, as it may on
+    a CPU driver, the lag is doubled and the race tried again, four times at most, and then
+    the canary fails as "the lag ended before the pause", not as a validator unheard. The race
+    is undefined behaviour for the driver, so a watchdog aborts the process after 30 seconds,
+    which the run records as the canary failed: an abort, not an exit, since an exit runs the
+    layer's teardown of the live device, which takes the layer's locks and hangs where a
+    stuck thread holds one (reviewer-concurrency's stand-in, a thread parked in the layer's
+    callback, under a watchdog cut to 3 seconds: an abort ended the process at 4.0 seconds on
+    MoltenVK and 3.9 on KosmicKrisp, signal 6, while an exit on MoltenVK was still running
+    when the probe killed it at 60). *Each device
+    test's process has a deadline* (`DEADLINE`, 120 seconds), past which `cargo xtask gpu`
+    kills it and records it failed, `past its deadline of 120 s`, so that a hung driver fails
+    one test and not the run: the longest device test on the M1 takes 2.9 seconds
+    (`dispatch_beyond_the_group_limit_is_refused` under MoltenVK), a margin of forty times
+    for a loaded machine and a CPU driver, with the canary's 30-second watchdog inside it.
+    `cargo xtask
+    gpu` runs the library's ignored unit tests of its `canary` module beside the
+    `integration` binary's, so that no other ignored unit test runs as a device test.
+  - *The M1's gate is both drivers* (the owner's ruling of 19 November 2026, D154's addendum):
+    `cargo xtask gpu` with no `--driver` runs the Metal step, then the Vulkan step under
+    MoltenVK with Metal API and shader validation and under KosmicKrisp without them, every
+    step runs and a failure of any fails the run. Under Metal's validation each test that
+    does not skip must print both validators' banners, which shows them loaded in its process, and Metal must
+    write no report of shader validation's, no assertion of API validation's and no other
+    line of the system log, where API validation's warnings go. Metal's shader validation has a
+    canary in the MoltenVK step: a dispatch's read past a buffer, whose report (`Invalid load
+    in 'device' or 'constant' address space`) the judge must hear from the test's process and
+    accepts there alone; with `MTL_SHADER_VALIDATION_REPORT_TO_STDERR` unset it is unheard and
+    the run fails, where the banners alone would pass. A run clears inherited `MTL_*`
+    variables and `METAL_DEVICE_WRAPPER_TYPE`, so KosmicKrisp's runs without. `--gpu-assisted` with no `--driver` runs
+    KosmicKrisp alone, and `--driver <name>` runs one driver, for development. A removed
+    barrier between two dispatches of one pass, which MoltenVK's serial compute encoder hides,
+    fails the gate through KosmicKrisp (`dispatches_of_one_pass_see_each_others_writes`, shown
+    by mutation); no storage binding is added to the contract for it.
+  - *`[test_support]`* (decision 5.12): any crate's tests may name the backend. A boundary
+    crate's test that names it is still refused, since it reaches `lactose-rhi-api`, which
+    `[boundary_internal]` does not allow at any depth (`cargo xtask boundary`, a test against the
+    real tier file).
+- Rejected: `VK_INSTANCE_LAYERS` (the loader's warning is a counted message); Ubuntu's own layer
+  package (1.3.275, decision 5.10); a suballocator now; a `Capabilities` field for
+  `subTexelPrecisionBits`, which only a test would read: the sampler case samples at each
+  pixel's centre over the target's side (`SV_Position`, exact), where each linear weight is a
+  multiple of 1/16, which Vulkan's least, 4 bits, holds, and holds each sample within 1.5;
+  a public, hidden method for the thread-safety canary's unlocked call,
+  which would be a safe function able to race a queue; KosmicKrisp under Metal's validation,
+  which it does not pass for its own defects; a storage binding in the contract so that a
+  removed dispatch barrier shows under MoltenVK, whose serial compute encoder hides it, since
+  KosmicKrisp's run shows it.
 
 ## 10. Review history
 

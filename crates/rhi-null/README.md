@@ -174,7 +174,7 @@ a row for each place and a third that removes both.
 | `pending` | a host read, or an invalidate, waiting for writes alone | `conformance::read_under_a_pending_transition_to_host_read_is_refused` (a row each) |
 | `pending` | a host write waiting for changes too | `conformance::write_under_a_pending_writer_is_refused` |
 | `pending` | a submit's writes stamped on the buffer | `conformance::write_under_a_pending_writer_is_refused`, `submit_racing_a_host_access_refuses_one` |
-| `host-overlap` | a host write, or a host read, over a host access | `conformance::overlapping_host_access_is_refused` (a row each) |
+| `host-overlap` | a host write, a host read, a flush or an invalidate over a host access | `conformance::overlapping_host_access_is_refused` (a row each) |
 | `host-overlap` | a destroy during a host access | `conformance::destroy_during_host_access_is_refused` |
 | `host-overlap` | a submit that writes a buffer during a host access | `conformance::submit_writing_under_a_host_access_is_refused`, `submit_racing_a_host_access_refuses_one`, `tests::a_submit_that_writes_during_a_host_write_is_refused` |
 | `uuwp-used` | a slot rewritten under a pending submit | `conformance::heap_write_under_a_pending_reader_is_refused`, `heap_write_racing_a_submit_refuses_one` |
@@ -186,9 +186,11 @@ a row for each place and a third that removes both.
 | `encoding` | an encoder submitted again | `conformance::encoder_in_two_submits_is_refused`, `encoder_resubmitted_without_reset_is_refused` |
 | `encoding` | a pass left open | `conformance::pass_left_open_is_refused` |
 | `encoding` | a draw outside a render pass | `conformance::command_outside_its_scope_is_refused` |
+| `encoding` | a render pass or a depth image's copy on a `Compute` encoder (a graphics bind and a draw there are the scope rule's: they need a render pass, and none begins) | `conformance::graphics_on_a_compute_encoder_is_refused` |
 | `encoding` | a draw with no pipeline | `conformance::draw_with_nothing_bound_is_refused` |
 | `usage` | a buffer used outside its usage | `conformance::buffer_use_outside_its_usage_is_refused` |
 | `usage` | an image used outside its usage | `conformance::image_use_outside_its_usage_is_refused` |
+| `usage` | a host write, a flush, or an invalidate of a buffer outside its memory class | `conformance::host_access_outside_the_memory_class_is_refused` |
 | `usage` | a heap slot written with an image that is not `SAMPLED` | `conformance::image_use_outside_its_usage_is_refused` |
 | `usage` | a transition into a state the image's usage does not allow | `conformance::image_use_outside_its_usage_is_refused` |
 | `usage` | a pipeline of more colour targets than `colour_attachments` | `conformance::pipeline_of_other_formats_than_its_pass_is_refused` |

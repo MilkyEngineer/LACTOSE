@@ -10,7 +10,9 @@
 //! commands run at once on one machine. Nor is [`measure`]: it runs the milestone
 //! measurements and writes their result files. [`check_groups`] is a check, and also prints
 //! the packages of the group a CI check job builds. Nor is [`slang`]: it installs the pinned
-//! Slang release, which the binary's `gpu` command cooks the engine's shaders with.
+//! Slang release, which the binary's `gpu` command cooks the engine's shaders with. Nor is
+//! [`vulkan`]: it holds the pinned validation layer, the loader's environment for a driver
+//! and the rule a device test passes by, for the `gpu` command's Vulkan step.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +30,7 @@ pub mod slang;
 pub mod test_targets;
 pub mod tiers;
 pub mod vendor;
+pub mod vulkan;
 pub mod workspace;
 
 use std::fmt;
