@@ -380,6 +380,21 @@ mod windows_rules {
                 [Call::Priority(PRIORITY_BELOW_NORMAL), Call::Throttling(EXECUTION_SPEED)]
             );
             assert_eq!(message(result), "setting thread priority failed (Windows error 5)");
+            for class in [
+                ThreadClass::FrameCritical,
+                ThreadClass::Network,
+                ThreadClass::Present,
+                ThreadClass::Audio,
+                ThreadClass::PhysicsSolver,
+                ThreadClass::Io,
+            ] {
+                let (_, result) = run(class, Err(5), Err(ERROR_INVALID_PARAMETER));
+                assert_eq!(
+                    message(result),
+                    "setting thread priority failed (Windows error 5)",
+                    "{class:?}"
+                );
+            }
         }
 
         #[test]
@@ -506,9 +521,9 @@ mod os {
             (THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_EXECUTION_SPEED);
         const SYSTEM_MANAGED: (u32, u32) = (0, 0);
 
-        /// The calling thread's control and state masks, or `None`, said on standard error,
-        /// where the kernel refuses to answer the class. Any other failure means this call is
-        /// wrong, and fails the test.
+        /// The calling thread's control mask and the state bits under it, or `None`, said on
+        /// standard error, where the kernel refuses to answer the class. Any other failure
+        /// means this call is wrong, and fails the test.
         fn throttling() -> Option<(u32, u32)> {
             let mut state = THREAD_POWER_THROTTLING_STATE {
                 Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
@@ -527,7 +542,10 @@ mod os {
                 )
             };
             match status {
-                0 => Some((state.ControlMask, state.StateMask)),
+                // Microsoft documents a state bit as meaningful only under its control bit, so
+                // the state bits outside the control mask are dropped: a kernel that reports
+                // the effective state in them would otherwise fail a reset step.
+                0 => Some((state.ControlMask, state.StateMask & state.ControlMask)),
                 STATUS_INVALID_INFO_CLASS | STATUS_NOT_IMPLEMENTED | STATUS_NOT_SUPPORTED => {
                     eprintln!(
                         "the kernel refused to read the power-throttling state (status \
@@ -542,11 +560,12 @@ mod os {
         /// Each class but `Background`, on a fresh thread: the class, then `Background`, then
         /// the class again, each `enter` returning `Ok`.
         ///
-        /// Where the kernel answers the read, the masks are asserted exactly after each step,
-        /// which catches a missing throttling call, `Io` throttled, a missing reset, an
-        /// opt-out for `Background` and a reset written as an opt-out. Where it refuses, the
-        /// test says so on standard error (shown by `--no-capture`) and holds only that each
-        /// set call succeeded, which catches none of those.
+        /// Where the kernel answers the read, the control mask and the state bits under it are
+        /// asserted exactly after each step, which catches a missing throttling call, `Io`
+        /// throttled, a missing reset, an opt-out for `Background` and a reset written as an
+        /// opt-out. Where it refuses, the test says so on standard error (shown by
+        /// `--no-capture`) and holds only that each set call succeeded, which catches none of
+        /// those.
         #[test]
         #[cfg_attr(miri, ignore = "Miri has no shim for the thread information calls")]
         #[expect(
