@@ -106,8 +106,10 @@ fn a_job_allocates_its_cell_and_a_child_a_share_of_a_queue_block() {
     let (ready, ready_task) = count(calls, || executor.block_on(async {}));
     assert_eq!(ready_task, 0);
     // What a mutex costs when it is first locked: nothing on most targets, one allocation
-    // where std's mutex is a pthread mutex, as on Apple targets.
-    let (mutex, _) = count(calls, || {
+    // where std's mutex is a pthread mutex, as on Apple targets. Counted under the task tag,
+    // which nothing in this test takes on a worker, so that it is this thread's alone.
+    let (_, mutex) = count(calls, || {
+        let _tag = AllocTag::Task.scope();
         let mutex = std::hint::black_box(std::sync::Mutex::new(0u32));
         *mutex.lock().unwrap() += 1;
     });
