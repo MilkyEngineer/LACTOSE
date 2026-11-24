@@ -31,13 +31,19 @@ impl ThreadClass {
     ///
     /// The floating-point state is always set (see [`fp::set_deterministic`]). The scheduling
     /// class is best effort: an operating system that refuses it yields an error of kind
-    /// `Platform`, and the thread still runs correctly at its default priority.
+    /// `Platform`, whose message names the call refused, and the thread still runs correctly
+    /// under the operating system's default for what was refused.
     ///
     /// Enter a class at thread start; entering the class a thread is already in is
     /// harmless. On Linux the two utility classes, `Background` and `Io`, lower priority in a
     /// way an unprivileged thread cannot undo, so a later `enter` of another class leaves it
-    /// lowered. On Windows the class sets thread priority only; steering background threads
-    /// to efficiency cores is an open item in `docs/verification.md`.
+    /// lowered. On Windows every class sets thread priority and then the thread's
+    /// power-throttling state. `Background` opts into execution-speed throttling (EcoQoS),
+    /// which on Windows 11 steers the thread to efficiency cores at their most efficient
+    /// frequency, on mains power as on battery. Every other class, `Io` included, hands the
+    /// state back to the system's own management, so there a later `enter` of another class
+    /// undoes `Background`'s. Windows 10 before version 1709 has no such state: there
+    /// `Background` reports the refusal and the other classes do not.
     pub fn enter(self) -> Result<()> {
         fp::set_deterministic();
         os::set_scheduling(self)
@@ -239,15 +245,33 @@ mod os {
 
 #[cfg(windows)]
 mod os {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
-        THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
+        GetCurrentThread, SetThreadInformation, SetThreadPriority,
+        THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        THREAD_POWER_THROTTLING_STATE, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_BELOW_NORMAL,
+        THREAD_PRIORITY_TIME_CRITICAL, ThreadPowerThrottling,
     };
 
     use super::ThreadClass;
     use crate::error::{Error, ErrorKind, Result};
 
     pub(super) fn set_scheduling(class: ThreadClass) -> Result<()> {
+        // Priority first, then the throttling state; a refusal of one does not skip the other.
+        let priority = set_priority(class);
+        let throttling = set_power_throttling(class);
+        let (message, source) = match (priority, throttling) {
+            (Ok(()), Ok(())) => return Ok(()),
+            (Err(source), Ok(())) => ("setting thread priority failed", source),
+            (Ok(()), Err(source)) => ("setting the thread's power-throttling state failed", source),
+            (Err(source), Err(_)) => {
+                ("setting thread priority and the thread's power-throttling state failed", source)
+            }
+        };
+        Err(Error::new(ErrorKind::Platform, message).with_source(source))
+    }
+
+    fn set_priority(class: ThreadClass) -> std::io::Result<()> {
         let priority = match class {
             ThreadClass::Background | ThreadClass::Io => THREAD_PRIORITY_BELOW_NORMAL,
             ThreadClass::Audio => THREAD_PRIORITY_TIME_CRITICAL,
@@ -259,12 +283,146 @@ mod os {
         // SAFETY: `GetCurrentThread` returns a pseudo-handle that is always valid for the
         // calling thread, and `SetThreadPriority` takes plain values.
         let ok = unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        if ok != 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    }
+
+    /// `Background` opts the thread into execution-speed throttling, which Windows 11 calls
+    /// EcoQoS: the most efficient frequency and the efficiency cores, on mains power as on
+    /// battery (Windows 10, which has no EcoQoS, applies it as its low QoS, on battery only).
+    /// Every other class hands the setting back to the system, which infers a level from
+    /// window focus, audibility and priority. No class opts out of throttling: that would
+    /// hold its thread at high QoS while the game is minimised.
+    fn set_power_throttling(class: ThreadClass) -> std::io::Result<()> {
+        let mask = match class {
+            ThreadClass::Background => THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            ThreadClass::FrameCritical
+            | ThreadClass::Network
+            | ThreadClass::Present
+            | ThreadClass::Audio
+            | ThreadClass::PhysicsSolver
+            | ThreadClass::Io => 0,
+        };
+        let state = THREAD_POWER_THROTTLING_STATE {
+            Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: mask,
+            StateMask: mask,
+        };
+        // SAFETY: the pseudo-handle is valid for the calling thread, `state` is a live local
+        // of the structure this information class reads, and the size passed is its size.
+        let ok = unsafe {
+            SetThreadInformation(
+                GetCurrentThread(),
+                ThreadPowerThrottling,
+                (&raw const state).cast(),
+                size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+            )
+        };
         if ok != 0 {
-            Ok(())
-        } else {
-            let source = std::io::Error::last_os_error();
-            Err(Error::new(ErrorKind::Platform, "setting thread priority failed")
-                .with_source(source))
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // Windows 10 before version 1709 refuses the information class. A thread there is
+        // under the system's management already, which is all a reset asks for, so only a
+        // refused opt-in is reported, and only by the threads it concerns.
+        if mask == 0 && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+        use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadInformation, THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
+            ThreadPowerThrottling,
+        };
+
+        use crate::ThreadClass;
+
+        /// Windows 11 version 22H2, the first build whose kernel answers a query of this
+        /// information class; setting it has worked since Windows 10 version 1709. Microsoft
+        /// documents only the set, so the build is the system's own query, not the
+        /// documentation's.
+        const FIRST_READABLE_BUILD: u32 = 22_621;
+
+        const SET: (u32, u32) =
+            (THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_EXECUTION_SPEED);
+        const SYSTEM_MANAGED: (u32, u32) = (0, 0);
+
+        fn build() -> u32 {
+            let mut info = OSVERSIONINFOW {
+                dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
+                ..OSVERSIONINFOW::default()
+            };
+            // SAFETY: `info` is a live local whose size field holds its size, which is the
+            // contract of `RtlGetVersion`.
+            let status = unsafe { RtlGetVersion(&raw mut info) };
+            assert_eq!(status, 0, "RtlGetVersion cannot fail");
+            info.dwBuildNumber
+        }
+
+        /// The calling thread's control and state masks, or `None` where the system refuses
+        /// to read them.
+        fn throttling() -> Option<(u32, u32)> {
+            let mut state = THREAD_POWER_THROTTLING_STATE {
+                Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+                ..THREAD_POWER_THROTTLING_STATE::default()
+            };
+            // SAFETY: the pseudo-handle is valid for the calling thread, and `state` is a
+            // live local of the structure this information class writes, of the size passed.
+            let ok = unsafe {
+                GetThreadInformation(
+                    GetCurrentThread(),
+                    ThreadPowerThrottling,
+                    (&raw mut state).cast(),
+                    size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+                )
+            };
+            (ok != 0).then_some((state.ControlMask, state.StateMask))
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri has no shim for the thread information calls")]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "each class is entered on a fresh thread, as a pool outside the boundary does"
+        )]
+        fn background_alone_opts_into_throttling_and_other_classes_reset_it() {
+            let readable = build() >= FIRST_READABLE_BUILD;
+            if !readable {
+                eprintln!(
+                    "build {} does not read the power-throttling state back: only the set \
+                     calls are checked",
+                    build()
+                );
+            }
+            for class in [
+                ThreadClass::FrameCritical,
+                ThreadClass::Network,
+                ThreadClass::Present,
+                ThreadClass::Audio,
+                ThreadClass::PhysicsSolver,
+                ThreadClass::Io,
+            ] {
+                std::thread::spawn(move || {
+                    // `enter` reports a refused set call as an error.
+                    let check = |entered: ThreadClass, masks: (u32, u32)| {
+                        entered.enter().unwrap();
+                        match throttling() {
+                            Some(read) => assert_eq!(read, masks, "{class:?} after {entered:?}"),
+                            None => assert!(!readable, "build {} refused the read", build()),
+                        }
+                    };
+                    check(class, SYSTEM_MANAGED);
+                    check(ThreadClass::Background, SET);
+                    check(class, SYSTEM_MANAGED);
+                })
+                .join()
+                .unwrap();
+            }
         }
     }
 }

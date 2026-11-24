@@ -71,3 +71,7 @@ comments rely on. The crate's tests run under Miri.
 
 - Each call (`pthread_set_qos_class_self_np`, `setpriority`, `SetThreadPriority`) takes plain
   values and affects only the calling thread.
+- `SetThreadInformation` with `ThreadPowerThrottling` reads a `THREAD_POWER_THROTTLING_STATE`
+  from a live local, passed with its own size, and affects only the calling thread, named by
+  the pseudo-handle `GetCurrentThread` returns. The Windows test reads the state back through
+  `GetThreadInformation` into a local of the same type and size.
