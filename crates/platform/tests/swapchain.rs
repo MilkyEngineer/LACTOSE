@@ -1046,9 +1046,11 @@ fn report(record: &Record, bound: Duration, apart: Duration) -> Result<()> {
 }
 
 /// The swapchain as a shipped build makes it: the device's copies turned off, so that its
-/// images are colour attachments alone, which MoltenVK makes framebuffer-only. Frames are
-/// presented, each image cleared to its frame's colour on the present queue and nothing read
-/// back, and the swapchain is dropped on the present thread; nothing is sent to the sink.
+/// images are colour attachments alone, which MoltenVK makes framebuffer-only. A copy from
+/// the first image acquired is refused at its submit as an image used outside its usage,
+/// before any driver call. Then frames are presented, each image cleared to its frame's
+/// colour on the present queue and nothing read back, none of them stale, and the swapchain
+/// is dropped on the present thread; nothing is sent to the sink.
 pub(crate) fn a_swapchain_without_copies_presents_on_the_window() -> Result<()> {
     const CASE: &str = "a_swapchain_without_copies_presents_on_the_window";
     const FRAMES: u64 = 36;
@@ -1063,25 +1065,36 @@ pub(crate) fn a_swapchain_without_copies_presents_on_the_window() -> Result<()> 
         let reports = wait(main.run(|main| main.window().reports()))?;
         let extent = extent_of(reports.size());
         let shown = device.create_timeline(0)?;
-        let (on, presents, stale) = wait_within(
+        let copied = readback(&device, "copy readback")?;
+        let (on, copy, presents, stale) = wait_within(
             PATIENCE * 2,
             present.run({
                 let device = Arc::clone(&device);
                 move |(): &mut ()| {
-                    let (presents, stale) = cleared_frames(&device, extent, shown, FRAMES)?;
+                    let (copy, presents, stale) =
+                        cleared_frames(&device, extent, shown, copied, FRAMES)?;
                     let on = std::thread::current().name().map(str::to_owned);
-                    Ok::<_, lactose_core::Error>((on, presents, stale))
+                    Ok::<_, lactose_core::Error>((on, copy, presents, stale))
                 }
             }),
         )??;
+        let copy = copy.err().map(|error| (Rule::of(&error), error.to_string()));
         println!(
-            "stage: {presents} presents ({stale} stale) of {FRAMES} frames at {extent:?}, \
-             cleared and not read back, on {on:?}; the swapchain was dropped there"
+            "stage: the copy from the first image answered {copy:?}; {presents} presents \
+             ({stale} stale) of {FRAMES} frames at {extent:?}, cleared and not read back, on \
+             {on:?}; the swapchain was dropped there"
         );
         wait(thread.stop())?;
+        device.destroy_buffer(copied)?;
         drop_on_the_main_thread(&main, device)?;
         assert_eq!(on.as_deref(), Some("present"));
+        let Some((rule, refusal)) = copy else {
+            panic!("the copy from an image without copies was submitted");
+        };
+        assert_eq!(rule, Some(Rule::Usage), "{refusal}");
+        assert!(refusal.contains("an image used outside its usage"), "{refusal}");
         assert_eq!(presents, FRAMES, "every frame is presented once");
+        assert_eq!(stale, 0, "a present answered stale");
         let others = sink.others();
         assert!(others.is_empty(), "messages: {others:?}");
         Ok(())
@@ -1090,16 +1103,20 @@ pub(crate) fn a_swapchain_without_copies_presents_on_the_window() -> Result<()> 
 
 /// `frames` frames presented on a swapchain made at `extent`, each image cleared alone, on
 /// the present thread; the swapchain is made again where an acquire or a present is stale.
-/// The presents and the stale ones among them.
+/// Before the first frame, a copy of the first image acquired into `copied` is submitted on
+/// an encoder of its own. What that submit answered, the presents, and the stale ones among
+/// them.
 fn cleared_frames(
     device: &VulkanDevice,
     extent: Extent,
     shown: TimelineHandle,
+    copied: BufferHandle,
     frames: u64,
-) -> Result<(u64, u64)> {
+) -> Result<(Result<()>, u64, u64)> {
     let mut swapchain = device.create_swapchain(&SwapchainDesc { extent })?;
     // Each present's encoder, kept until its point is reached.
     let mut kept = Vec::new();
+    let mut copy = None;
     let (mut presents, mut stale) = (0, 0);
     let until = Instant::now() + PATIENCE;
     while presents < frames {
@@ -1112,6 +1129,20 @@ fn cleared_frames(
                 continue;
             }
         };
+        if copy.is_none() {
+            let mut encoder = device.create_encoder(P, "copy")?;
+            let rect = Rect { x: 0, y: 0, extent: TARGET };
+            let region = [BufferImageCopy { buffer_offset: 0, mip: 0, layer: 0, rect }];
+            encoder.copy_image_to_buffer(image, copied, &region);
+            let mut encoders = [encoder];
+            copy = Some(
+                device.submit(P, Submit { encoders: &mut encoders, waits: &[], signals: &[] }),
+            );
+            // Submitted only where the image takes copies; then the frames' last point,
+            // later on the same queue, is reached after it.
+            let [encoder] = encoders;
+            kept.push(encoder);
+        }
         let frame = presents + 1;
         let mut encoder = device.create_encoder(P, "present")?;
         encoder.transition_images(&[image_to(
@@ -1143,7 +1174,8 @@ fn cleared_frames(
     }
     drop(kept);
     drop(swapchain);
-    Ok((presents, stale))
+    let copy = copy.ok_or_else(|| failed("no image was acquired"))?;
+    Ok((copy, presents, stale))
 }
 
 /// Row 182: frames are presented to a minimised window, through the platform's own call,
