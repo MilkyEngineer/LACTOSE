@@ -430,3 +430,23 @@ fn of_pass<T>(items: &[T], pass: u32, id: impl Fn(&T) -> u32) -> &[T] {
     let end = items.partition_point(|item| id(item) <= pass);
     &items[start..end]
 }
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+
+    /// A run longer than a dispatch is split into dispatches of `per_dispatch` entries and
+    /// one of the rest, each beginning where the one before it ended.
+    #[test]
+    fn a_run_of_130_entries_is_split_into_dispatches_of_64_64_and_2() {
+        let mut builder = Builder::new(64);
+        builder.run = 1;
+        let entries: Vec<ScatterEntry> = (0..130)
+            .map(|index| ScatterEntry { slot: Slot::new(index), row: 0, flags: ScatterEntry::FREE })
+            .collect();
+        let mut dispatches = Vec::new();
+        builder.close_run(&entries, &mut dispatches);
+        let split: Vec<(u32, u32)> = dispatches.iter().map(|d| (d.first, d.count)).collect();
+        assert_eq!(split, [(0, 64), (64, 64), (128, 2)]);
+    }
+}

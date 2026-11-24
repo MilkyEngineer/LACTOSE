@@ -2,8 +2,8 @@
 //! "A frame, by step", "Pipelines and shaders"): the plans a client's steady state takes and
 //! the cache size it needs, the frame after `torn`, the scatter's queue where compute has a
 //! queue of its own, the flushes a device whose host memory is not coherent needs, and
-//! `Renderer::new`'s check of each cooked shader's reflection. Adopted from reviewer-gpu's
-//! probes of renderer-impl round 1.
+//! `Renderer::new`'s check of each cooked shader's reflection and of the batch's bound.
+//! Adopted from reviewer-gpu's probes of renderer-impl round 1.
 
 use std::sync::Arc;
 
@@ -299,4 +299,22 @@ fn new_holds_each_shader_reflection() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// `Renderer::new` refuses a description whose batch bound, `instances + 2 * rows`, is past
+/// `u32::MAX`, with `InvalidData` and before anything else that could refuse it: without
+/// shaders, where null would otherwise refuse the entries buffer with `ResourceExhausted`, and
+/// with a shader whose reflection `new` refuses, which it checks after the bound.
+#[test]
+fn new_refuses_a_batch_bound_past_u32_max_first() {
+    let mut shaders = null_shaders();
+    shaders[2].push_bytes = 16;
+    let [scatter, vertex, fragment] = &shaders;
+    let wrong = Shaders { scatter, vertex, fragment, target: TARGET };
+    for shaders in [None, Some(wrong)] {
+        let desc = RendererDesc { instances: u32::MAX, rows: 4, regions: 2, shaders };
+        let error = Renderer::new(null_of(Capabilities::LEAST), &desc).err().expect("refused");
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{error:?}");
+        assert!(error.message().contains("u32::MAX"), "the batch bound refused it: {error:?}");
+    }
 }

@@ -895,10 +895,13 @@ fn run_seed(seed: u64, t: &mut Tally) -> Result<(), String> {
             queues.push((4, vec![Op::Prepare]));
         }
         if run.rng.pct(3) {
-            queues.push((
-                run.rng.below(3) as usize,
-                vec![Op::Write(run.rows(WorldKind::Server)), Op::Removed(vec![the_key(0)])],
-            ));
+            // Writes and removes with no pass open: on a sink whose kind has no pass this
+            // frame, so they never land in a pass (a `Client` pass writes no row).
+            let actor = run.rng.below(3) as usize;
+            let ops = vec![Op::Write(run.rows(WorldKind::Server)), Op::Removed(vec![the_key(0)])];
+            if !queues.iter().any(|q| q.0 == actor) {
+                queues.push((actor, ops));
+            }
         }
         let client_pending = |queues: &Vec<(usize, Vec<Op>)>| queues.iter().any(|q| q.0 == 1);
         let mut remote_queue = remote_ops;

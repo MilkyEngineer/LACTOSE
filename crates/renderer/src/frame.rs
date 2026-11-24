@@ -85,7 +85,8 @@ pub struct FrameStats {
     /// counted here alone, since the next frame's batch writes every remote instance
     /// again. Below saturation it is at least the sum of `dropped_in` over the kinds,
     /// in every frame. A pass lost with no region open can still be reported lost a frame
-    /// before some of its dropped rows are counted, the early report "Writers" allows.
+    /// before some of its dropped rows are counted, the early report "Writers" allows, and
+    /// never a frame after: `models::a_kinds_rows_are_never_taken_before_its_loss`.
     pub dropped: u32,
     /// The rows left out of the batch because a later row of their pass or batch named
     /// the same instance. Zero unless a writer broke its contract.

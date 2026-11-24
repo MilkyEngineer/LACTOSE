@@ -711,13 +711,26 @@ fn many_duplicates_across_workgroups_scatter_the_kept_row() {
     });
 }
 
-/// How [`held`] holds frame 1 in flight.
+/// How [`held`] holds frame 1 in flight. Each form keeps frame 1's scatter and its camera's
+/// read behind the host's writes only through a mask wider than the pair it orders
+/// (`README.md`, "What a frame's first pass waits for"), so narrowing either mask must re-run
+/// the device round's mutants `open-ignores-point` and `one-camera-buffer` against each form
+/// alone.
 #[derive(Clone, Copy, Debug)]
 enum Hold {
     /// Behind a gate on its target's import, which the host signals after its writes: the
-    /// GPU starts frame 1 after them.
+    /// GPU starts frame 1 after them. It relies on rhi-vulkan's wait on a `ready` point at
+    /// every command (`submit.rs`, the `point` closure): a wait at the target's first use,
+    /// colour output, would let the scatter and the vertex shader's camera read run first.
     Gate,
-    /// Behind [`Lag`]'s dispatch at its head: the GPU runs frame 1 while the host writes.
+    /// Behind [`Lag`]'s dispatch at its head: the GPU runs frame 1 while the host writes. It
+    /// relies on the `Undefined` imports of the region's entries and camera, which rhi-vulkan
+    /// records with a source of every command: the lag shares no resource with the
+    /// renderer's passes, and nothing else orders them behind it. The test cannot give it
+    /// one without changing the renderer: the lag is declared before `Renderer::declare`,
+    /// whose only handle, `DeclaredFrame::instances`, comes after it, and the target, the one
+    /// resource the test imports that the triangle pass declares, would order the colour
+    /// output alone.
     Lag,
 }
 
@@ -764,7 +777,10 @@ struct Held {
 /// Instance 1 at `x = 0` in frame 1, which looks at it from the origin's cell, and nothing
 /// new in frame 2, which looks from 50 metres along `+X`, where nothing is. `None` where a
 /// lag of `rounds` let frame 1's point be reached before the host's work for frame 2 was
-/// done, so that the frames show nothing of a frame in flight.
+/// done, so that the frames show nothing of a frame in flight. That frame 1's point was not
+/// reached shows the frame in flight, not that its scatter and triangle pass had not run:
+/// that rests on the mask each [`Hold`] relies on, the gate's every-command wait or the
+/// `Undefined` imports' every-command source behind the lag.
 fn held(gpu: &mut Gpu, hold: Hold, rounds: u32) -> Option<Held> {
     let row = placement([0; 3], [0.0; 3], 0.3);
     world_pass(&gpu.renderer, WorldKind::Server, Tick(1), true, &[moved(1, row)]);

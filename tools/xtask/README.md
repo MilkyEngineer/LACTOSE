@@ -789,7 +789,10 @@ writes its report.
    driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
    cleared:`, or `none`), every variable it set, the canaries heard or skipped, the
    device's `DeviceInfo` and `Capabilities`, and each test with `passed`, the suite's
-   `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed. Under a
+   `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed, then
+   each line of its output that ends in `retrying`, so that a test that passed only on a
+   retry says so (the renderer's device tests print one where a held frame was reached
+   before its release, `crates/renderer/README.md`, "Proof"). Under a
    failed test it writes how its process ended, its exit status or on unix the signal that
    killed it, and the last lines of its standard output and of its standard error, 40 at
    most between them (`TAIL_LINES` in `src/vulkan.rs`), so a process that died silently still

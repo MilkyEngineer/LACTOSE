@@ -380,6 +380,33 @@ fn a_kinds_dropped_rows_are_within_the_total_in_each_sealing() {
 }
 
 #[test]
+fn a_kinds_rows_are_never_taken_before_its_loss() {
+    // The same pass, which finds no region open where it begins before the `open`: it
+    // marks its kind lost, then drops its row, while the sealings take the record. A sealing
+    // that takes the row has taken the loss, in it or in a sealing before it (README
+    // "Writers"). Adopted from reviewer-concurrency's model of renderer-impl round 2.
+    model(|| {
+        let staging = ring(8);
+        staging.seal().expect("region zero is open");
+        let shared = Arc::clone(&staging);
+        let writer = thread::spawn(move || {
+            let mut sink = ExtractSink::new(shared);
+            sink.begin(ExtractPass { kind: WorldKind::Server, ..PASS });
+            sink.write(&[row(1)]);
+            sink.end();
+        });
+        staging.open(Use { region: 1, generation: 2 });
+        let first = seal_when_closed(&staging);
+        writer.join().expect("the writer");
+        staging.open(Use { region: 0, generation: 3 });
+        let second = seal_when_closed(&staging);
+        let server = |s: &Sealed| s.counts.dropped_by_kind[kind_index(WorldKind::Server)];
+        let lost_in = |s: &Sealed| s.counts.lost & lost(WorldKind::Server) != 0;
+        assert!(server(&first) == 0 || lost_in(&first), "{:?} {:?}", first.counts, second.counts);
+    });
+}
+
+#[test]
 fn a_remote_batch_beside_a_pass_is_read_whole() {
     // The render side writes the remote batch while a pass runs on another thread: the
     // sealing reads both whole, each row once.

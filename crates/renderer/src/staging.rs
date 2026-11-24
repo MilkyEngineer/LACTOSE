@@ -152,7 +152,10 @@ impl Record {
             return;
         }
         let count = kind.map_or(&self.unkinded, |kind| &self.dropped_by_kind[kind_index(kind)]);
-        count.fetch_add(rows, Ordering::Relaxed);
+        // `Release`, which `take`'s acquire of a kind's count pairs with: a pass with no
+        // region marks its kind's loss before it drops a row, so a `take` that takes the
+        // row takes the loss.
+        count.fetch_add(rows, Ordering::Release);
     }
 
     /// The counts, which the caller reads after the sealing.
@@ -164,13 +167,13 @@ impl Record {
         )
     }
 
-    /// The counts, reset to zero.
+    /// The counts, reset to zero: the rows first and the lost kinds last, so that rows of a
+    /// lost pass are never taken before its loss, which the pass marks before it drops
+    /// them. The loss may still be taken before rows dropped after it.
     fn take(&self) -> Counts {
-        Counts::of(
-            self.lost.swap(0, Ordering::Relaxed),
-            self.unkinded.swap(0, Ordering::Relaxed),
-            self.dropped_by_kind.each_ref().map(|c| c.swap(0, Ordering::Relaxed)),
-        )
+        let unkinded = self.unkinded.swap(0, Ordering::Relaxed);
+        let by_kind = self.dropped_by_kind.each_ref().map(|c| c.swap(0, Ordering::Acquire));
+        Counts::of(self.lost.swap(0, Ordering::Relaxed), unkinded, by_kind)
     }
 
     fn reset(&self) {
@@ -482,9 +485,10 @@ struct OpenPass {
 ///
 /// A sink holds the device and the ring's shared state, so it outlives its renderer: what
 /// it writes after the renderer's drop is refused and dropped, and the device lives until
-/// the last sink is dropped, so a teardown gives every world `set_sink(None)` before it
-/// drops the renderer. A sink passed to `mem::forget` with a pass open keeps that pass's
-/// count, and every later `prepare` refuses.
+/// the last sink is dropped. `lactose-app` drops the render side before
+/// `Server::shutdown` drops the world and its sink, and the device's last holder after
+/// both (`crates/app/README.md`, "Shutdown"). A sink passed to `mem::forget` with a pass
+/// open keeps that pass's count, and every later `prepare` refuses.
 pub struct ExtractSink {
     /// What the sink shares with the renderer.
     staging: Arc<Staging>,
@@ -977,8 +981,9 @@ mod tests {
     impl Read {
         /// Reads one sealing: every entry is of a pass whose begin it reads, a pass read
         /// with its end is read with each of its rows, and one read without it is of a
-        /// kind the sealing reports lost.
-        fn sealing(&mut self, staging: &Staging, sealed: &Sealed) {
+        /// kind the sealing reports lost. Returns how many passes it read whole.
+        fn sealing(&mut self, staging: &Staging, sealed: &Sealed) -> usize {
+            let mut whole = 0;
             let entries: Vec<Entry> = staging.entries(sealed).collect();
             let begins: Vec<(u32, WorldKind, u64)> = entries
                 .iter()
@@ -1009,21 +1014,35 @@ mod tests {
                     written.sort_unstable();
                     assert_eq!(rows, written, "an ended pass read without some rows: {mine:?}");
                     *self.whole.entry(pass).or_default() += 1;
+                    whole += 1;
                 } else {
                     let lost = sealed.counts.lost & super::tests::lost(kind) != 0;
                     assert!(lost, "a pass read without its end, its kind not lost: {mine:?}");
                     *self.unended.entry(pass).or_default() += 1;
                 }
             }
+            whole
         }
     }
+
+    /// The sealings in a row [`passes_on_three_threads_race_a_sealer`]'s sealer may have
+    /// refused before it panics, taking a pass's count for never given back. The most seen
+    /// in a row at this round's code was 2,611 under Miri (sixteen seeds) and 5,594 natively
+    /// (thirty runs at load averages near 20, renderer-impl fix round 2); the bound is more
+    /// than ten times the greater. A drop that never gives its count back reaches it in under
+    /// a second natively and in under two minutes under Miri, four seeds at once.
+    const REFUSALS_MAX: u64 = 100_000;
 
     /// The ring under three writers, one per kind, each running passes of three rows with
     /// every seventh dropped with its pass open, while the test's thread seals, reads and
     /// opens the regions in turn, on the standard library's atomics. Each pass whose begin
     /// took a count is read whole once if it ended and without its end once if it did
     /// not; a pass that took none is never read. The writers wait at their midpoint for a
-    /// sealing, so that some sealing comes while they run; the test fails if none did.
+    /// sealing, and after each `open` the sealer waits for a pass to take a count on the
+    /// new use, so that sealings come while the writers run and race their passes; the
+    /// test fails unless one of them read a pass whole. A sealing refused
+    /// [`REFUSALS_MAX`] times in a row fails it too, so that a count never given back
+    /// fails with a message rather than hanging.
     ///
     /// Under Miri, which runs it with twelve passes a writer, its weak-memory emulation
     /// checks the shipped orderings that the shadow entries' reads rest on; elsewhere it
@@ -1070,26 +1089,39 @@ mod tests {
             .into_iter()
             .collect();
         let mut read = Read::default();
-        let (mut region, mut generation, mut mid) = (0, 1, 0);
+        let (mut region, mut generation, mut mid, mut mid_whole) = (0, 1, 0, 0);
+        let mut refused = 0;
+        wait_for_a_begin(&staging, &done);
         loop {
             let finished = done.load(StdOrdering::SeqCst) == KINDS.len();
             match staging.seal() {
                 Ok(sealed) => {
-                    read.sealing(&staging, &sealed);
+                    let whole = read.sealing(&staging, &sealed);
                     sealings.fetch_add(1, StdOrdering::SeqCst);
+                    refused = 0;
                     if finished {
                         break;
                     }
                     mid += 1;
+                    mid_whole += whole;
                     region = 1 - region;
                     generation = next_generation(generation);
                     staging.open(Use { region, generation });
+                    wait_for_a_begin(&staging, &done);
                 }
-                Err(Unsealed::PassOpen) => std::thread::yield_now(),
+                Err(Unsealed::PassOpen) => {
+                    refused += 1;
+                    assert!(
+                        refused < REFUSALS_MAX,
+                        "{refused} sealings in a row refused: a pass's count is never given back"
+                    );
+                    std::thread::yield_now();
+                }
                 Err(Unsealed::NotOpen) => panic!("the sealer keeps a region open"),
             }
         }
         assert!(mid > 0, "no sealing came while the writers ran");
+        assert!(mid_whole > 0, "no sealing while the writers ran read a pass whole");
         for (kind, writer) in KINDS.into_iter().zip(writers) {
             let took = writer.join().expect("a writer");
             for (seq, (held, abandoned)) in (0..).zip(took) {
@@ -1103,6 +1135,21 @@ mod tests {
                 };
                 assert_eq!((whole, unended), expected, "{kind:?} pass {seq}");
             }
+        }
+    }
+
+    /// Waits, for a bound, until a pass has taken a count on the use the sealer of
+    /// [`passes_on_three_threads_race_a_sealer`] just opened, or the writers are done, so
+    /// that its next sealing has a pass to race. One `Relaxed` load a try: it orders nothing
+    /// the test checks. Past the bound the sealer seals what it finds.
+    fn wait_for_a_begin(staging: &Staging, done: &AtomicUsize) {
+        let bound = if cfg!(miri) { 10_000 } else { 1_000_000 };
+        for _ in 0..bound {
+            let (_, _, count) = fields(staging.open.load(Ordering::Relaxed));
+            if count > 0 || done.load(StdOrdering::SeqCst) == KINDS.len() {
+                return;
+            }
+            std::thread::yield_now();
         }
     }
 
