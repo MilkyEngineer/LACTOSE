@@ -7975,9 +7975,9 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     device keeps the object of an image a pending submit names, so an encoder dropped while
     a panic unwinds, which waits for nothing, does not let the driver swapchain go before
     that submit completes; the owner destroys it once the last holder goes, after its
-    present fences. A swapchain whose
-    drop cannot see its presents end leaks the device, and the records keep its mark, so a
-    second `create_swapchain` is refused. It is no change to `lactose-rhi-api`'s contract.
+    present fences. The drop waits for no batch of the present queue: its semaphores go to
+    the device behind its stamp. A drop that cannot see its presents end leaks the device,
+    and the records keep its mark, so a second `create_swapchain` is refused. No contract change.
 
 **D159. `lactose-platform`: one window whose `Arc` is its lifetime, the two pumps over `lactose-task`'s lanes, a close and a resize as states, and a present thread over the caller's state** (§3, §4, §5.1, §21, `lactose-platform`, `crates/app/README.md`, `crates/task/README.md`)
 - Why: section 4 gives the crate four nouns and section 5.1 two threads, and the milestone 2
