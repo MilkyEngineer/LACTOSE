@@ -353,6 +353,9 @@ pub(crate) struct Shared {
     pub(crate) heap: Heap,
     pub(crate) records: Mutex<Records>,
     lost: AtomicBool,
+    /// Whether a swapchain made now takes copies into its images' usage: from the
+    /// `swapchain-copies` feature, and turned off by `VulkanDevice::set_swapchain_copies`.
+    pub(crate) copies: AtomicBool,
     /// The device objects and encoders that hold the device (`hold`).
     holders: Holders,
     pub(crate) buffers: Table<BufferObj>,
@@ -394,6 +397,14 @@ impl Shared {
         // holder's wait for idle, which needs every queue of the device externally
         // synchronised (`Holders::let_go`).
         if !self.holders.let_go() {
+            return;
+        }
+        // A leaking device waits for nothing and destroys nothing: what may be in use stays
+        // so for the life of the process. What `left` holds is let go here, after
+        // `Holders::let_go`'s acquire, so that each object's drop sees the flag.
+        if self.raw.leaking() {
+            let left = core::mem::take(&mut *lock(&self.left));
+            drop(left);
             return;
         }
         if std::thread::panicking() {
@@ -626,8 +637,9 @@ impl VulkanDevice {
     /// required set (named in the message), its limits are below
     /// [`Capabilities::LEAST`]'s or below the heap and sampler table asked for, or the request
     /// has a surface the instance or adapter cannot present to (no swapchain or surface
-    /// maintenance extension, a handle of another kind, an AppKit view off the main
-    /// thread). `ErrorKind::NotFound` for an adapter no name of the loader's contains. A
+    /// maintenance extension or feature, no queue family that both draws and presents to
+    /// it, a handle of another kind or missing what its kind needs, an AppKit view off the
+    /// main thread). `ErrorKind::NotFound` for an adapter no name of the loader's contains. A
     /// driver's failure as its kind. A pipeline cache that fails a check starts the cache
     /// empty and is no error.
     pub fn new(request: DeviceRequest) -> Result<Self> {
@@ -676,6 +688,7 @@ impl VulkanDevice {
             heap,
             records: Mutex::new(Records::new(caps.heap_slots, caps.samplers, start)),
             lost: AtomicBool::new(false),
+            copies: AtomicBool::new(cfg!(feature = "swapchain-copies")),
             holders: Holders::new(),
             buffers: Table::new(),
             images: Table::new(),
@@ -687,6 +700,17 @@ impl VulkanDevice {
             cache,
         };
         Ok(Self { shared: Arc::new(shared) })
+    }
+
+    /// Whether a swapchain made after this call has copies in its images' usage, which the
+    /// `swapchain-copies` feature turns on: off, the images are colour attachments alone, as
+    /// the contract names them, for a window test that presents as a shipped build does.
+    #[doc(hidden)]
+    #[cfg(feature = "swapchain-copies")]
+    pub fn set_swapchain_copies(&self, on: bool) {
+        // Relaxed: read by a later `create_swapchain` or `resize`, which the caller orders
+        // after this call.
+        self.shared.copies.store(on, Ordering::Relaxed);
     }
 
     /// What the device holds, for the unit tests' calls below the contract: the

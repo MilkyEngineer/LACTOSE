@@ -146,6 +146,11 @@ const CASES: &[Case] = &[
         expect: Expect::Done,
     },
     Case {
+        name: "a_swapchain_without_copies_presents_on_the_window",
+        child: swapchain::a_swapchain_without_copies_presents_on_the_window,
+        expect: Expect::Done,
+    },
+    Case {
         name: "a_minimised_window_is_presented_to_and_the_frame_goes_on",
         child: swapchain::a_minimised_window_is_presented_to_and_the_frame_goes_on,
         expect: Expect::Done,

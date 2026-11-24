@@ -140,16 +140,24 @@ pub(crate) struct Raw {
     pub(crate) properties: vk::PhysicalDeviceProperties,
     /// What a device made with a surface presents through.
     pub(crate) presents: Option<Presents>,
-    /// Set by a drop that unwinds a panic with work maybe in flight: every object of the
-    /// device is then leaked, never destroyed under the GPU's use.
+    /// Set by a drop that unwinds a panic with work maybe in flight, or by a swapchain's
+    /// drop whose presents may not have ended: what may be in the GPU's or the presentation
+    /// engine's use is then leaked, never destroyed under it.
     leaking: AtomicBool,
 }
 
 impl Raw {
     /// Whether drops leak rather than destroy.
     pub(crate) fn leaking(&self) -> bool {
-        // Relaxed: set once, before the last holder's drop; every object's drop that reads
-        // it runs after that drop in the same thread, or after the `Arc`'s release.
+        // Relaxed: set once, and never cleared. The reads that must see it are ordered after
+        // the store without this load's help. The leaked swapchain's driver swapchain is
+        // dropped after its `Arc`'s release sequence, since the swapchain's drop gives up its
+        // chain's count after the store. What `Shared::left` holds is drained by the last
+        // holder's `let_go` after `Holders::let_go`'s release decrements and acquire fence,
+        // since the store comes before its own holder's `let_go`; that `let_go` reads it
+        // there too. An image object another thread drops before it sees the flag may
+        // destroy its views, and a plain image its image and memory: nothing pending names
+        // them.
         self.leaking.load(Ordering::Relaxed)
     }
 

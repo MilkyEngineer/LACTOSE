@@ -749,9 +749,13 @@ impl Records {
         if walk.deciding[queue].is_some_and(|from| through >= from) {
             return Ok(via);
         }
-        if through > self.queues[queue].received {
-            return Ok(via);
-        }
+        // Every submit through `through` has been received: `point` asks only of a received
+        // one, and the walk's first call is made under its queue's lock.
+        debug_assert!(
+            through <= self.queues[queue].received,
+            "a walk of queue {queue} through {through}, past its received {}",
+            self.queues[queue].received
+        );
         for seq in walk.decided[queue] + 1..=through {
             // The submits from `seq` on are in progress; those before it are decided.
             walk.deciding[queue] = Some(seq);

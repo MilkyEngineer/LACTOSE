@@ -161,8 +161,11 @@ fn main_thread() -> bool {
 
 /// Takes a layer made for a view out of the view, on the main thread, where AppKit's view
 /// tree is changed: at once on it, or later from its queue, which runs once the thread
-/// returns to its run loop. The layer is let go there too, its observers of the view's
-/// layer removed after it. A view's own layer (`pre_existing`) stays the view's.
+/// returns to its run loop. The surface's retain of the layer is released there too, but
+/// it need not be the last: a drawable retains its layer, and MoltenVK releases a presented
+/// one on Metal's completion thread, after it signals the present fence. So the layer's
+/// drop, which removes its observers of the view's layer, may run on that thread, as
+/// `raw-window-metal`'s drop allows. A view's own layer (`pre_existing`) stays the view's.
 #[cfg(target_os = "macos")]
 fn detach(layer: Layer) {
     if layer.pre_existing() {

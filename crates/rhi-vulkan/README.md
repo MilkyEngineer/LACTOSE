@@ -31,8 +31,10 @@ leaves to the backend.
 
 One feature, `swapchain-copies`, is for dev-dependency edges alone: with it a swapchain's
 images are made for copies from and to as well, where the surface allows both, so that a
-window test reads a swapchain image back. The contract's swapchain images are colour
-attachments and nothing else, and nothing that ships turns it on.
+window test reads a swapchain image back. A hidden switch it adds,
+`VulkanDevice::set_swapchain_copies`, turns that off for the swapchains made after it, so
+that a window test presents with the usage a shipped build has. The contract's swapchain
+images are colour attachments and nothing else, and nothing that ships turns it on.
 
 ## What the device makes
 
@@ -145,11 +147,14 @@ attachments and nothing else, and nothing that ships turns it on.
   `VK_EXT_swapchain_maintenance1` where the instance took `VK_EXT_surface_maintenance1`, else
   the `KHR` form of each by name, with the `swapchainMaintenance1` feature. At the device's
   last drop, once the surface is destroyed, the layer made for an AppKit view is taken out of
-  the view (`removeFromSuperlayer`) and let go on the main thread: at once on it, and
-  otherwise from the main queue (`dispatch`), which runs once that thread returns to its run
-  loop. A view whose own layer is a `CAMetalLayer` keeps it. A device leaked on the leak path
-  leaves the layer in the view, alive. `ash` 0.38 names neither `KHR` form; their structures and
-  values are the `EXT` form's, which the backend uses for both. The backend calls no
+  the view (`removeFromSuperlayer`) and the surface's retain of it released on the main
+  thread: at once on it, and otherwise from the main queue (`dispatch`), which runs once
+  that thread returns to its run loop. A presented drawable's retain may be the layer's
+  last, which MoltenVK releases on Metal's completion thread, so the layer's observers of
+  the view's layer may be removed there. A view whose own layer is a `CAMetalLayer` keeps
+  it. A device leaked on the leak path leaves the layer in the view, alive. `ash` 0.38
+  names neither `KHR` form; their structures and values are the `EXT` form's, which the
+  backend uses for both. The backend calls no
   `vkReleaseSwapchainImagesEXT`, which the `KHR` form names otherwise.
 - **The images** are `FIFO`, of the first of `B8G8R8A8_UNORM`, `R8G8B8A8_UNORM` and their
   `SRGB` forms the surface offers in `SRGB_NONLINEAR`, three where the surface allows,
@@ -186,7 +191,7 @@ attachments and nothing else, and nothing that ships turns it on.
   | `VK_ERROR_OUT_OF_HOST_MEMORY`, `VK_ERROR_OUT_OF_DEVICE_MEMORY` | No: the spec names only the three below as enqueued | Never signals | Takes the fence back, and waits for the image's present semaphore, left signalled, with an empty batch that `resize` and the drop wait for |
   | `VK_ERROR_OUT_OF_DATE_KHR`, `VK_ERROR_SURFACE_LOST_KHR`, `VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT` | Yes, by the spec | Signals | Waits for it as for a shown present's |
   | `VK_ERROR_DEVICE_LOST` | Either | Need not signal | Nothing waits after a loss |
-  | Any other, MoltenVK's `VK_ERROR_OUT_OF_POOL_MEMORY` among them | Not stated | MoltenVK 1.4.2 signals it where the drawable timed out, and never where the present had no command buffer | Waits for it as for a shown present's; one not signalled a bound after its present, with the present queue idle, is given up and leaked with the image's present semaphore, whose wait may be pending |
+  | Any other, MoltenVK's `VK_ERROR_OUT_OF_POOL_MEMORY` among them | Not stated | MoltenVK 1.4.2 signals it where the drawable timed out, and never where the present had no command buffer | Waits for it as for a shown present's; one not signalled a bound after its present, with the present queue idle, is taken to have enqueued nothing and is destroyed, and the image's present semaphore with its chain: MoltenVK's present with no command buffer is the one known source |
 
   No safe call makes a present fail on a headless surface: a unit test injects the refusal
   with nothing enqueued, out of memory and an unlisted error. The enqueued errors and the
@@ -200,9 +205,10 @@ attachments and nothing else, and nothing that ships turns it on.
   either way): the swapchain has no images, reports a zero extent and is stale, its acquire
   answering `Stale` and its present refused, until a later `resize` makes one from nothing.
 - **A zero extent.** While the surface's current or largest extent has a zero dimension, as a
-  minimised window's may, `create_swapchain` and `resize` make no driver swapchain: the
-  swapchain has no images and is stale, `acquire` answers `Stale`, and a `resize` once the
-  extent is not zero makes one. A unit test holds the decision, which reads only the
+  minimised window's may, no driver swapchain is made: a `create_swapchain` there has no
+  images, and a `resize` there keeps the images it has, as `resize`'s contract says. Either
+  way the swapchain is stale, `acquire` answers `Stale`, and a `resize` once the extent is
+  not zero makes one. A unit test holds the decision, which reads only the
   surface's capabilities.
 - **The drop** waits, for at most three seconds, for the pending present fences and for the
   submits that waited for the acquires' semaphores, and while its thread unwinds a panic
@@ -341,17 +347,23 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   it; a drop whose present never ends, which leaks the device, the layer silent, and refuses
   a second swapchain; a `resize` whose `vkCreateSwapchainKHR` or image fails, stale until a
   later `resize`; a present refused with nothing enqueued, out of memory and an unlisted
-  error, stale until a `resize`, the unlisted error's fence and semaphore leaked and reported
-  at the device's destroy alone; and frames presented beside a frame thread whose submit
+  error, stale until a `resize`, the unlisted error's fence and semaphore destroyed and the
+  layer silent; a frame submit pending on an acquired image, held by a host point, at a
+  `resize`, its encoder dropped while a panic unwinds, the replaced driver swapchain kept
+  until the point is signalled, and the layer silent; and frames presented beside a frame thread whose submit
   each present's walk finds stamped and not yet received, each undecided at least once
-  (a test-only count). With no driver: the zero extent's decision, and the display-time
-  report's widening, watermark, order and read guard.
+  (a test-only count). With no driver: the zero extent's decision, the images' usage with
+  and without copies, and the display-time report's widening, watermark, order and read
+  guard.
 - On a window, in `lactose-platform`'s `tests/window.rs` (`tests/swapchain.rs` there), run on
   the M1 under MoltenVK, with Metal API and shader validation, and under KosmicKrisp, each
   with the layer: 131 frames across a resize to half the window and a rebuild right after a
   present, every present's image read back equal to its target, which the
-  `swapchain-copies` feature allows; each id reported once and in order, the call's bound
-  held at every call; and frames presented to a minimised window for 8 s while workers draw.
+  `swapchain-copies` feature allows, the image cleared first to a colour its target is not,
+  so that only the copy makes the two equal; each id reported once and in order, the call's
+  bound held at every call; 36 frames presented with the copies turned off, the images
+  colour attachments alone, which MoltenVK makes framebuffer-only, with no message and no
+  driver line; and frames presented to a minimised window for 8 s while workers draw.
   `cargo xtask gpu` does not run them; the window run does, on the driver the loader finds.
 - Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, no size,
   two sizes or the built-in state no workgroup, an entry declared by its name and its stage's

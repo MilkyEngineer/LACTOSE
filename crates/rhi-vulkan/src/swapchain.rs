@@ -13,6 +13,7 @@
 //! recorded an image, or a submit still pending that names one, keeps it past a `resize` or
 //! the swapchain's drop.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -60,14 +61,14 @@ const FORMATS: [(vk::Format, Format); 4] = [
 ];
 
 /// What the images are made for: colour attachments alone, which the contract names, and
-/// with the `swapchain-copies` feature, for tests that read an image back, copies from and to
-/// as well where the surface allows both.
-fn usage(supported: vk::ImageUsageFlags) -> (vk::ImageUsageFlags, ImageUsage) {
-    let copies = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-    if cfg!(feature = "swapchain-copies") && supported.contains(copies) {
+/// where `copies`, for tests that read an image back, copies from and to as well where the
+/// surface allows both (`Shared::copies`).
+fn usage(supported: vk::ImageUsageFlags, copies: bool) -> (vk::ImageUsageFlags, ImageUsage) {
+    let copy = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+    if copies && supported.contains(copy) {
         let usage =
             ImageUsage::COLOUR.union(ImageUsage::COPY_SOURCE).union(ImageUsage::COPY_DESTINATION);
-        (vk::ImageUsageFlags::COLOR_ATTACHMENT | copies, usage)
+        (vk::ImageUsageFlags::COLOR_ATTACHMENT | copy, usage)
     } else {
         (vk::ImageUsageFlags::COLOR_ATTACHMENT, ImageUsage::COLOUR)
     }
@@ -208,8 +209,8 @@ pub(crate) struct VulkanSwapchain {
     /// Unsignalled fences for later presents: signalled ones reset, and ones no present took.
     spare: Vec<vk::Fence>,
     /// The fences of `pending` whose present failed with an error that does not say whether
-    /// the present was enqueued, with when: given up, and leaked, once the bound has passed
-    /// and the present queue is idle.
+    /// the present was enqueued, with when: given up, and destroyed, once the bound has
+    /// passed and the present queue is idle.
     doubtful: Vec<(vk::Fence, Instant)>,
     /// An acquire or a present was out of date, the surface was empty at the last make, or
     /// the last make failed.
@@ -332,7 +333,10 @@ impl VulkanSwapchain {
         .find(|alpha| caps.supported_composite_alpha.contains(*alpha))
         .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
         let family = [self.shared.queue(self.queue).family];
-        let (vk_usage, usage) = usage(caps.supported_usage_flags);
+        // Relaxed: set before the device is shared, or on the thread that makes the
+        // swapchain, by the one test switch.
+        let copies = self.shared.copies.load(Ordering::Relaxed);
+        let (vk_usage, usage) = usage(caps.supported_usage_flags, copies);
         // A dropped swapchain's driver swapchain that an image's user still holds is the
         // surface's, not retired: the new one is made from it.
         let unretired = match self.chain.owner {
@@ -550,8 +554,8 @@ impl VulkanSwapchain {
         for &semaphore in &chain.present_semaphores {
             // SAFETY: each present's wait for it is done (its fence), the empty batch that
             // waited for one a present left signalled has completed (`unsignalled`), and no
-            // submit to come signals it. One given up with its fence is null, which the
-            // call ignores.
+            // submit to come signals it. One a given-up present left signalled has no wait
+            // pending, since that present enqueued nothing.
             unsafe { self.device().destroy_semaphore(semaphore, None) };
         }
     }
@@ -590,7 +594,11 @@ impl VulkanSwapchain {
 
     /// Waits until `deadline` for `fences`, and reaps what signalled; whether they all did.
     /// A doubtful fence that has not signalled a bound after its present, with the present
-    /// queue idle, is given up and leaked: its present was never enqueued.
+    /// queue idle, is given up and destroyed: the bound with the queue idle is taken to show
+    /// that the present enqueued nothing, so nothing pending names the fence or the image's
+    /// present semaphore, which is left for `destroy_semaphores`. The one known source is
+    /// MoltenVK 1.4.2's present with no command buffer, whose waits and fence go nowhere; its
+    /// drawable timeout, the same error, still signals the fence, which is reaped as usual.
     fn wait_fences(&mut self, fences: &[vk::Fence], deadline: Instant) -> Result<bool> {
         let fences: Vec<vk::Fence> =
             fences.iter().copied().filter(|fence| self.pending.contains(fence)).collect();
@@ -621,14 +629,16 @@ impl VulkanSwapchain {
                 .collect();
             for fence in given_up {
                 self.pending.retain(|&pending| pending != fence);
-                // The present's wait for the image's present semaphore may yet be pending:
-                // the semaphore is leaked with the fence. The image presents no more, since
-                // the error left the swapchain stale until its chain is replaced.
-                let at = self.chain.last_fence.iter().position(|&last| last == Some(fence));
-                if let Some(at) = at {
-                    self.chain.present_semaphores[at] = vk::Semaphore::null();
-                }
                 self.unname(fence);
+                // SAFETY: the bound with the present queue idle is taken to show that the
+                // present enqueued nothing, so no queue operation names the fence. MoltenVK
+                // 1.4.2's present with no command buffer (`MVKQueue.mm` 739-750) is the one
+                // known source; its drawable timeout (`MVKImage.mm` 1625), the same error,
+                // signals the fence, which `reap` takes as any other. The image's present
+                // semaphore, left signalled with no wait pending, is never signalled again:
+                // the error left the swapchain stale until its chain is replaced, whose
+                // retirement destroys it.
+                unsafe { self.device().destroy_fence(fence, None) };
             }
         }
         Ok(fences.iter().all(|fence| !self.pending.contains(fence)))
@@ -769,7 +779,7 @@ impl VulkanSwapchain {
                 Staging::Staged(staged) => return Ok((held_queue, staged)),
                 Staging::Undecided(point) => {
                     #[cfg(test)]
-                    UNDECIDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    UNDECIDED.fetch_add(1, Ordering::Relaxed);
                     // The wait is made with no lock held: on a shared queue the submit
                     // that signals the point may need the queue's.
                     drop(held_queue);
@@ -1186,8 +1196,10 @@ impl Drop for VulkanSwapchain {
         if !self.shared.raw.leaking() {
             // SAFETY: every present's fence has signalled, or its present was never
             // enqueued, or the device is lost; the batches that waited for the acquire
-            // semaphores have completed; a fence given up as doubtful is in neither list,
-            // and is leaked.
+            // semaphores have completed. A fence given up as doubtful, a bound after its
+            // present with the present queue idle, which is taken to show that the present
+            // enqueued nothing (MoltenVK 1.4.2's present with no command buffer is the one
+            // known source), was destroyed then and is in neither list.
             unsafe {
                 for &(semaphore, _) in &self.pool {
                     self.device().destroy_semaphore(semaphore, None);
@@ -1215,6 +1227,7 @@ mod tests {
     //! semaphore reused under a pending wait, a drop that leaks, an injected failure of a
     //! resize, and the walk a frame thread's submit decides, which a counter shows.
 
+    use std::panic::AssertUnwindSafe;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex, PoisonError, mpsc};
     use std::time::{Duration, Instant};
@@ -1223,14 +1236,14 @@ mod tests {
     use lactose_core::ErrorKind;
     use lactose_rhi_api::{
         Acquired, Device, DeviceRequest, DisplayTime, Encoder, Extent, HEAP_SLOTS_DEFAULT,
-        ImageHandle, ImageRange, ImageState, ImageTransition, Message, MessageSink, PresentId,
-        Presented, QueueRole, Rule, SAMPLERS_DEFAULT, StateOn, Submit, Swapchain, TimelineHandle,
-        TimelinePoint,
+        ImageHandle, ImageRange, ImageState, ImageTransition, ImageUsage, Message, MessageSink,
+        PresentId, Presented, QueueRole, Rule, SAMPLERS_DEFAULT, StateOn, Submit, Swapchain,
+        TimelineHandle, TimelinePoint,
     };
 
     use super::{
         BOUND, DRAIN_MOST, Fail, HISTORY, Timing, UNDECIDED, Use, VulkanSwapchain, empty,
-        read_history, widen,
+        read_history, usage, widen,
     };
     use crate::{VulkanDevice, lock};
 
@@ -1253,6 +1266,21 @@ mod tests {
         assert!(empty(&caps((800, 600), (0, 4096))));
         assert!(!empty(&caps((800, 600), (4096, 4096))));
         assert!(!empty(&caps((u32::MAX, u32::MAX), (4096, 4096))));
+    }
+
+    /// The images are colour attachments alone without copies, or where the surface does
+    /// not allow both copies; with them, copies from and to as well.
+    #[test]
+    fn the_images_take_copies_only_where_asked_and_allowed() {
+        let colour = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let copy = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let all = colour | copy | vk::ImageUsageFlags::SAMPLED;
+        assert_eq!(usage(all, false), (colour, ImageUsage::COLOUR));
+        let source = colour | vk::ImageUsageFlags::TRANSFER_SRC;
+        assert_eq!(usage(source, true), (colour, ImageUsage::COLOUR));
+        let copies =
+            ImageUsage::COLOUR.union(ImageUsage::COPY_SOURCE).union(ImageUsage::COPY_DESTINATION);
+        assert_eq!(usage(all, true), (colour | copy, copies));
     }
 
     /// The driver carries a present id's low 32 bits; it is widened against the newest id
@@ -1415,6 +1443,7 @@ mod tests {
 
     const SMALL: Extent = Extent { width: 64, height: 64 };
     const P: QueueRole = QueueRole::Present;
+    const G: QueueRole = QueueRole::Graphics;
 
     fn at(timeline: TimelineHandle, value: u64) -> TimelinePoint {
         TimelinePoint { timeline, value }
@@ -1663,13 +1692,12 @@ mod tests {
     /// `Stale` with an id. Out of memory, host or device, gives its fence back and unsignals
     /// the image's present semaphore with an empty batch, which the `resize` after waits
     /// for. An error the spec does not list waits for its fence a bound, with the present
-    /// queue idle, then leaks it with the image's present semaphore. A later `resize` makes
-    /// a swapchain that presents; the layer says nothing but, after the unlisted error, the
-    /// leak at the device's destroy.
+    /// queue idle, then destroys it, and the `resize` the image's present semaphore. A later
+    /// `resize` makes a swapchain that presents, and the layer says nothing, to the device's
+    /// destroy.
     #[test]
     #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
     fn a_present_refused_with_nothing_enqueued_is_stale_until_a_resize() {
-        const LEAK: &str = "VUID-vkDestroyDevice-device-05137";
         let errors = [
             vk::Result::ERROR_OUT_OF_HOST_MEMORY,
             vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
@@ -1703,13 +1731,52 @@ mod tests {
             drop(encoders);
             drop(more);
             drop(device);
-            let breaches = breaches(&kept);
-            if unlisted {
-                assert!(!breaches.is_empty(), "the leak is reported at the device's destroy");
-                assert!(breaches.iter().all(|text| text.contains(LEAK)), "{breaches:?}");
-            } else {
-                assert_eq!(breaches, Vec::<String>::new(), "{error}");
-            }
+            assert_eq!(breaches(&kept), Vec::<String>::new(), "{error}");
         }
+    }
+
+    /// A frame submit that writes the acquired image, held by a host point, is pending at a
+    /// `resize`, and its encoder is dropped while a panic unwinds, which waits for nothing:
+    /// the device keeps the image's object, and so the replaced driver swapchain, until the
+    /// point is signalled and the submit is known complete, and the layer says nothing.
+    #[test]
+    #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+    fn an_encoder_dropped_unwinding_leaves_its_pending_image_to_the_device() {
+        let kept = Arc::new(Kept::default());
+        let test = "an_encoder_dropped_unwinding_leaves_its_pending_image_to_the_device";
+        let Some(device) = device(&kept, test) else { return };
+        let mut swapchain = VulkanSwapchain::new(device.shared(), SMALL).expect("a swapchain");
+        let first = image(&mut swapchain);
+        let replaced = Arc::downgrade(swapchain.chain.owner.as_ref().expect("a driver swapchain"));
+        let gate = device.create_timeline(0).expect("a timeline");
+        let done = device.create_timeline(0).expect("a timeline");
+        let mut draw = device.create_encoder(G, "frame").expect("an encoder");
+        draw.transition_images(&[ImageTransition {
+            image: first,
+            range: ImageRange::FIRST,
+            from: StateOn { state: ImageState::Undefined, queue: G },
+            to: StateOn { state: ImageState::ColourAttachment, queue: G },
+        }]);
+        let mut draws = [draw];
+        let submit =
+            Submit { encoders: &mut draws, waits: &[at(gate, 1)], signals: &[at(done, 1)] };
+        device.submit(G, submit).expect("the frame's submit");
+        swapchain.resize(Extent { width: 96, height: 48 }).expect("the resize");
+        let [draw] = draws;
+        let unwound = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            let _draw = draw;
+            // No hook runs: the test's output holds no panic.
+            std::panic::resume_unwind(Box::new("the encoder is dropped unwinding"));
+        }));
+        assert!(unwound.is_err());
+        swapchain.reap_left();
+        assert!(replaced.upgrade().is_some(), "the driver swapchain went with the submit pending");
+        device.signal_timeline(at(gate, 1)).expect("the gate");
+        assert!(device.wait_timeline(at(done, 1), BOUND * 20).expect("the wait"), "the submit");
+        swapchain.reap_left();
+        assert!(replaced.upgrade().is_none(), "the driver swapchain outlived the submit");
+        drop(swapchain);
+        drop(device);
+        assert_eq!(breaches(&kept), Vec::<String>::new());
     }
 }
