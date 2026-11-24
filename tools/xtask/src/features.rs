@@ -988,7 +988,7 @@ root v0.0.0 (/ws)|
         let tail = "only lactose-task names loom, since a feature turned on in one build turns \
                     its executor into loom's model everywhere (except the optional dependency \
                     and `loom = [\"dep:loom\"]` of a package that builds its own loom models: \
-                    lactose-input-host, lactose-net-host)";
+                    lactose-input-host, lactose-net-host, lactose-renderer)";
         let mut ecs = package("lactose-ecs", &[("lactose-task", Normal), ("loom", Dev)]);
         ecs.deps[0].features.push("loom".to_owned());
         ecs.deps[1].rename = Some("model_checker".to_owned());
