@@ -729,8 +729,8 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
     let (published, loaded) = cook_and_load(&env, &root().join("shaders"));
     let targets: &[&str] =
         if cfg!(target_os = "macos") { &["metallib", "msl", "spirv"] } else { &["msl", "spirv"] };
-    // `shaders/conformance/`'s entries, which the RHI suites run, cook into the pack beside
-    // the surface's, in name order.
+    // `shaders/conformance/`'s entries, which the RHI suites run, and `shaders/renderer/`'s,
+    // which `lactose-renderer` runs, cook into the pack beside the surface's, in name order.
     let entries = [
         "conformance/address.fs_main",
         "conformance/address.vs_main",
@@ -752,6 +752,9 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
         "conformance/triangles.fs_main",
         "conformance/triangles.vs_main",
         "conformance/workgroup.cs_main",
+        "renderer/scatter.cs_main",
+        "renderer/triangle.fs_main",
+        "renderer/triangle.vs_main",
         "surface.fs_main",
         "surface.fs_resolve",
         "surface.vs_main",
@@ -784,7 +787,9 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
         let entry = asset.name.split('.').nth(1).unwrap();
         assert_eq!(shader.entry, entry);
         if !asset.name.starts_with("surface.") {
-            // The suites hold a conformance shader's reflection to what they run.
+            // The RHI suites hold a conformance shader's reflection to what they run, and
+            // `lactose-renderer`'s `Renderer::new` a renderer shader's, which its `graph` and
+            // `device` tests hold.
             let stage = match &entry[..3] {
                 "cs_" => ShaderStage::Compute,
                 "vs_" => ShaderStage::Vertex,

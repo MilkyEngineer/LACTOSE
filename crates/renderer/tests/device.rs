@@ -12,14 +12,18 @@
 //! in two ways: behind a `ready` point of its target's import, which the host signals once
 //! the later frame's writes are made, so the GPU starts the held frame after them; and
 //! behind a dispatch at the head of the frame that runs for about a second (the conformance
-//! suite's `store.slang` with a lag), so the GPU runs the frame while the host writes. The
-//! barrier mutations, which need the GPU made to lag inside a frame, are the desktop's.
+//! suite's `store.slang` with a lag), so the GPU runs the frame while the host writes, with
+//! the next frame's plan compiled first so that none of the host's work waits for it
+//! (`holding`, `warm`).
+//! The barrier mutations, which need the GPU made to lag inside a frame, are the desktop's.
 //!
 //! Each image is compared with a reference the test computes on the CPU, never with an image
 //! checked in.
 
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use lactose_core::{StableKey, Tick};
 use lactose_ecs::{World, WorldKind};
@@ -37,11 +41,11 @@ use lactose_renderer::{
     Projection, Renderer, RendererDesc, ScatterEntry, Shaders, shader,
 };
 use lactose_rhi_api::{
-    BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferState, BufferUsage,
-    ComputePipelineDesc, ComputePipelineHandle, CookedShader, Device, DeviceRequest, Extent,
-    HEAP_SLOTS_DEFAULT, ImageDesc, ImageHandle, ImageMemory, ImageState, ImageUsage, MemoryClass,
-    Message, MessageSink, QueueRole, Rect, SAMPLERS_DEFAULT, Sharing, StageDesc, StateOn,
-    TimelinePoint,
+    BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferReach, BufferState,
+    BufferTransition, BufferUsage, ComputePass, ComputePipelineDesc, ComputePipelineHandle,
+    CookedShader, Device, DeviceRequest, Extent, Format, HEAP_SLOTS_DEFAULT, ImageDesc,
+    ImageHandle, ImageMemory, ImageState, ImageUsage, MemoryClass, Message, MessageSink, PassReach,
+    QueueRole, Rect, SAMPLERS_DEFAULT, Sharing, StageDesc, StateOn, Submit, TimelinePoint,
 };
 use lactose_rhi_vulkan::VulkanDevice;
 use lactose_task::{Executor, JobContext};
@@ -730,7 +734,10 @@ enum Hold {
     /// one without changing the renderer: the lag is declared before `Renderer::declare`,
     /// whose only handle, `DeclaredFrame::instances`, comes after it, and the target, the one
     /// resource the test imports that the triangle pass declares, would order the colour
-    /// output alone.
+    /// output alone. The host's work must not wait for frame 1, as lavapipe's image
+    /// creation would: [`warm`] leaves frame 2's plan in the graph's cache, and where a lag
+    /// still does not hold on a device that makes an image only once the submit it is
+    /// running has run, the form's checks do not run ([`holding`]).
     Lag,
 }
 
@@ -739,6 +746,17 @@ enum Hold {
 /// work, which a fast device or a slow host can undo, so a lag that did not hold is run
 /// again with twice the rounds, [`LAG_RETRIES`] times at most, and the test fails if none
 /// held. Each retry is printed.
+///
+/// Frame 1's lag gives it a shape of its own, so frame 2's plan, with its depth image,
+/// would be compiled while frame 1 runs; lavapipe's queue thread holds the lock that an
+/// image view's creation takes for the whole of a submit's commands (`README.md`, "Where
+/// the device tests run"), and the host's work would outlast every lag. [`warm`] compiles
+/// that plan first, and frame 2 makes no image. Where a lag still does not hold on a device
+/// that makes an image only once the submit it is running has run, as
+/// [`makes_images_after_submits`] finds, one of the host's other calls may wait the same
+/// way: there the lag's checks do not run, and the test says so in a line ending in
+/// `retrying`, so that `cargo xtask gpu` keeps it in its report, which keeps no other line
+/// of a test that passed.
 fn holding(test: &str, desc: Desc, hold: Hold, check: impl Fn(&mut Gpu, Held)) {
     let mut rounds = LAG_ROUNDS;
     for retry in 0..=LAG_RETRIES {
@@ -757,10 +775,86 @@ fn holding(test: &str, desc: Desc, hold: Hold, check: impl Fn(&mut Gpu, Held)) {
             }
             return;
         }
+        if makes_images_after_submits(desc, rounds) == Some(true) {
+            eprintln!(
+                "{test}: {hold:?}'s checks did not run: no lag held frame 1 through the \
+                 host's work, and this device makes an image only once the submit it runs has \
+                 run, as it may run other host calls; not retrying"
+            );
+            return;
+        }
         eprintln!("{test}: {hold:?} at {rounds} rounds was reached before the release: retrying");
         rounds *= 2;
     }
     panic!("{test}: {hold:?} never held frame 1 in flight through the host's work");
+}
+
+/// How long [`makes_images_after_submits`] waits between the lag's submit and the image:
+/// long enough on a loaded machine for the device to have begun the lag, and well inside
+/// the lag's run.
+const PAUSE: Duration = Duration::from_millis(100);
+
+/// Whether the device makes an image only once the submit it is running has run: a lag of
+/// `rounds` is submitted alone and, after [`PAUSE`] and with the lag still pending, an image
+/// is made as a plan makes its depth transient. The call waited for the lag where it
+/// returned nearer the lag's end than its own start: its span is longer than the rest of
+/// the lag after it. A device that runs a submit beside the host's calls returns in
+/// microseconds, with all but the pause of the lag still to run. `None` where the lag ended
+/// inside the pause, too short to tell.
+fn makes_images_after_submits(desc: Desc, rounds: u32) -> Option<bool> {
+    let mut waited = None;
+    session(desc, |gpu| {
+        let device = Arc::clone(gpu.device());
+        let (pipeline, scratch) = (gpu.lag.pipeline, gpu.lag.scratch);
+        let on = |state| StateOn { state, queue: QueueRole::Graphics };
+        let mut encoder = device.create_encoder(QueueRole::Graphics, "lag").expect("an encoder");
+        encoder.transition_buffers(&[BufferTransition {
+            buffer: scratch,
+            from: on(BufferState::Undefined),
+            to: on(BufferState::ShaderWrite),
+        }]);
+        let reach = [BufferReach { buffer: scratch, state: BufferState::ShaderWrite }];
+        let reach = PassReach { slots: &[], buffers: &reach };
+        encoder.begin_compute_pass(&ComputePass { label: "lag", reach });
+        encoder.bind_compute_pipeline(pipeline);
+        encoder.push_address(0, scratch, 0);
+        encoder.push_bytes(8, &1u32.to_le_bytes());
+        encoder.push_bytes(12, &rounds.to_le_bytes());
+        encoder.push_bytes(16, &LAG_WORD.to_le_bytes());
+        encoder.dispatch([1, 1, 1]);
+        encoder.end_pass();
+        let timeline = device.create_timeline(0).expect("a timeline");
+        let point = TimelinePoint { timeline, value: 1 };
+        // An encoder's drop waits for its submit: it is kept until the point is reached.
+        let mut encoders = [encoder];
+        let submit = Submit { encoders: &mut encoders, waits: &[], signals: &[point] };
+        device.submit(QueueRole::Graphics, submit).expect("the lag's submit");
+        thread::sleep(PAUSE);
+        if device.wait_timeline(point, Duration::ZERO).expect("a wait of no time") {
+            return;
+        }
+        let start = Instant::now();
+        let depth = device
+            .create_image(&ImageDesc {
+                label: "depth",
+                format: Format::Depth32Float,
+                extent: EXTENT,
+                mips: 1,
+                layers: 1,
+                usage: ImageUsage::DEPTH,
+                memory: ImageMemory::Own,
+                sharing: Sharing::Exclusive,
+            })
+            .expect("a depth image");
+        let made = start.elapsed();
+        gpu.reached(point);
+        let rest = start.elapsed() - made;
+        eprintln!("an image made in {made:?} with the lag pending, which ran {rest:?} more");
+        device.destroy_image(depth).expect("a destroy");
+        drop(encoders);
+        waited = Some(made > rest);
+    });
+    waited
 }
 
 /// What two frames held in flight show: frame 1, held, and frame 2, submitted after it;
@@ -774,24 +868,42 @@ struct Held {
     row: RenderTransform,
 }
 
+/// The frames before [`held`]'s, which leave frame 2's plan, and its depth image, in the
+/// graph's cache: the renderer's first frame, which places instance 1 at `row`, then a
+/// frame with no tick from 50 metres along `+X` into set 1, as frame 2 is, both waited for.
+/// Frame 1 then places the instance at `row` again, so that its record is as it would be
+/// with no warm-up.
+fn warm(gpu: &mut Gpu, row: RenderTransform) {
+    world_pass(&gpu.renderer, WorldKind::Server, Tick(1), true, &[moved(1, row)]);
+    gpu.frame(Shot::at(pivot([0.0; 3])));
+    gpu.open();
+    let last = gpu.frame(Shot { back: 1, ..Shot::at(pivot([50.0, 0.0, 0.0])) });
+    gpu.reached(last.point);
+    gpu.open();
+}
+
 /// Instance 1 at `x = 0` in frame 1, which looks at it from the origin's cell, and nothing
 /// new in frame 2, which looks from 50 metres along `+X`, where nothing is. `None` where a
 /// lag of `rounds` let frame 1's point be reached before the host's work for frame 2 was
 /// done, so that the frames show nothing of a frame in flight. That frame 1's point was not
 /// reached shows the frame in flight, not that its scatter and triangle pass had not run:
 /// that rests on the mask each [`Hold`] relies on, the gate's every-command wait or the
-/// `Undefined` imports' every-command source behind the lag.
+/// `Undefined` imports' every-command source behind the lag. Frame 2 compiles no plan: its
+/// plan is [`warm`]'s.
 fn held(gpu: &mut Gpu, hold: Hold, rounds: u32) -> Option<Held> {
     let row = placement([0; 3], [0.0; 3], 0.3);
-    world_pass(&gpu.renderer, WorldKind::Server, Tick(1), true, &[moved(1, row)]);
+    warm(gpu, row);
+    world_pass(&gpu.renderer, WorldKind::Server, Tick(2), true, &[moved(1, row)]);
     let gate = matches!(hold, Hold::Gate).then(|| gpu.gate());
     let lag = matches!(hold, Hold::Lag).then_some(rounds);
     let first = gpu.frame(Shot { held: gate, lag, ..Shot::at(pivot([0.0; 3])) });
     gpu.open();
+    let compiles = gpu.graph.stats().compiles;
     let second = gpu.frame(Shot { back: 1, ..Shot::at(pivot([50.0, 0.0, 0.0])) });
+    assert_eq!(gpu.graph.stats().compiles, compiles, "frame 2's plan is the warm-up's");
     let opened = gpu.renderer.open().expect("the timeline's value");
     // Into frame 1's region, were it reopened: the same indices, another placement.
-    world_pass(&gpu.renderer, WorldKind::Server, Tick(2), true, &[moved(1, placed(-1.0))]);
+    world_pass(&gpu.renderer, WorldKind::Server, Tick(3), true, &[moved(1, placed(-1.0))]);
     let value = gpu.device().timeline_value(first.point.timeline).expect("the value");
     let in_flight = value < first.point.value;
     assert!(in_flight || lag.is_some(), "the gate held frame 1 until the writes were made");

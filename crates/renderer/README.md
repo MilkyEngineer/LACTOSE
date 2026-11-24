@@ -474,7 +474,9 @@ Step 1 for the next frame may come any time after step 3.
   vertex read behind the release. Adopting the lever, or narrowing that wait, must re-run
   the device round's mutants `open-ignores-point` and `one-camera-buffer` against each form
   alone (`for hold in [Hold::Lag]`, then `Gate`): on a GPU that overlaps independent
-  dispatches, the narrowed form would pass both.
+  dispatches, the narrowed form would pass both. The `Lag` form also needs the host's work
+  for frame 2 not to wait for frame 1, which a plan's depth image made under lavapipe's
+  queue lock did: frame 2's plan is compiled before frame 1 ("Where the device tests run").
 - **Plans.** The graph keys a plan on the declaration's shape (graph, "Compile and its
   cache"), and a frame's shape changes with whether it scatters, whether its batch reads
   rows, whether it draws and whether it imports the instance buffer from `Undefined`. In
@@ -968,7 +970,7 @@ description and report type to plain data, and each format to its size.
 | A batch names each slot once, resolved in batch order and asserted | On null: duplicate rows through `RemoteWriter::write`, then `ScatterBatch` and `FrameStats::duplicates`. Null's assertion is what proves the resolution | One without the resolution: the assertion fires |
 | Many duplicates in different workgroups of a large batch | On a device: slots made `LIVE` at a known placement `c0` by an earlier frame, then duplicates from a world pass at a new tick, entries `TAKE_BASE \| HAS_BASE`, each instance's two rows at least 2^15 rows apart in the region (row `i` and row `n + i`); the instance buffer copied out, each record's `base` and `previous` equal to `c0` and `current` to the kept row. It shows that a resolved batch scatters right; an entry with neither flag reads nothing of its record, so remote rows on fresh slots cannot show it | Without the resolution and with the assertion off, the second entry of a slot lacks `TAKE_BASE`, and run in order its records match: the host's check of the flags fails that build. The records fail one that marks both entries `TAKE_BASE \| HAS_BASE`, at that spacing. Null's assertion is the proof of the resolution |
 | The scatter's dispatches each apply their own entries, all of them and no more | On a device: a batch of two runs, of 37 and 5 entries, each `TAKE_BASE \| HAS_BASE`, in a region whose earlier use had a longer batch; every record read back equal to `InstanceRecord::scatter`'s on the host | One that reads each dispatch's entries from the batch's first; one that pushes one entry too many; one that rounds the groups down; one that pushes no rows address |
-| With the GPU made to lag, the ring never overwrites a region a frame in flight reads | Frames held behind an import's `ready` point, and behind a dispatch of about a second at the frame's head; `Opened::Wait`; the readback of a held frame after later writes | One whose `open` ignores the point |
+| With the GPU made to lag, the ring never overwrites a region a frame in flight reads | Frames held behind an import's `ready` point, and behind a dispatch of about a second at the frame's head, with the next frame's plan compiled before the held frame; `Opened::Wait`; the readback of a held frame after later writes | One whose `open` ignores the point |
 | Frame N's readback shows N's camera after N + 1's has been written | The same, with two latches | One camera buffer for all regions |
 | An instance in the camera's cell and one in a neighbouring cell along an axis the scene is moved 2^25 + 1 cells on, its triangle covering pixels at the origin, render the pixels they render at the origin | Two scenes 2^25 + 1 cells apart on that axis, with instances in the camera's cell and the next along it: equal images | A shader that subtracts after converting to float: at 2^25 + 1 cells the neighbour's difference converts to zero cells. In one cell alone, below 2^24 cells, or with the neighbour along an axis the scene was not moved on, where every cell converts exactly, it renders the same pixels and fails nothing |
 | A record without `LIVE` produces no fragment | A slot freed in frame 2, below the highest slot held: its triangle's pixels are `CLEAR`, and the highest slot's are drawn | One that ignores `LIVE`, which draws the freed record at the placement it last held; one that draws `SlotTable::live` instances, not `extent`. The record is placed at `(2, 2, 2, 1)` and not `(0, 0, 0, 0)`, whose result no specification defines, and which the M1 draws nothing for |
@@ -986,7 +988,23 @@ test of `65,536` slots freed by one run and given by the next under KosmicKrisp,
 lag with the barrier kept passes it; without the lag it passes, and under MoltenVK, whose
 serial compute encoder orders the dispatches anyway, it passes with the lag. No shipped
 shader lags, so `cargo xtask gpu` alone cannot fail the mutation: the mutation and its lag
-are a script's, on the M1 and on the desktop. The other two, the
+are a script's, on the M1 and on the desktop. lavapipe's queue thread runs a submit's
+commands holding the device's queue lock, which an image view's creation and destruction,
+a buffer view's, a sampler's creation, a pipeline's compile and destruction take too (Mesa
+26.0.8: `lvp_queue_submit` in `lvp_device.c`, `lvp_CreateImageView` in `lvp_image.c`).
+The merge's run under lavapipe failed both held-frame tests in their `Lag` form: frame 1's
+lag gives it a shape of its own, so frame 2's compile made a plan's depth image while frame 1
+ran, and the host's work waited for frame 1 at every lag. The tests now draw two frames
+first, the renderer's first and one of frame 2's shape, and frame 2's plan comes from the
+cache, which each test asserts; no other call of the host's work takes that lock, so the
+next lavapipe run is expected to hold frame 1 behind the lag and run the form's checks.
+Where a lag still does not hold, a probe asks what the device does: an image made after a
+pause with a lag's submit pending, on a device that waits for the submit, returns nearer the
+lag's end than its own start. There the test passes on its `Gate` form and prints that the
+`Lag` form's checks did not run, and why, in a line ending in `retrying` only so that
+`cargo xtask gpu` keeps it in its report, which keeps no other line of a test that passed,
+until the xtask has a form for a check not run; a device that makes the image at once and
+still does not hold frame 1 fails the test, as before. The other two, the
 scatter-to-vertex barrier and the barrier across frames, cannot fail as a frame is
 declared: dropping the instance buffer's transition leaves other imports' transitions from
 `Undefined` before the same pass (the entries' before the scatter; the camera's, the
