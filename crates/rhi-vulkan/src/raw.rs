@@ -16,6 +16,7 @@ use lactose_rhi_api::{
 };
 
 use crate::convert::{self, image_usage};
+use crate::surface::{Surface, Target};
 
 /// The vendor id of Apple's GPUs.
 const APPLE: u32 = 0x106B;
@@ -137,16 +138,26 @@ pub(crate) struct Raw {
     pub(crate) queues: Vec<Queue>,
     pub(crate) memory: MemoryTypes,
     pub(crate) properties: vk::PhysicalDeviceProperties,
-    /// Set by a drop that unwinds a panic with work maybe in flight: every object of the
-    /// device is then leaked, never destroyed under the GPU's use.
+    /// What a device made with a surface presents through.
+    pub(crate) presents: Option<Presents>,
+    /// Set by a drop that unwinds a panic with work maybe in flight, or by a swapchain's
+    /// drop whose presents may not have ended: what may be in the GPU's or the presentation
+    /// engine's use is then leaked, never destroyed under it.
     leaking: AtomicBool,
 }
 
 impl Raw {
     /// Whether drops leak rather than destroy.
     pub(crate) fn leaking(&self) -> bool {
-        // Relaxed: set once, before the last holder's drop; every object's drop that reads
-        // it runs after that drop in the same thread, or after the `Arc`'s release.
+        // Relaxed: set once, and never cleared. The reads that must see it are ordered after
+        // the store without this load's help. The leaked swapchain's driver swapchain is
+        // dropped after its `Arc`'s release sequence, since the swapchain's drop gives up its
+        // chain's count after the store. What `Shared::left` holds is drained by the last
+        // holder's `let_go` after `Holders::let_go`'s release decrements and acquire fence,
+        // since the store comes before its own holder's `let_go`; that `let_go` reads it
+        // there too. An image object another thread drops before it sees the flag may
+        // destroy its views, and a plain image its image and memory: nothing pending names
+        // them.
         self.leaking.load(Ordering::Relaxed)
     }
 
@@ -172,6 +183,9 @@ impl Drop for Raw {
                 self.device.destroy_semaphore(queue.timeline, None);
             }
             self.device.destroy_device(None);
+            if let Some(presents) = &mut self.presents {
+                presents.surface.destroy();
+            }
             if let Some((utils, messenger)) = &self.debug {
                 utils.destroy_debug_utils_messenger(*messenger, None);
             }
@@ -180,6 +194,15 @@ impl Drop for Raw {
             ManuallyDrop::drop(&mut self.entry);
         }
     }
+}
+
+/// What a device made with a surface presents through: the surface, the swapchain's
+/// functions, and `VK_GOOGLE_display_timing`'s where the device offers it and a window
+/// shows the surface.
+pub(crate) struct Presents {
+    pub(crate) surface: Surface,
+    pub(crate) swapchain: ash::khr::swapchain::Device,
+    pub(crate) timing: Option<ash::google::display_timing::Device>,
 }
 
 /// The sink the messengers' callback reaches through their user data: the allocation of a
@@ -332,6 +355,60 @@ fn families(families: &[vk::QueueFamilyProperties]) -> Option<(u32, Option<(u32,
     Some((graphics as u32, compute))
 }
 
+/// The present role's queue on a device made with a surface: a queue other than the
+/// graphics and compute queues, in a family that draws and can present to the surface
+/// (`presents`), in a family other than the graphics family first, then a further queue of
+/// the graphics family. `Some(None)` where there is none and the graphics family presents,
+/// so the roles share the graphics queue; `None` where no family serves.
+fn present_queue(
+    families: &[vk::QueueFamilyProperties],
+    graphics: u32,
+    compute: Option<(u32, u32)>,
+    presents: &[bool],
+) -> Option<Option<(u32, u32)>> {
+    // The queues the graphics and compute roles take of a family.
+    let taken = |family: u32| {
+        u32::from(family == graphics) + u32::from(compute.is_some_and(|(f, _)| f == family))
+    };
+    let fits = |family: u32| {
+        let at = family as usize;
+        presents[at]
+            && families[at].queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            && families[at].queue_count > taken(family)
+    };
+    let count = families.len() as u32;
+    let own = (0..count)
+        .find(|&family| family != graphics && fits(family))
+        .or_else(|| fits(graphics).then_some(graphics))
+        .map(|family| (family, taken(family)));
+    match own {
+        Some(queue) => Some(Some(queue)),
+        None => presents[graphics as usize].then_some(None),
+    }
+}
+
+/// The device extensions a swapchain needs, of the forms `has` finds: `VK_KHR_swapchain`
+/// and `VK_EXT_swapchain_maintenance1`, else its `KHR` form, whose structures are the same.
+/// Each form needs the instance's surface maintenance of its own form, which `surface`
+/// says were enabled, `EXT` first.
+fn swapchain_extensions(
+    has: impl Fn(&CStr) -> bool,
+    surface: [bool; 2],
+) -> Option<[&'static CStr; 2]> {
+    let maintenance = [ash::ext::swapchain_maintenance1::NAME, KHR_SWAPCHAIN_MAINTENANCE1]
+        .into_iter()
+        .zip(surface)
+        .find(|&(name, enabled)| enabled && has(name))?
+        .0;
+    has(ash::khr::swapchain::NAME).then_some([ash::khr::swapchain::NAME, maintenance])
+}
+
+/// `VK_KHR_surface_maintenance1`, which `ash` 0.38 does not name; its structures are the
+/// `EXT` form's, of the same values.
+const KHR_SURFACE_MAINTENANCE1: &CStr = c"VK_KHR_surface_maintenance1";
+/// `VK_KHR_swapchain_maintenance1`, as above.
+const KHR_SWAPCHAIN_MAINTENANCE1: &CStr = c"VK_KHR_swapchain_maintenance1";
+
 /// A viewport bound rounded inward to a whole texel.
 fn bounds(range: [f32; 2], vendor: u32) -> [i32; 2] {
     let low = range[0].ceil() as i32;
@@ -381,7 +458,9 @@ pub(crate) fn image_info(
 
 /// Opens the loader, makes the instance with its messenger, picks the adapter the request
 /// names, checks the required set and makes the device with every reported capability on.
-pub(crate) fn open(request: &DeviceRequest) -> Result<Opened> {
+pub(crate) fn open(request: &DeviceRequest, target: Option<Target>) -> Result<Opened> {
+    // The window's handles are read here, on the constructor's thread, and never again.
+    let chosen = target.map(crate::surface::read).transpose()?;
     // SAFETY: loading the system's loader library runs its initialisers, which the loader
     // documents as safe to run in any process.
     let entry = unsafe { ash::Entry::load() }.map_err(|error| {
@@ -400,11 +479,40 @@ pub(crate) fn open(request: &DeviceRequest) -> Result<Opened> {
     if debug {
         extensions.push(ash::ext::debug_utils::NAME.as_ptr());
     }
+    // The forms of surface maintenance enabled, `EXT` first.
+    let mut surface_maintenance = [false; 2];
+    if let Some(chosen) = &chosen {
+        let required = [
+            ash::khr::surface::NAME,
+            ash::khr::get_surface_capabilities2::NAME,
+            chosen.extension(),
+        ];
+        for name in required {
+            if !has(name) {
+                return Err(unsupported(format!(
+                    "a surface without the instance extension {}",
+                    name.to_string_lossy()
+                )));
+            }
+            extensions.push(name.as_ptr());
+        }
+        // Either form of surface maintenance, both where both are offered: the
+        // swapchain's maintenance extension needs the one of its own form.
+        let maintenance = [ash::ext::surface_maintenance1::NAME, KHR_SURFACE_MAINTENANCE1];
+        let offered = maintenance.map(has);
+        if offered == [false; 2] {
+            return Err(unsupported("a surface without VK_EXT_ or VK_KHR_surface_maintenance1"));
+        }
+        let enabled = maintenance.into_iter().zip(offered);
+        extensions.extend(enabled.filter(|&(_, on)| on).map(|(name, _)| name.as_ptr()));
+        surface_maintenance = offered;
+    }
     // From here every failure destroys what it made, and frees the sink after: `Partial`
     // does on its drop.
     let mut partial = Partial {
         instance: None,
         debug: None,
+        surface: None,
         device: None,
         sink: Some(Sink::new(Arc::clone(&request.messages))),
     };
@@ -449,6 +557,11 @@ pub(crate) fn open(request: &DeviceRequest) -> Result<Opened> {
             .map_err(|e| driver(e, "vkCreateDebugUtilsMessengerEXT"))?;
         partial.debug = Some((utils, messenger));
     }
+    if let Some(chosen) = chosen {
+        // SAFETY: the instance is live and has the surface's extensions; `Partial` destroys
+        // the surface before it, and `Raw` after the device.
+        partial.surface = Some(unsafe { Surface::create(&entry, &instance, chosen) }?);
+    }
     // SAFETY: the instance is live.
     let adapters = unsafe { instance.enumerate_physical_devices() }
         .map_err(|e| driver(e, "vkEnumeratePhysicalDevices"))?;
@@ -471,7 +584,7 @@ pub(crate) fn open(request: &DeviceRequest) -> Result<Opened> {
         }
         None => *adapters.first().ok_or_else(|| unsupported("the loader offers no adapter"))?,
     };
-    device(&entry, &instance, physical, request, &mut partial)
+    device(&entry, &instance, physical, request, surface_maintenance, &mut partial)
 }
 
 /// What `open` has made so far, destroyed on a failure. The sink is freed after the
@@ -480,6 +593,7 @@ pub(crate) fn open(request: &DeviceRequest) -> Result<Opened> {
 struct Partial {
     instance: Option<ash::Instance>,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+    surface: Option<Surface>,
     device: Option<ash::Device>,
     sink: Option<Sink>,
 }
@@ -491,6 +605,9 @@ impl Drop for Partial {
         unsafe {
             if let Some(device) = self.device.take() {
                 device.destroy_device(None);
+            }
+            if let Some(mut surface) = self.surface.take() {
+                surface.destroy();
             }
             if let Some((utils, messenger)) = self.debug.take() {
                 utils.destroy_debug_utils_messenger(messenger, None);
@@ -510,6 +627,7 @@ fn device(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     request: &DeviceRequest,
+    surface_maintenance: [bool; 2],
     partial: &mut Partial,
 ) -> Result<Opened> {
     let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
@@ -536,6 +654,17 @@ fn device(
         return Err(unsupported(format!("{adapter} lacks VK_KHR_dynamic_rendering_local_read")));
     }
     let subset = has(ash::khr::portability_subset::NAME);
+    let presenting = match &partial.surface {
+        Some(_) => Some(swapchain_extensions(has, surface_maintenance).ok_or_else(|| {
+            unsupported(format!(
+                "{adapter} lacks VK_KHR_swapchain or VK_EXT_ or VK_KHR_swapchain_maintenance1"
+            ))
+        })?),
+        None => None,
+    };
+    let timing = partial.surface.as_ref().is_some_and(|surface| surface.shown)
+        && has(ash::google::display_timing::NAME);
+    let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
     let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
     let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
     let mut local = vk::PhysicalDeviceDynamicRenderingLocalReadFeaturesKHR::default();
@@ -547,9 +676,15 @@ fn device(
     if subset {
         features2 = features2.push_next(&mut port);
     }
+    if presenting.is_some() {
+        features2 = features2.push_next(&mut maintenance);
+    }
     // SAFETY: as above.
     unsafe { instance.get_physical_device_features2(physical, &mut features2) };
     let core = features2.features;
+    if presenting.is_some() && maintenance.swapchain_maintenance1 != vk::TRUE {
+        return Err(unsupported(format!("{adapter} lacks the swapchainMaintenance1 feature")));
+    }
     let lacking = missing(&core, &v12, &v13, &local);
     if !lacking.is_empty() {
         return Err(unsupported(format!("{adapter} lacks {}", lacking.join(", "))));
@@ -610,21 +745,36 @@ fn device(
     let Some((graphics_family, compute)) = families(&family_props) else {
         return Err(unsupported(format!("{adapter} has no family that draws and computes")));
     };
-    let priorities = [1.0f32, 1.0];
-    let mut queue_infos = vec![
-        vk::DeviceQueueCreateInfo::default().queue_family_index(graphics_family).queue_priorities(
-            &priorities[..1 + usize::from(compute.is_some_and(|(f, _)| f == graphics_family))],
-        ),
-    ];
-    if let Some((family, _)) = compute
-        && family != graphics_family
-    {
-        queue_infos.push(
+    let present = match &partial.surface {
+        Some(surface) => {
+            let presents = (0..family_props.len() as u32)
+                .map(|family| surface.supports(physical, family))
+                .collect::<Result<Vec<bool>>>()?;
+            present_queue(&family_props, graphics_family, compute, &presents).ok_or_else(|| {
+                unsupported(format!("{adapter} has no family that draws and presents"))
+            })?
+        }
+        None => None,
+    };
+    // Each family's queues, from index zero: graphics, then compute, then present.
+    let chosen: Vec<(u32, u32)> =
+        [Some((graphics_family, 0)), compute, present].into_iter().flatten().collect();
+    let mut counts: Vec<(u32, usize)> = Vec::new();
+    for &(family, index) in &chosen {
+        match counts.iter_mut().find(|(f, _)| *f == family) {
+            Some((_, count)) => *count = (*count).max(index as usize + 1),
+            None => counts.push((family, index as usize + 1)),
+        }
+    }
+    let priorities = [1.0f32; 3];
+    let queue_infos: Vec<_> = counts
+        .iter()
+        .map(|&(family, count)| {
             vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(family)
-                .queue_priorities(&priorities[..1]),
-        );
-    }
+                .queue_priorities(&priorities[..count])
+        })
+        .collect();
     // Every reported capability offered is turned on; the rest of the required set too.
     let multi_draw = core.multi_draw_indirect == vk::TRUE;
     let indirect_count = v12.draw_indirect_count == vk::TRUE;
@@ -657,6 +807,14 @@ fn device(
     if subset {
         device_extensions.push(ash::khr::portability_subset::NAME.as_ptr());
     }
+    for name in presenting.iter().flatten() {
+        device_extensions.push(name.as_ptr());
+    }
+    if timing {
+        device_extensions.push(ash::google::display_timing::NAME.as_ptr());
+    }
+    let mut enable_maintenance =
+        vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default().swapchain_maintenance1(true);
     let mut device_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)
         .enabled_extension_names(&device_extensions)
@@ -666,6 +824,9 @@ fn device(
         .push_next(&mut enable_local);
     if subset {
         device_info = device_info.push_next(&mut enable_port);
+    }
+    if presenting.is_some() {
+        device_info = device_info.push_next(&mut enable_maintenance);
     }
     // SAFETY: the create info and every structure it chains live through the call; each
     // feature turned on is one the adapter reported.
@@ -739,8 +900,7 @@ fn device(
         coherent_host_memory: coherent,
         queues: QueueLayout {
             compute: if compute.is_some() { QueuePath::Own } else { QueuePath::Shared },
-            // No surface: the swapchain lane gives the present role a queue.
-            present: QueuePath::Shared,
+            present: if present.is_some() { QueuePath::Own } else { QueuePath::Shared },
         },
         heap_slots: request.heap_slots,
         samplers: request.samplers,
@@ -766,7 +926,7 @@ fn device(
         // SAFETY: the device is live and the info valid.
         unsafe { device.create_semaphore(&info, None) }.map_err(|e| driver(e, "vkCreateSemaphore"))
     };
-    let mut queues = Vec::with_capacity(2);
+    let mut queues = Vec::with_capacity(3);
     let make_queue = |family: u32, index: u32, queues: &mut Vec<Queue>| -> Result<()> {
         // SAFETY: the family and index are among those the device was made with.
         let queue = unsafe { device.get_device_queue(family, index) };
@@ -775,9 +935,8 @@ fn device(
         queues.push(Queue { queue, family, graphics, timeline: semaphore });
         Ok(())
     };
-    let made = make_queue(graphics_family, 0, &mut queues).and_then(|()| {
-        compute.map_or(Ok(()), |(family, index)| make_queue(family, index, &mut queues))
-    });
+    let made =
+        chosen.iter().try_for_each(|&(family, index)| make_queue(family, index, &mut queues));
     if let Err(error) = made {
         for queue in &queues {
             // SAFETY: semaphores this call made, used by nothing yet.
@@ -785,7 +944,8 @@ fn device(
         }
         return Err(error);
     }
-    let compute_index = if compute.is_some() { 1 } else { 0 };
+    let compute_index = usize::from(compute.is_some());
+    let present_index = if present.is_some() { 1 + compute_index } else { 0 };
     let text = |raw: &[core::ffi::c_char]| {
         let bytes: Vec<u8> = raw.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
         String::from_utf8_lossy(&bytes).into_owned()
@@ -806,6 +966,11 @@ fn device(
     let debug = partial.debug.take();
     let device = partial.device.take().ok_or_else(|| unsupported("no device"))?;
     let sink = partial.sink.take().ok_or_else(|| unsupported("no sink"))?;
+    let presents = partial.surface.take().map(|surface| Presents {
+        surface,
+        swapchain: ash::khr::swapchain::Device::new(&instance, &device),
+        timing: timing.then(|| ash::google::display_timing::Device::new(&instance, &device)),
+    });
     let raw = Raw {
         entry: ManuallyDrop::new(entry.clone()),
         instance,
@@ -816,16 +981,20 @@ fn device(
         queues,
         memory,
         properties,
+        presents,
         leaking: AtomicBool::new(false),
     };
-    Ok(Opened { raw: Arc::new(raw), caps, info, roles: [0, compute_index, 0], cache_identity })
+    let roles = [0, compute_index, present_index];
+    Ok(Opened { raw: Arc::new(raw), caps, info, roles, cache_identity })
 }
 
 #[cfg(test)]
 mod tests {
     use ash::vk;
 
-    use super::{APPLE, bounds, families};
+    use core::ffi::CStr;
+
+    use super::{APPLE, KHR_SWAPCHAIN_MAINTENANCE1, bounds, families, swapchain_extensions};
 
     fn family(flags: vk::QueueFlags, count: u32) -> vk::QueueFamilyProperties {
         vk::QueueFamilyProperties { queue_flags: flags, queue_count: count, ..Default::default() }
@@ -852,5 +1021,27 @@ mod tests {
         assert_eq!(bounds([-32768.0, 32767.0], APPLE), [-16384, 16383]);
         assert_eq!(bounds([-32768.0, 32767.0], 0x10DE), [-32768, 32767]);
         assert_eq!(bounds([-8192.5, 8191.5], 0x10DE), [-8192, 8191]);
+    }
+
+    /// A swapchain's maintenance extension is of a form the instance enabled for its
+    /// surface: never the `EXT` form over a `KHR` surface form alone.
+    #[test]
+    fn the_swapchain_maintenance_form_follows_the_surface_form_enabled() {
+        const SWAPCHAIN: &CStr = ash::khr::swapchain::NAME;
+        const EXT: &CStr = ash::ext::swapchain_maintenance1::NAME;
+        const KHR: &CStr = KHR_SWAPCHAIN_MAINTENANCE1;
+        let (swapchain, ext) = (SWAPCHAIN, EXT);
+        let khr = KHR;
+        let offering = |names: &'static [&'static CStr]| move |name: &CStr| names.contains(&name);
+        const BOTH: &[&CStr] = &[SWAPCHAIN, EXT, KHR];
+        assert_eq!(swapchain_extensions(offering(BOTH), [true, true]), Some([swapchain, ext]));
+        assert_eq!(swapchain_extensions(offering(BOTH), [false, true]), Some([swapchain, khr]));
+        assert_eq!(swapchain_extensions(offering(BOTH), [true, false]), Some([swapchain, ext]));
+        const EXT_ONLY: &[&CStr] = &[SWAPCHAIN, EXT];
+        assert_eq!(swapchain_extensions(offering(EXT_ONLY), [false, true]), None);
+        const KHR_ONLY: &[&CStr] = &[SWAPCHAIN, KHR];
+        assert_eq!(swapchain_extensions(offering(KHR_ONLY), [true, false]), None);
+        const NEITHER: &[&CStr] = &[EXT, KHR];
+        assert_eq!(swapchain_extensions(offering(NEITHER), [true, true]), None);
     }
 }

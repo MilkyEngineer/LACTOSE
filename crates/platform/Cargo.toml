@@ -29,6 +29,14 @@ winit.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 winit = { workspace = true, features = ["x11"] }
 
+[dev-dependencies]
+# The window tests' swapchain cases (tests/swapchain.rs): a device made on a window in a
+# main-lane call, and its swapchain on the present thread. A test-support crate
+# (crate-tiers.toml); `swapchain-copies` lets a case read a swapchain image back, which the
+# contract's images, colour attachments alone, do not.
+lactose-rhi-api.workspace = true
+lactose-rhi-vulkan = { workspace = true, features = ["swapchain-copies"] }
+
 # A thread's CPU clock, which both test binaries read to bound an idle pump's cost
 # (tests/thread_cpu.rs).
 [target.'cfg(unix)'.dev-dependencies]

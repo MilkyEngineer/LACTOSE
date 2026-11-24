@@ -109,7 +109,9 @@ pub use shader::{
 pub use state::{
     BufferReach, BufferState, BufferTransition, ImageState, ImageTransition, PassReach, StateOn,
 };
-pub use surface::{Acquired, Presented, SurfaceSource, Swapchain, SwapchainDesc};
+pub use surface::{
+    Acquired, DisplayTime, PresentId, Presented, SurfaceSource, Swapchain, SwapchainDesc,
+};
 pub use sync::{Submit, TimelineHandle, TimelinePoint};
 
 // What the contract promises at the type level, so that an implementation or an amendment
@@ -155,6 +157,8 @@ const _: () = {
     plain::<ImageTransition>();
     plain::<BufferTransition>();
     plain::<Rule>();
+    plain::<PresentId>();
+    plain::<DisplayTime>();
 
     // A handle is two 32-bit words, and the indirect record is the twenty bytes both
     // drivers read.

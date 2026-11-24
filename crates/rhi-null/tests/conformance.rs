@@ -329,6 +329,7 @@ cases! {
     resize_with_a_present_pending_is_refused
     image_of_before_a_resize_is_refused
     frame_submits_complete_while_a_present_is_pending
+    present_ids_count_up_and_display_times_follow_them
     loss_is_returned_and_stays
     waits_return_at_once_after_a_loss
     teardown_succeeds_after_a_loss

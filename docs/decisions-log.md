@@ -231,6 +231,25 @@ editorial pass rather than one taken from a review.
 - Driven by: R2-23, R2-2.
 - Replaced: revision 2's one worker per physical core minus one, two deques per worker, and 50
   to 200 µs batches.
+- Addendum (D153, lane eco-qos, 2026-11-24): on Windows `ThreadClass::Background` opts its
+  thread into execution-speed throttling (EcoQoS) after setting its priority, and every other
+  class hands the thread's throttling back to the system (both masks 0), so a later `enter` of
+  another class undoes it, where on Linux the lowered priority stays. No class opts out of
+  throttling (the control bit set, the state bit clear): that would hold frame workers at
+  high QoS while the game is minimised or covered, which the system's own heuristics lower.
+  A refusal is an error of kind `Platform` whose message names the call refused, priority or
+  throttling, with the system's error code, both when both fail; both are attempted whatever
+  the other does. A reset that Windows 10 before version 1709 refuses as an unknown
+  information class is not reported, since such a thread is already under the system's
+  management: only the background threads, whose steering is missing there, warn.
+  `ThreadClass::Io` sets its priority and resets the throttling state to the system's, as
+  the other classes do, until a measurement says otherwise: Windows' EcoQoS is held on mains
+  power too, stricter than the utility QoS the class has on macOS, and an IO thread's work
+  between blocking calls is the latency from a completed read to its waiter. Rules out an
+  opt-out for the frame classes, a background setting that outlives the class on Windows,
+  and a log line from every thread on a system that has no such setting. The two open
+  questions, Io's EcoQoS and an opt-out under gamepad-only play, are a verification row of
+  gate none, each with the run that decides it.
 
 **D18. Timer root, present thread, futures for main-thread requests, time scale** (§5.1, §11)
 - Why: with no coordinator and a main thread that only pumps events, something must wake at tick
@@ -7874,6 +7893,91 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   The suite has 183 cases, 155 of them contract cases. The device refusal list in
   `lactose-rhi-api`'s README has 69 cases, the three repeat cases among them; it read 64
   where it held 65 before this lane.
+- Addendum (lane `swapchain`, 2026-11-24): the display-time report D162 asks of the
+  swapchain, and a presenting device's own present path.
+  - *Present ids and display times* (`lactose-rhi-api`'s "The display-time report"):
+    `PresentId(pub u64)` and `DisplayTime { present: PresentId, shown: Instant }`, plain
+    data, and two methods of `Swapchain`: `last_present(&self) -> Option<PresentId>` and
+    `display_times(&mut self, into: &mut Vec<DisplayTime>) -> bool`. Each present the
+    swapchain takes, `Presented::Shown` or `Stale`, has the next id from one; a `resize`
+    does not restart it, and a refused present or one that returns `DeviceLost` takes none.
+    `display_times` appends to the caller's buffer the reports that arrived since its last
+    call, oldest first, each id once at most and in increasing order, and allocates nothing
+    once that buffer has room, so the present thread keeps one buffer across frames; it never
+    waits and reaches no queue, and is called on the thread that presents between that
+    thread's other calls of the swapchain, since every Vulkan source's read is externally
+    synchronised with the acquire and the present. It returns `false`, appending nothing,
+    where the device has no source, an answer fixed at the swapchain's creation, so a caller
+    tells "nothing shown yet" from "never says". The first form, `display_times(&mut self)
+    -> Option<Vec<DisplayTime>>`, allocated on the present thread at every call that had
+    reports; `frame-impl`, its first consumer, had not been written. A present the display
+    never took is left out or reported, and each backend's README says which; a caller takes
+    a present as displayed once its id or a later one is reported. The contract case is
+    `present_ids_count_up_and_display_times_follow_them`. The suite has 186 cases,
+    158 of them contract cases.
+  - *The present thread's hold* (`lactose-rhi-api`'s "The present thread"): the present
+    thread names a finished target in a command for the span of one present call, and
+    between its calls its heap slot may keep the last target's image until a call names
+    another or `close`; the frame takes the image back by the point that call reports. On
+    null, `frame_submits_complete_while_a_present_holds_its_queue` holds the present thread
+    inside `present`, its queue's lock taken, while another thread's graphics submits
+    complete, where present has a queue of its own; where it shares the graphics queue a
+    frame submit waits for that lock, by design. A one-thread test,
+    `a_present_the_display_holds_lets_the_frame_finish_other_targets_and_refuses_its_own`,
+    holds the display's read of the image while the frame's other targets complete.
+  - *The backends.* Null takes ids and returns `false`. `rhi-vulkan` reads
+    `VK_GOOGLE_display_timing` on a window's swapchain on macOS, where the driver offers it,
+    which is MoltenVK: every present chains `VkPresentTimesInfoGOOGLE` with its id's low 32
+    bits, and a report's `actualPresentTime`, on the host clock `CLOCK_UPTIME_RAW`, is moved
+    onto `Instant` by a pairing of the two clocks at the swapchain's creation, the host read
+    bracketed by two `Instant` reads within 10 µs where one of 100 reads is, so within 5 µs;
+    otherwise the narrowest read is paired with its bracket's midpoint, so the pairing's
+    error is at most half that bracket. MoltenVK 1.4.2 reports a
+    present the display never took with its handler's time, which the backend cannot tell
+    apart; its README says so. A headless surface, KosmicKrisp, lavapipe and every other
+    system return `false`. The call reads the driver's history into a buffer of 64 entries,
+    again while the driver says more are held, at most 256 entries a call, and keeps each
+    call's entries: MoltenVK takes off every entry it writes, so `ash`'s wrapper, which
+    counts and then fills and throws a fill away on `VK_INCOMPLETE`, would lose a report
+    that landed between its two calls. The entries are sorted, the reported and repeated
+    ones dropped, by a function the unit tests hold with no driver, across the ids' 32-bit
+    wrap and a read that meets its guard. Measured on a window under MoltenVK 1.4.2 at
+    60 Hz, in `lactose-platform`'s window case, before the signature changed: each id once
+    and in order, the call's longest 0.04 ms against a bound of 5 ms the case holds at every
+    call, a present shown a median 48 ms after its call returned and reported a median 2 ms
+    after, and no report of a replaced swapchain lost; at fix round 1's head the same case, with
+    the new signature, gave each id once and in order, the call's longest 0.021 ms, a present
+    shown a median 46.8 ms after its call returned and reported a median 3.2 ms after, at most
+    34.5 ms, and no report lost; at fix round 2's head, the call's longest 0.051 ms, a present
+    shown a median 47.8 ms after its call returned and reported a median 2.3 ms after, at most
+    66.1 ms, and no report lost.
+  - *Swapchain images that copy, for tests* (`lactose-rhi-vulkan`'s feature
+    `swapchain-copies`): the contract's swapchain images stay colour attachments alone; the
+    feature, which only a dev-dependency turns on, adds copies from and to them where the
+    surface allows both, so a window test reads a swapchain image back. A hidden switch it
+    adds, `VulkanDevice::set_swapchain_copies`, turns them off for later swapchains, so a
+    window test also presents with the usage a shipped build has, and shows a present that
+    copies such an image refused with `Rule::Usage`. It is no change to
+    `lactose-rhi-api`. `crate-tiers.toml`'s `[dev_only_features]` names it, so `cargo xtask
+    tiers` refuses a library that turns it on from its normal dependencies.
+  - *A presenting device's present path* (`conformance::Harness::device`'s doc): the
+    harness's device made to present may report a present path other than the capability
+    set's, since its surface decides which family presents. `rhi-vulkan`'s device on a
+    headless surface gives present a queue of its own where the set's device shares the
+    graphics queue, so `present_behind_an_unmet_wait_is_refused` reads the device's own
+    `capabilities().queues.present`. `VulkanDevice::headless(DeviceRequest)` is that device,
+    a public constructor of `rhi-vulkan` for tests that need a swapchain with no window:
+    `InvalidData` for a request that names a window, and `Unsupported` on a driver with no
+    `VK_EXT_headless_surface`, which KosmicKrisp is.
+  - *A swapchain image's lifetime* (`rhi-vulkan`): every image object of a swapchain holds
+    the driver swapchain's owner, so an encoder or a pending submit that names an image keeps
+    the driver swapchain past a `resize` or the swapchain's drop, which retire it; the
+    device keeps the object of an image a pending submit names, so an encoder dropped while
+    a panic unwinds, which waits for nothing, does not let the driver swapchain go before
+    that submit completes; the owner destroys it once the last holder goes, after its
+    present fences. A swapchain whose
+    drop cannot see its presents end leaks the device, and the records keep its mark, so a
+    second `create_swapchain` is refused. It is no change to `lactose-rhi-api`'s contract.
 
 **D159. `lactose-platform`: one window whose `Arc` is its lifetime, the two pumps over `lactose-task`'s lanes, a close and a resize as states, and a present thread over the caller's state** (§3, §4, §5.1, §21, `lactose-platform`, `crates/app/README.md`, `crates/task/README.md`)
 - Why: section 4 gives the crate four nouns and section 5.1 two threads, and the milestone 2
@@ -9767,6 +9871,25 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     other agents' builds. Its longest models are the two width configurations of three workers;
     the nightly job's runner has fewer cores, and its sixty minutes also hold
     `lactose-input-host`'s and `lactose-net-host`'s models.
+- Addendum (lane `task-alloc-flake`, 2026-11-24): `tests/job_alloc.rs`'s
+  `a_job_allocates_its_cell_and_a_child_a_share_of_a_queue_block` failed under load with a
+  correct pool, through two costs that are paid once and that its warm-up of 252 jobs did not
+  always pay. A frame-critical worker's scope arena allocates its chunk and its list of chunks
+  at the first scope the worker opens that forks, and the scheduler chooses which worker takes
+  a job, so a worker that took none of the warm-up's jobs paid them in a measured window. A
+  frame-critical worker locks the timers' mutex whenever it goes idle. Where std's mutex is a
+  pthread mutex, as on Apple targets, that mutex is allocated at its first lock by any thread,
+  once on each thread that races to it, and under load no worker may have gone idle before the
+  windows. The warm-up now runs until every frame-critical worker has opened a scope that
+  forks, and then waits once on a sleep, whose registration takes that first lock on the test
+  thread. The window that measures what a mutex's first lock costs is counted under the task
+  tag, so that it holds the test thread's allocations alone. A second cell per call, an
+  allocation per fork and one per stolen child each still fail the test. How often the old
+  test failed depends on the machine's state. The lane's figures, beside eight CPU-bound loops:
+  the old test failed 100 of 600 runs at load 24 to 35, and the new one passed 1,000 nextest
+  stress runs at load 23 to 27 and, after review round 1, 500 more at load 17 to 26. The
+  reviewer's: main's unchanged test passed 1,500 nextest runs at load 28 to 35, and only an
+  instrumented copy reproduced the arena's cost, in 6 of 1,200 runs.
 
 **D163. `lactose-rhi-vulkan` without a window, and the Vulkan step of `cargo xtask gpu`** (§12.1, §20, §21, `lactose-rhi-vulkan`, `lactose-rhi-api`, `tools/xtask`, `crate-tiers.toml`)
 - Why: the milestone 2 plan's lane `vulkan`, under its decisions 5.7, 5.10, 5.12 and D158.

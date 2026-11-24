@@ -86,7 +86,8 @@ pub trait Harness {
 
     /// A new device that reports exactly `set`, one of [`sets`](Self::sets), with
     /// `messages` as its sink. With `presents` it has a surface to make a swapchain for:
-    /// null's is its own, and needs no window.
+    /// null's is its own, and needs no window; its present path is then the one the
+    /// surface gives, which may be `Own` where the set's is `Shared`.
     ///
     /// # Errors
     ///
@@ -408,6 +409,7 @@ pub const CASES: &[Case] = cases! {
     contract "resize_with_a_present_pending_is_refused" => Pending everywhere;
     contract "image_of_before_a_resize_is_refused" => Destroyed everywhere;
     contract "frame_submits_complete_while_a_present_is_pending";
+    contract "present_ids_count_up_and_display_times_follow_them";
     // Device loss and messages.
     contract "loss_is_returned_and_stays";
     contract "waits_return_at_once_after_a_loss";

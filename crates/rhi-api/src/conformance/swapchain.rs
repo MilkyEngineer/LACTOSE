@@ -6,9 +6,9 @@ use lactose_core::Result;
 
 use super::kit::{Body, Ctx, EXTENT, PATIENCE, attachment, begin, buffer_to, clear, image_to};
 use crate::{
-    Acquired, BufferCopy, BufferState, BufferUsage, Device, Encoder, Extent, ImageHandle,
-    ImageState, Load, MemoryClass, PassReach, Presented, QueuePath, QueueRole, Rule, Store, Submit,
-    Swapchain, SwapchainDesc, TimelinePoint,
+    Acquired, BufferCopy, BufferState, BufferUsage, Device, DisplayTime, Encoder, Extent,
+    ImageHandle, ImageState, Load, MemoryClass, PassReach, PresentId, Presented, QueuePath,
+    QueueRole, Rule, Store, Submit, Swapchain, SwapchainDesc, TimelinePoint,
 };
 
 type Applies = core::result::Result<(), &'static str>;
@@ -39,6 +39,10 @@ pub(super) const BODIES: &[(&str, Body)] = &[
     (
         "frame_submits_complete_while_a_present_is_pending",
         frame_submits_complete_while_a_present_is_pending,
+    ),
+    (
+        "present_ids_count_up_and_display_times_follow_them",
+        present_ids_count_up_and_display_times_follow_them,
     ),
 ];
 
@@ -136,7 +140,8 @@ fn present_behind_an_unmet_wait_is_refused(ctx: &Ctx<'_>) -> Applies {
     let unmet = ctx.point(&*device, 1);
     let done = ctx.point(&*device, 1);
     let mut encoders = [frame(ctx, &*device, &[image])];
-    let waits: &[TimelinePoint] = if ctx.set.queues.present == QueuePath::Shared {
+    // The device's own path: a surface may give the present role a queue the set's lacks.
+    let waits: &[TimelinePoint] = if device.capabilities().queues.present == QueuePath::Shared {
         ctx.submit(&*device, G, &mut [], &[unmet], &[]);
         &[]
     } else {
@@ -346,6 +351,52 @@ fn frame_submits_complete_while_a_present_is_pending(ctx: &Ctx<'_>) -> Applies {
     show(ctx, &*device, &mut *swapchain, next);
     if stalled {
         ctx.stall(&*device, false);
+    }
+    Ok(())
+}
+
+/// Each present taken has the next id from one, a refused present takes none, and a resize
+/// restarts nothing. Where the swapchain reports display times, each report is of a present
+/// taken, each id once and in increasing order, appended to what the buffer held; a
+/// swapchain whose device has no source answers `false` at every call and appends nothing.
+fn present_ids_count_up_and_display_times_follow_them(ctx: &Ctx<'_>) -> Applies {
+    let device = ctx.presenting()?;
+    let mut swapchain = swapchain(ctx, &*device);
+    ctx.check(swapchain.last_present().is_none(), "no id before the first present");
+    // A buffer that holds an earlier caller's entry, which every call keeps.
+    let earlier = DisplayTime { present: PresentId(0), shown: Instant::now() };
+    let mut times = vec![earlier];
+    let reports = swapchain.display_times(&mut times);
+    let mut reported: Option<PresentId> = None;
+    for round in 1..=6 {
+        if round == 4 {
+            ctx.ok(
+                swapchain.resize(Extent { width: EXTENT.width * 2, height: EXTENT.height }),
+                "a resize",
+            );
+        }
+        let image = acquire(ctx, &mut *swapchain);
+        let mut encoders = [ctx.encoder(&*device, G)];
+        ctx.refused_by(
+            present(&mut *swapchain, image, &mut encoders, &[], &[]),
+            Rule::Encoding,
+            "a present of a graphics encoder",
+        );
+        show(ctx, &*device, &mut *swapchain, image);
+        ctx.check(swapchain.last_present() == Some(PresentId(round)), "the present's id");
+        times.truncate(1);
+        let answered = swapchain.display_times(&mut times);
+        ctx.check(answered == reports, "whether the swapchain reports is fixed at its creation");
+        ctx.check(times.first() == Some(&earlier), "a call keeps what the buffer held");
+        ctx.check(answered || times.len() == 1, "a swapchain that reports nothing appends nothing");
+        for time in &times[1..] {
+            ctx.check(
+                reported.is_none_or(|last| time.present > last),
+                "the reports' ids increase, each once",
+            );
+            ctx.check(time.present.0 <= round, "a report is of a present taken");
+            reported = Some(time.present);
+        }
     }
     Ok(())
 }

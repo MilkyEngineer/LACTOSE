@@ -4,8 +4,10 @@ Every `unsafe` block carries a `// SAFETY:` comment. This file states the invari
 comments rely on. Architecture section 21 lists the reason for unsafe here: FFI to the Vulkan
 driver, through `ash`, whose every driver call is an `unsafe fn`. No `unsafe` of this crate
 is anything else: it has no `unsafe` data structure, and its integration tests forbid `unsafe`.
-The one `unsafe` block of its unit tests is the thread-safety canary's (below), a driver call
-that breaks the queue's external synchronisation on purpose.
+Two of its unit tests have `unsafe` blocks, each a driver call that breaks a rule on purpose:
+the thread-safety canary's (below), which breaks the queue's external synchronisation, and the
+injected reuse of an acquire semaphore (`src/swapchain.rs`), whose batch waits for the
+semaphore under the queue's lock before the test takes it as free.
 
 The methods of `VulkanDevice` and its encoders are safe, and their callers forbid `unsafe`, so
 no call they make may reach undefined behaviour through this crate's code. Each driver call is
@@ -68,6 +70,79 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   is destroyed before the instance, and the sink is freed and the loader released after the
   instance, never before: the loader is a `ManuallyDrop` and the sink a pointer with no drop
   of its own, so neither goes with the fields. On the leak path neither is freed.
+
+### The surface and the swapchain (`surface.rs`, `swapchain.rs`)
+
+- A window's surface is made from the handles its `SurfaceSource` lends, read once on the
+  constructor's thread; the surface keeps the source, so the handles live as long as the
+  surface. An AppKit view's layer is made by `raw-window-metal` on the main thread alone
+  (`pthread_main_np` is checked first, as `Layer::from_ns_view` requires), and the surface
+  keeps the layer. `Raw`'s drop destroys the surface after the device and before the
+  messenger and the instance; a swapchain holds the device, so none outlives it. After the
+  surface is destroyed, the layer is sent `removeFromSuperlayer` on the main thread alone,
+  where AppKit's view tree is changed, and the surface's retain of it is released there:
+  called there at once, or moved to a closure the main queue runs
+  (`raw_window_metal::Layer` is `Send`). That retain need not be the last. A drawable
+  retains its layer, and MoltenVK 1.4.2 releases a presented drawable on Metal's completion
+  thread after it signals the present fence, so the layer's last release, and with it the
+  drop of `raw-window-metal`'s `ObserverLayer`, which removes its key-value observers of the
+  view's layer, may run on that thread; that crate's drop allows it, holding the view's
+  layer weakly. Nothing here takes the observers' removal to be on the main thread. A
+  surface never destroyed, on the leak path, leaks its layer with it, since the driver may
+  still present to it.
+- An acquire signals a semaphore no operation is pending on: one never used, or one whose
+  waiting submit the present queue's timeline shows complete. A present's submit waits for
+  the acquire's semaphore once and signals the image's present semaphore, whose last wait,
+  that image's last present, has its present fence signalled first. `vkQueuePresentKHR` is
+  called under the present queue's lock, which every submit to that queue takes, after the
+  submit; every signal its semaphore depends on has been submitted, as the present's walk
+  decided before the submit was stamped (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
+- An image given up while acquired, at `resize` or the drop, has its semaphore waited for by
+  an empty batch, so that no signalled semaphore is destroyed or reused unwaited.
+- A driver swapchain is destroyed by the drop of its owner (`SwapchainObj`), which every
+  image object of it holds, so it outlives every view of its images and every encoder and
+  submit that names one. A `resize` and the swapchain's drop forget the images' handles,
+  and hand the objects of those a submit not yet known complete names to the device
+  (`Shared::left`), which lets each go once its stamps are reached, or at the device's last
+  drop. A driver swapchain whose images outlive the swapchain's drop stays the surface's
+  (`Left::unretired`): the next swapchain names it as `oldSwapchain`, so the surface has at
+  most one swapchain that is not retired, as the spec allows a native window.
+  A retired driver swapchain is destroyed by whichever thread drops its last image object,
+  which may be beside the present thread's `vkCreateSwapchainKHR`. The spec allows it:
+  `vkDestroySwapchainKHR` externally synchronises only its `swapchain`, and
+  `vkCreateSwapchainKHR` its `surface` and `oldSwapchain`. MoltenVK 1.4.2 reads and writes
+  the surface's `_activeSwapchain` unlocked in both calls (`MVKSwapchain.mm` 651 and
+  399–400, `MVKSurface.mm` 65–66), a race inside the driver that a retired swapchain does
+  not reach, since it is never the active one.
+  On the leak path no owner that sees the flag destroys anything (below).
+- A driver swapchain is replaced, by `resize`, and its owner let go, only once every present
+  fence of it has signalled, or after a loss; the present semaphores, only once the submits
+  that wait for them are complete; it is retired whether its replacement's creation
+  succeeds or not. A present fence never signals after an error that enqueued nothing (out
+  of memory): the fence is reused, and the image's present semaphore, left signalled, is
+  waited for by an empty batch before the semaphore is signalled again or destroyed. A fence
+  of a present that failed with an error the spec does not list is waited for a bound after
+  its present with the present queue idle, then destroyed: the bound with the queue idle is
+  taken to show that the present enqueued nothing, so that no wait for the image's present
+  semaphore is pending either, and the semaphore, left signalled, is destroyed with its
+  chain's (`destroy_semaphores`); the error leaves the swapchain stale, so that image is not
+  presented again. The one known source is MoltenVK 1.4.2's present with no command buffer
+  (`MVKQueue.mm` 739–750), which takes neither the waits nor the fence. Its drawable timeout
+  (`MVKImage.mm` 1625), the same error, signals the fence, which is reaped as any other.
+- A drop whose waits do not end within three seconds, or that unwinds a panic with
+  something of the swapchain pending, leaks the device (`Raw::leak`), and the records keep
+  the swapchain's mark, so no second swapchain is made on the surface while the leaked one
+  may be in use. A holder that sees the flag destroys nothing: the device's last holder
+  (`let_go`) lets go of what `Shared::left` holds and returns, with no wait for idle and
+  no sampler or orphaned pool destroyed, and the device and its surface are not destroyed.
+  Two reads must see it, and do, the load being `Relaxed`: the leaked driver swapchain's
+  drop, ordered after the store by its `Arc`'s release sequence, since the swapchain's drop
+  lets its chain's count go after the store; and what `Shared::left` holds, drained by the
+  last holder's `let_go` after `Holders::let_go`'s acquire. An image object another thread
+  drops before it sees the flag may destroy its views, and a plain image its image and
+  memory; nothing pending names those, so that is sound.
+- `vkGetPastPresentationTimingGOOGLE` is called on the swapchain from the thread that
+  acquires and presents, between those calls (`Swapchain` is not `Sync`).
 
 ### The messenger's callback (`raw.rs`, `on_message`)
 
@@ -147,10 +222,12 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
 ### Drops while unwinding
 
 - A drop of the device's last holder, made while the thread unwinds a panic with a submit
-  pending, does not wait; it marks the device leaking (`Raw::leak`), and every object's drop
-  after it returns without destroying anything, `Raw`'s included, which frees neither the
-  sink nor the loader the leaked messengers reach. Nothing is destroyed under the GPU's use,
-  at the cost of the device's memory. With nothing pending, the unwinding last holder tears
+  pending, does not wait; it marks the device leaking (`Raw::leak`), and every drop that
+  sees the flag returns without destroying anything, `Raw`'s included, which frees neither
+  the sink nor the loader the leaked messengers reach. An image object another thread drops
+  before it sees the flag may destroy its views, and a plain image its image and memory;
+  nothing pending names them (above). Nothing is destroyed under the GPU's use, at the cost
+  of the device's memory. With nothing pending, the unwinding last holder tears
   the device down as any last holder does.
 - The holders' count (`Holders`, `holders.rs`) is decremented with `Release` and the last
   holder takes an `Acquire` fence, as `Arc`'s drop does, so every queue call another holder

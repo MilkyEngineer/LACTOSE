@@ -121,7 +121,9 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - Each worker has three separate arenas: job scratch, child-job scratch, and scope job
   storage. Scope job storage is reset when the scope closes. Child scratch is reset after
   each child, which must not disturb the scratch of an opener that is running that child
-  inline.
+  inline. An arena allocates its chunk, and its list of chunks, at its first use on that
+  worker, another chunk when a use outgrows the last, and one larger chunk at its first use
+  after a reset that freed more than one.
 
 **Jobs of `run_job`**
 

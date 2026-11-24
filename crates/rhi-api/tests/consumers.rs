@@ -13,10 +13,10 @@ use lactose_core::{ErrorKind, Result};
 use lactose_rhi_api::{
     Acquired, BufferDesc, BufferHandle, BufferReach, BufferState, BufferTransition, BufferUsage,
     Capabilities, ColourAttachment, ComputePass, CookedShader, Device, DeviceInfo, DeviceRequest,
-    Encoder, Extent, GraphicsPipelineDesc, GraphicsPipelineHandle, HeapSlot, ImageDesc,
-    ImageHandle, ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage,
-    IndexedIndirectArgs, Load, MemoryClass, Message, MessageSink, PassReach, Presented, QueueRole,
-    RenderPass, Rule, Sharing, StateOn, Store, Submit, SurfaceSource, Swapchain, Target,
+    DisplayTime, Encoder, Extent, GraphicsPipelineDesc, GraphicsPipelineHandle, HeapSlot,
+    ImageDesc, ImageHandle, ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage,
+    IndexedIndirectArgs, Load, MemoryClass, Message, MessageSink, PassReach, PresentId, Presented,
+    QueueRole, RenderPass, Rule, Sharing, StateOn, Store, Submit, SurfaceSource, Swapchain, Target,
     TimelinePoint,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -329,6 +329,28 @@ fn present_once(
     Ok(shown == Presented::Shown)
 }
 
+/// The binary's present side (D162): it keeps each present's id beside its call, and as
+/// each call begins reads the display times on the thread that presents, with no wait. It
+/// counts the presents not yet known displayed: a present is taken as displayed once its
+/// own id or a later one is reported. `None` where the swapchain reports no display time.
+/// The buffer is the caller's, cleared and reused at each call.
+fn waiting(
+    swapchain: &mut dyn Swapchain,
+    times: &mut Vec<DisplayTime>,
+    displayed: &mut Option<PresentId>,
+) -> Option<u64> {
+    times.clear();
+    if !swapchain.display_times(times) {
+        return None;
+    }
+    if let Some(last) = times.last() {
+        *displayed = Some(last.present);
+        let age_at_display: Duration = last.shown.elapsed();
+    }
+    let presented = swapchain.last_present().map_or(0, |PresentId(id)| id);
+    Some(presented - displayed.map_or(0, |PresentId(id)| id))
+}
+
 /// `tools/cook` and a backend: the cooker writes the format, and a pipeline is made from
 /// what `decode` reads back.
 fn cook_then_load(device: &dyn Device, shader: &CookedShader) -> Result<GraphicsPipelineHandle> {
@@ -612,6 +634,12 @@ mod backend {
         }
         fn resize(&mut self, extent: Extent) -> Result<()> {
             unimplemented!()
+        }
+        fn last_present(&self) -> Option<PresentId> {
+            None
+        }
+        fn display_times(&mut self, into: &mut Vec<DisplayTime>) -> bool {
+            false
         }
     }
 

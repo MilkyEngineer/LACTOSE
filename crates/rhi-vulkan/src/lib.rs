@@ -23,6 +23,8 @@ mod pipeline;
 mod raw;
 mod records;
 mod submit;
+mod surface;
+mod swapchain;
 mod table;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
