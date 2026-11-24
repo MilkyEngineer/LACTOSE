@@ -477,7 +477,7 @@ const LOOM_OWNER: &str = "lactose-task";
 /// The other packages that may name loom, each as an optional dependency that only its own
 /// feature `loom = ["dep:loom"]` turns on. The feature builds the package's loom models of a
 /// lock it ships and changes nothing it ships.
-const LOOM_MODELS: &[&str] = &["lactose-input-host", "lactose-net-host"];
+const LOOM_MODELS: &[&str] = &["lactose-input-host", "lactose-net-host", "lactose-renderer"];
 
 /// Features unify across a build, so one package turning on `lactose-task/loom` would switch
 /// every executor in that build to loom's primitives, which panic outside a model. No
@@ -988,7 +988,7 @@ root v0.0.0 (/ws)|
         let tail = "only lactose-task names loom, since a feature turned on in one build turns \
                     its executor into loom's model everywhere (except the optional dependency \
                     and `loom = [\"dep:loom\"]` of a package that builds its own loom models: \
-                    lactose-input-host, lactose-net-host)";
+                    lactose-input-host, lactose-net-host, lactose-renderer)";
         let mut ecs = package("lactose-ecs", &[("lactose-task", Normal), ("loom", Dev)]);
         ecs.deps[0].features.push("loom".to_owned());
         ecs.deps[1].rename = Some("model_checker".to_owned());

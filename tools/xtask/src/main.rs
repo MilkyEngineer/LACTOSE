@@ -294,12 +294,14 @@ const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
 /// inject what no safe call makes (an acquire semaphore's reuse, a present fence that never
 /// signals, a failed `resize`, a present the driver refuses) or watch what none reports (a
 /// present's walk left undecided, a driver swapchain kept for a submit an encoder dropped
-/// while unwinding left pending). The render graph's are its `device` module's.
-const DEVICE_TESTS: [(&str, Option<&str>, &str); 4] = [
+/// while unwinding left pending). The render graph's and the renderer's are their `device`
+/// modules'.
+const DEVICE_TESTS: [(&str, Option<&str>, &str); 5] = [
     ("lactose-rhi-vulkan", None, "canary::"),
     ("lactose-rhi-vulkan", None, "swapchain::"),
     ("lactose-rhi-vulkan", Some("integration"), ""),
     ("lactose-render-graph", Some("integration"), "device::"),
+    ("lactose-renderer", Some("integration"), "device::"),
 ];
 
 /// What `gpu` was asked to run.
@@ -1052,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn the_device_tests_are_rhi_vulkans_canary_and_swapchain_modules_and_two_test_targets() {
+    fn the_device_tests_are_rhi_vulkans_canary_and_swapchain_modules_and_three_test_targets() {
         let library: Vec<&str> = DEVICE_TESTS
             .iter()
             .filter(|(_, target, _)| target.is_none())
@@ -1068,7 +1070,8 @@ mod tests {
             targets,
             [
                 ("lactose-rhi-vulkan", "integration", ""),
-                ("lactose-render-graph", "integration", "device::")
+                ("lactose-render-graph", "integration", "device::"),
+                ("lactose-renderer", "integration", "device::"),
             ]
         );
     }

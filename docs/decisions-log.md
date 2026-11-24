@@ -8785,6 +8785,106 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
 - Replaced: section 12.4's "keyed by `StableKey`", where it is read as the key alone, and its
   "freed from the structural change log", where it is read as the renderer reading the log;
   this merge amends the sentence. Nothing of D157, D158 or D160 is replaced.
+- Addendum (lane `renderer-impl`, 2026-11-24; round one, the null half): *implemented and
+  proved on null, with no public signature changed.* Every `todo!()` of the facade is written;
+  the crate README's proof table runs on null where its row needs no shader to run, each line
+  failed by the build the table names, and the device rows are left to the device round.
+  What the README left to the implementation is settled so:
+  - *The base rule is a count of each kind's ticks.* Each kind keeps the tick of its last
+    applied pass and an epoch that a `begin` of another tick advances; a `begin` of an earlier
+    tick also marks the epoch dropped. A slot keeps the epoch it was given in and the epoch its
+    base was last taken in. An entry of a world pass is `0` in a dropped epoch or on a slot
+    given in this epoch, `HAS_BASE` where the base was taken in this epoch, and
+    `TAKE_BASE | HAS_BASE` otherwise, which takes it; a remote entry is `0`. A lost kind and a
+    torn frame forget the kind's last tick, so its next `begin` is compared with none. This is
+    the eager sink of present-api's proof row, kept per slot in place of per key, and its
+    sixteen sequences hold it: a build that sets `HAS_BASE` in a dropped tick, or takes the
+    base at every write, fails them (`tests/sequences.rs`).
+  - *A pass applies in four steps:* its removed keys, its rows of held instances in ascending
+    key order, a full pass's sweep of the kind's held slots it did not write, then its new
+    instances in ascending key order, each at the lowest free slot. A slot freed and given
+    again in one pass takes the new instance's entry alone. Each slot carries the run numbers
+    of its last write, free, gift and naming, so a run's checks are by stamp and not by set,
+    and `close_run` asserts that a run names each slot once before it splits the run into
+    dispatches. Of a pass's or batch's rows that name one instance, sorted by key and then by
+    region index, the last is kept.
+  - *A pass with no region open marks the renderer-wide record,* which `prepare` takes with a
+    swap after its sealing. A mark made between the sealing's compare-exchange and the swap is
+    reported by that `prepare`, one early, as the README allows; the loom models accept the
+    loss in either sealing and hold that it is reported by exactly one. The record keeps each
+    kind's dropped rows and the rows with no kind, and no total: `FrameStats::dropped` is
+    their sum as the sealing takes them, so no frame's `dropped_in` exceeds its `dropped`,
+    though the lost bit may come a frame before its rows (fix round 1; a total kept apart,
+    taken between two of a writer's additions, failed the loom model that holds it), and
+    never after them: the swap takes the rows first and the lost kinds last, a kind's rows
+    added with `Release` and swapped with `Acquire` (fix round 2;
+    `a_kinds_rows_are_never_taken_before_its_loss`, which fails with the loss swapped first).
+  - *A tick is earlier than the last by present-api's `tick_before`:* the wrapping
+    difference from the last is at least 2^31, so a tick exactly 2^31 back is earlier and
+    drops the bases (fix round 1; `model::a_resync_exactly_half_the_ring_back_drops_the_bases`).
+  - *The frame's declaration names what its batch reads.* The instance buffer is imported from
+    `Undefined` while it is fresh, at the first frame and after a torn frame forgot every slot,
+    and from `ShaderRead` after; the region's entries only when the batch has one, its rows only
+    when an entry reads a row, and the draw's vertices, indices and arguments only when the
+    table's extent is above zero. So no first frame reads what no submit wrote, and a build that
+    declares the instance buffer or the rows in every frame is refused by null
+    (`undefined-read`). A frame of a renderer made with shaders that was opened, prepared
+    and not declared, and that `submitted` is called on, forgets its slots as a torn frame
+    does, so the instance buffer
+    is fresh again: no submit of the frame wrote what its batch applied.
+  - *`Renderer::new` refuses a description whose batch bound is past `u32::MAX`,* with
+    `InvalidData`, before it makes a buffer (fix round 1; fix round 2's
+    `graph::new_refuses_a_batch_bound_past_u32_max_first`). `instances + 2 * rows` bounds a
+    batch, and `BatchRange` names an entry by a `u32`. Round one let such a description through
+    on the reasoning that its batch needs regions of 2^31 rows, which no device makes; that was
+    wrong: `instances` near 2^32 with a few rows reaches the bound after a torn frame, whose
+    run frees every slot index ever given, and the batch's check was a panic, which aborts a
+    binary, not a refusal of the frame. With the refusal at `new` the check is an assertion
+    that cannot fail.
+- Addendum (lane `renderer-impl`, 2026-11-24; the device round): *proved on the M1's two
+  Vulkan drivers, with no public signature changed.* What it settled:
+  - *The shaders.* `shaders/modules/lactose/renderer.slang` declares the records as the crate
+    README's "Records" table gives them, and `shaders/renderer/scatter.slang` and
+    `triangle.slang` transcribe `InstanceRecord::scatter` and `free`, and `drawn`,
+    `CellTransform::apply` and `CameraData::clip`. Each push block is an entry-point `uniform`
+    parameter: the cooked MSL of the scatter and of the vertex stage takes it at
+    `[[buffer(0)]]`, and the fragment stage's SPIR-V has no `PushConstant` variable and its
+    MSL no buffer argument. The cells are subtracted as `uint`, reinterpreted as `int`, then
+    converted. Every access through a physical-storage-buffer pointer in the cooked SPIR-V is
+    `Aligned 4`, and the cooked MSL's entry is three scalar `uint`s, so a dispatch's entries
+    pointer, `first * 12`, is never claimed more aligned than it is.
+  - *The device tests* are the `device` module of the `integration` binary, one
+    `DEVICE_TESTS` entry. Each reads the instance buffer back through a copy pass into a
+    `Readback` buffer that it invalidates before the read, and compares each image with a
+    reference computed on the CPU at decision 5.1's quarter-pixel margin, the three counts
+    printed and none wrong. A frame is held in flight two ways, behind a gate on its
+    target's import that the host signals after the later frame's writes, and behind a
+    dispatch of about a second at its head (the conformance suite's `store.slang`); the
+    tests of the ring and of the camera run both.
+  - *The proof table, amended* (`reviewer-gpu`'s round-1 list): a row for the scatter's
+    dispatches, a batch of two runs whose records are each the host's rule, failed by four
+    builds the null half could not fail (the entries read from the batch's first, a count
+    of one too many, the groups rounded down, no rows address); row 12's failing build is
+    one that ignores `LIVE`, with `(0, 0, 0, 0)` kept as the reason for `(2, 2, 2, 1)`, and
+    one that draws `live` instances, not `extent`; row 13's, one that pushes a fraction of
+    1. Row 8's two rows of an instance are 2^15 apart in the region: the builder sorts a
+    pass's rows by key, so a batch that kept both would hold them in adjacent entries, and
+    the build without the resolution, which has no use for the sort, keeps region order.
+  - *The barrier mutations* (`reviewer-gpu`'s G5): the barrier between two dispatches of the
+    scatter is the one that matters, and its test is 65,536 slots freed by one run and given
+    by the next. Dropped in a scratch copy of `lactose-rhi-vulkan`'s encoder, with one
+    invocation in 64 of the scatter's `FREE` path spinning 2^22 rounds, it fails that test
+    under KosmicKrisp in four runs of four, at a slot above 50,000 each time, and the lag
+    with the barrier kept passes it in four of four; without the lag it passes, and under
+    MoltenVK, whose serial compute encoder orders the dispatches, it passes with the lag.
+    No shipped shader lags, so `cargo xtask gpu` cannot fail the mutation by itself.
+    Dropping the scatter-to-vertex transition or the one across frames leaves other
+    imports' transitions from `Undefined` before the same pass, full execution
+    dependencies. Across frames that is all a write after a read needs, so that mutation is
+    correct by the specification; the scatter-to-vertex one drops the memory dependency on
+    the instance buffer alone, which desktop drivers carry out as a global cache operation,
+    so its survival would not show the barrier unneeded. The script for the three is left
+    for the desktop.
 
 **D162. The shown frame in `lactose-app`: two traits of its own over `-api` types, extract after the frame before is taken back, the frame's job one closure run as a job on all the frame-critical workers but one, three states and a frame that waits for the frame before until a margin before the next tick's deadline and defers past it, two targets with at most one present call a frame and no worker behind a present, the timer root the pacer and, on two frame-critical workers or more, no tick behind the render side, and no lock of its own** (§3, §5.1, §5.3, §8.1, §8.3, §9.7, §11, §16, §19, `lactose-app`, `lactose-task`, `game-sim`, `crates/present-api/README.md`, `crates/rhi-api/README.md`, `crates/platform/README.md`, `crates/render-graph/README.md`, `crates/renderer/README.md`, `crates/task/README.md`)
 - Why: section 5.3 fixes the tick at 60 Hz from the timer root, extract as exclusive, the overlap of

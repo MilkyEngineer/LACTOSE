@@ -9,6 +9,13 @@ license.workspace = true
 # D150: the integration tests are one binary, whose root declares the others as modules.
 autotests = false
 
+[features]
+# Builds the loom models of the open word and the region's counts (`src/models.rs`), which
+# run the shipped `ExtractSink`, `RemoteWriter` and seal over loom's atomics. Run them with
+# `cargo test -p lactose-renderer --features loom --release`. The feature changes nothing
+# the crate ships: the staging ring runs on the standard atomics with or without it.
+loom = ["dep:loom"]
+
 [dependencies]
 # `StableKey`, the only identity a slot is keyed by; `Result` and `ErrorKind`.
 lactose-core.workspace = true
@@ -28,12 +35,24 @@ lactose-input-host.workspace = true
 lactose-rhi-api.workspace = true
 # `FrameDecl`: the renderer's passes are declared into the caller's frame.
 lactose-render-graph.workspace = true
+# The events under `LOG_TARGET`.
+tracing.workspace = true
+loom = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The compile-only sketches: a frame recorded from a job, and a world whose extract is
 # handed the renderer's sink.
 lactose-task.workspace = true
 lactose-sim.workspace = true
+# The device the null proofs, the unit tests and the loom models run on.
+lactose-rhi-null.workspace = true
+# `PlayerInput::aim` and `Yaw::rotation`, which the camera's direction is held to.
+lactose-input.workspace = true
+# `Transform`, the component a world's instance rows are extracted from.
+lactose-physics-api.workspace = true
+# The device the `device` tests run the renderer on, under `cargo xtask gpu`'s drivers and
+# validation; a plain run ignores them.
+lactose-rhi-vulkan.workspace = true
 
 [[test]]
 name = "integration"

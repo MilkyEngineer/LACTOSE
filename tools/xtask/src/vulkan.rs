@@ -784,7 +784,9 @@ pub fn judge_ended(test: &str, ended: &Ended, expected: Option<&[&str]>, metal: 
 pub const TAIL_LINES: usize = 40;
 
 /// The entry of the device test `test` of `package` in its run's report: its name and word,
-/// then each message, report and driver line it printed; for a failed test, how its process
+/// then each message, report and driver line it printed, then each line of its output that
+/// ends in `retrying`, which a device test prints where it ran a step again and still
+/// passed (`crates/renderer/tests/device.rs`, `held`); for a failed test, how its process
 /// ended and the last lines of its standard output and of its standard error, [`TAIL_LINES`]
 /// at most between them, each half of them and a share one leaves to the other. The run
 /// prints a failed test's entry to standard error too, then its [`output`] in full.
@@ -792,6 +794,10 @@ pub const TAIL_LINES: usize = 40;
 pub fn entry(package: &str, test: &str, verdict: &Verdict, ended: &Ended) -> String {
     let mut entry = format!("{package} {test}: {}\n", verdict.word());
     for line in verdict.messages.iter().chain(&verdict.reports).chain(&verdict.driver) {
+        entry.push_str(&format!("  {line}\n"));
+    }
+    let output = ended.stdout.lines().chain(ended.stderr.lines()).map(str::trim_end);
+    for line in output.filter(|line| line.ends_with("retrying")) {
         entry.push_str(&format!("  {line}\n"));
     }
     if verdict.failure.is_none() {
@@ -1086,6 +1092,18 @@ mod tests {
         assert_eq!(
             entry("a-package", test, &verdict, &passed),
             format!("a-package device::a_canary: passed\n  {}", message("AN-ID"))
+        );
+        // A passing test's retries are kept beside its word, from either stream.
+        let retried = ended(
+            "exit status: 0",
+            "test device::a_canary ... ok\n",
+            "device::a_canary: Lag at 2 rounds was reached before the release: retrying\n",
+        );
+        let verdict = judge_ended(test, &retried, None, false);
+        assert_eq!(
+            entry("a-package", test, &verdict, &retried),
+            "a-package device::a_canary: passed\n  device::a_canary: Lag at 2 rounds was \
+             reached before the release: retrying\n"
         );
         // A message fails a case whose process succeeded: its entry has the tail too.
         let sent = ended("exit status: 0", &format!("{CLEAN}{}", message("VUID-x")), "");

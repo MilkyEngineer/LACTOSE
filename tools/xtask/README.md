@@ -696,9 +696,9 @@ writes its report.
 4. The Vulkan step runs every device test: each ignored test of the test targets
    `DEVICE_TESTS` in `src/main.rs` lists, which are `lactose-rhi-vulkan`'s library's unit
    tests, of its `canary` and `swapchain` modules alone, so that no other ignored unit test
-   runs as a device test, its `integration` binary, and the `device` module of
-   `lactose-render-graph`'s `integration` binary, each in a process of its own, built with
-   `cargo test --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
+   runs as a device test, its `integration` binary, and the `device` modules of
+   `lactose-render-graph`'s and `lactose-renderer`'s `integration` binaries, each in a
+   process of its own, built with `cargo test --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
    - the layer is the Khronos validation layer of the Vulkan SDK that
      `tools/xtask/vulkan-layer.toml` pins, refused unless its library's SHA-256 and its
      manifest's version are the pin's. On Linux the SDK's archive is fetched into
@@ -789,7 +789,10 @@ writes its report.
    driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
    cleared:`, or `none`), every variable it set, the canaries heard or skipped, the
    device's `DeviceInfo` and `Capabilities`, and each test with `passed`, the suite's
-   `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed. Under a
+   `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed, then
+   each line of its output that ends in `retrying`, so that a test that passed only on a
+   retry says so (the renderer's device tests print one where a held frame was reached
+   before its release, `crates/renderer/README.md`, "Proof"). Under a
    failed test it writes how its process ended, its exit status or on unix the signal that
    killed it, and the last lines of its standard output and of its standard error, 40 at
    most between them (`TAIL_LINES` in `src/vulkan.rs`), so a process that died silently still

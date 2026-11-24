@@ -16,10 +16,12 @@ binary name this crate; `lactose-app` never does (decision 5.11).
 | Determinism boundary | outside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final for milestone 2's lanes and every body
-that decides anything is `todo!()`. What runs is plain data: a slot's index, a batch's
-accessors, a frame's counts. This file is the contract `renderer-impl` meets, and every
-sentence under "Behaviour the signatures cannot express" is one a dependent crate may rely on.
+**Status: implemented.** Every public signature is final for milestone 2's lanes and every
+body is written (D161's addendum at `renderer-impl`). The slot table, the sink, the ring, the
+batch and the frame's declaration are proved on null, and the scatter, the triangle pass and
+the camera on Vulkan devices, with the shaders of `shaders/renderer/` ("Proof"). This file is
+the contract `renderer-impl` meets, and every sentence under "Behaviour the signatures cannot
+express" is one a dependent crate may rely on.
 Architecture sections 3, 5.3, 12.4 and 12.5 are the design, with the milestone 2 plan's
 decisions 5.1 to 5.4, 5.11, 5.14 and 5.18; where this file and the architecture disagree, the
 architecture wins and this file is wrong. Decision D161 records the choices they left open.
@@ -68,7 +70,8 @@ writers share with the renderer ("Concurrency").
 | `lactose-terrain`, `lactose-debug-ui`, later `lactose-ui` | To add passes to the frame, the first two without naming `lactose-render-graph` (`crate-tiers.toml`); to test their `declare` on null with no renderer and no cooked shader | `RenderFeature`, `FeatureView`, `Renderer::add_feature`; module `graph`; `FeatureView::new` over ids of a declaration of the test's own |
 | The milestone 4 merge of a client's two worlds (verification, the row on section 9.4's shadowing) | The kind of every instance, so the prediction world's copy can shadow the replicated one | Slots are keyed by kind and key, and `SlotHolder::kind` says which |
 
-What `frame-design` must still decide, since no signature here does:
+What `frame-design` must still decide, since no signature here does. D162 decides each
+(`crates/app/README.md`, from "The shown frame" to "Counts, torn frames and resets"):
 
 - **Where the frame waits for a region.** `open` never waits. With `regions` regions the
   device may hold `regions - 1` frames; one more and `open` returns `Opened::Wait`. The
@@ -94,7 +97,8 @@ What `frame-design` must still decide, since no signature here does:
   `torn` it is every world shown. The remote batch's dropped and unplaced rows are in the
   totals alone and need nothing: its next batch writes every remote instance again.
 - **How `lactose-app` reaches these calls.** `lactose-app` names no `[server_denylist]`
-  crate, so it drives a `dyn` object of a foundation crate's trait that `lactose-app-client`
+  crate, so it drives a `dyn` object of a trait of its own over `-api` types,
+  `lactose_app::RenderSide` (D162), that `lactose-app-client`
   implements over a `Renderer` and a `RenderGraph` (graph, "What each consumer needs";
   D160). `RemoteWriter` borrows the renderer, so the object lends it to the presentation
   schedule inside one of its methods.
@@ -107,8 +111,9 @@ What `frame-design` must still decide, since no signature here does:
 ## A frame, by step
 
 1. **Open.** `Renderer::open` opens a free region to the writers, or returns the point that
-   frees one, which the frame waits for off the frame-critical workers before it calls
-   `open` again. A new renderer has region zero open. A frame that failed is followed by
+   frees one. The client's frame does not wait for it: it runs its ticks, defers its passes
+   and calls `open` again at its next frame (D162); a step-driven caller may wait for the
+   point on a thread of its own. A new renderer has region zero open. A frame that failed is followed by
    this step as any other is.
 2. **Write.** Extract's pass for each world shown writes through its `ExtractSink`, inside
    `Simulation::run_passes`. Then, once the `Client` world's pass has ended, the
@@ -259,14 +264,32 @@ Step 1 for the next frame may come any time after step 3.
   so the remote instances are missing until the next frame's batch.
 - **With no region open** there is no region to note a loss in. A pass that begins then,
   and a row written then, are recorded in the renderer-wide record of kinds lost and rows
-  dropped, by kind and in all. The next `prepare` takes the record with a swap after it has
-  sealed its region, and `open` never resets it, so a loss is reported no later than the
-  kind's next pass is applied; reported one `prepare` early, it frees the kind until a full
-  pass and shows nothing stale.
+  dropped: the rows of each kind's passes, and the rows with no kind on their own, whose sum
+  is the total. The next `prepare` takes the record with a swap after it has sealed its
+  region, and `open` never resets it, so a loss is reported no later than the kind's next
+  pass is applied; reported one `prepare` early, it frees the kind until a full pass and
+  shows nothing stale. A sealing may take a kind's loss and not yet the rows its pass drops
+  after it, which the next takes; it never takes those rows before the loss, since a pass
+  marks its loss before it drops a row and the swap takes the rows first and the lost kinds
+  last, the kinds' rows added with `Release` and swapped with `Acquire`
+  (`models::a_kinds_rows_are_never_taken_before_its_loss` checks the order over every
+  interleaving; that the orderings carry it to weak memory, neither loom nor Miri
+  checks). No frame's rows dropped by kind exceed its rows dropped: the total is summed as
+  it is taken.
 - **A sink dropped with a pass open** leaves that pass lost and, where its `begin` took a
   count, gives it back, so the region can still be sealed and the `prepare` that seals it
   sees the loss (`ExtractSink`'s `Drop`; "Concurrency"). Only a pass whose `begin` took a
   count gives one back, by its `end` or by the drop: a pass lost at its `begin` took none.
+  A sink passed to `mem::forget` with a pass open never gives its count back, so every
+  later `prepare` of the renderer refuses, with `InvalidData`, as it refuses one made while
+  a pass is open.
+- **A sink outlives its renderer.** A sink holds the ring's shared state and the device.
+  What it writes after the renderer's drop is lost: a pass finds no region open, or the
+  one the renderer left open, whose buffers the renderer destroyed and the device refuses
+  writes to, and no `prepare` reads the counts. The device lives until the last sink is
+  dropped (`writers::a_sink_outlives_its_renderer`). `lactose-app` drops the render side,
+  the graph before the renderer, before `Server::shutdown` drops the world and its sink,
+  and the device's last holder after both (`crates/app/README.md`, "Shutdown").
 - **The remote batch takes no count** of the open word: the writer borrows the renderer
   mutably, which keeps `prepare` out already. So a `RemoteWriter` passed to `mem::forget`
   cannot keep the renderer from preparing: its batch has no end note, and a remote batch
@@ -285,7 +308,10 @@ Step 1 for the next frame may come any time after step 3.
   earlier tick than the pass before it for its kind, by the wrapping comparison of ticks,
   nor for an instance new since the tick's first pass. An idle pass that calls nothing
   leaves nothing, and a pass at a new tick with nothing to write leaves its `begin` and
-  `end`, which is how the renderer learns the tick (present-api).
+  `end`, which is how the renderer learns the tick (present-api). Lazy and eager agree
+  because only a kind's own passes write its instances with base flags: a `Client`
+  world's passes write no row, and remote entries take no base (`tests/model.rs`, whose
+  model is eager, writes no row in a `Client` pass).
 - **Remote rows.** `RemoteWriter::write` takes `InstanceRow`s whose kind is
   `WorldKind::Client`. Their entries carry neither base flag, so the scatter sets both
   placements to the row's whatever `no_interpolate` says. Each remote instance is written
@@ -340,7 +366,10 @@ Step 1 for the next frame may come any time after step 3.
   out for want of it. `instances + 2 * rows` entries bound a batch: one for each row, and
   one free for each slot held when the frame began or given in it. After a torn frame no
   slot is held, and the run that frees every slot index ever given takes the place of the
-  first of those ("The batch").
+  first of those ("The batch"). A `BatchRange` names an entry by a `u32`, so
+  `Renderer::new` refuses, with `InvalidData`, a description whose bound is past
+  `u32::MAX`, before it makes a buffer; the batch's own check that it is below 2^32
+  entries is then an assertion that cannot fail.
 - **Room.** A region holds `rows` rows and notes together, and drops nothing while every
   pass and batch written between two `prepare`s fits. One pass of each kind of world and a
   remote batch, whose rows together are at most `instances`, fit in `instances + 8` plus
@@ -421,12 +450,44 @@ Step 1 for the next frame may come any time after step 3.
   on the queue it is in, which needs no `ready` (graph, "Imports"). The renderer's first
   frame, and the first frame declared after `torn`, import it from `Undefined` instead,
   which keeps its bytes on the one queue it is used on (graph, "Submission": a torn
-  frame's imports are in no state the graph vouches for). So the scatter of a frame waits
-  for the earlier work on the queue at its shader stages, every one of them, since
-  `ShaderRead` names no stage and a Vulkan backend gives it all, the previous frame's
-  fragment shading included; it does not wait for that work's attachment writes, copies
-  or tests. The declaration changes, and is compiled again, once after each of those
-  frames. D160 allows it: `initial` is the caller's word.
+  frame's imports are in no state the graph vouches for). D160 allows it: `initial` is the
+  caller's word.
+- **What a frame's first pass waits for.** The import from `ShaderRead` narrows nothing as
+  the frame is declared. The scatter also imports the region's entries, and its rows
+  wherever an entry reads one, from `Undefined`, which rhi-vulkan carries out with a source
+  of every command and every memory write, recorded just before the scatter, and a
+  barrier's execution scope is not its buffer's. So the scatter waits for every earlier
+  command on the graphics queue, the previous frame's fragment shading, attachment writes
+  and copies included; a frame with no scatter waits the same way at the triangle pass,
+  through the camera's, the vertices', the indices' and the arguments' imports from
+  `Undefined`. The cost is that a frame's first pass never overlaps the work before it on
+  the queue: one drain of the queue a frame, which no figure here measures. The lever, for
+  when the drain is measured to cost, is to narrow those imports: the vertex and index
+  buffers from the states their first frame leaves them in, and each region's buffers from
+  their `last` state after the region's first use, each with a bit for its first use as the
+  instance buffer has `fresh`, so that null's `state` rule holds. `renderer-impl` keeps
+  them as they are. The held-frame tests rest on these masks (`tests/device.rs`, `Hold`):
+  the `Lag` form on the `Undefined` imports' every-command source, which alone orders the
+  scatter and the triangle pass behind the lag's dispatch, an independent pass at the
+  graph's head; the `Gate` form on rhi-vulkan's wait on the target's `ready` point at every
+  command (`submit.rs`, the `point` closure), which alone keeps the scatter and the camera's
+  vertex read behind the release. Adopting the lever, or narrowing that wait, must re-run
+  the device round's mutants `open-ignores-point` and `one-camera-buffer` against each form
+  alone (`for hold in [Hold::Lag]`, then `Gate`): on a GPU that overlaps independent
+  dispatches, the narrowed form would pass both.
+- **Plans.** The graph keys a plan on the declaration's shape (graph, "Compile and its
+  cache"), and a frame's shape changes with whether it scatters, whether its batch reads
+  rows, whether it draws and whether it imports the instance buffer from `Undefined`. In
+  steady state the declaration alternates three plans: a frame with no tick, a tick with
+  rows, and a tick that only despawns. The renderer's first frame, a frame that frees every
+  slot, a frame with the table empty and the first frame after `torn` take one each:
+  `graph::the_steady_state_alternates_three_plans_and_each_edge_takes_one` sees seven
+  plans in sixteen frames with `GraphDesc::plans` at 16. Below three the cache thrashes:
+  at two, every frame of the alternation compiles. Each plan owns its transients (graph,
+  "Transients"), here the depth image at the target's extent, `Depth32Float`: about
+  14.7 MB at 2560x1440 and about 33 MB at 3840x2160 wherever it is not memoryless, as on
+  a desktop GPU, and each miss costs a compile and an image's creation. So the caller's
+  `GraphDesc::plans` holds the steady state's three beside the plans of its own passes.
 
 ### Formats
 
@@ -607,8 +668,11 @@ table, which already holds each instance's mesh; it adds no field to the row.
   reads every note, shadow entry and lost mark of every pass that ended or was dropped. A
   reservation is a `Relaxed` addition to the region's cursor: what makes a pass's rows
   visible to `prepare` is its `end`'s release, not the reservation. A row or a pass
-  recorded while no region is open goes to the renderer-wide record with `Relaxed`
-  additions and bit sets, which `prepare` takes with a swap after the sealing's acquire.
+  recorded while no region is open goes to the renderer-wide record, which `prepare` takes
+  with swaps after the sealing's acquire, the lost kinds last. A pass's lost mark is a
+  `Relaxed` bit set made before its rows' additions, a kind's `Release` and the rows with
+  no kind `Relaxed`; the swap of a kind's rows is `Acquire`, so the swap of the lost kinds
+  after it sees every loss marked before the rows it took ("Writers").
   The remote batch's writes are ordered by the mutable borrow its writer holds, which ends
   before `prepare` is called.
 - **The only locks a call of this crate takes** are the device backend's, inside
@@ -676,12 +740,23 @@ table, which already holds each instance's mesh; it adds no field to the row.
   which is one of a frame the renderer was told no point for, is logged under `cheddar` and
   the object is leaked. While the thread unwinds a panic the drop waits for nothing and
   destroys what the device lets it.
+- Two lifetime paths are reached by no test, and neither matters at milestone 2. A torn
+  frame's region is held until the next `submitted`'s point; were it freed at once, no
+  submit would read it, since a renderer's frame is one submit and on one queue a torn
+  frame made none: it matters only with a provider's pass on another queue, which
+  milestone 2 has none of. A drop without the wait for the last point would destroy under
+  a pending submit, which the device refuses: the drop logs a leak, never a use after free.
 - A sink dropped with a pass open leaves that pass lost and gives back its count
   ("Writers").
 
 ## The shader interface
 
-Three stages, cooked by RICOTTA for each target and handed over as `Shaders`. Every buffer
+Three stages, cooked by RICOTTA for each target and handed over as `Shaders`: the entries
+`cs_main` of `shaders/renderer/scatter.slang` and `vs_main` and `fs_main` of
+`shaders/renderer/triangle.slang`, which import the records from
+`shaders/modules/lactose/renderer.slang`, cooked as `renderer/scatter.cs_main` and so on.
+Each is a transcription of the host's statement of its rule: `InstanceRecord::scatter` and
+`free`, and `drawn`, `CellTransform::apply` and `CameraData::clip`. Every buffer
 is reached through a device address in the push block; no stage uses the heap. A shader
 reads `SV_VulkanVertexID` and `SV_VulkanInstanceID` (rhi-api, "Pipelines and the cooked
 shader format").
@@ -781,10 +856,14 @@ native Metal as the calls it makes are. The backend columns are those of rhi-api
 | The renderer's drop | `wait_timeline`, the destroys | Refuses a destroy while pending | Objects released | Objects destroyed | rhi-api, "Handles and lifetimes" |
 
 Null runs no shader. On null `renderer-impl` proves the batch from `Renderer::batch`, with
-`InstanceRecord::scatter` standing for the shader, and the region rule from null's own:
-`host-overlap`, `unflushed`, and a host write under a pending writer (`pending`). A host
-write under a pending *reader* null cannot see (rhi-api), so the frames-in-flight proof is a
-device test with the GPU made to lag.
+`InstanceRecord::scatter` standing for the shader; the writers' ranges from null's
+`host-overlap`; the flushes from `unflushed`, on a null whose host memory is not coherent
+(`graph::frames_on_a_null_whose_host_memory_is_not_coherent_flush_their_writes`); and the
+region rule from `open`'s answers alone
+(`frames::frames_held_in_flight_leave_no_region_to_open_until_the_oldest_point`). Null's
+`pending` sees a host write under a pending writer, and no submit writes a region, so it
+shows nothing of the rule; a host write under a pending *reader* null cannot see
+(rhi-api), so the frames-in-flight proof is a device test with the GPU made to lag.
 
 **What neither spike shows.** The instance buffer is `MemoryClass::Device`: the host never
 writes or reads it, the scatter writes it through its address and a test reads it through a
@@ -843,7 +922,29 @@ amendment of the kind section 20 allows.
 
 ## Proof
 
-There is nothing to run against a facade but its plain data. `tests/consumers.rs` compiles
+The null proofs are modules of the `integration` binary: `tests/slots.rs`, the slot table
+through a world's sink and through passes by hand; `tests/frames.rs`, frames through a
+render graph on null; `tests/graph.rs`, the frame's plans, queues, flushes and shader
+checks through a graph on null; `tests/sequences.rs`, present-api's sequences through
+`ExtractSink` with the batch scattered on the host by `InstanceRecord::scatter`;
+`tests/model.rs`, random sequences of passes, batches, losses, refusals and torn frames
+against a model of this file's rules; `tests/writers.rs`, writes from several jobs, run
+again until two overlapped; `tests/camera.rs`, the orbit against `lactose-input`; and
+`tests/cost.rs`, the steering figures, ignored. `src/models.rs`'s loom models hold the
+ring's orderings: they search the shipped functions' interleavings over loom's atomics, at
+a preemption bound where the search is exhaustive, with each shadow entry checked as one
+location, so that a read of it by one use's `prepare` unordered with the next use's write
+fails. `src/staging.rs`'s unit tests include three writers' passes racing a sealer on the
+standard library's atomics, which fails a reservation or a `begin` that is not one
+read-modify-write on real threads; the nightly runs them under Miri with four seeds, whose
+weak-memory emulation checks the orderings on the executions those seeds reach and
+searches no others. `tests/device.rs` holds the rows that
+need a shader to run, as ignored tests that `cargo xtask gpu` runs under its drivers and
+validation, with `shaders/renderer/` cooked: the instance buffer read back through a copy
+into a `Readback` buffer, frames held behind an import's `ready` point that the host signals
+once a later frame's writes are made and behind a dispatch of about a second at the frame's
+head, and each image against a reference computed on the CPU, with its three counts
+printed. `tests/consumers.rs` compiles
 what each consumer writes: `renderer-impl`'s proofs (slots through a world's sink, the batch
 on null, the instance buffer read back, frames held in flight, the CPU reference), the cost
 tests of the ring with no shader, the presentation schedule's remote upload from forked jobs,
@@ -865,12 +966,13 @@ description and report type to plain data, and each format to its size.
 | (the same) A `Client` pass lost after a batch stops it | The same region, with frame 2's `Client` pass lost for want of room: `lost(Client)`, and no slot of the kind held | One that applies the region's batches whatever kind is lost: frame 1's batch brings `gone` back |
 | (the same) A batch that overlaps a `Client` pass is left out | One frame that breaks its ordering, from an empty table: a `Client` pass begins, the batch writes `gone` and `kept`, and the pass removes `gone` and ends; and the batch first, then the pass. In both orders neither holds a slot, `remote_rows` is 2 and nothing is lost | One that compares the batch's opening with the `Client` begins alone: the pass-first order applies the batch over the removal, and `gone` is drawn with no count |
 | A batch names each slot once, resolved in batch order and asserted | On null: duplicate rows through `RemoteWriter::write`, then `ScatterBatch` and `FrameStats::duplicates`. Null's assertion is what proves the resolution | One without the resolution: the assertion fires |
-| Many duplicates in different workgroups of a large batch | On a device: slots made `LIVE` at a known placement `c0` by an earlier frame, then duplicates from a world pass at a new tick, entries `TAKE_BASE \| HAS_BASE`, each instance's two rows at least 2^15 entries apart (row `i` and row `n + i`); the instance buffer copied out, each record's `base` and `previous` equal to `c0` and `current` to the kept row. It shows that a resolved batch scatters right; an entry with neither flag reads nothing of its record, so remote rows on fresh slots cannot show it | Without the resolution and with the assertion off, the second entry of a slot lacks `TAKE_BASE`, and run in order its records match: the host's check of the flags fails that build. The records fail one that marks both entries `TAKE_BASE \| HAS_BASE`, at that spacing. Null's assertion is the proof of the resolution |
-| With the GPU made to lag, the ring never overwrites a region a frame in flight reads | Frames held behind an import's `ready` point; `Opened::Wait`; the readback of a held frame after later writes | One whose `open` ignores the point |
+| Many duplicates in different workgroups of a large batch | On a device: slots made `LIVE` at a known placement `c0` by an earlier frame, then duplicates from a world pass at a new tick, entries `TAKE_BASE \| HAS_BASE`, each instance's two rows at least 2^15 rows apart in the region (row `i` and row `n + i`); the instance buffer copied out, each record's `base` and `previous` equal to `c0` and `current` to the kept row. It shows that a resolved batch scatters right; an entry with neither flag reads nothing of its record, so remote rows on fresh slots cannot show it | Without the resolution and with the assertion off, the second entry of a slot lacks `TAKE_BASE`, and run in order its records match: the host's check of the flags fails that build. The records fail one that marks both entries `TAKE_BASE \| HAS_BASE`, at that spacing. Null's assertion is the proof of the resolution |
+| The scatter's dispatches each apply their own entries, all of them and no more | On a device: a batch of two runs, of 37 and 5 entries, each `TAKE_BASE \| HAS_BASE`, in a region whose earlier use had a longer batch; every record read back equal to `InstanceRecord::scatter`'s on the host | One that reads each dispatch's entries from the batch's first; one that pushes one entry too many; one that rounds the groups down; one that pushes no rows address |
+| With the GPU made to lag, the ring never overwrites a region a frame in flight reads | Frames held behind an import's `ready` point, and behind a dispatch of about a second at the frame's head; `Opened::Wait`; the readback of a held frame after later writes | One whose `open` ignores the point |
 | Frame N's readback shows N's camera after N + 1's has been written | The same, with two latches | One camera buffer for all regions |
 | An instance in the camera's cell and one in a neighbouring cell along an axis the scene is moved 2^25 + 1 cells on, its triangle covering pixels at the origin, render the pixels they render at the origin | Two scenes 2^25 + 1 cells apart on that axis, with instances in the camera's cell and the next along it: equal images | A shader that subtracts after converting to float: at 2^25 + 1 cells the neighbour's difference converts to zero cells. In one cell alone, below 2^24 cells, or with the neighbour along an axis the scene was not moved on, where every cell converts exactly, it renders the same pixels and fails nothing |
-| A record without `LIVE` produces no fragment | A slot freed in frame 2: its triangle's pixels are `CLEAR` | One that writes `(0, 0, 0, 0)`, whose result no specification defines |
-| A world stepped, extracted, rendered and compared with the CPU reference | `InstanceRecord::drawn`, `CellTransform::apply`, `CameraData::clip`, `shader::{TRIANGLE, PALETTE, CLEAR}`. Exact at each pixel whose centre is at least a quarter of a pixel inside or outside every edge the reference computes in `f64`, decision 5.1's margin, justified from four bits of sub-pixel snapping and 32-bit error at the scene's extent; the others accepted either way, and the three counts stated: surely drawn, surely clear, in the margin, with zero wrong | One that draws nothing; one that draws every instance in the clear colour |
+| A record without `LIVE` produces no fragment | A slot freed in frame 2, below the highest slot held: its triangle's pixels are `CLEAR`, and the highest slot's are drawn | One that ignores `LIVE`, which draws the freed record at the placement it last held; one that draws `SlotTable::live` instances, not `extent`. The record is placed at `(2, 2, 2, 1)` and not `(0, 0, 0, 0)`, whose result no specification defines, and which the M1 draws nothing for |
+| A world stepped, extracted, rendered and compared with the CPU reference, at a fraction strictly between 0 and 1 | `InstanceRecord::drawn`, `CellTransform::apply`, `CameraData::clip`, `shader::{TRIANGLE, PALETTE, CLEAR}`. Exact at each pixel whose centre is at least a quarter of a pixel inside or outside every edge the reference computes in `f64`, decision 5.1's margin, justified from four bits of sub-pixel snapping and 32-bit error at the scene's extent; the others accepted either way, and the three counts printed: surely drawn, surely clear, in the margin, with zero wrong. Of each image's 16,384 pixels, under MoltenVK and KosmicKrisp alike (`--nocapture` runs of renderer-impl fix round 2): the camera's frame 1, Gate and Lag, 404, 15,932 and 48, and its frame 2 0, 16,384 and 0; the held frame whose instance the next frame moves, frames 1 and 2, 392, 15,934 and 58; the far scene at the origin, 798, 15,481 and 105; the freed slot's frames 1 and 2, 784, 15,484 and 116, then 392, 15,934 and 58; the world, 2,428, 13,681 and 275 | One that draws nothing; one that draws every instance in the clear colour; one that pushes a fraction of 1 |
 | The first frames on null | A renderer's first frame with nothing extracted, and a frame that frees every slot in a region no writer has used: each submitted, none refused (`undefined-read`) | One that declares the instance buffer or the rows in every frame |
 | The sink and the frame agree (present-api's proof row "A rollback in a frame with no step") | present-api's sequences run through `ExtractSink`, the records read back on a device or computed with `InstanceRecord::scatter` on null | One that sets `HAS_BASE` in a dropped tick; one that takes the base at every write |
 
@@ -878,8 +980,23 @@ description and report type to plain data, and each format to its size.
 the M1. A run with no device says that it skipped. Every dependency between the scatter and
 the draw passes through device addresses, which synchronisation validation does not track,
 and lavapipe runs each dispatch to completion before the next command, so neither shows a
-dropped barrier: the barrier mutations (the scatter-to-vertex barrier, the barrier between
-dispatches, the barrier across frames) are the desktop's, with the GPU made to lag.
+dropped barrier. The barrier between two dispatches of the scatter is the one that matters:
+nothing else orders them. Dropped, with the scatter's `FREE` path made to lag, it fails the
+test of `65,536` slots freed by one run and given by the next under KosmicKrisp, and the
+lag with the barrier kept passes it; without the lag it passes, and under MoltenVK, whose
+serial compute encoder orders the dispatches anyway, it passes with the lag. No shipped
+shader lags, so `cargo xtask gpu` alone cannot fail the mutation: the mutation and its lag
+are a script's, on the M1 and on the desktop. The other two, the
+scatter-to-vertex barrier and the barrier across frames, cannot fail as a frame is
+declared: dropping the instance buffer's transition leaves other imports' transitions from
+`Undefined` before the same pass (the entries' before the scatter; the camera's, the
+vertices', the indices' and the arguments' before the triangle pass), each a full execution
+dependency: a mutation fails as the frame is declared only if it drops every transition the
+graph records before the pass. Across frames, a write after a read, that is all the hazard
+needs, so the mutation is correct by the specification. Before the triangle pass the
+mutation drops the memory dependency on the instance buffer alone, which desktop drivers
+carry out as a global cache operation, so a desktop run in which it survives does not show
+the barrier unneeded.
 
 It also owes:
 
@@ -888,10 +1005,15 @@ It also owes:
   to xtask's `LOOM_MODELS`: that a `begin` and a sealing cannot both succeed, that a pass
   that ends is read whole by the `prepare` that seals after it, that a pass of an earlier use
   of a region is never read as a later use's, that no `prepare` reads an entry of a later
-  use, that a loss with no region open is reported, that a sink dropped with a pass open
-  does not keep the region from being sealed, and that the `prepare` that seals after it
-  reports that pass lost; and Miri over `Staging`'s tests;
-- a test that `ExtractSink::write` from several jobs leaves every row once;
+  use, with each shadow entry an access loom checks, that a loss with no region open is
+  reported, that no sealing's rows dropped by kind exceed its rows dropped, that a sink
+  dropped with a pass open does not keep the region from being sealed, that the `prepare`
+  that seals after it reports that pass lost, and that a remote batch written beside a pass
+  is read whole, at a preemption bound where the search is exhaustive; and Miri, with four
+  seeds, over `Staging`'s tests, one of which races three writers' passes against a sealer
+  on threads;
+- a test that `ExtractSink::write` from several jobs leaves every row once, run again until
+  two writes overlapped;
 - as steering, the ring's write cost, and `prepare`'s cost, median and maximum, at 50,000
   incremental rows among 100,000 held, at a full pass of 100,000 held keys, and at a load
   that replaces 100,000 held keys with 100,000 new ones, which `reviewer`'s round-1 model

@@ -6,6 +6,7 @@
 //! `renderer-impl` builds and the reference a device test compares against are three
 //! readings of one text.
 
+use lactose_math::render::RenderPosition;
 use lactose_present_api::{InstanceRow, RenderTransform};
 
 use crate::slots::Slot;
@@ -38,13 +39,17 @@ impl StagingRow {
     /// and the mesh are not in the ring: a writer hands them to the slot table beside it.
     #[must_use]
     pub fn of(row: &InstanceRow) -> Self {
-        todo!()
+        let flags = if row.no_interpolate { Self::NO_INTERPOLATE } else { 0 };
+        Self { transform: row.transform, flags }
     }
 
     /// The row's bytes, as the ring holds them.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 48] {
-        todo!()
+        let mut bytes = [0; 48];
+        put_placement(&mut bytes[..40], &self.transform);
+        bytes[40..44].copy_from_slice(&self.flags.to_le_bytes());
+        bytes
     }
 }
 
@@ -82,7 +87,11 @@ impl ScatterEntry {
     /// The entry's bytes, as the batch holds them.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 12] {
-        todo!()
+        let mut bytes = [0; 12];
+        for (at, word) in [self.slot.index(), self.row, self.flags].into_iter().enumerate() {
+            bytes[4 * at..4 * at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
     }
 }
 
@@ -122,7 +131,12 @@ impl InstanceRecord {
     /// Reads a record from the bytes a readback of the instance buffer returned.
     #[must_use]
     pub fn from_bytes(bytes: &[u8; 128]) -> Self {
-        todo!()
+        Self {
+            previous: placement(&bytes[..40]),
+            current: placement(&bytes[40..80]),
+            base: placement(&bytes[80..120]),
+            flags: word(&bytes[120..124]),
+        }
     }
 
     /// What the scatter does to this record for an entry whose flags are `entry` and
@@ -139,13 +153,20 @@ impl InstanceRecord {
     /// for each entry of a dispatch, in no order: no two entries of a dispatch name one
     /// slot.
     pub fn scatter(&mut self, entry: u32, row: &StagingRow) {
-        todo!()
+        if entry & ScatterEntry::TAKE_BASE != 0 {
+            self.base = self.current;
+        }
+        let from_base =
+            entry & ScatterEntry::HAS_BASE != 0 && row.flags & StagingRow::NO_INTERPOLATE == 0;
+        self.previous = if from_base { self.base } else { row.transform };
+        self.current = row.transform;
+        self.flags = Self::LIVE;
     }
 
     /// What the scatter does to this record for a [`ScatterEntry::FREE`] entry: the flags
     /// become zero, and the placements stay as they were.
     pub fn free(&mut self) {
-        todo!()
+        self.flags = 0;
     }
 
     /// Where the triangle pass draws the instance at `fraction` for a camera in `cell`,
@@ -164,7 +185,20 @@ impl InstanceRecord {
     /// `None` for a record without [`LIVE`](Self::LIVE).
     #[must_use]
     pub fn drawn(&self, fraction: f32, cell: [i32; 3]) -> Option<CellTransform> {
-        todo!()
+        if self.flags & Self::LIVE == 0 {
+            return None;
+        }
+        let from = self.previous.position.relative_to(cell);
+        let to = self.current.position.relative_to(cell);
+        let position = core::array::from_fn(|axis| from[axis] + (to[axis] - from[axis]) * fraction);
+        let p = self.previous.rotation;
+        let mut c = self.current.rotation;
+        if p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3] * c[3] < 0.0 {
+            c = c.map(|component| -component);
+        }
+        let q: [f32; 4] = core::array::from_fn(|i| p[i] + (c[i] - p[i]) * fraction);
+        let length = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        Some(CellTransform { position, rotation: q.map(|component| component / length) })
     }
 }
 
@@ -182,7 +216,12 @@ impl CellTransform {
     /// with the rotation applied as `v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)`.
     #[must_use]
     pub fn apply(&self, vertex: [f32; 3]) -> [f32; 3] {
-        todo!()
+        let [x, y, z, w] = self.rotation;
+        let axis = [x, y, z];
+        let inner = cross(axis, vertex);
+        let inner = core::array::from_fn(|i| inner[i] + w * vertex[i]);
+        let outer = cross(axis, inner);
+        core::array::from_fn(|i| self.position[i] + (vertex[i] + 2.0 * outer[i]))
     }
 }
 
@@ -237,5 +276,40 @@ impl<'a> ScatterBatch<'a> {
     #[must_use]
     pub fn run(&self, range: BatchRange) -> &'a [ScatterEntry] {
         &self.entries[range.first as usize..(range.first + range.count) as usize]
+    }
+}
+
+/// `a x b`, each component `a1 * b2 - a2 * b1` in that order.
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+/// Writes a placement's 40 bytes into `out`.
+fn put_placement(out: &mut [u8], transform: &RenderTransform) {
+    let position = &transform.position;
+    let words = position
+        .cell
+        .map(i32::to_le_bytes)
+        .into_iter()
+        .chain(position.offset.into_iter().chain(transform.rotation).map(f32::to_le_bytes));
+    for (at, word) in words.enumerate() {
+        out[4 * at..4 * at + 4].copy_from_slice(&word);
+    }
+}
+
+/// The `u32` of four little-endian bytes.
+fn word(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// The placement of 40 bytes, as [`put_placement`] writes it.
+fn placement(bytes: &[u8]) -> RenderTransform {
+    let at = |i: usize| word(&bytes[4 * i..4 * i + 4]);
+    RenderTransform {
+        position: RenderPosition {
+            cell: core::array::from_fn(|i| at(i).cast_signed()),
+            offset: core::array::from_fn(|i| f32::from_bits(at(3 + i))),
+        },
+        rotation: core::array::from_fn(|i| f32::from_bits(at(6 + i))),
     }
 }
