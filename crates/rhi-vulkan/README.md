@@ -188,7 +188,7 @@ images are colour attachments and nothing else, and nothing that ships turns it 
 
   | `vkQueuePresentKHR`'s error | Enqueued | The fence | The backend |
   |---|---|---|---|
-  | `VK_ERROR_OUT_OF_HOST_MEMORY`, `VK_ERROR_OUT_OF_DEVICE_MEMORY` | No: the spec names only the three below as enqueued | Never signals | Takes the fence back, and waits for the image's present semaphore, left signalled, with an empty batch that `resize` and the drop wait for |
+  | `VK_ERROR_OUT_OF_HOST_MEMORY`, `VK_ERROR_OUT_OF_DEVICE_MEMORY` | No: the spec names only the three below as enqueued | Never signals | Takes the fence back, and waits for the image's present semaphore, left signalled, with an empty batch, which `resize` waits for and the drop's semaphores are destroyed after |
   | `VK_ERROR_OUT_OF_DATE_KHR`, `VK_ERROR_SURFACE_LOST_KHR`, `VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT` | Yes, by the spec | Signals | Waits for it as for a shown present's |
   | `VK_ERROR_DEVICE_LOST` | Either | Need not signal | Nothing waits after a loss |
   | Any other, MoltenVK's `VK_ERROR_OUT_OF_POOL_MEMORY` among them | Not stated | MoltenVK 1.4.2 signals it where the drawable timed out, and never where the present had no command buffer | Waits for it as for a shown present's; one not signalled a bound after its present, with the present queue idle, is taken to have enqueued nothing and is destroyed, and the image's present semaphore with its chain: MoltenVK's present with no command buffer is the one known source |
@@ -210,12 +210,20 @@ images are colour attachments and nothing else, and nothing that ships turns it 
   way the swapchain is stale, `acquire` answers `Stale`, and a `resize` once the extent is
   not zero makes one. A unit test holds the decision, which reads only the
   surface's capabilities.
-- **The drop** waits, for at most three seconds, for the pending present fences and for the
-  submits that waited for the acquires' semaphores, and while its thread unwinds a panic
-  waits for nothing. Where something of the swapchain may still be in use, it leaks the
-  device (`Raw::leak`), as the device's last holder does with a submit pending: nothing of
-  the swapchain or the device is destroyed under the presentation engine's or a queue's use,
-  at the cost of the device's memory, and the records keep the swapchain's mark, so a second
+- **The drop** waits, for at most three seconds, for the pending present fences, which the
+  presentation engine signals, and while its thread unwinds a panic waits for nothing. It
+  spends an acquired image's semaphore with an empty batch and waits for no batch of the
+  present queue: it hands the acquire and present semaphores to the device with the stamp
+  of the last batch that waits for one, and a count of the driver swapchain, and they are
+  destroyed once the present queue reaches that stamp, or at the device's last drop. So a
+  submit held by a host point on a queue the present role shares, as on a driver of one
+  queue such as lavapipe, neither holds the drop nor leaks the device, and a
+  `create_swapchain` after it is made from the old driver swapchain. Where a present may
+  still be in the presentation engine's use, its fence not signalled within the wait, or
+  while unwinding an acquire's semaphore is left with no batch to wait for it, the drop
+  leaks the device (`Raw::leak`), as the device's last holder does with a submit pending:
+  nothing of the swapchain or the device is destroyed under that use, at the cost of the
+  device's memory, and the records keep the swapchain's mark, so a second
   `create_swapchain` is refused (`swapchain`) and never reaches the driver with the surface
   in use. After a loss it destroys them at once.
 - **The bound** of the contract is one second: an acquire's timeout, a present's wait for its
@@ -345,7 +353,10 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   report (`VUID-vkAcquireNextImageKHR-semaphore-01779`), heard by a sink that prints nothing,
   a core validation check, so the GPU-assisted run, which turns core validation off, skips
   it; a drop whose present never ends, which leaks the device, the layer silent, and refuses
-  a second swapchain; a `resize` whose `vkCreateSwapchainKHR` or image fails, stale until a
+  a second swapchain; on a device whose present role is served by the graphics queue, a
+  drop behind a graphics submit held there by a host point on the acquired image, which
+  neither waits for it nor leaks the device, a second swapchain made at once that presents
+  once the point is signalled; a `resize` whose `vkCreateSwapchainKHR` or image fails, stale until a
   later `resize`; a present refused with nothing enqueued, out of memory and an unlisted
   error, stale until a `resize`, the unlisted error's fence and semaphore destroyed and the
   layer silent; a frame submit pending on an acquired image, held by a host point, at a

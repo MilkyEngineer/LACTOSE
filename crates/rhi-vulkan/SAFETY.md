@@ -98,17 +98,23 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   submit; every signal its semaphore depends on has been submitted, as the present's walk
   decided before the submit was stamped (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
 - An image given up while acquired, at `resize` or the drop, has its semaphore waited for by
-  an empty batch, so that no signalled semaphore is destroyed or reused unwaited.
+  an empty batch, so that no signalled semaphore is destroyed or reused unwaited. The drop
+  waits for no batch of the present queue, which a submit held by a host point ahead of it
+  on a shared queue holds: it hands its acquire and present semaphores to the device
+  (`Left::spent`) with the stamp of the last batch that waits for one, after waiting for its
+  presents' fences, and they are destroyed once the present queue reaches that stamp, or at
+  the device's last drop, once it is idle. They hold a count of their driver swapchain, so
+  it outlives those batches, its acquires' signals included.
 - A driver swapchain is destroyed by the drop of its owner (`SwapchainObj`), which every
   image object of it holds, so it outlives every view of its images and every encoder and
   submit that names one. A `resize` and the swapchain's drop forget the images' handles,
   and hand the objects of those a submit not yet known complete names to the device
   (`Shared::left`), which lets each go once its stamps are reached, or at the device's last
-  drop. A driver swapchain whose images outlive the swapchain's drop stays the surface's
-  (`Left::unretired`): the next swapchain names it as `oldSwapchain`, so the surface has at
-  most one swapchain that is not retired, as the spec allows a native window.
-  A retired driver swapchain is destroyed by whichever thread drops its last image object,
-  which may be beside the present thread's `vkCreateSwapchainKHR`. The spec allows it:
+  drop. A driver swapchain whose images or semaphores outlive the swapchain's drop stays the
+  surface's (`Left::unretired`): the next swapchain names it as `oldSwapchain`, so the
+  surface has at most one swapchain that is not retired, as the spec allows a native window.
+  A retired driver swapchain is destroyed by whichever thread drops its last image object or
+  lets go of its semaphores, which may be beside the present thread's `vkCreateSwapchainKHR`. The spec allows it:
   `vkDestroySwapchainKHR` externally synchronises only its `swapchain`, and
   `vkCreateSwapchainKHR` its `surface` and `oldSwapchain`. MoltenVK 1.4.2 reads and writes
   the surface's `_activeSwapchain` unlocked in both calls (`MVKSwapchain.mm` 651 and

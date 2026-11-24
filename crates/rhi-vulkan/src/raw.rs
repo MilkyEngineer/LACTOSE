@@ -750,9 +750,14 @@ fn device(
             let presents = (0..family_props.len() as u32)
                 .map(|family| surface.supports(physical, family))
                 .collect::<Result<Vec<bool>>>()?;
-            present_queue(&family_props, graphics_family, compute, &presents).ok_or_else(|| {
-                unsupported(format!("{adapter} has no family that draws and presents"))
-            })?
+            let present = present_queue(&family_props, graphics_family, compute, &presents)
+                .ok_or_else(|| {
+                    unsupported(format!("{adapter} has no family that draws and presents"))
+                })?;
+            #[cfg(test)]
+            let present = present
+                .filter(|_| !(PRESENT_ON_GRAPHICS.get() && presents[graphics_family as usize]));
+            present
         }
         None => None,
     };
@@ -986,6 +991,14 @@ fn device(
     };
     let roles = [0, compute_index, present_index];
     Ok(Opened { raw: Arc::new(raw), caps, info, roles, cache_identity })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A unit test's ask that the devices this thread makes serve the present role from the
+    /// graphics queue where its family presents, as a driver of one queue does.
+    pub(crate) static PRESENT_ON_GRAPHICS: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
 }
 
 #[cfg(test)]

@@ -7,6 +7,9 @@
 //! waited for it is known complete; each image has its own present semaphore, which its
 //! present's submit signals and which is signalled again only once that present's fence
 //! has. A present is pending until its fence signals: `resize` and the drop wait for them.
+//! Neither waits for a batch of the present queue, which a submit held by a host point ahead
+//! of it on a shared queue may hold: the drop hands its semaphores to the device with the
+//! queue's stamp they wait behind.
 //!
 //! The driver swapchain is destroyed with the last count of its owner, which the swapchain
 //! holds while it presents to it and each of its images' objects holds: an encoder that
@@ -112,9 +115,40 @@ pub(crate) struct Left {
     /// The objects of a chain's images given up while a submit that names one is pending,
     /// with that image's stamps.
     images: Vec<(Stamps, Arc<ImageObj>)>,
-    /// The driver swapchain of a dropped swapchain whose images something still holds: not
-    /// retired, so the next swapchain is made from it.
+    /// The driver swapchain of a dropped swapchain whose images or semaphores something
+    /// still holds: not retired, so the next swapchain is made from it.
     unretired: Option<Arc<SwapchainObj>>,
+    /// The semaphores of dropped swapchains whose last batches may be pending.
+    spent: Vec<Spent>,
+}
+
+/// A dropped swapchain's semaphores, its acquire semaphores and its images' present
+/// semaphores, with the stamp of the present queue's last batch that waits for one:
+/// destroyed once that stamp is reached, or at the device's last drop, once it is idle. It
+/// holds a count of the driver swapchain whose acquires signalled them, which so outlives
+/// those batches.
+pub(crate) struct Spent {
+    raw: Arc<Raw>,
+    queue: usize,
+    seq: u64,
+    semaphores: Vec<vk::Semaphore>,
+    _owner: Option<Arc<SwapchainObj>>,
+}
+
+impl Drop for Spent {
+    fn drop(&mut self) {
+        if self.raw.leaking() {
+            return;
+        }
+        for &semaphore in &self.semaphores {
+            // SAFETY: the present queue has reached `seq`, or the device is idle (its last
+            // drop) or lost: every batch that waited for one of these has completed. Each
+            // present that waited for a present semaphore is done, by its fence, which the
+            // swapchain's drop waited for before it handed these over; nothing signals one
+            // again.
+            unsafe { self.raw.device.destroy_semaphore(semaphore, None) };
+        }
+    }
 }
 
 /// Where an acquire semaphore of the pool is.
@@ -520,14 +554,16 @@ impl VulkanSwapchain {
     }
 
     /// Lets go of what the device keeps for its swapchains that no pending submit names any
-    /// more, and of a dropped swapchain's unretired driver swapchain that nothing else holds.
+    /// more, of semaphores whose last batch has completed, and then of a dropped swapchain's
+    /// unretired driver swapchain that nothing else holds.
     fn reap_left(&self) {
         let read = self.shared.read_queues();
         let mut left = lock(&self.shared.left);
-        if left.images.is_empty() && left.unretired.is_none() {
+        if left.images.is_empty() && left.unretired.is_none() && left.spent.is_empty() {
             return;
         }
         let mut released = Vec::new();
+        let mut spent = Vec::new();
         {
             let mut records = self.shared.records();
             records.fold(&read, &[]);
@@ -539,11 +575,22 @@ impl VulkanSwapchain {
                     released.push(left.images.swap_remove(at));
                 }
             }
+            let mut at = 0;
+            while at < left.spent.len() {
+                let batch = &left.spent[at];
+                if batch.seq > records.queues[batch.queue].known && !records.lost {
+                    at += 1;
+                } else {
+                    spent.push(left.spent.swap_remove(at));
+                }
+            }
         }
-        let unretired = left.unretired.take_if(|owner| Arc::strong_count(owner) == 1);
         drop(left);
-        // The last counts are dropped once the locks are given up.
+        // The last counts are dropped once the locks are given up; the unretired driver
+        // swapchain is looked at after, since those counts may be its others.
         drop(released);
+        drop(spent);
+        let unretired = lock(&self.shared.left).unretired.take_if(|o| Arc::strong_count(o) == 1);
         drop(unretired);
     }
 
@@ -1141,38 +1188,41 @@ impl Swapchain for VulkanSwapchain {
 }
 
 impl VulkanSwapchain {
-    /// The drop's waits, three bounds in all: for the presents' fences, and for the batches
-    /// that waited for the acquire semaphores and for a present semaphore a present left
-    /// signalled. Whether they all ended, or the device is lost.
+    /// The drop's wait, three bounds, for the presents' fences, which the presentation
+    /// engine signals; then a held image's acquire semaphore is spent by an empty batch,
+    /// which is not waited for. Whether the presents ended, or the device is lost.
     fn finish(&mut self) -> bool {
         // A present is pending until its fence signals, which the presentation engine
-        // gives within a few refreshes.
+        // gives within a few refreshes. No batch of the present queue is waited for: where
+        // the present role shares a queue, a submit held there by a host point holds every
+        // batch after it, for as long as its caller keeps the point unsignalled.
         let deadline = Instant::now() + BOUND * 3;
         let pending = self.pending.clone();
         let shown = self.wait_fences(&pending, deadline).unwrap_or(false);
         let _ = self.spend();
-        let waited = self.pool.iter().filter_map(|entry| match entry.1 {
-            Use::Waited(seq) => Some(seq),
-            Use::Free | Use::Signalled | Use::Abandoned => None,
-        });
-        let last = waited.max().unwrap_or(0).max(self.chain.unsignalled);
-        let spent = self.wait_queue(last, deadline).unwrap_or(false);
-        (shown && spent) || self.shared.records().lost
+        shown || self.shared.records().lost
     }
 
     /// The drop's check while its thread unwinds a panic, which waits for nothing: whether
-    /// nothing of the swapchain is pending.
+    /// no present is pending and no acquire semaphore is left signalled with no batch to
+    /// wait for it.
     fn quiet(&mut self) -> bool {
         if self.reap().is_err() {
             return self.shared.records().lost;
         }
-        let known = self.shared.settled().queues[self.queue].known;
-        let spent = self.pool.iter().all(|entry| match entry.1 {
-            Use::Waited(seq) => seq <= known,
-            Use::Signalled => false,
-            Use::Free | Use::Abandoned => true,
+        let spent = self.pool.iter().all(|entry| entry.1 != Use::Signalled);
+        self.pending.is_empty() && spent
+    }
+
+    /// The stamp of the present queue's last batch that waits for a semaphore of the
+    /// swapchain: the empty batches after its acquires, and after a present the driver did
+    /// not take.
+    fn last_batch(&self) -> u64 {
+        let waited = self.pool.iter().filter_map(|entry| match entry.1 {
+            Use::Waited(seq) => Some(seq),
+            Use::Free | Use::Signalled | Use::Abandoned => None,
         });
-        self.pending.is_empty() && spent && self.chain.unsignalled <= known
+        waited.max().unwrap_or(0).max(self.chain.unsignalled)
     }
 }
 
@@ -1192,29 +1242,40 @@ impl Drop for VulkanSwapchain {
             self.shared.let_go();
             return;
         }
-        self.destroy_semaphores(&chain);
         if !self.shared.raw.leaking() {
             // SAFETY: every present's fence has signalled, or its present was never
-            // enqueued, or the device is lost; the batches that waited for the acquire
-            // semaphores have completed. A fence given up as doubtful, a bound after its
-            // present with the present queue idle, which is taken to show that the present
-            // enqueued nothing (MoltenVK 1.4.2's present with no command buffer is the one
-            // known source), was destroyed then and is in neither list.
+            // enqueued, or the device is lost. A fence given up as doubtful, a bound after
+            // its present with the present queue idle, which is taken to show that the
+            // present enqueued nothing (MoltenVK 1.4.2's present with no command buffer is
+            // the one known source), was destroyed then and is in neither list.
             unsafe {
-                for &(semaphore, _) in &self.pool {
-                    self.device().destroy_semaphore(semaphore, None);
-                }
                 for &fence in self.pending.iter().chain(&self.spare) {
                     self.device().destroy_fence(fence, None);
                 }
             }
         }
-        // The driver swapchain is destroyed here where nothing else holds an image of it;
-        // otherwise it is the surface's still, kept for the next swapchain or the device's
-        // last drop.
+        // The semaphores go to the device with the stamp of the last batch that waits for
+        // one and a count of the driver swapchain; `reap_left` below destroys them at once
+        // where that batch has completed.
+        let mut semaphores: Vec<vk::Semaphore> = self.pool.iter().map(|entry| entry.0).collect();
+        semaphores.extend_from_slice(&chain.present_semaphores);
+        let spent = Spent {
+            raw: Arc::clone(&self.shared.raw),
+            queue: self.queue,
+            seq: self.last_batch(),
+            semaphores,
+            _owner: chain.owner.clone(),
+        };
+        let mut left = lock(&self.shared.left);
+        left.spent.push(spent);
+        // The driver swapchain is the surface's still while an image's object or the
+        // semaphores' batches hold it: it is kept for the next swapchain, which is made from
+        // it, and destroyed with its last count, at the latest at the device's last drop.
         if let Some(owner) = chain.owner.filter(|owner| Arc::strong_count(owner) > 1) {
-            lock(&self.shared.left).unretired = Some(owner);
+            left.unretired = Some(owner);
         }
+        drop(left);
+        self.reap_left();
         self.shared.records().swapchain = false;
         self.shared.let_go();
     }
@@ -1576,6 +1637,59 @@ mod tests {
         assert!(shared.raw.leaking(), "the drop did not leak the device");
         let again = VulkanSwapchain::new(&shared, SMALL).err().expect("a second swapchain");
         assert_eq!(Rule::of(&again), Some(Rule::Swapchain), "{again}");
+        drop(shared);
+        drop(device);
+        assert_eq!(breaches(&kept), Vec::<String>::new());
+    }
+
+    /// The present role served by the graphics queue, as on a driver of one queue: a
+    /// graphics submit that writes the acquired image, held by a host point, is pending on
+    /// that queue while the swapchain is dropped. The drop waits for nothing behind it: the
+    /// device does not leak, a swapchain is made again at once, and once the point is
+    /// signalled it presents, with the layer silent to the device's drop.
+    #[test]
+    #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+    fn a_drop_behind_a_held_submit_on_the_shared_queue_lets_a_swapchain_be_made_again() {
+        let test = "a_drop_behind_a_held_submit_on_the_shared_queue_lets_a_swapchain_be_made_again";
+        let kept = Arc::new(Kept::default());
+        crate::raw::PRESENT_ON_GRAPHICS.set(true);
+        let made = device(&kept, test);
+        crate::raw::PRESENT_ON_GRAPHICS.set(false);
+        let Some(device) = made else { return };
+        let shared = Arc::clone(device.shared());
+        assert_eq!(shared.queue_of(P), shared.queue_of(G), "the present role has its own queue");
+        let mut swapchain = VulkanSwapchain::new(&shared, SMALL).expect("a swapchain");
+        let held = image(&mut swapchain);
+        let gate = device.create_timeline(0).expect("a timeline");
+        let drawn = device.create_timeline(0).expect("a timeline");
+        let mut draw = device.create_encoder(G, "frame").expect("an encoder");
+        draw.transition_images(&[ImageTransition {
+            image: held,
+            range: ImageRange::FIRST,
+            from: StateOn { state: ImageState::Undefined, queue: G },
+            to: StateOn { state: ImageState::ColourAttachment, queue: G },
+        }]);
+        let mut draws = [draw];
+        let waits = [at(gate, 1)];
+        let signals = [at(drawn, 1)];
+        device
+            .submit(G, Submit { encoders: &mut draws, waits: &waits, signals: &signals })
+            .expect("the frame's submit");
+        let start = Instant::now();
+        drop(swapchain);
+        let took = start.elapsed();
+        eprintln!("{test}: the drop took {took:?}");
+        let mut swapchain = VulkanSwapchain::new(&shared, SMALL).expect("a swapchain again");
+        assert!(!shared.raw.leaking(), "the drop leaked the device");
+        device.signal_timeline(waits[0]).expect("the gate");
+        assert!(device.wait_timeline(signals[0], BOUND * 5).expect("the wait"), "the submit");
+        drop(draws);
+        let image = image(&mut swapchain);
+        let mut encoders = [presentable(&device, image)];
+        let submit = Submit { encoders: &mut encoders, waits: &[], signals: &[] };
+        assert_eq!(swapchain.present(image, submit).expect("a present"), Presented::Shown);
+        drop(swapchain);
+        drop(encoders);
         drop(shared);
         drop(device);
         assert_eq!(breaches(&kept), Vec::<String>::new());
