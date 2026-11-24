@@ -1490,7 +1490,9 @@ files under macOS 14.7.4 (`docs/plans/milestone-1.md`, section 7); the x86 half 
 on the desktop in milestone 2 (D151). Milestone 0's two zstd loads are tasks of the background
 class, as the engine runs background CPU work (section 5.1). On the M1 they run on the
 efficiency cores and barely reach the frame workers. On a hybrid part under Windows the
-background class sets thread priority alone, and steering there is an open verification item.
+background class sets its thread's power-throttling state (EcoQoS), which Windows uses to prefer
+the efficiency cores; whether that moves the load off the frame workers is an open verification
+item.
 On a part with no efficiency cores they are two low-priority threads beside the frame workers,
 the harder case. The desktop's first file says which part it is (D152).
 

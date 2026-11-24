@@ -71,3 +71,14 @@ comments rely on. The crate's tests run under Miri.
 
 - Each call (`pthread_set_qos_class_self_np`, `setpriority`, `SetThreadPriority`) takes plain
   values and affects only the calling thread.
+- `SetThreadInformation` with `ThreadPowerThrottling` reads a `THREAD_POWER_THROTTLING_STATE`
+  from a live local, passed with its own size, and affects only the calling thread, named by
+  the pseudo-handle `GetCurrentThread` returns. `GetLastError` after a refused call reads the
+  calling thread's own last error.
+- The Windows test reads the state back with `NtQueryInformationThread` and the kernel's class
+  49 (`ThreadPowerThrottlingState`), which `windows-sys` does not name. The number is phnt's,
+  where it precedes `ThreadWorkloadClass` (50), and the structure is phnt's
+  `POWER_THROTTLING_THREAD_STATE`, three `ULONG`s, the layout of
+  `THREAD_POWER_THROTTLING_STATE`. The call writes into the live local passed, of that size,
+  and no returned length is asked for. Every field of the structure is valid for any bit
+  pattern. The test fails on any status but success and the refusals of the class.

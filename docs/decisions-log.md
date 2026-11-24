@@ -231,6 +231,25 @@ editorial pass rather than one taken from a review.
 - Driven by: R2-23, R2-2.
 - Replaced: revision 2's one worker per physical core minus one, two deques per worker, and 50
   to 200 µs batches.
+- Addendum (D153, lane eco-qos, 2026-11-24): on Windows `ThreadClass::Background` opts its
+  thread into execution-speed throttling (EcoQoS) after setting its priority, and every other
+  class hands the thread's throttling back to the system (both masks 0), so a later `enter` of
+  another class undoes it, where on Linux the lowered priority stays. No class opts out of
+  throttling (the control bit set, the state bit clear): that would hold frame workers at
+  high QoS while the game is minimised or covered, which the system's own heuristics lower.
+  A refusal is an error of kind `Platform` whose message names the call refused, priority or
+  throttling, with the system's error code, both when both fail; both are attempted whatever
+  the other does. A reset that Windows 10 before version 1709 refuses as an unknown
+  information class is not reported, since such a thread is already under the system's
+  management: only the background threads, whose steering is missing there, warn.
+  `ThreadClass::Io` sets its priority and resets the throttling state to the system's, as
+  the other classes do, until a measurement says otherwise: Windows' EcoQoS is held on mains
+  power too, stricter than the utility QoS the class has on macOS, and an IO thread's work
+  between blocking calls is the latency from a completed read to its waiter. Rules out an
+  opt-out for the frame classes, a background setting that outlives the class on Windows,
+  and a log line from every thread on a system that has no such setting. The two open
+  questions, Io's EcoQoS and an opt-out under gamepad-only play, are a verification row of
+  gate none, each with the run that decides it.
 
 **D18. Timer root, present thread, futures for main-thread requests, time scale** (§5.1, §11)
 - Why: with no coordinator and a main thread that only pumps events, something must wake at tick
