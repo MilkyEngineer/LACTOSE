@@ -9767,6 +9767,25 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     other agents' builds. Its longest models are the two width configurations of three workers;
     the nightly job's runner has fewer cores, and its sixty minutes also hold
     `lactose-input-host`'s and `lactose-net-host`'s models.
+- Addendum (lane `task-alloc-flake`, 2026-11-24): `tests/job_alloc.rs`'s
+  `a_job_allocates_its_cell_and_a_child_a_share_of_a_queue_block` failed under load with a
+  correct pool, through two costs that are paid once and that its warm-up of 252 jobs did not
+  always pay. A frame-critical worker's scope arena allocates its chunk and its list of chunks
+  at the first scope the worker opens that forks, and the scheduler chooses which worker takes
+  a job, so a worker that took none of the warm-up's jobs paid them in a measured window. A
+  frame-critical worker locks the timers' mutex whenever it goes idle. Where std's mutex is a
+  pthread mutex, as on Apple targets, that mutex is allocated at its first lock by any thread,
+  once on each thread that races to it, and under load no worker may have gone idle before the
+  windows. The warm-up now runs until every frame-critical worker has opened a scope that
+  forks, and then waits once on a sleep, whose registration takes that first lock on the test
+  thread. The window that measures what a mutex's first lock costs is counted under the task
+  tag, so that it holds the test thread's allocations alone. A second cell per call, an
+  allocation per fork and one per stolen child each still fail the test. How often the old
+  test failed depends on the machine's state. The lane's figures, beside eight CPU-bound loops:
+  the old test failed 100 of 600 runs at load 24 to 35, and the new one passed 1,000 nextest
+  stress runs at load 23 to 27 and, after review round 1, 500 more at load 17 to 26. The
+  reviewer's: main's unchanged test passed 1,500 nextest runs at load 28 to 35, and only an
+  instrumented copy reproduced the arena's cost, in 6 of 1,200 runs.
 
 **D163. `lactose-rhi-vulkan` without a window, and the Vulkan step of `cargo xtask gpu`** (§12.1, §20, §21, `lactose-rhi-vulkan`, `lactose-rhi-api`, `tools/xtask`, `crate-tiers.toml`)
 - Why: the milestone 2 plan's lane `vulkan`, under its decisions 5.7, 5.10, 5.12 and D158.
