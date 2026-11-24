@@ -356,8 +356,8 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   a second swapchain; on a device whose present role is served by the graphics queue, a
   drop behind a graphics submit held there by a host point on the acquired image, which
   neither waits for it nor leaks the device, a second swapchain made at once that presents
-  once the point is signalled; a `resize` whose `vkCreateSwapchainKHR` or image fails, stale until a
-  later `resize`; a present refused with nothing enqueued, out of memory and an unlisted
+  once the point is signalled; a `resize` whose `vkCreateSwapchainKHR` or image fails, stale
+  until a later `resize`; a present refused with nothing enqueued, out of memory and an unlisted
   error, stale until a `resize`, the unlisted error's fence and semaphore destroyed and the
   layer silent; a frame submit pending on an acquired image, held by a host point, at a
   `resize`, its encoder dropped while a panic unwinds, the replaced driver swapchain kept
@@ -423,9 +423,9 @@ MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choos
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2, under Metal API and shader validation | 179 | 37: 31 null alone, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363) | 147 | 68: 31 null alone, 9 no window, 10 no headless surface, 4 no loss, 11 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
-| KosmicKrisp under GPU-assisted validation | 142 | 68: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit; the injected acquire-semaphore reuse skips for core validation off | 0 |
+| MoltenVK 1.4.2, under Metal API and shader validation | 180 | 37: 31 null alone, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363) | 147 | 69: 31 null alone, 9 no window, 11 no headless surface, 4 no loss, 11 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
+| KosmicKrisp under GPU-assisted validation | 142 | 69: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit; the injected acquire-semaphore reuse skips for core validation off | 0 |
 
 The counts are of the device tests: the suite's 186 cases, 158 contract and 28 output, and the
 device's own; the Metal canary runs under MoltenVK alone. Each driver passes 27 of the 28

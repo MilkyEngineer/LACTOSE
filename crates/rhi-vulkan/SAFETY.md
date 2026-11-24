@@ -114,8 +114,8 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   surface's (`Left::unretired`): the next swapchain names it as `oldSwapchain`, so the
   surface has at most one swapchain that is not retired, as the spec allows a native window.
   A retired driver swapchain is destroyed by whichever thread drops its last image object or
-  lets go of its semaphores, which may be beside the present thread's `vkCreateSwapchainKHR`. The spec allows it:
-  `vkDestroySwapchainKHR` externally synchronises only its `swapchain`, and
+  lets go of its semaphores, which may be beside the present thread's `vkCreateSwapchainKHR`.
+  The spec allows it: `vkDestroySwapchainKHR` externally synchronises only its `swapchain`, and
   `vkCreateSwapchainKHR` its `surface` and `oldSwapchain`. MoltenVK 1.4.2 reads and writes
   the surface's `_activeSwapchain` unlocked in both calls (`MVKSwapchain.mm` 651 and
   399–400, `MVKSurface.mm` 65–66), a race inside the driver that a retired swapchain does
