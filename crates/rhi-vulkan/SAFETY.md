@@ -103,8 +103,13 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   on a shared queue holds: it hands its acquire and present semaphores to the device
   (`Left::spent`) with the stamp of the last batch that waits for one, after waiting for its
   presents' fences, and they are destroyed once the present queue reaches that stamp, or at
-  the device's last drop, once it is idle. They hold a count of their driver swapchain, so
-  it outlives those batches, its acquires' signals included.
+  the device's last drop, once it is idle. The stamp is read before the drop takes the
+  chain, whose `unsignalled` is the batch after a present the driver did not take. They hold
+  a count of their driver swapchain, so that it outlives every batch that waits for one of
+  its semaphores; a `resize` hands the device the same count, with no semaphore, for the
+  batch after the acquire it gave up. No valid-usage rule found requires the count
+  (VUID-vkDestroySwapchainKHR-swapchain-01282 is of the uses of its acquired images, not of
+  a pending wait for an acquire's semaphore): it is conservative.
 - A driver swapchain is destroyed by the drop of its owner (`SwapchainObj`), which every
   image object of it holds, so it outlives every view of its images and every encoder and
   submit that names one. A `resize` and the swapchain's drop forget the images' handles,
@@ -114,7 +119,8 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   surface's (`Left::unretired`): the next swapchain names it as `oldSwapchain`, so the
   surface has at most one swapchain that is not retired, as the spec allows a native window.
   A retired driver swapchain is destroyed by whichever thread drops its last image object or
-  lets go of its semaphores, which may be beside the present thread's `vkCreateSwapchainKHR`.
+  lets go of its last count in `Left::spent`, which may be beside the present thread's
+  `vkCreateSwapchainKHR`.
   The spec allows it: `vkDestroySwapchainKHR` externally synchronises only its `swapchain`, and
   `vkCreateSwapchainKHR` its `surface` and `oldSwapchain`. MoltenVK 1.4.2 reads and writes
   the surface's `_activeSwapchain` unlocked in both calls (`MVKSwapchain.mm` 651 and
