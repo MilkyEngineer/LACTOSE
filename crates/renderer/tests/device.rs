@@ -154,20 +154,20 @@ struct Shot {
     back: usize,
     /// The presentation fraction.
     fraction: f32,
-    /// Whether the frame begins with [`Lag`]'s dispatch.
-    lag: bool,
+    /// The rounds of [`Lag`]'s dispatch the frame begins with, if any.
+    lag: Option<u32>,
 }
 
 impl Shot {
     /// A frame that looks at `pivot`, at fraction one, into set 0, with no lag.
     fn at(pivot: RenderPosition) -> Self {
-        Self { pivot, held: None, back: 0, fraction: 1.0, lag: false }
+        Self { pivot, held: None, back: 0, fraction: 1.0, lag: None }
     }
 }
 
 /// A dispatch that holds the GPU for about a second on the M1: one thread of the
 /// conformance suite's `store.slang`, which writes a word through its block's address after
-/// `LAG_ROUNDS` rounds of arithmetic, into `scratch`, which the frame's copy pass then
+/// `LAG_ROUNDS` rounds of arithmetic or more, into `scratch`, which the frame's copy pass then
 /// copies into `back`. The copy keeps the dispatch on the graphics queue, ahead of the
 /// frame's passes.
 struct Lag {
@@ -176,8 +176,11 @@ struct Lag {
     back: BufferHandle,
 }
 
-/// `store.slang`'s rounds, as rhi-vulkan's lagging submits give it.
+/// `store.slang`'s rounds, as rhi-vulkan's lagging submits give it: [`Lag`]'s first.
 const LAG_ROUNDS: u32 = 1 << 25;
+
+/// The times [`holding`] runs a lag again, with twice the rounds, when it did not hold.
+const LAG_RETRIES: u32 = 3;
 
 /// The word `store.slang` writes after its rounds.
 const LAG_WORD: u32 = 7;
@@ -369,9 +372,9 @@ impl Parts {
             };
             let pixels = readback("pixels back", back.pixels);
             let records = readback("records back", back.records);
-            let lag_back = shot.lag.then(|| readback("lag back", self.lag.back));
+            let lag_back = shot.lag.map(|rounds| (rounds, readback("lag back", self.lag.back)));
             let (pipeline, scratch) = (self.lag.pipeline, self.lag.scratch);
-            let lag = lag_back.map(|back| {
+            let lag = lag_back.map(|(rounds, back)| {
                 let scratch = decl.import_buffer(&BufferImport {
                     label: "lag",
                     buffer: scratch,
@@ -387,7 +390,7 @@ impl Parts {
                     recorder.bind_pipeline(pipeline);
                     recorder.push_address(0, scratch, 0);
                     recorder.push_bytes(8, &1u32.to_le_bytes());
-                    recorder.push_bytes(12, &LAG_ROUNDS.to_le_bytes());
+                    recorder.push_bytes(12, &rounds.to_le_bytes());
                     recorder.push_bytes(16, &LAG_WORD.to_le_bytes());
                     recorder.dispatch([1, 1, 1]);
                 });
@@ -718,6 +721,35 @@ enum Hold {
     Lag,
 }
 
+/// Runs `check` over [`held`]'s frames, each try in a session of its own. Behind a gate
+/// frame 1 is held by construction; behind a lag only while the lag outlasts the host's
+/// work, which a fast device or a slow host can undo, so a lag that did not hold is run
+/// again with twice the rounds, [`LAG_RETRIES`] times at most, and the test fails if none
+/// held. Each retry is printed.
+fn holding(test: &str, desc: Desc, hold: Hold, check: impl Fn(&mut Gpu, Held)) {
+    let mut rounds = LAG_ROUNDS;
+    for retry in 0..=LAG_RETRIES {
+        let mut was_held = false;
+        session(desc, |gpu| {
+            if let Some(held) = held(gpu, hold, rounds) {
+                was_held = true;
+                check(gpu, held);
+            }
+        });
+        if was_held {
+            if retry > 0 {
+                eprintln!(
+                    "{test}: {hold:?} held frame 1 at {rounds} rounds, after {retry} retries"
+                );
+            }
+            return;
+        }
+        eprintln!("{test}: {hold:?} at {rounds} rounds was reached before the release: retrying");
+        rounds *= 2;
+    }
+    panic!("{test}: {hold:?} never held frame 1 in flight through the host's work");
+}
+
 /// What two frames held in flight show: frame 1, held, and frame 2, submitted after it;
 /// then `open`'s answer with both regions held, and a pass written whatever it answered;
 /// then frame 1 let go. Frame 1's scatter runs after that pass, and its triangles after
@@ -730,12 +762,14 @@ struct Held {
 }
 
 /// Instance 1 at `x = 0` in frame 1, which looks at it from the origin's cell, and nothing
-/// new in frame 2, which looks from 50 metres along `+X`, where nothing is.
-fn held(gpu: &mut Gpu, hold: Hold) -> Held {
+/// new in frame 2, which looks from 50 metres along `+X`, where nothing is. `None` where a
+/// lag of `rounds` let frame 1's point be reached before the host's work for frame 2 was
+/// done, so that the frames show nothing of a frame in flight.
+fn held(gpu: &mut Gpu, hold: Hold, rounds: u32) -> Option<Held> {
     let row = placement([0; 3], [0.0; 3], 0.3);
     world_pass(&gpu.renderer, WorldKind::Server, Tick(1), true, &[moved(1, row)]);
     let gate = matches!(hold, Hold::Gate).then(|| gpu.gate());
-    let lag = matches!(hold, Hold::Lag);
+    let lag = matches!(hold, Hold::Lag).then_some(rounds);
     let first = gpu.frame(Shot { held: gate, lag, ..Shot::at(pivot([0.0; 3])) });
     gpu.open();
     let second = gpu.frame(Shot { back: 1, ..Shot::at(pivot([50.0, 0.0, 0.0])) });
@@ -743,18 +777,19 @@ fn held(gpu: &mut Gpu, hold: Hold) -> Held {
     // Into frame 1's region, were it reopened: the same indices, another placement.
     world_pass(&gpu.renderer, WorldKind::Server, Tick(2), true, &[moved(1, placed(-1.0))]);
     let value = gpu.device().timeline_value(first.point.timeline).expect("the value");
-    assert!(value < first.point.value, "frame 1 was held until the writes were made");
+    let in_flight = value < first.point.value;
+    assert!(in_flight || lag.is_some(), "the gate held frame 1 until the writes were made");
     if let Some(gate) = gate {
         gpu.device().signal_timeline(gate).expect("the gate's signal");
     }
     gpu.reached(first.point);
     gpu.reached(second.point);
-    if lag {
+    if lag.is_some() {
         let mut word = [0; 4];
         gpu.read(gpu.lag.back, 4, |bytes| word.copy_from_slice(bytes));
         assert_eq!(u32::from_le_bytes(word), LAG_WORD, "the lag ran");
     }
-    Held { first, second, opened, row }
+    in_flight.then_some(Held { first, second, opened, row })
 }
 
 /// With the GPU made to lag, the ring never overwrites a region a frame in flight reads:
@@ -768,8 +803,7 @@ fn held(gpu: &mut Gpu, hold: Hold) -> Held {
 fn a_region_a_held_frame_reads_is_not_reopened() {
     let desc = Desc { instances: 4, rows: 16, regions: 2, backs: 2 };
     for hold in [Hold::Gate, Hold::Lag] {
-        session(desc, |gpu| {
-            let held = held(gpu, hold);
+        holding("a_region_a_held_frame_reads_is_not_reopened", desc, hold, |gpu, held| {
             let record = gpu.records(0, 1)[0];
             let scattered = (record.previous, record.current, record.flags);
             let own = (held.row, held.row, InstanceRecord::LIVE);
@@ -792,8 +826,7 @@ fn a_region_a_held_frame_reads_is_not_reopened() {
 fn a_held_frame_draws_with_its_own_camera() {
     let desc = Desc { instances: 4, rows: 16, regions: 2, backs: 2 };
     for hold in [Hold::Gate, Hold::Lag] {
-        session(desc, |gpu| {
-            let held = held(gpu, hold);
+        holding("a_held_frame_draws_with_its_own_camera", desc, hold, |gpu, held| {
             let records = gpu.records(0, 1);
             let first = reference(&records, &held.first.camera.data, 1.0);
             assert!(surely(&first, 0) > 100, "frame 1's camera sees the instance");

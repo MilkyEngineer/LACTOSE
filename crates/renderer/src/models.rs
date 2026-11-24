@@ -3,13 +3,19 @@
 //!
 //! Run with `cargo test -p lactose-renderer --features loom --release`. Every model calls
 //! what the crate ships, `ExtractSink`, `RemoteWriter`, `Staging::open`, `Staging::seal` and
-//! `Staging::entries`, over loom's atomics through the `sync` shim. The rows' bytes go to a
-//! null device behind its own lock, which loom does not model and no property here rests
-//! on: what `prepare` reads of a region is its shadow entries and counts.
+//! `Staging::entries`, over loom's atomics through the `sync` shim, whose access marker
+//! stands for each shadow entry as one location, so that a model fails where an entry's
+//! read by one use's `prepare` and its write by the next use's writer are unordered. The
+//! rows' bytes go to a null device behind its own lock, which loom does not model and no
+//! property here rests on: what `prepare` reads of a region is its shadow entries and
+//! counts.
 //!
-//! The models run at preemption bound 3 unless `LOOM_MAX_PREEMPTIONS` sets another.
+//! The models run at preemption bound 10 unless `LOOM_MAX_PREEMPTIONS` sets another. Each
+//! explores as many executions at 10 as at 64, so the search is exhaustive; all of them
+//! take under a second in a release build.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
 
 use lactose_asset_api::{AssetId, AssetRef};
 use lactose_core::{NetId, StableKey, Tick};
@@ -25,16 +31,25 @@ use loom::thread;
 
 use crate::key::KeyBits;
 use crate::scatter::StagingRow;
-use crate::staging::{ExtractSink, Note, Sealed, Staging, Unsealed, Use, kind_index};
+use crate::staging::{ExtractSink, Note, RemoteWriter, Sealed, Staging, Unsealed, Use, kind_index};
 
-const PREEMPTION_BOUND: usize = 3;
+const PREEMPTION_BOUND: usize = 10;
 
+/// Runs `body` under loom and prints how many executions it explored.
 fn model(body: impl Fn() + Sync + Send + 'static) {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&runs);
     let mut builder = loom::model::Builder::new();
     if builder.preemption_bound.is_none() {
         builder.preemption_bound = Some(PREEMPTION_BOUND);
     }
-    builder.check(body);
+    let bound = builder.preemption_bound;
+    builder.check(move || {
+        counted.fetch_add(1, StdOrdering::Relaxed);
+        body();
+    });
+    let runs = runs.load(StdOrdering::Relaxed);
+    eprintln!("{runs} executions at preemption bound {bound:?}");
 }
 
 struct Silent;
@@ -285,5 +300,113 @@ fn a_sink_dropped_with_a_pass_open_leaves_the_region_sealable_and_the_pass_lost(
             assert_eq!(sealed.counts.lost, lost(KIND));
             assert_eq!(next.counts.lost, 0);
         }
+    });
+}
+
+/// Whether the pass of `kind` in `read`, which wrote `row(n)`, is read whole: its begin,
+/// its row and its end. `None` when `read` holds no begin of `kind`.
+fn of_kind(read: &[(u32, Note)], kind: WorldKind, n: u64) -> Option<bool> {
+    let &(at, _) =
+        read.iter().find(|(_, note)| matches!(note, Note::Begin { kind: k, .. } if *k == kind))?;
+    let mine: Vec<&Note> = read.iter().filter(|(p, _)| *p == at).map(|(_, note)| note).collect();
+    let row = row(n);
+    let written = Note::Row { key: KeyBits::of(row.key), mesh: row.mesh };
+    Some(mine.len() == 3 && mine.contains(&&written) && mine.contains(&&Note::End))
+}
+
+#[test]
+fn no_prepare_reads_an_entry_of_a_later_use() {
+    // A pass fills region zero's first use; a pass on another thread lands in the first
+    // use, in the second or in none. The renderer seals and reads the first use, opens
+    // region zero again, and seals and reads the second. The other pass's writes into the
+    // second use reach entries the first use's reads read: the access markers fail the
+    // model unless those reads happen before the writes, which `open`'s release and
+    // `begin`'s acquire order.
+    model(|| {
+        let staging = ring(8);
+        let mut sink = ExtractSink::new(Arc::clone(&staging));
+        sink.begin(PASS);
+        sink.write(&[row(1)]);
+        sink.end();
+        let shared = Arc::clone(&staging);
+        let writer = thread::spawn(move || {
+            let mut sink = ExtractSink::new(shared);
+            sink.begin(ExtractPass { kind: WorldKind::Server, ..PASS });
+            sink.write(&[row(2)]);
+            sink.end();
+        });
+        let first = seal_when_closed(&staging);
+        let first_read = notes(&staging, &first);
+        staging.open(Use { region: 0, generation: 2 });
+        let second = seal_when_closed(&staging);
+        let second_read = notes(&staging, &second);
+        writer.join().expect("the writer");
+        assert_eq!(of_kind(&first_read, KIND, 1), Some(true), "{first_read:?}");
+        for read in [&first_read, &second_read] {
+            assert_ne!(of_kind(read, WorldKind::Server, 2), Some(false), "{read:?}");
+        }
+    });
+}
+
+#[test]
+fn a_kinds_dropped_rows_are_within_the_total_in_each_sealing() {
+    // With no region open, a pass counts its rows in the renderer-wide record while the
+    // sealings take it: whichever sealing takes which count, none reports more rows of a
+    // kind dropped than rows dropped.
+    model(|| {
+        let staging = ring(8);
+        staging.seal().expect("region zero is open");
+        let shared = Arc::clone(&staging);
+        let writer = thread::spawn(move || {
+            let mut sink = ExtractSink::new(shared);
+            sink.begin(ExtractPass { kind: WorldKind::Server, ..PASS });
+            sink.write(&[row(1)]);
+            sink.end();
+        });
+        staging.open(Use { region: 1, generation: 2 });
+        let first = seal_when_closed(&staging);
+        writer.join().expect("the writer");
+        staging.open(Use { region: 0, generation: 3 });
+        let second = seal_when_closed(&staging);
+        for sealed in [&first, &second] {
+            let kinds: u64 = sealed.counts.dropped_by_kind.iter().sum();
+            assert!(kinds <= sealed.counts.dropped, "{:?} {:?}", first.counts, second.counts);
+        }
+        let server = |s: &Sealed| s.counts.dropped_by_kind[kind_index(WorldKind::Server)];
+        let dropped = first.counts.dropped + second.counts.dropped;
+        assert_eq!(server(&first) + server(&second), dropped);
+        assert!(dropped <= 1);
+    });
+}
+
+#[test]
+fn a_remote_batch_beside_a_pass_is_read_whole() {
+    // The render side writes the remote batch while a pass runs on another thread: the
+    // sealing reads both whole, each row once.
+    model(|| {
+        let staging = ring(16);
+        let shared = Arc::clone(&staging);
+        let writer = thread::spawn(move || {
+            let mut sink = ExtractSink::new(shared);
+            sink.begin(ExtractPass { kind: WorldKind::Server, ..PASS });
+            sink.write(&[row(1)]);
+            sink.end();
+        });
+        RemoteWriter::new(&staging).write(&[row(2)]);
+        writer.join().expect("the writer");
+        let sealed = staging.seal().expect("closed");
+        let read = notes(&staging, &sealed);
+        assert_eq!(of_kind(&read, WorldKind::Server, 1), Some(true), "{read:?}");
+        let remote = row(2);
+        let remote = Note::Row { key: KeyBits::of(remote.key), mesh: remote.mesh };
+        let batch: Vec<Note> = read
+            .iter()
+            .filter(|(_, note)| {
+                matches!(note, Note::RemoteOpen | Note::RemoteEnd) || *note == remote
+            })
+            .map(|&(_, note)| note)
+            .collect();
+        assert_eq!(batch, [Note::RemoteOpen, remote, Note::RemoteEnd], "{read:?}");
+        assert_eq!(sealed.counts.dropped, 0);
     });
 }

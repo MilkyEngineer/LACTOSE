@@ -83,7 +83,9 @@ pub struct FrameStats {
     /// the device refused the write; never a written row. Those of each kind's extract
     /// passes are also counted by [`dropped_in`](Self::dropped_in); the remote batch's are
     /// counted here alone, since the next frame's batch writes every remote instance
-    /// again.
+    /// again. Below saturation it is at least the sum of `dropped_in` over the kinds,
+    /// in every frame. A pass lost with no region open can still be reported lost a frame
+    /// before some of its dropped rows are counted, the early report "Writers" allows.
     pub dropped: u32,
     /// The rows left out of the batch because a later row of their pass or batch named
     /// the same instance. Zero unless a writer broke its contract.
@@ -299,6 +301,17 @@ fn invalid(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
 
+/// The most entries a batch of a renderer of `instances` instances and `rows` rows a region
+/// holds, `instances + 2 * rows`: a free of every slot after a torn frame, and a row and a
+/// free for each row. A [`BatchRange`] names an entry by a `u32`, so a description past
+/// `u32::MAX` is refused, before any buffer is made.
+fn batch_bound(instances: u32, rows: u32) -> Result<u32> {
+    let batch = u64::from(instances) + 2 * u64::from(rows);
+    u32::try_from(batch).map_err(|_| {
+        invalid("a renderer's batch, `instances + 2 * rows` entries, is at most `u32::MAX`")
+    })
+}
+
 impl Renderer {
     /// A renderer for `device`: the ring's regions, a camera buffer for each, the
     /// instance buffer, the built-in triangle's vertices and indices, and, with
@@ -315,7 +328,10 @@ impl Renderer {
     ///
     /// `ErrorKind::InvalidData` where `desc.instances` or `desc.rows` is zero or
     /// `desc.regions` is less than two or more than 65,535, the most the open word's
-    /// region index holds (`README.md`, "Concurrency"), and for a cooked shader whose
+    /// region index holds (`README.md`, "Concurrency"), where the batch's bound,
+    /// `desc.instances + 2 * desc.rows` entries, is past `u32::MAX`, the most a
+    /// [`BatchRange`] names (`README.md`, "Regions"), checked before any buffer is made,
+    /// and for a cooked shader whose
     /// reflection is not the interface's (its stage, the bytes of its push block, its
     /// heap, its constants, its inputs and outputs), naming the shader and the field
     /// (`README.md`, "Pipelines and shaders"); what the device returns for a buffer or a
@@ -330,7 +346,7 @@ impl Renderer {
         if !(2..=REGIONS_MAX).contains(&desc.regions) {
             return Err(invalid("a renderer has from 2 to 65,535 regions"));
         }
-        let batch = u64::from(desc.instances) + 2 * u64::from(desc.rows);
+        let batch = u64::from(batch_bound(desc.instances, desc.rows)?);
         if let Some(shaders) = &desc.shaders {
             pipeline::check(shaders)?;
         }
@@ -940,6 +956,21 @@ impl Drop for Made<'_> {
         for &buffer in &self.buffers {
             // No submit has used them, so the device refuses none.
             let _ = self.device.destroy_buffer(buffer);
+        }
+    }
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_batch_bound_is_refused_one_past_u32_max_and_accepted_at_it() {
+        assert_eq!(batch_bound(u32::MAX - 2, 1).ok(), Some(u32::MAX));
+        assert_eq!(batch_bound(1, u32::MAX / 2).ok(), Some(u32::MAX));
+        for (instances, rows) in [(u32::MAX - 1, 1), (u32::MAX, 4), (2, u32::MAX / 2)] {
+            let refused = batch_bound(instances, rows).expect_err("past `u32::MAX`");
+            assert_eq!(refused.kind(), ErrorKind::InvalidData, "{instances} {rows}");
         }
     }
 }

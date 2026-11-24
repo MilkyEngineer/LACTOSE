@@ -109,8 +109,10 @@ jobs:
           # The renderer's staging ring: the open word, the regions' cursors and the
           # renderer-wide record, which every writer and sealing reaches through atomics, under
           # four seeds: the library's unit tests, those of `src/staging.rs`, which reach the
-          # ring's private functions, and of `src/key.rs`. Its loom models search the same
-          # functions' interleavings.
+          # ring's private functions, and of `src/key.rs`. One of them races three writers'
+          # passes against a sealer on threads, where Miri's weak-memory emulation checks the
+          # shipped orderings on the executions these seeds reach; it searches no others. The
+          # search of the same functions' interleavings is the loom models' job.
           - name: renderer, staging
             key: renderer-staging
             args: -p lactose-renderer --lib

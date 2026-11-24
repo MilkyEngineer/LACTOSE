@@ -264,14 +264,27 @@ Step 1 for the next frame may come any time after step 3.
   so the remote instances are missing until the next frame's batch.
 - **With no region open** there is no region to note a loss in. A pass that begins then,
   and a row written then, are recorded in the renderer-wide record of kinds lost and rows
-  dropped, by kind and in all. The next `prepare` takes the record with a swap after it has
-  sealed its region, and `open` never resets it, so a loss is reported no later than the
-  kind's next pass is applied; reported one `prepare` early, it frees the kind until a full
-  pass and shows nothing stale.
+  dropped: the rows of each kind's passes, and the rows with no kind on their own, whose sum
+  is the total. The next `prepare` takes the record with a swap after it has sealed its
+  region, and `open` never resets it, so a loss is reported no later than the kind's next
+  pass is applied; reported one `prepare` early, it frees the kind until a full pass and
+  shows nothing stale. A sealing may take a kind's loss and not yet the rows its pass drops
+  after it, which the next takes, but no frame's rows dropped by kind exceed its rows
+  dropped: the total is summed as it is taken.
 - **A sink dropped with a pass open** leaves that pass lost and, where its `begin` took a
   count, gives it back, so the region can still be sealed and the `prepare` that seals it
   sees the loss (`ExtractSink`'s `Drop`; "Concurrency"). Only a pass whose `begin` took a
   count gives one back, by its `end` or by the drop: a pass lost at its `begin` took none.
+  A sink passed to `mem::forget` with a pass open never gives its count back, so every
+  later `prepare` of the renderer refuses, with `InvalidData`, as it refuses one made while
+  a pass is open.
+- **A sink outlives its renderer.** A sink holds the ring's shared state and the device.
+  What it writes after the renderer's drop is lost: a pass finds no region open, or the
+  one the renderer left open, whose buffers the renderer destroyed and the device refuses
+  writes to, and no `prepare` reads the counts. The device lives until the last sink is
+  dropped. So `lactose-app`'s teardown gives every world `set_sink(None)`
+  before it drops the renderer, and the device goes with them
+  (`writers::a_sink_outlives_its_renderer`).
 - **The remote batch takes no count** of the open word: the writer borrows the renderer
   mutably, which keeps `prepare` out already. So a `RemoteWriter` passed to `mem::forget`
   cannot keep the renderer from preparing: its batch has no end note, and a remote batch
@@ -345,7 +358,10 @@ Step 1 for the next frame may come any time after step 3.
   out for want of it. `instances + 2 * rows` entries bound a batch: one for each row, and
   one free for each slot held when the frame began or given in it. After a torn frame no
   slot is held, and the run that frees every slot index ever given takes the place of the
-  first of those ("The batch").
+  first of those ("The batch"). A `BatchRange` names an entry by a `u32`, so
+  `Renderer::new` refuses, with `InvalidData`, a description whose bound is past
+  `u32::MAX`, before it makes a buffer; the batch's own check that it is below 2^32
+  entries is then an assertion that cannot fail.
 - **Room.** A region holds `rows` rows and notes together, and drops nothing while every
   pass and batch written between two `prepare`s fits. One pass of each kind of world and a
   remote batch, whose rows together are at most `instances`, fit in `instances + 8` plus
@@ -426,12 +442,36 @@ Step 1 for the next frame may come any time after step 3.
   on the queue it is in, which needs no `ready` (graph, "Imports"). The renderer's first
   frame, and the first frame declared after `torn`, import it from `Undefined` instead,
   which keeps its bytes on the one queue it is used on (graph, "Submission": a torn
-  frame's imports are in no state the graph vouches for). So the scatter of a frame waits
-  for the earlier work on the queue at its shader stages, every one of them, since
-  `ShaderRead` names no stage and a Vulkan backend gives it all, the previous frame's
-  fragment shading included; it does not wait for that work's attachment writes, copies
-  or tests. The declaration changes, and is compiled again, once after each of those
-  frames. D160 allows it: `initial` is the caller's word.
+  frame's imports are in no state the graph vouches for). D160 allows it: `initial` is the
+  caller's word.
+- **What a frame's first pass waits for.** The import from `ShaderRead` narrows nothing as
+  the frame is declared. The scatter also imports the region's entries, and its rows
+  wherever an entry reads one, from `Undefined`, which rhi-vulkan carries out with a source
+  of every command and every memory write, recorded just before the scatter, and a
+  barrier's execution scope is not its buffer's. So the scatter waits for every earlier
+  command on the graphics queue, the previous frame's fragment shading, attachment writes
+  and copies included; a frame with no scatter waits the same way at the triangle pass,
+  through the camera's, the vertices', the indices' and the arguments' imports from
+  `Undefined`. The cost is that a frame's first pass never overlaps the work before it on
+  the queue: one drain of the queue a frame, which no figure here measures. The lever, for
+  when the drain is measured to cost, is to narrow those imports: the vertex and index
+  buffers from the states their first frame leaves them in, and each region's buffers from
+  their `last` state after the region's first use, each with a bit for its first use as the
+  instance buffer has `fresh`, so that null's `state` rule holds. `renderer-impl` keeps
+  them as they are.
+- **Plans.** The graph keys a plan on the declaration's shape (graph, "Compile and its
+  cache"), and a frame's shape changes with whether it scatters, whether its batch reads
+  rows, whether it draws and whether it imports the instance buffer from `Undefined`. In
+  steady state the declaration alternates three plans: a frame with no tick, a tick with
+  rows, and a tick that only despawns. The renderer's first frame, a frame that frees every
+  slot, a frame with the table empty and the first frame after `torn` take one each:
+  `graph::the_steady_state_alternates_three_plans_and_each_edge_takes_one` sees seven
+  plans in sixteen frames with `GraphDesc::plans` at 16. Below three the cache thrashes:
+  at two, every frame of the alternation compiles. Each plan owns its transients (graph,
+  "Transients"), here the depth image at the target's extent, `Depth32Float`: about
+  14.7 MB at 2560x1440 and about 33 MB at 3840x2160 wherever it is not memoryless, as on
+  a desktop GPU, and each miss costs a compile and an image's creation. So the caller's
+  `GraphDesc::plans` holds the steady state's three beside the plans of its own passes.
 
 ### Formats
 
@@ -681,6 +721,12 @@ table, which already holds each instance's mesh; it adds no field to the row.
   which is one of a frame the renderer was told no point for, is logged under `cheddar` and
   the object is leaked. While the thread unwinds a panic the drop waits for nothing and
   destroys what the device lets it.
+- Two lifetime paths are reached by no test, and neither matters at milestone 2. A torn
+  frame's region is held until the next `submitted`'s point; were it freed at once, no
+  submit would read it, since a renderer's frame is one submit and on one queue a torn
+  frame made none: it matters only with a provider's pass on another queue, which
+  milestone 2 has none of. A drop without the wait for the last point would destroy under
+  a pending submit, which the device refuses: the drop logs a leak, never a use after free.
 - A sink dropped with a pass open leaves that pass lost and gives back its count
   ("Writers").
 
@@ -791,10 +837,14 @@ native Metal as the calls it makes are. The backend columns are those of rhi-api
 | The renderer's drop | `wait_timeline`, the destroys | Refuses a destroy while pending | Objects released | Objects destroyed | rhi-api, "Handles and lifetimes" |
 
 Null runs no shader. On null `renderer-impl` proves the batch from `Renderer::batch`, with
-`InstanceRecord::scatter` standing for the shader, and the region rule from null's own:
-`host-overlap`, `unflushed`, and a host write under a pending writer (`pending`). A host
-write under a pending *reader* null cannot see (rhi-api), so the frames-in-flight proof is a
-device test with the GPU made to lag.
+`InstanceRecord::scatter` standing for the shader; the writers' ranges from null's
+`host-overlap`; the flushes from `unflushed`, on a null whose host memory is not coherent
+(`graph::frames_on_a_null_whose_host_memory_is_not_coherent_flush_their_writes`); and the
+region rule from `open`'s answers alone
+(`frames::frames_held_in_flight_leave_no_region_to_open_until_the_oldest_point`). Null's
+`pending` sees a host write under a pending writer, and no submit writes a region, so it
+shows nothing of the rule; a host write under a pending *reader* null cannot see
+(rhi-api), so the frames-in-flight proof is a device test with the GPU made to lag.
 
 **What neither spike shows.** The instance buffer is `MemoryClass::Device`: the host never
 writes or reads it, the scatter writes it through its address and a test reads it through a
@@ -855,11 +905,21 @@ amendment of the kind section 20 allows.
 
 The null proofs are modules of the `integration` binary: `tests/slots.rs`, the slot table
 through a world's sink and through passes by hand; `tests/frames.rs`, frames through a
-render graph on null; `tests/sequences.rs`, present-api's sequences through `ExtractSink`
-with the batch scattered on the host by `InstanceRecord::scatter`; `tests/writers.rs`,
-writes from several jobs; `tests/camera.rs`, the orbit against `lactose-input`; and
-`tests/cost.rs`, the steering figures, ignored. `src/staging.rs`'s unit tests, which Miri
-runs, and `src/models.rs`'s loom models hold the ring. `tests/device.rs` holds the rows that
+render graph on null; `tests/graph.rs`, the frame's plans, queues, flushes and shader
+checks through a graph on null; `tests/sequences.rs`, present-api's sequences through
+`ExtractSink` with the batch scattered on the host by `InstanceRecord::scatter`;
+`tests/model.rs`, random sequences of passes, batches, losses, refusals and torn frames
+against a model of this file's rules; `tests/writers.rs`, writes from several jobs, run
+again until two overlapped; `tests/camera.rs`, the orbit against `lactose-input`; and
+`tests/cost.rs`, the steering figures, ignored. `src/models.rs`'s loom models hold the
+ring's orderings: they search the shipped functions' interleavings over loom's atomics, at
+a preemption bound where the search is exhaustive, with each shadow entry checked as one
+location, so that a read of it by one use's `prepare` unordered with the next use's write
+fails. `src/staging.rs`'s unit tests include three writers' passes racing a sealer on the
+standard library's atomics, which fails a reservation or a `begin` that is not one
+read-modify-write on real threads; the nightly runs them under Miri with four seeds, whose
+weak-memory emulation checks the orderings on the executions those seeds reach and
+searches no others. `tests/device.rs` holds the rows that
 need a shader to run, as ignored tests that `cargo xtask gpu` runs under its drivers and
 validation, with `shaders/renderer/` cooked: the instance buffer read back through a copy
 into a `Readback` buffer, frames held behind an import's `ready` point that the host signals
@@ -912,10 +972,12 @@ scatter-to-vertex barrier and the barrier across frames, cannot fail as a frame 
 declared: dropping the instance buffer's transition leaves other imports' transitions from
 `Undefined` before the same pass (the entries' before the scatter; the camera's, the
 vertices', the indices' and the arguments' before the triangle pass), each a full execution
-dependency. Across frames, a write after a read, that is all the hazard needs, so the
-mutation is correct by the specification. Before the triangle pass the mutation drops the
-memory dependency on the instance buffer alone, which desktop drivers carry out as a global
-cache operation, so a desktop run in which it survives does not show the barrier unneeded.
+dependency: a mutation fails as the frame is declared only if it drops every transition the
+graph records before the pass. Across frames, a write after a read, that is all the hazard
+needs, so the mutation is correct by the specification. Before the triangle pass the
+mutation drops the memory dependency on the instance buffer alone, which desktop drivers
+carry out as a global cache operation, so a desktop run in which it survives does not show
+the barrier unneeded.
 
 It also owes:
 
@@ -924,10 +986,15 @@ It also owes:
   to xtask's `LOOM_MODELS`: that a `begin` and a sealing cannot both succeed, that a pass
   that ends is read whole by the `prepare` that seals after it, that a pass of an earlier use
   of a region is never read as a later use's, that no `prepare` reads an entry of a later
-  use, that a loss with no region open is reported, that a sink dropped with a pass open
-  does not keep the region from being sealed, and that the `prepare` that seals after it
-  reports that pass lost; and Miri over `Staging`'s tests;
-- a test that `ExtractSink::write` from several jobs leaves every row once;
+  use, with each shadow entry an access loom checks, that a loss with no region open is
+  reported, that no sealing's rows dropped by kind exceed its rows dropped, that a sink
+  dropped with a pass open does not keep the region from being sealed, that the `prepare`
+  that seals after it reports that pass lost, and that a remote batch written beside a pass
+  is read whole, at a preemption bound where the search is exhaustive; and Miri, with four
+  seeds, over `Staging`'s tests, one of which races three writers' passes against a sealer
+  on threads;
+- a test that `ExtractSink::write` from several jobs leaves every row once, run again until
+  two writes overlapped;
 - as steering, the ring's write cost, and `prepare`'s cost, median and maximum, at 50,000
   incremental rows among 100,000 held, at a full pass of 100,000 held keys, and at a load
   that replaces 100,000 held keys with 100,000 new ones, which `reviewer`'s round-1 model

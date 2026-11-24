@@ -18,7 +18,7 @@ use lactose_rhi_api::{BufferHandle, Device};
 
 use crate::key::KeyBits;
 use crate::scatter::StagingRow;
-use crate::sync::{AtomicU64, Ordering};
+use crate::sync::{Access, AtomicU64, Ordering};
 
 /// The open word's region index while no region is open.
 const NO_REGION: u32 = 0xffff;
@@ -118,13 +118,17 @@ struct Region {
     shadow: Box<[Shadow]>,
 }
 
-/// Kinds lost and rows dropped, in all and by kind. Each count is 64 bits, so it never
-/// wraps, and saturates at `u32::MAX` where `prepare` reports it.
+/// Kinds lost and rows dropped: the rows of each kind's extract passes, and the rows with
+/// no kind, the remote batch's and those written with no pass open. Each count is 64 bits,
+/// so it never wraps, and saturates at `u32::MAX` where `prepare` reports it. No total is
+/// kept: it is the sum of the four counts as they are read, so that a sealing that takes
+/// the record while a writer adds to it takes a total that is the sum of what it took, and
+/// one frame's rows dropped by kind never exceed its rows dropped.
 struct Record {
     /// The lost kinds, as bits of [`kind_index`].
     lost: AtomicU64,
-    /// The rows dropped.
-    dropped: AtomicU64,
+    /// The rows with no kind dropped.
+    unkinded: AtomicU64,
     /// The rows of extract's passes dropped, by [`kind_index`].
     dropped_by_kind: [AtomicU64; 3],
 }
@@ -133,7 +137,7 @@ impl Record {
     fn new() -> Self {
         Self {
             lost: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
+            unkinded: AtomicU64::new(0),
             dropped_by_kind: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
@@ -147,33 +151,31 @@ impl Record {
         if rows == 0 {
             return;
         }
-        self.dropped.fetch_add(rows, Ordering::Relaxed);
-        if let Some(kind) = kind {
-            self.dropped_by_kind[kind_index(kind)].fetch_add(rows, Ordering::Relaxed);
-        }
+        let count = kind.map_or(&self.unkinded, |kind| &self.dropped_by_kind[kind_index(kind)]);
+        count.fetch_add(rows, Ordering::Relaxed);
     }
 
     /// The counts, which the caller reads after the sealing.
     fn read(&self) -> Counts {
-        Counts {
-            lost: self.lost.load(Ordering::Relaxed) as u8,
-            dropped: self.dropped.load(Ordering::Relaxed),
-            dropped_by_kind: self.dropped_by_kind.each_ref().map(|c| c.load(Ordering::Relaxed)),
-        }
+        Counts::of(
+            self.lost.load(Ordering::Relaxed),
+            self.unkinded.load(Ordering::Relaxed),
+            self.dropped_by_kind.each_ref().map(|c| c.load(Ordering::Relaxed)),
+        )
     }
 
     /// The counts, reset to zero.
     fn take(&self) -> Counts {
-        Counts {
-            lost: self.lost.swap(0, Ordering::Relaxed) as u8,
-            dropped: self.dropped.swap(0, Ordering::Relaxed),
-            dropped_by_kind: self.dropped_by_kind.each_ref().map(|c| c.swap(0, Ordering::Relaxed)),
-        }
+        Counts::of(
+            self.lost.swap(0, Ordering::Relaxed),
+            self.unkinded.swap(0, Ordering::Relaxed),
+            self.dropped_by_kind.each_ref().map(|c| c.swap(0, Ordering::Relaxed)),
+        )
     }
 
     fn reset(&self) {
         self.lost.store(0, Ordering::Relaxed);
-        self.dropped.store(0, Ordering::Relaxed);
+        self.unkinded.store(0, Ordering::Relaxed);
         for count in &self.dropped_by_kind {
             count.store(0, Ordering::Relaxed);
         }
@@ -192,6 +194,14 @@ pub(crate) struct Counts {
 }
 
 impl Counts {
+    /// The counts of the `lost` bits, `unkinded` rows and `by_kind` rows, `dropped` their
+    /// sum.
+    fn of(lost: u64, unkinded: u64, by_kind: [u64; 3]) -> Self {
+        let dropped = by_kind.iter().fold(unkinded, |sum, &rows| sum.saturating_add(rows));
+        // Three bits, those of `kind_index`.
+        Self { lost: lost as u8, dropped, dropped_by_kind: by_kind }
+    }
+
     fn add(self, other: Self) -> Self {
         Self {
             lost: self.lost | other.lost,
@@ -216,6 +226,8 @@ struct Shadow {
     key: [AtomicU64; 2],
     /// A row's mesh, as `AssetId` bits.
     mesh: AtomicU64,
+    /// The entry as one location, for the loom models; nothing elsewhere.
+    access: Access,
 }
 
 impl Shadow {
@@ -225,6 +237,7 @@ impl Shadow {
             note: AtomicU64::new(0),
             key: [AtomicU64::new(0), AtomicU64::new(0)],
             mesh: AtomicU64::new(0),
+            access: Access::new(),
         }
     }
 }
@@ -346,6 +359,7 @@ impl Staging {
         let generation = u64::from(sealed.at.generation);
         let shadow = &self.regions[sealed.at.region as usize].shadow[..sealed.len as usize];
         shadow.iter().enumerate().filter_map(move |(index, entry)| {
+            entry.access.with();
             let mark = entry.mark.load(Ordering::Relaxed);
             if mark >> 32 != generation {
                 return None;
@@ -390,6 +404,7 @@ impl Staging {
     /// `prepare` is the release of its pass's `end`, or the borrow a remote batch holds.
     fn store(&self, at: Use, index: u32, pass: u32, note: u64, key: [u64; 2], mesh: u64) {
         let entry = &self.regions[at.region as usize].shadow[index as usize];
+        entry.access.with_mut();
         entry.mark.store(u64::from(at.generation) << 32 | u64::from(pass), Ordering::Relaxed);
         entry.note.store(note, Ordering::Relaxed);
         entry.key[0].store(key[0], Ordering::Relaxed);
@@ -464,6 +479,12 @@ struct OpenPass {
 /// `crates/present-api/README.md`, "What a pass gives the sink" and "What the sink keeps":
 /// what it keeps is kept on the render side, in the slot table and in the instance
 /// buffer, from what each pass leaves in the region (`README.md`, "Writers").
+///
+/// A sink holds the device and the ring's shared state, so it outlives its renderer: what
+/// it writes after the renderer's drop is refused and dropped, and the device lives until
+/// the last sink is dropped, so a teardown gives every world `set_sink(None)` before it
+/// drops the renderer. A sink passed to `mem::forget` with a pass open keeps that pass's
+/// count, and every later `prepare` refuses.
 pub struct ExtractSink {
     /// What the sink shares with the renderer.
     staging: Arc<Staging>,
@@ -623,7 +644,11 @@ impl<'r> RemoteWriter<'r> {
     /// A writer on `staging`'s open region, with its batch opened. The renderer's
     /// plumbing.
     pub(crate) fn new(staging: &'r Staging) -> Self {
-        let (generation, region, _) = fields(staging.open.load(Ordering::Acquire));
+        // `Relaxed`: the region and generation were stored by `Renderer::open`, and both it
+        // and `Renderer::remote` take the renderer by `&mut`, so the borrow orders that store
+        // before this load. Nothing a sink wrote is read through it, and the batch's own
+        // writes reach `prepare` through the borrow too.
+        let (generation, region, _) = fields(staging.open.load(Ordering::Relaxed));
         let at = (region != NO_REGION).then_some(Use { region, generation });
         let opening = at.and_then(|at| staging.note(at, None, REMOTE_OPEN));
         Self { staging, at, opening, exclusive: PhantomData }
@@ -665,6 +690,7 @@ impl Drop for RemoteWriter<'_> {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
 
     use lactose_core::NetId;
     use lactose_present_api::RenderTransform;
@@ -930,5 +956,166 @@ mod tests {
         assert_eq!(sealed.counts.lost, lost(WorldKind::Prediction));
         assert_eq!(sealed.counts.dropped_by_kind, [0, 0, 1]);
         assert_eq!(sealed.len, 0);
+    }
+
+    /// The rows each pass of [`passes_on_three_threads_race_a_sealer`] writes.
+    const RACE_ROWS: u64 = 3;
+
+    /// The key's bits of row `i` of pass `seq` of the writer of `kind`.
+    fn race_key(kind: WorldKind, seq: u64, i: u64) -> u64 {
+        (kind_index(kind) as u64 + 1) << 48 | seq << 8 | (i + 1)
+    }
+
+    /// What the sealings of [`passes_on_three_threads_race_a_sealer`] read: for each pass,
+    /// by its kind and its tick, how often it was read whole and how often without its end.
+    #[derive(Default)]
+    struct Read {
+        whole: std::collections::BTreeMap<(usize, u64), u32>,
+        unended: std::collections::BTreeMap<(usize, u64), u32>,
+    }
+
+    impl Read {
+        /// Reads one sealing: every entry is of a pass whose begin it reads, a pass read
+        /// with its end is read with each of its rows, and one read without it is of a
+        /// kind the sealing reports lost.
+        fn sealing(&mut self, staging: &Staging, sealed: &Sealed) {
+            let entries: Vec<Entry> = staging.entries(sealed).collect();
+            let begins: Vec<(u32, WorldKind, u64)> = entries
+                .iter()
+                .filter_map(|entry| match entry.note {
+                    Note::Begin { kind, tick, .. } => Some((entry.index, kind, u64::from(tick.0))),
+                    _ => None,
+                })
+                .collect();
+            for entry in &entries {
+                let begun = begins.iter().any(|&(at, ..)| at == entry.pass);
+                assert!(begun, "an entry whose pass's begin is not read: {entry:?}");
+            }
+            for &(at, kind, seq) in &begins {
+                let mine: Vec<Note> =
+                    entries.iter().filter(|e| e.pass == at).map(|e| e.note).collect();
+                let mut rows: Vec<KeyBits> = mine
+                    .iter()
+                    .filter_map(|note| match *note {
+                        Note::Row { key, .. } => Some(key),
+                        _ => None,
+                    })
+                    .collect();
+                rows.sort_unstable();
+                let pass = (kind_index(kind), seq);
+                if mine.contains(&Note::End) {
+                    let mut written: Vec<KeyBits> =
+                        (0..RACE_ROWS).map(|i| KeyBits::of(key(race_key(kind, seq, i)))).collect();
+                    written.sort_unstable();
+                    assert_eq!(rows, written, "an ended pass read without some rows: {mine:?}");
+                    *self.whole.entry(pass).or_default() += 1;
+                } else {
+                    let lost = sealed.counts.lost & super::tests::lost(kind) != 0;
+                    assert!(lost, "a pass read without its end, its kind not lost: {mine:?}");
+                    *self.unended.entry(pass).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    /// The ring under three writers, one per kind, each running passes of three rows with
+    /// every seventh dropped with its pass open, while the test's thread seals, reads and
+    /// opens the regions in turn, on the standard library's atomics. Each pass whose begin
+    /// took a count is read whole once if it ended and without its end once if it did
+    /// not; a pass that took none is never read. The writers wait at their midpoint for a
+    /// sealing, so that some sealing comes while they run; the test fails if none did.
+    ///
+    /// Under Miri, which runs it with twelve passes a writer, its weak-memory emulation
+    /// checks the shipped orderings that the shadow entries' reads rest on; elsewhere it
+    /// races real threads, where a reservation or a `begin` that is not one atomic
+    /// read-modify-write fails it.
+    #[test]
+    fn passes_on_three_threads_race_a_sealer() {
+        let per: u64 = if cfg!(miri) { 12 } else { 20_000 };
+        // Room for every pass in one region, so that none is dropped for room.
+        let rows = u32::try_from(3 * per * (RACE_ROWS + 2) + 16).expect("rows");
+        let staging = ring(2, rows);
+        let done = Arc::new(AtomicUsize::new(0));
+        let sealings = Arc::new(AtomicUsize::new(0));
+        let writers: Vec<_> = KINDS
+            .map(|kind| {
+                let staging = Arc::clone(&staging);
+                let done = Arc::clone(&done);
+                let sealings = Arc::clone(&sealings);
+                std::thread::spawn(move || {
+                    let mut took = Vec::new();
+                    let mut sink = ExtractSink::new(Arc::clone(&staging));
+                    for seq in 0..per {
+                        sink.begin(pass(kind, seq as u32, false));
+                        let held = sink.pass.as_ref().is_some_and(|pass| pass.at.is_some());
+                        for i in 0..RACE_ROWS {
+                            sink.write(&[row(race_key(kind, seq, i))]);
+                        }
+                        let abandoned = seq % 7 == 3;
+                        if abandoned {
+                            sink = ExtractSink::new(Arc::clone(&staging));
+                        } else {
+                            sink.end();
+                        }
+                        took.push((held, abandoned));
+                        if seq == per / 2 {
+                            wait_for_a_sealing(&sealings);
+                        }
+                        std::thread::yield_now();
+                    }
+                    done.fetch_add(1, StdOrdering::SeqCst);
+                    took
+                })
+            })
+            .into_iter()
+            .collect();
+        let mut read = Read::default();
+        let (mut region, mut generation, mut mid) = (0, 1, 0);
+        loop {
+            let finished = done.load(StdOrdering::SeqCst) == KINDS.len();
+            match staging.seal() {
+                Ok(sealed) => {
+                    read.sealing(&staging, &sealed);
+                    sealings.fetch_add(1, StdOrdering::SeqCst);
+                    if finished {
+                        break;
+                    }
+                    mid += 1;
+                    region = 1 - region;
+                    generation = next_generation(generation);
+                    staging.open(Use { region, generation });
+                }
+                Err(Unsealed::PassOpen) => std::thread::yield_now(),
+                Err(Unsealed::NotOpen) => panic!("the sealer keeps a region open"),
+            }
+        }
+        assert!(mid > 0, "no sealing came while the writers ran");
+        for (kind, writer) in KINDS.into_iter().zip(writers) {
+            let took = writer.join().expect("a writer");
+            for (seq, (held, abandoned)) in (0..).zip(took) {
+                let pass = (kind_index(kind), seq);
+                let whole = read.whole.get(&pass).copied().unwrap_or(0);
+                let unended = read.unended.get(&pass).copied().unwrap_or(0);
+                let expected = match (held, abandoned) {
+                    (true, false) => (1, 0),
+                    (true, true) => (0, 1),
+                    (false, _) => (0, 0),
+                };
+                assert_eq!((whole, unended), expected, "{kind:?} pass {seq}");
+            }
+        }
+    }
+
+    /// Waits until the sealer of [`passes_on_three_threads_race_a_sealer`] has sealed once,
+    /// or for a bound long past any sealing on a loaded machine; the test then fails on its
+    /// count of sealings while the writers ran.
+    fn wait_for_a_sealing(sealings: &AtomicUsize) {
+        let bound = if cfg!(miri) { 100_000 } else { 10_000_000 };
+        for _ in 0..bound {
+            if sealings.load(StdOrdering::SeqCst) > 0 {
+                return;
+            }
+            std::thread::yield_now();
+        }
     }
 }

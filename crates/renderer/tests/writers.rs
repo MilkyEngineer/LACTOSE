@@ -1,10 +1,13 @@
 //! `ExtractSink::write` from several jobs (`README.md`, "Writers", "Concurrency"): the units
 //! of one graph node write disjoint rows of one pass through one sink at once, as extract's
-//! forked jobs do, and the pass is read back with every row once.
+//! forked jobs do, and the pass is read back with every row once. A run in which no two
+//! writes overlapped shows nothing of that, so the test counts the writes in flight and runs
+//! again when it never saw two; it fails if no run of several did.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use lactose_core::Tick;
 use lactose_ecs::WorldKind;
@@ -21,6 +24,9 @@ const UNITS: u32 = 64;
 struct Writers {
     sink: Arc<ExtractSink>,
     rows: Vec<InstanceRow>,
+    /// The writes in flight, and the most seen at once.
+    in_flight: AtomicU32,
+    most: AtomicU32,
 }
 
 impl GraphNode for Writers {
@@ -37,14 +43,31 @@ impl GraphNode for Writers {
         for unit in units {
             let mine = &self.rows[unit as usize * share..(unit as usize + 1) * share];
             for batch in mine.chunks(7) {
+                let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                self.most.fetch_max(now, Ordering::Relaxed);
                 self.sink.write(batch);
+                self.in_flight.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
 }
 
+/// The runs the test makes before it fails for want of two writes at once.
+const RUNS: u32 = 20;
+
 #[test]
 fn rows_written_from_several_jobs_are_each_read_once() {
+    for run in 1..=RUNS {
+        if writes_from_several_jobs_overlapped() {
+            eprintln!("two writes overlapped in run {run}");
+            return;
+        }
+    }
+    panic!("no two writes overlapped in {RUNS} runs");
+}
+
+/// One run: whether two writes overlapped. Every row is read once whichever.
+fn writes_from_several_jobs_overlapped() -> bool {
     let desc = RendererDesc { instances: ROWS, rows: ROWS + 8, regions: 2, shaders: None };
     let mut renderer = ok(Renderer::new(null(), &desc));
     let executor = executor(4);
@@ -53,8 +76,16 @@ fn rows_written_from_several_jobs_are_each_read_once() {
     sink.begin(ExtractPass { kind: WorldKind::Server, tick: Tick(1), full: true });
     let sink = Arc::new(sink);
     let mut builder = GraphBuilder::new();
-    builder.add_node(Arc::new(Writers { sink: Arc::clone(&sink), rows: rows.clone() }));
+    let writers = Arc::new(Writers {
+        sink: Arc::clone(&sink),
+        rows: rows.clone(),
+        in_flight: AtomicU32::new(0),
+        most: AtomicU32::new(0),
+    });
+    builder.add_node(Arc::clone(&writers) as Arc<dyn GraphNode>);
     executor.block_on(executor.run_graph(builder.build().expect("one node"))).expect("the run");
+    let overlapped = writers.most.load(Ordering::Relaxed) > 1;
+    drop(writers);
     let mut sink = Arc::into_inner(sink).expect("the writers are done");
     sink.end();
     executor.shutdown();
@@ -71,4 +102,24 @@ fn rows_written_from_several_jobs_are_each_read_once() {
         .map(|n| slots.get(WorldKind::Server, key(n)).expect("every row is held"))
         .collect();
     assert_eq!(held.len(), ROWS as usize);
+    overlapped
+}
+
+/// A sink holds the ring's state and the device, so it outlives its renderer: its writes
+/// go on to buffers the renderer destroyed, which null refuses and the sink counts as
+/// dropped, and the device lives until the sink is dropped (`README.md`, "Writers").
+#[test]
+fn a_sink_outlives_its_renderer() {
+    let device = null();
+    let weak = Arc::downgrade(&device);
+    let desc = RendererDesc { instances: 2, rows: 16, regions: 2, shaders: None };
+    let renderer = ok(Renderer::new(device, &desc));
+    let mut sink = renderer.sink();
+    drop(renderer);
+    sink.begin(ExtractPass { kind: WorldKind::Server, tick: Tick(1), full: true });
+    sink.write(&[row(1, 1.0)]);
+    sink.end();
+    assert!(weak.upgrade().is_some(), "the sink holds the device after its renderer's drop");
+    drop(sink);
+    assert!(weak.upgrade().is_none(), "the device is dropped with the last sink");
 }

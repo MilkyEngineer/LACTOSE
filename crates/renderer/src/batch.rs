@@ -38,8 +38,9 @@ impl KindState {
             Some(last) if last == tick => {}
             Some(last) => {
                 self.epoch += 1;
-                // Earlier by the wrapping comparison: the difference is in `1..2^31`.
-                if (1..1 << 31).contains(&last.0.wrapping_sub(tick.0)) {
+                // Earlier as present-api's `tick_before` has it: the difference from `last`
+                // is at least 2^31, so a tick exactly 2^31 back is earlier.
+                if tick.0.wrapping_sub(last.0) >= 1 << 31 {
                     self.dropped = Some(self.epoch);
                 }
             }
@@ -403,11 +404,10 @@ impl Builder {
             assert!(stamp.named != run, "a run of the batch names slot {:?} twice", entry.slot);
             stamp.named = run;
         }
-        // At most `instances + 2 * rows` entries. A batch range cannot name an entry past
-        // 2^32, but a batch that long needs regions of 2^31 rows, 96 GiB each, which no
-        // device makes; were one made, this stops the frame rather than wrap.
+        // At most `instances + 2 * rows` entries, which `Renderer::new` refuses past
+        // `u32::MAX`, so the `expect` is an assertion that cannot fail.
         let mut at = first;
-        let end = u32::try_from(entries.len()).expect("a batch below 2^32 entries");
+        let end = u32::try_from(entries.len()).expect("`new` bounds a batch at `u32::MAX`");
         while at < end {
             let count = (end - at).min(self.per_dispatch);
             dispatches.push(BatchRange { first: at, count });
