@@ -19,10 +19,9 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 xxhash-rust = { workspace = true, features = ["xxh64"] }
 
-# The thread-class test reads the system's build to know whether it can read a thread's
-# power-throttling state back.
+# The thread-class test reads a thread's power-throttling state back through the kernel.
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_System_SystemInformation"] }
+windows-sys = { workspace = true, features = ["Wdk_System_Threading"] }
 
 [lints]
 workspace = true

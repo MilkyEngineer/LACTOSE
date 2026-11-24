@@ -73,5 +73,12 @@ comments rely on. The crate's tests run under Miri.
   values and affects only the calling thread.
 - `SetThreadInformation` with `ThreadPowerThrottling` reads a `THREAD_POWER_THROTTLING_STATE`
   from a live local, passed with its own size, and affects only the calling thread, named by
-  the pseudo-handle `GetCurrentThread` returns. The Windows test reads the state back through
-  `GetThreadInformation` into a local of the same type and size.
+  the pseudo-handle `GetCurrentThread` returns. `GetLastError` after a refused call reads the
+  calling thread's own last error.
+- The Windows test reads the state back with `NtQueryInformationThread` and the kernel's class
+  49 (`ThreadPowerThrottlingState`), which `windows-sys` does not name. The number is safe to
+  use even if it were wrong: the call writes at most the size passed, which is the size of the
+  live local `THREAD_POWER_THROTTLING_STATE` it is given, and no returned length is asked for.
+  A wrong number could yield a wrong status or wrong masks, never a write outside that local,
+  and every field of the structure is valid for any bit pattern. The test fails on any status
+  but success and the refusals of the class.
