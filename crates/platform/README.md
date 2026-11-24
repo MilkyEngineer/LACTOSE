@@ -635,10 +635,10 @@ destroy is caught too.
   `lactose-rhi-vulkan` as a dev-dependency and its `swapchain-copies` feature; each case
   passes, saying it skipped, where the device is `Unsupported`.)
 - The swapchain a shipped build makes: with the device's copies turned off, its images are
-  colour attachments alone, which MoltenVK makes framebuffer-only. A copy from the first image
-  acquired is refused at its submit with `Rule::Usage`, before any driver call, and then 36
-  frames are presented, each image cleared and nothing read back, none stale, with no message
-  and no driver line.
+  colour attachments alone, which MoltenVK makes framebuffer-only. A present of the first
+  image acquired whose encoder copies it is refused with `Rule::Usage`, with nothing
+  submitted, and then 36 frames are presented, each image cleared and nothing read back, none
+  stale, with no message and no driver line.
   (`window`: `a_swapchain_without_copies_presents_on_the_window`.)
 - Frames are presented to a window `set_minimised` minimised, for 8 s, while workers draw
   targets the present thread does not hold and each of their submits completes; after the

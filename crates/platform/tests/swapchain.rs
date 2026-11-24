@@ -1046,11 +1046,12 @@ fn report(record: &Record, bound: Duration, apart: Duration) -> Result<()> {
 }
 
 /// The swapchain as a shipped build makes it: the device's copies turned off, so that its
-/// images are colour attachments alone, which MoltenVK makes framebuffer-only. A copy from
-/// the first image acquired is refused at its submit as an image used outside its usage,
-/// before any driver call. Then frames are presented, each image cleared to its frame's
-/// colour on the present queue and nothing read back, none of them stale, and the swapchain
-/// is dropped on the present thread; nothing is sent to the sink.
+/// images are colour attachments alone, which MoltenVK makes framebuffer-only. A present of
+/// the first image acquired whose encoder copies it is refused as an image used outside its
+/// usage, with nothing submitted, and the image is still the acquired one. Then frames are
+/// presented, each image cleared to its frame's colour on the present queue and nothing read
+/// back, none of them stale, and the swapchain is dropped on the present thread; nothing is
+/// sent to the sink.
 pub(crate) fn a_swapchain_without_copies_presents_on_the_window() -> Result<()> {
     const CASE: &str = "a_swapchain_without_copies_presents_on_the_window";
     const FRAMES: u64 = 36;
@@ -1080,16 +1081,16 @@ pub(crate) fn a_swapchain_without_copies_presents_on_the_window() -> Result<()> 
         )??;
         let copy = copy.err().map(|error| (Rule::of(&error), error.to_string()));
         println!(
-            "stage: the copy from the first image answered {copy:?}; {presents} presents \
-             ({stale} stale) of {FRAMES} frames at {extent:?}, cleared and not read back, on \
-             {on:?}; the swapchain was dropped there"
+            "stage: the present that copies the first image answered {copy:?}; {presents} \
+             presents ({stale} stale) of {FRAMES} frames at {extent:?}, cleared and not read \
+             back, on {on:?}; the swapchain was dropped there"
         );
         wait(thread.stop())?;
         device.destroy_buffer(copied)?;
         drop_on_the_main_thread(&main, device)?;
         assert_eq!(on.as_deref(), Some("present"));
         let Some((rule, refusal)) = copy else {
-            panic!("the copy from an image without copies was submitted");
+            panic!("a present that copies an image without copies was taken");
         };
         assert_eq!(rule, Some(Rule::Usage), "{refusal}");
         assert!(refusal.contains("an image used outside its usage"), "{refusal}");
@@ -1103,9 +1104,9 @@ pub(crate) fn a_swapchain_without_copies_presents_on_the_window() -> Result<()> 
 
 /// `frames` frames presented on a swapchain made at `extent`, each image cleared alone, on
 /// the present thread; the swapchain is made again where an acquire or a present is stale.
-/// Before the first frame, a copy of the first image acquired into `copied` is submitted on
-/// an encoder of its own. What that submit answered, the presents, and the stale ones among
-/// them.
+/// Before the first frame, the first image acquired is presented with an encoder that copies
+/// it into `copied` and does nothing else. What that present answered, the frames' presents,
+/// and the stale ones among them.
 fn cleared_frames(
     device: &VulkanDevice,
     extent: Extent,
@@ -1135,13 +1136,18 @@ fn cleared_frames(
             let region = [BufferImageCopy { buffer_offset: 0, mip: 0, layer: 0, rect }];
             encoder.copy_image_to_buffer(image, copied, &region);
             let mut encoders = [encoder];
-            copy = Some(
-                device.submit(P, Submit { encoders: &mut encoders, waits: &[], signals: &[] }),
-            );
+            let answer = swapchain
+                .present(image, Submit { encoders: &mut encoders, waits: &[], signals: &[] });
             // Submitted only where the image takes copies; then the frames' last point,
             // later on the same queue, is reached after it.
             let [encoder] = encoders;
             kept.push(encoder);
+            let presented = answer.is_ok();
+            copy = Some(answer.map(drop));
+            // A refused present leaves the image acquired; a present taken does not.
+            if presented {
+                continue;
+            }
         }
         let frame = presents + 1;
         let mut encoder = device.create_encoder(P, "present")?;

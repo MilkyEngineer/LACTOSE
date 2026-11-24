@@ -362,9 +362,10 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   `swapchain-copies` feature allows, the image cleared first to a colour its target is not,
   so that only the copy makes the two equal; each id reported once and in order, the call's
   bound held at every call; with the copies turned off, the images colour attachments
-  alone, which MoltenVK makes framebuffer-only, a copy from one refused with `Rule::Usage`
-  before any driver call and 36 frames presented, none stale, with no message and no driver
-  line; and frames presented to a minimised window for 8 s while workers draw.
+  alone, which MoltenVK makes framebuffer-only, a present whose encoder copies one refused
+  with `Rule::Usage`, with nothing submitted, and 36 frames presented, none stale, with no
+  message and no driver line; and frames presented to a minimised window for 8 s while
+  workers draw.
   `cargo xtask gpu` does not run them; the window run does, on the driver the loader finds.
 - Unit tests in `src/pipeline.rs`: the workgroup a module states for an entry point, no size,
   two sizes or the built-in state no workgroup, an entry declared by its name and its stage's
