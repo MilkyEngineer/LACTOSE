@@ -28,6 +28,8 @@ use crate::records::{
     BlockRec, BufferRec, ImageRec, PipelineRec, QUEUES, Records, Stamps, TimelineRec, queue_index,
     stale,
 };
+use crate::surface::Target;
+use crate::swapchain::{Left, SwapchainObj, VulkanSwapchain};
 use crate::table::Table;
 use crate::{lock, submit};
 
@@ -187,9 +189,46 @@ pub(crate) struct ImageObj {
     pub(crate) sampled: Option<vk::ImageView>,
     /// A view of each mip of each layer an attachment names, by `layer * mips + mip`.
     pub(crate) views: Vec<vk::ImageView>,
+    /// For one of a swapchain's images, the driver swapchain that owns the image, held so
+    /// that it is destroyed only after the image's last user lets go; the object owns its
+    /// views.
+    pub(crate) swapchain: Option<Arc<SwapchainObj>>,
 }
 
 impl ImageObj {
+    /// The object of one of a swapchain's images, with its attachment view: a colour
+    /// attachment of one mip and one layer, owned by the present queue's family, made for
+    /// `usage`.
+    pub(crate) fn swapchain_image(
+        raw: &Arc<Raw>,
+        owner: &Arc<SwapchainObj>,
+        image: vk::Image,
+        format: Format,
+        usage: ImageUsage,
+        extent: Extent,
+    ) -> Result<Self> {
+        let mut object = Self {
+            raw: Arc::clone(raw),
+            image,
+            memory: None,
+            _block: None,
+            format,
+            extent,
+            mips: 1,
+            layers: 1,
+            usage,
+            memoryless_request: false,
+            memoryless: false,
+            placed: false,
+            exclusive: true,
+            sampled: None,
+            views: Vec::new(),
+            swapchain: Some(Arc::clone(owner)),
+        };
+        make_views(&raw.device, &mut object)?;
+        Ok(object)
+    }
+
     pub(crate) fn mip_extent(&self, mip: u32) -> Extent {
         Extent {
             width: (self.extent.width >> mip.min(31)).max(1),
@@ -208,10 +247,14 @@ impl Drop for ImageObj {
             return;
         }
         // SAFETY: as `BufferObj`'s; no slot holds the image (`pending`), and its block, if
-        // any, is freed after it.
+        // any, is freed after it. A swapchain's image is its driver swapchain's to destroy,
+        // which this object's count keeps until the views are gone.
         unsafe {
             for view in self.sampled.iter().chain(&self.views) {
                 self.raw.device.destroy_image_view(*view, None);
+            }
+            if self.swapchain.is_some() {
+                return;
             }
             self.raw.device.destroy_image(self.image, None);
             if let Some(memory) = self.memory {
@@ -288,10 +331,10 @@ struct HeapState {
 
 /// What a device, its encoders and its submits share.
 ///
-/// The locks, in the one order any call takes them: a queue's (`queues`) or the heap's
-/// (`heap_state`), never both and never two queues'; then the records' (`records`); then
-/// one entry's, a handle's in a table or a heap slot's (`slots`). Recording takes an entry's
-/// lock alone. No lock but a queue's or the heap's is held across a driver call, and none
+/// The locks, in the one order any call takes them: a queue's (`queues`), the heap's
+/// (`heap_state`) or the swapchain's leftovers' (`left`), never two of them; then the
+/// records' (`records`); then one entry's, a handle's in a table or a heap slot's
+/// (`slots`). Recording takes an entry's lock alone. No lock but a queue's or the heap's is held across a driver call, and none
 /// across a wait or the caller's closure. A destroying call is one: the last count of a
 /// driver object is dropped, and a reaped sampler destroyed, once the records', entry and
 /// slot locks are given up.
@@ -305,9 +348,14 @@ pub(crate) struct Shared {
     /// Taken by a submit through its checks, its driver call and its hold after.
     pub(crate) queues: [Mutex<()>; QUEUES],
     heap_state: Mutex<HeapState>,
+    /// What a swapchain let go of that a submit or an encoder may still use.
+    pub(crate) left: Mutex<Left>,
     pub(crate) heap: Heap,
     pub(crate) records: Mutex<Records>,
     lost: AtomicBool,
+    /// Whether a swapchain made now takes copies into its images' usage: from the
+    /// `swapchain-copies` feature, and turned off by `VulkanDevice::set_swapchain_copies`.
+    pub(crate) copies: AtomicBool,
     /// The device objects and encoders that hold the device (`hold`).
     holders: Holders,
     pub(crate) buffers: Table<BufferObj>,
@@ -340,7 +388,8 @@ impl Shared {
     }
 
     /// A holder's drop. The last waits for the device to idle, as the contract's last drop
-    /// waits for every submit, and destroys the samplers and the orphaned pools; one made
+    /// waits for every submit, and destroys the samplers, the orphaned pools and what a
+    /// swapchain left; one made
     /// while the thread unwinds a panic with a submit pending leaks the device instead, and
     /// one made so with none pending tears down as any other.
     pub(crate) fn let_go(&self) {
@@ -348,6 +397,14 @@ impl Shared {
         // holder's wait for idle, which needs every queue of the device externally
         // synchronised (`Holders::let_go`).
         if !self.holders.let_go() {
+            return;
+        }
+        // A leaking device waits for nothing and destroys nothing: what may be in use stays
+        // so for the life of the process. What `left` holds is let go here, after
+        // `Holders::let_go`'s acquire, so that each object's drop sees the flag.
+        if self.raw.leaking() {
+            let left = core::mem::take(&mut *lock(&self.left));
+            drop(left);
             return;
         }
         if std::thread::panicking() {
@@ -381,6 +438,10 @@ impl Shared {
                 device.destroy_command_pool(pool, None);
             }
         }
+        drop(guard);
+        // As above: no submit names the images, and no present reads them.
+        let left = core::mem::take(&mut *lock(&self.left));
+        drop(left);
     }
 
     /// The families a resource of `sharing` is made concurrent across: none for an
@@ -575,17 +636,38 @@ impl VulkanDevice {
     /// `ErrorKind::Unsupported` where no loader is found, the adapter lacks a feature of the
     /// required set (named in the message), its limits are below
     /// [`Capabilities::LEAST`]'s or below the heap and sampler table asked for, or the request
-    /// has a surface: this device presents to no window yet. `ErrorKind::NotFound` for an
-    /// adapter no name of the loader's contains. A driver's failure as its kind. A
-    /// pipeline cache that fails a check starts the cache empty and is no error.
+    /// has a surface the instance or adapter cannot present to (no swapchain or surface
+    /// maintenance extension or feature, no queue family that both draws and presents to
+    /// it, a handle of another kind or missing what its kind needs, an AppKit view off the
+    /// main thread). `ErrorKind::NotFound` for an adapter no name of the loader's contains. A
+    /// driver's failure as its kind. A pipeline cache that fails a check starts the cache
+    /// empty and is no error.
     pub fn new(request: DeviceRequest) -> Result<Self> {
+        let target = request.surface.as_ref().map(|source| Target::Window(Arc::clone(source)));
+        Self::open(&request, target)
+    }
+
+    /// Makes a device as [`new`](Self::new) does that presents to a surface no window shows
+    /// (`VK_EXT_headless_surface`), for tests that need a swapchain and no window. Its
+    /// swapchain's images reach no display, and it reports no display times.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new)'s; `ErrorKind::InvalidData` for a request that names a window,
+    /// which is the caller's error, and `ErrorKind::Unsupported` too where the driver offers
+    /// no headless surface.
+    pub fn headless(request: DeviceRequest) -> Result<Self> {
         if request.surface.is_some() {
             return Err(Error::new(
-                ErrorKind::Unsupported,
-                "a Vulkan device that presents: the swapchain is not built yet",
+                ErrorKind::InvalidData,
+                "a headless device for a request that names a window",
             ));
         }
-        let opened = raw::open(&request)?;
+        Self::open(&request, Some(Target::Headless))
+    }
+
+    fn open(request: &DeviceRequest, target: Option<Target>) -> Result<Self> {
+        let opened = raw::open(request, target)?;
         let caps = opened.caps;
         let heap = Heap::new(&opened.raw, caps.heap_slots, caps.samplers, caps.colour_attachments)?;
         let (cache, start) =
@@ -602,9 +684,11 @@ impl VulkanDevice {
                 retired: Vec::new(),
                 orphans: Vec::new(),
             }),
+            left: Mutex::new(Left::default()),
             heap,
             records: Mutex::new(Records::new(caps.heap_slots, caps.samplers, start)),
             lost: AtomicBool::new(false),
+            copies: AtomicBool::new(cfg!(feature = "swapchain-copies")),
             holders: Holders::new(),
             buffers: Table::new(),
             images: Table::new(),
@@ -618,9 +702,21 @@ impl VulkanDevice {
         Ok(Self { shared: Arc::new(shared) })
     }
 
-    /// What the device holds, for the thread-safety canary's call below the contract.
+    /// Whether a swapchain made after this call has copies in its images' usage, which the
+    /// `swapchain-copies` feature turns on: off, the images are colour attachments alone, as
+    /// the contract names them, for a window test that presents as a shipped build does.
+    #[doc(hidden)]
+    #[cfg(feature = "swapchain-copies")]
+    pub fn set_swapchain_copies(&self, on: bool) {
+        // Relaxed: read by a later `create_swapchain` or `resize`, which the caller orders
+        // after this call.
+        self.shared.copies.store(on, Ordering::Relaxed);
+    }
+
+    /// What the device holds, for the unit tests' calls below the contract: the
+    /// thread-safety canary's, and the swapchain's injected reuse.
     #[cfg(test)]
-    pub(crate) fn shared(&self) -> &Shared {
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
         &self.shared
     }
 
@@ -835,39 +931,37 @@ impl VulkanDevice {
         unsafe { self.shared.raw.device.get_device_image_memory_requirements(&request, &mut out) };
         out.memory_requirements
     }
+}
 
-    /// Makes the views of an image: the heap's and one for each attachment subresource.
-    fn views(&self, object: &mut ImageObj) -> Result<()> {
-        let device = &self.shared.raw.device;
-        let view = |mip: u32, mips: u32, layer: u32| {
-            let range = vk::ImageSubresourceRange::default()
-                .aspect_mask(aspect(object.format))
-                .base_mip_level(mip)
-                .level_count(mips)
-                .base_array_layer(layer)
-                .layer_count(1);
-            let info = vk::ImageViewCreateInfo::default()
-                .image(object.image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(convert::format(object.format))
-                .subresource_range(range);
-            // SAFETY: the image is live and bound, and the range within it.
-            unsafe { device.create_image_view(&info, None) }
-                .map_err(|e| driver(e, "vkCreateImageView"))
-        };
-        if object.usage.contains(ImageUsage::SAMPLED) {
-            object.sampled = Some(view(0, object.mips, 0)?);
-        }
-        if object.usage.contains(ImageUsage::COLOUR) || object.usage.contains(ImageUsage::DEPTH) {
-            for layer in 0..object.layers {
-                for mip in 0..object.mips {
-                    let made = view(mip, 1, layer)?;
-                    object.views.push(made);
-                }
+/// Makes the views of an image: the heap's and one for each attachment subresource.
+fn make_views(device: &ash::Device, object: &mut ImageObj) -> Result<()> {
+    let view = |mip: u32, mips: u32, layer: u32| {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(aspect(object.format))
+            .base_mip_level(mip)
+            .level_count(mips)
+            .base_array_layer(layer)
+            .layer_count(1);
+        let info = vk::ImageViewCreateInfo::default()
+            .image(object.image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(convert::format(object.format))
+            .subresource_range(range);
+        // SAFETY: the image is live and bound, and the range within it.
+        unsafe { device.create_image_view(&info, None) }.map_err(|e| driver(e, "vkCreateImageView"))
+    };
+    if object.usage.contains(ImageUsage::SAMPLED) {
+        object.sampled = Some(view(0, object.mips, 0)?);
+    }
+    if object.usage.contains(ImageUsage::COLOUR) || object.usage.contains(ImageUsage::DEPTH) {
+        for layer in 0..object.layers {
+            for mip in 0..object.mips {
+                let made = view(mip, 1, layer)?;
+                object.views.push(made);
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 impl Drop for VulkanDevice {
@@ -1095,6 +1189,7 @@ impl Device for VulkanDevice {
             exclusive: desc.sharing == Sharing::Exclusive,
             sampled: None,
             views: Vec::new(),
+            swapchain: None,
         };
         // SAFETY: the image is live.
         let actual = unsafe { device.get_image_memory_requirements(image) };
@@ -1119,7 +1214,7 @@ impl Device for VulkanDevice {
                     .map_err(|e| driver(e, "vkBindImageMemory"))?;
             }
         }
-        self.views(&mut object)?;
+        make_views(device, &mut object)?;
         let handle = {
             let mut records = self.records();
             alive(&records)?;
@@ -1127,7 +1222,12 @@ impl Device for VulkanDevice {
             if let Some(handle) = placed {
                 records.blocks.live_mut(handle, "a memory block")?.images += 1;
             }
-            records.images.insert(ImageRec { stamps: [0; QUEUES], slots: 0, placed })?
+            records.images.insert(ImageRec {
+                stamps: [0; QUEUES],
+                slots: 0,
+                placed,
+                swapchain: false,
+            })?
         };
         self.shared.images.insert(handle, Arc::new(object));
         Ok(handle)
@@ -1136,6 +1236,9 @@ impl Device for VulkanDevice {
     fn destroy_image(&self, image: ImageHandle) -> Result<()> {
         let mut records = self.shared.settled();
         let rec = records.images.live(image, "an image")?;
+        if rec.swapchain {
+            return Err(Rule::Swapchain.refuse("a destroy of a swapchain's image"));
+        }
         if !records.lost {
             if rec.slots > 0 {
                 return Err(Rule::Pending.refuse("an image a heap slot holds, destroyed"));
@@ -1517,9 +1620,8 @@ impl Device for VulkanDevice {
         submit::submit(&self.shared, queue, submit)
     }
 
-    fn create_swapchain(&self, _desc: &SwapchainDesc) -> Result<Box<dyn Swapchain>> {
-        alive(&self.records())?;
-        Err(Error::new(ErrorKind::Unsupported, "a swapchain of a device made with no surface"))
+    fn create_swapchain(&self, desc: &SwapchainDesc) -> Result<Box<dyn Swapchain>> {
+        Ok(Box::new(VulkanSwapchain::new(&self.shared, desc.extent)?))
     }
 }
 

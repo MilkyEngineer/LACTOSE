@@ -735,9 +735,18 @@ impl Encoder for VulkanEncoder {
             if transition.to.state == ImageState::Undefined {
                 continue;
             }
+            // A swapchain's image is presented from `PRESENT_SRC_KHR`; any other image a
+            // caller moves to `Present` is in `GENERAL` (`convert::image_scope`).
+            let scope = |state: ImageState| {
+                let mut scope = image_scope(state);
+                if state == ImageState::Present && object.swapchain.is_some() {
+                    scope.layout = vk::ImageLayout::PRESENT_SRC_KHR;
+                }
+                scope
+            };
             let change = self.change(
-                image_scope(transition.from.state),
-                image_scope(transition.to.state),
+                scope(transition.from.state),
+                scope(transition.to.state),
                 (transition.from.queue, transition.to.queue),
                 transition.from.state == ImageState::Undefined,
                 object.exclusive,

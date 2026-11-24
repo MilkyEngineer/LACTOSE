@@ -289,11 +289,15 @@ const SHADERS: &str = "shaders";
 const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
 /// The device tests the Vulkan step runs: each package, its test target (`None` for its
 /// library's unit tests) and the prefix of the names taken, whose ignored tests are the ones
-/// that need a device. The library's are its `canary` module's alone: the thread-safety
-/// canary, whose unlocked driver call no safe call can make. The render graph's are its
-/// `device` module's.
-const DEVICE_TESTS: [(&str, Option<&str>, &str); 3] = [
+/// that need a device. The library's are its `canary` module's, the thread-safety canary,
+/// whose unlocked driver call no safe call can make, and its `swapchain` module's, which
+/// inject what no safe call makes (an acquire semaphore's reuse, a present fence that never
+/// signals, a failed `resize`, a present the driver refuses) or watch what none reports (a
+/// present's walk left undecided, a driver swapchain kept for a submit an encoder dropped
+/// while unwinding left pending). The render graph's are its `device` module's.
+const DEVICE_TESTS: [(&str, Option<&str>, &str); 4] = [
     ("lactose-rhi-vulkan", None, "canary::"),
+    ("lactose-rhi-vulkan", None, "swapchain::"),
     ("lactose-rhi-vulkan", Some("integration"), ""),
     ("lactose-render-graph", Some("integration"), "device::"),
 ];
@@ -1048,13 +1052,25 @@ mod tests {
     }
 
     #[test]
-    fn the_librarys_unit_tests_run_as_device_tests_by_the_canary_module_alone() {
+    fn the_device_tests_are_rhi_vulkans_canary_and_swapchain_modules_and_two_test_targets() {
         let library: Vec<&str> = DEVICE_TESTS
             .iter()
             .filter(|(_, target, _)| target.is_none())
             .map(|(_, _, prefix)| *prefix)
             .collect();
-        assert_eq!(library, ["canary::"]);
+        assert_eq!(library, ["canary::", "swapchain::"]);
+        // Each test target by its name too: another binary's name would run the wrong one.
+        let targets: Vec<(&str, &str, &str)> = DEVICE_TESTS
+            .iter()
+            .filter_map(|(package, target, prefix)| Some((*package, (*target)?, *prefix)))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                ("lactose-rhi-vulkan", "integration", ""),
+                ("lactose-render-graph", "integration", "device::")
+            ]
+        );
     }
 
     #[test]

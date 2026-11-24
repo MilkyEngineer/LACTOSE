@@ -1,8 +1,10 @@
-//! The surface and the swapchain: where a window comes in, and what the present thread
-//! holds.
+//! The surface and the swapchain: where a window comes in, what the present thread holds,
+//! and when its presents reached the display.
 //!
 //! A surface is made from `raw-window-handle`'s types, so that a backend names the
 //! windowing crate's handles and never `lactose-platform` (`README.md`, "The surface").
+
+use std::time::Instant;
 
 use lactose_core::Result;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -63,6 +65,24 @@ pub enum Presented {
     /// On Vulkan, `VK_ERROR_OUT_OF_DATE_KHR`, and `VK_ERROR_OUT_OF_POOL_MEMORY` after
     /// MoltenVK's drawable timeout.
     Stale,
+}
+
+/// The id of a present the swapchain took, `Presented::Shown` or `Stale`: one for its first
+/// and one more for each after it, which a `resize` does not restart. A present that was
+/// refused, or that returned `ErrorKind::DeviceLost`, took none.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct PresentId(pub u64);
+
+/// When a present's image reached the display, as the swapchain's source reports it
+/// (`README.md`, "The display-time report").
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DisplayTime {
+    /// The present it reports.
+    pub present: PresentId,
+    /// The instant its source names, on the host's monotonic clock, which `Instant` reads.
+    /// Each backend's README states which instant it is, how late a report may arrive after
+    /// it, and the error of its reading against `Instant`.
+    pub shown: Instant,
 }
 
 /// A device's swapchain, which one thread holds: the present thread.
@@ -137,4 +157,20 @@ pub trait Swapchain: Send {
     /// extent with a zero dimension ([`Rule::Bounds`](crate::Rule::Bounds)). Both on every
     /// backend.
     fn resize(&mut self, extent: Extent) -> Result<()>;
+
+    /// The id of the last present taken ([`PresentId`]): read after a `present` returns
+    /// `Ok`, it is that present's. `None` before the first.
+    fn last_present(&self) -> Option<PresentId>;
+
+    /// Appends to `into` the display times that arrived since the last call, oldest first:
+    /// each present's id once at most, in increasing order. It allocates nothing once `into`
+    /// has room. `false` from the swapchain's creation on where its device has no source of
+    /// display times, and nothing appended; `true` where it has one, whether or not anything
+    /// arrived. It never waits and reaches no queue, and returns within the bound its
+    /// backend's README states. It is called on the thread that presents, between that
+    /// thread's other calls of the swapchain, since every source's read is synchronised
+    /// with the acquire and the present. A present the display never took may be left out
+    /// or reported; each backend's README says which, and a report of a later id covers it
+    /// either way (`README.md`, "The display-time report").
+    fn display_times(&mut self, into: &mut Vec<DisplayTime>) -> bool;
 }

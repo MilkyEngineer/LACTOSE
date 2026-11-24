@@ -74,6 +74,8 @@ crates = ["lactose-rhi-null", "lactose-rhi-vulkan"]
 "lactose-asset-api" = ["conformance"]
 # rhi-api's `conformance` builds the backend conformance suite: its cases and its harness.
 "lactose-rhi-api" = ["conformance"]
+# rhi-vulkan's swapchain-copies adds copies to a swapchain image's usage, for a window test's readback.
+"lactose-rhi-vulkan" = ["swapchain-copies"]
 
 [boundary]
 # Crates inside the determinism boundary. clippy.toml and the allowlists below apply here.

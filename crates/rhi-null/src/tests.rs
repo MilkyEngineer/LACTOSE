@@ -14,7 +14,7 @@ use lactose_rhi_api::{
     BufferUsage, Capabilities, ColourAttachment, ComputePass, ComputePipelineDesc, CookedShader,
     Device, DeviceRequest, Encoder, Extent, HeapSlot, ImageDesc, ImageHandle, ImageMemory,
     ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryClass, Message, MessageSink,
-    PassReach, Presented, QueueLayout, QueueRole, Rect, RenderPass, Rule, ShaderStage,
+    PassReach, Presented, QueueLayout, QueuePath, QueueRole, Rect, RenderPass, Rule, ShaderStage,
     ShaderTarget, Sharing, StageDesc, StateOn, Store, Submit, Swapchain, SwapchainDesc, Target,
     TimelineHandle, TimelinePoint,
 };
@@ -754,4 +754,49 @@ fn a_signal_2_31_above_a_value_the_caller_has_not_seen_is_accepted() {
     let f = device.create_timeline(0).expect("a timeline");
     submit(&device, C, &[], &[at(f, 1)]).expect("f = 1, run and unseen");
     submit(&device, C, &[], &[at(f, LIMIT)]).expect("2^31 from 0, within it from 1");
+}
+
+/// The present thread held inside `present`, its submit committed and its queue's lock
+/// taken (`PresentHeld`), while another thread's graphics submits each complete: a frame
+/// submit takes its own queue's lock alone. Where the present role has a queue of its own;
+/// where it shares the graphics queue, a frame submit waits for that lock by design.
+#[test]
+fn frame_submits_complete_while_a_present_holds_its_queue() {
+    let compute_shared = QueueLayout { compute: QueuePath::Shared, present: QueuePath::Own };
+    for queues in [QueueLayout::SEVERAL, compute_shared] {
+        let device = device(queues, true);
+        let (mut swapchain, image) = swapchain(&device);
+        let finished = device.create_timeline(0).expect("a timeline");
+        let twin = device.twin();
+        let (done, outcome) = mpsc::channel::<bool>();
+        let held = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&held);
+        let once = AtomicBool::new(false);
+        *lock(&device.shared().between) = Some(Arc::new(Mutex::new(move |reached| {
+            if reached != Between::PresentHeld || once.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            // The present thread stays here, its queue's lock taken, until the frame
+            // thread's submits have each completed or the patience runs out.
+            let frame = twin.twin();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut all = true;
+                for value in 1..=8 {
+                    all &= submit(&frame, G, &[], &[at(finished, value)]).is_ok()
+                        && frame.wait_timeline(at(finished, value), PATIENCE).unwrap_or(false);
+                }
+                let _ = done.send(all);
+            });
+            *lock(&seen) = Some(outcome.recv_timeout(Duration::from_secs(5)));
+        })));
+        let mut encoder = [frame(&device, image)];
+        let shown = present(&mut *swapchain, &mut encoder, image, &[]).expect("the present");
+        assert_eq!(shown, Presented::Shown);
+        *lock(&device.shared().between) = None;
+        let got = lock(&held).take().expect("the hook ran");
+        assert_eq!(got, Ok(true), "under {queues:?}, the frame's submits beside the held present");
+        drop(encoder);
+        drop(swapchain);
+    }
 }

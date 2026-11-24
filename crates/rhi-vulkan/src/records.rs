@@ -171,6 +171,8 @@ pub(crate) struct ImageRec {
     pub(crate) slots: u32,
     /// The block it is placed in.
     pub(crate) placed: Option<MemoryBlockHandle>,
+    /// One of the swapchain's images, which the swapchain alone destroys.
+    pub(crate) swapchain: bool,
 }
 
 pub(crate) struct BlockRec {
@@ -253,6 +255,26 @@ pub(crate) struct Records {
     pub(crate) samplers: Vec<bool>,
     pub(crate) queues: [QueueRec; QUEUES],
     pub(crate) stats: PipelineStats,
+    /// The device's swapchain lives.
+    pub(crate) swapchain: bool,
+}
+
+/// What a present's walk of the records decided of its submit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Release {
+    /// Every point it depends on is known reached, or promised by a released submit.
+    Released,
+    /// The walk could not decide this point: no released promise meets it, or the walk
+    /// came back to a submit it was still deciding, and this is the point it came back
+    /// from. The present waits for it with no lock held and walks again.
+    Undecided(TimelinePoint),
+}
+
+/// What a release walk has decided: for each queue, every submit through `decided` is
+/// released, and the submits from `deciding` on are still being decided.
+struct Walk {
+    decided: Stamps,
+    deciding: [Option<u64>; QUEUES],
 }
 
 impl Records {
@@ -275,6 +297,7 @@ impl Records {
                 stage_misses: 0,
                 creation: core::time::Duration::ZERO,
             },
+            swapchain: false,
         }
     }
 
@@ -657,6 +680,97 @@ impl Records {
     pub(crate) fn next_stamps(&self) -> Stamps {
         self.queues.each_ref().map(|rec| rec.next)
     }
+
+    /// Decides whether a submit to `queue` made now, waiting for `waits`, is released: each
+    /// of its waits known reached or promised by a released submit, and every earlier
+    /// submit of its queue released (`lactose-rhi-api`'s README, "The swapchain"). A
+    /// submit is released once its driver call has returned and did not fail, and its
+    /// waits and the submits before it on its queue are; the caller holds `queue`'s lock,
+    /// so every submit stamped on it has been received.
+    pub(crate) fn release(&self, queue: usize, waits: &[TimelinePoint]) -> Result<Release> {
+        let mut walk =
+            Walk { decided: self.queues.each_ref().map(|rec| rec.known), deciding: [None; QUEUES] };
+        for &wait in waits {
+            if let Some(point) = self.point(wait, &mut walk)? {
+                return Ok(Release::Undecided(point));
+            }
+        }
+        let last = self.queues[queue].next - 1;
+        if let Some(point) = self.submits(queue, last, None, &mut walk)? {
+            return Ok(Release::Undecided(point));
+        }
+        Ok(Release::Released)
+    }
+
+    /// Decides one point: `None` when it is known reached or its least promise at or above
+    /// it is released, or else the point the walk could not decide.
+    fn point(&self, point: TimelinePoint, walk: &mut Walk) -> Result<Option<TimelinePoint>> {
+        let timeline = self.timeline(point.timeline)?;
+        if timeline.known >= point.value {
+            return Ok(None);
+        }
+        // A greater promise never decides a point: every greater one depends on the least.
+        let mut least: Option<(u64, usize, &SubmitRec)> = None;
+        for (queue, rec) in self.queues.iter().enumerate() {
+            for submit in rec.submits.iter().filter(|submit| submit.seq > rec.known) {
+                for promise in &submit.signals {
+                    let meets = promise.timeline == point.timeline && promise.value >= point.value;
+                    if meets && least.is_none_or(|(value, ..)| promise.value < value) {
+                        least = Some((promise.value, queue, submit));
+                    }
+                }
+            }
+        }
+        let Some((_, queue, submit)) = least else { return Ok(Some(point)) };
+        // A failed submit's promise never reached the driver, and one whose call has not
+        // returned may yet fail.
+        if submit.failed || submit.seq > self.queues[queue].received {
+            return Ok(Some(point));
+        }
+        self.submits(queue, submit.seq, Some(point), walk)
+    }
+
+    /// Decides the submits of `queue` through `through`, in order: each is released once
+    /// its driver call has returned, its waits are and the one before it is. `via` is the
+    /// point whose promise led here; the first call of a walk, from the present's own
+    /// queue, has none and finds nothing in progress.
+    fn submits(
+        &self,
+        queue: usize,
+        through: u64,
+        via: Option<TimelinePoint>,
+        walk: &mut Walk,
+    ) -> Result<Option<TimelinePoint>> {
+        if through <= walk.decided[queue] {
+            return Ok(None);
+        }
+        // A return to a submit still being decided: its own promise, or one of a submit
+        // that depends on it, never meets its wait.
+        if walk.deciding[queue].is_some_and(|from| through >= from) {
+            return Ok(via);
+        }
+        // Every submit through `through` has been received: `point` asks only of a received
+        // one, and the walk's first call is made under its queue's lock.
+        debug_assert!(
+            through <= self.queues[queue].received,
+            "a walk of queue {queue} through {through}, past its received {}",
+            self.queues[queue].received
+        );
+        for seq in walk.decided[queue] + 1..=through {
+            // The submits from `seq` on are in progress; those before it are decided.
+            walk.deciding[queue] = Some(seq);
+            let kept = self.queues[queue].submits.iter().find(|submit| submit.seq == seq);
+            // A failed submit's stamp is reached by an empty batch that waits for nothing.
+            for &wait in kept.map_or(&[][..], SubmitRec::ordering) {
+                if let Some(point) = self.point(wait, walk)? {
+                    return Ok(Some(point));
+                }
+            }
+            walk.decided[queue] = seq;
+        }
+        walk.deciding[queue] = None;
+        Ok(None)
+    }
 }
 
 /// Whether a point of `through` is on `promise`'s timeline at or above it: a wait, of a new
@@ -677,7 +791,7 @@ fn waited_through(promise: &TimelinePoint, through: &[TimelinePoint]) -> bool {
 mod tests {
     use lactose_rhi_api::{CacheStart, ImageHandle, Rule, TimelineHandle, TimelinePoint};
 
-    use super::{DIFFERENCE_LIMIT, ImageRec, QUEUES, Records, TimelineRec};
+    use super::{DIFFERENCE_LIMIT, ImageRec, QUEUES, Records, Release, TimelineRec};
 
     fn records() -> Records {
         Records::new(4, 4, CacheStart::Empty)
@@ -1007,7 +1121,7 @@ mod tests {
         let (mut records, driver) = (records(), Driver::new());
         let image: ImageHandle = records
             .images
-            .insert(ImageRec { stamps: [0; QUEUES], slots: 0, placed: None })
+            .insert(ImageRec { stamps: [0; QUEUES], slots: 0, placed: None, swapchain: false })
             .unwrap();
         records.begin_slot_write(0, Some(image)).expect("the first hold");
         let declared = None;
@@ -1384,5 +1498,50 @@ mod tests {
         assert!(records.queues[1].submits.is_empty(), "X has left");
         let now = read(&records, &driver, &[at(c, 2)]);
         submit(&mut records, &driver, &now, 1, &[], &[at(c, 2)], false).expect("the retry");
+    }
+
+    /// A present's walk of a point another queue's submit promises: undecided while that
+    /// submit is stamped and its driver call has not returned, which may yet fail; released
+    /// once the call has returned; undecided for a submit whose call failed, whose promise
+    /// never reached the driver.
+    #[test]
+    fn a_walk_releases_a_promise_once_its_submit_is_received_and_not_failed() {
+        let (graphics, present) = (0, 2);
+        for failed in [false, true] {
+            let mut records = records();
+            let t = records.timelines.insert(TimelineRec { known: 0, mark: None }).unwrap();
+            let point = TimelinePoint { timeline: t, value: 1 };
+            let seq = records.stamp(graphics, &[], &[point]);
+            let walked = records.release(present, &[point]).unwrap();
+            assert_eq!(walked, Release::Undecided(point), "stamped and not received");
+            records.received(graphics, seq, failed);
+            let walked = records.release(present, &[point]).unwrap();
+            let expected = if failed { Release::Undecided(point) } else { Release::Released };
+            assert_eq!(walked, expected, "received, failed: {failed}");
+        }
+    }
+
+    /// A point already reached is released whatever promises it, a submit stamped and not
+    /// received among them; a promise's own waits are walked in turn.
+    #[test]
+    fn a_walk_releases_a_reached_point_and_walks_a_promises_waits() {
+        let (graphics, compute, present) = (0, 1, 2);
+        let mut records = records();
+        let mut timeline = || records.timelines.insert(TimelineRec { known: 0, mark: None });
+        let (t, gate) = (timeline().unwrap(), timeline().unwrap());
+        let at = |timeline, value| TimelinePoint { timeline, value };
+        let unreceived = records.stamp(compute, &[], &[at(t, 2)]);
+        records.fold(&[None, None, None], &[(t, 1)]);
+        assert_eq!(records.release(present, &[at(t, 1)]).unwrap(), Release::Released);
+        assert_eq!(records.release(present, &[at(t, 2)]).unwrap(), Release::Undecided(at(t, 2)));
+        records.received(compute, unreceived, false);
+        assert_eq!(records.release(present, &[at(t, 2)]).unwrap(), Release::Released);
+        // A received promise whose submit waits for a gate no one has signalled or promised.
+        let held = records.stamp(graphics, &[at(gate, 1)], &[at(t, 3)]);
+        records.received(graphics, held, false);
+        let walked = records.release(present, &[at(t, 3)]).unwrap();
+        assert_eq!(walked, Release::Undecided(at(gate, 1)));
+        records.fold(&[None, None, None], &[(gate, 1)]);
+        assert_eq!(records.release(present, &[at(t, 3)]).unwrap(), Release::Released);
     }
 }

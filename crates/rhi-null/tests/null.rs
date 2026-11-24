@@ -1,7 +1,7 @@
 //! What null alone holds, beyond the suite's cases: the device loss and the stall through
 //! [`Control`], the host read of a range the device wrote with no invalidate, the cache's
-//! start, and two races against a present: submits on two queues, and a destroy of the
-//! timeline its wait names.
+//! start, two races against a present (submits on two queues, and a destroy of the
+//! timeline its wait names), and the frame beside a present thread whose submit is held.
 
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -10,10 +10,11 @@ use std::time::Duration;
 use lactose_core::ErrorKind;
 use lactose_rhi_api::{
     Acquired, BufferCopy, BufferDesc, BufferHandle, BufferReach, BufferState, BufferTransition,
-    BufferUsage, CacheStart, Capabilities, ColourAttachment, ComputePass, Device, Encoder,
-    ImageHandle, ImageRange, ImageState, ImageTransition, Load, MemoryClass, PassReach, Presented,
-    QueueLayout, QueuePath, QueueRole, RenderPass, Rule, Sharing, StateOn, Store, Submit,
-    Swapchain, SwapchainDesc, Target, TimelinePoint,
+    BufferUsage, CacheStart, Capabilities, ColourAttachment, ComputePass, Device, Encoder, Extent,
+    Format, ImageDesc, ImageHandle, ImageMemory, ImageRange, ImageState, ImageTransition,
+    ImageUsage, Load, MemoryClass, PassReach, Presented, QueueLayout, QueuePath, QueueRole,
+    RenderPass, Rule, Sharing, StateOn, Store, Submit, Swapchain, SwapchainDesc, Target,
+    TimelinePoint,
 };
 use lactose_rhi_null::NullDevice;
 
@@ -470,5 +471,147 @@ fn a_destroy_races_a_present_wait() {
             );
             reached(device, done);
         }
+    }
+}
+
+/// An offscreen target the frame draws and the present thread samples.
+fn target(device: &dyn Device) -> ImageHandle {
+    let desc = ImageDesc {
+        label: "target",
+        format: Format::Rgba8Unorm,
+        extent: Extent { width: 8, height: 8 },
+        mips: 1,
+        layers: 1,
+        usage: ImageUsage::COLOUR.union(ImageUsage::SAMPLED),
+        memory: ImageMemory::Own,
+        sharing: Sharing::Exclusive,
+    };
+    device.create_image(&desc).expect("a target")
+}
+
+/// A frame submit on the graphics queue that takes `image` back from `Undefined`, clears it
+/// and releases it to the present role, as the frame's last submit for a target does.
+fn draw_target(
+    device: &dyn Device,
+    image: ImageHandle,
+    waits: &[TimelinePoint],
+    done: TimelinePoint,
+) -> lactose_core::Result<()> {
+    let submit = Submit { encoders: &mut [record_target(device, image)], waits, signals: &[done] };
+    device.submit(QueueRole::Graphics, submit)
+}
+
+/// The encoder of [`draw_target`]'s submit.
+fn record_target(device: &dyn Device, image: ImageHandle) -> Box<dyn Encoder> {
+    let (graphics, present) = (QueueRole::Graphics, QueueRole::Present);
+    let range = ImageRange::FIRST;
+    let on = |state, queue| StateOn { state, queue };
+    let mut encoder = device.create_encoder(graphics, "frame").expect("an encoder");
+    encoder.transition_images(&[ImageTransition {
+        image,
+        range,
+        from: on(ImageState::Undefined, graphics),
+        to: on(ImageState::ColourAttachment, graphics),
+    }]);
+    encoder.begin_render_pass(&RenderPass {
+        label: "frame",
+        colour: &[ColourAttachment {
+            target: Target { image, mip: 0, layer: 0 },
+            load: Load::Clear([0.5; 4]),
+            store: Store::Store,
+            local_read: false,
+        }],
+        depth: None,
+        reach: PassReach::NOTHING,
+    });
+    encoder.end_pass();
+    encoder.transition_images(&[ImageTransition {
+        image,
+        range,
+        from: on(ImageState::ColourAttachment, graphics),
+        to: on(ImageState::SampledRead, present),
+    }]);
+    encoder
+}
+
+/// The display's read of a presented image held (`stall`), as a drawable that does not
+/// come back holds it (decision 5.6): the present thread has taken a finished target across
+/// to the present role and presented, and nothing has seen the present's point, so its
+/// submit is pending. No lock is held across it. Meanwhile each frame submit on
+/// the graphics queue, each writing a target the present did not take, completes. A frame
+/// write of the taken target that does not wait for the present's point is refused
+/// (`queue`) where the present role has a queue of its own, and taken where the roles share
+/// one, whose order puts it behind the present ("The present thread" in `lactose-rhi-api`'s
+/// README); once the present's point is seen, a write that waits for it
+/// is taken on every layout. Then a loss with a frame in flight, and the drops after it,
+/// end cleanly. One thread plays both parts: what the records refuse does not depend on
+/// which thread submits. A present thread held inside its call, its queue's lock taken, is
+/// `src/tests.rs`'s `frame_submits_complete_while_a_present_holds_its_queue`.
+#[test]
+fn a_present_the_display_holds_lets_the_frame_finish_other_targets_and_refuses_its_own() {
+    let (graphics, present) = (QueueRole::Graphics, QueueRole::Present);
+    for queues in LAYOUTS {
+        let set = Capabilities { queues, ..Capabilities::LEAST };
+        let device = device(&set, true);
+        let control = device.control();
+        let mut swapchain = device
+            .create_swapchain(&SwapchainDesc { extent: Extent { width: 8, height: 8 } })
+            .expect("a swapchain");
+        let device: &dyn Device = &device;
+        let targets = [target(device), target(device), target(device)];
+        let finished = device.create_timeline(0).expect("a timeline");
+        let at = |value| TimelinePoint { timeline: finished, value };
+        draw_target(device, targets[0], &[], at(1)).expect("the first frame");
+        reached(device, at(1));
+        assert!(control.stall(true), "the display holds its image");
+        let image = acquire(&mut *swapchain);
+        let mut encoder = frame(device, image);
+        // The acquire of the frame's release; where one queue serves both roles, the
+        // release was the whole change.
+        let own = queues.present == QueuePath::Own;
+        if own {
+            encoder.transition_images(&[ImageTransition {
+                image: targets[0],
+                range: ImageRange::FIRST,
+                from: StateOn { state: ImageState::ColourAttachment, queue: graphics },
+                to: StateOn { state: ImageState::SampledRead, queue: present },
+            }]);
+        }
+        let read_done = point(device, 1);
+        let submit = Submit { encoders: &mut [encoder], waits: &[at(1)], signals: &[read_done] };
+        let shown = swapchain.present(image, submit).expect("the present");
+        assert_eq!(shown, Presented::Shown);
+
+        for value in 2..=9 {
+            let image = targets[1 + value as usize % 2];
+            draw_target(device, image, &[], at(value)).expect("a frame submit");
+            reached(device, at(value));
+        }
+        let taken = draw_target(device, targets[0], &[], at(10));
+        if own {
+            assert_eq!(
+                rule(&taken),
+                Some(Rule::Queue),
+                "under {queues:?} a write of the held target: {taken:?}"
+            );
+        } else {
+            taken.expect("a write the shared queue orders behind the present's read");
+            reached(device, at(10));
+        }
+        reached(device, read_done);
+        assert!(control.stall(false), "the display lets the image go");
+        draw_target(device, targets[0], &[read_done], at(11)).expect("a write after the read");
+        reached(device, at(11));
+        // The frame's encoder outlives the loss: its drop waits for a submit that has not
+        // run, and the loss ends that wait.
+        let mut flight = [record_target(device, targets[1])];
+        let unmet = point(device, 1);
+        let submit = Submit { encoders: &mut flight, waits: &[unmet], signals: &[at(12)] };
+        device.submit(graphics, submit).expect("a frame left in flight");
+        assert!(control.lose(), "the device is lost with a frame in flight");
+        let acquired = swapchain.acquire().map_err(|error| error.kind());
+        assert_eq!(acquired, Err(ErrorKind::DeviceLost), "an acquire after the loss");
+        drop(swapchain);
+        drop(flight);
     }
 }
