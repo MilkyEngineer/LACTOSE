@@ -7,10 +7,15 @@
 //! [`Renderer::prepare`](crate::Renderer::prepare), from what the writers handed over
 //! (`README.md`, "Slots").
 
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+
 use lactose_asset_api::AssetRef;
 use lactose_core::StableKey;
 use lactose_ecs::WorldKind;
 use lactose_present_api::MeshAsset;
+
+use crate::key::KeyBits;
 
 /// A render slot: the index of one instance's record in the persistent instance buffer.
 ///
@@ -56,6 +61,25 @@ pub struct SlotHolder {
 pub struct SlotTable {
     /// The most slots the table gives out: the records of the instance buffer.
     capacity: u32,
+    /// One for every slot index the table has ever given, by index: slots are given lowest
+    /// first, so these are the indices below the length.
+    records: Vec<SlotRecord>,
+    /// The slot of each instance held.
+    index: HashMap<(WorldKind, KeyBits), u32>,
+    /// The freed indices below `records.len()`, lowest first.
+    free: BinaryHeap<Reverse<u32>>,
+    /// One more than the highest held slot.
+    extent: u32,
+}
+
+/// What the table keeps for one slot index.
+pub(crate) struct SlotRecord {
+    /// The instance that holds it.
+    pub(crate) holder: Option<SlotHolder>,
+    /// The epoch of its kind ([`crate::frame`]'s base rule) in which its instance took it.
+    pub(crate) born: u64,
+    /// The epoch of its kind in which its instance's base was taken, if one was.
+    pub(crate) base: Option<u64>,
 }
 
 impl SlotTable {
@@ -68,34 +92,97 @@ impl SlotTable {
     /// How many instances hold a slot.
     #[must_use]
     pub fn live(&self) -> u32 {
-        todo!()
+        // At most `capacity` instances hold a slot.
+        self.index.len() as u32
     }
 
     /// One more than the highest slot an instance holds, or zero when none does: the
     /// instance count of the triangle pass's draw, which skips the freed slots below it.
     #[must_use]
     pub fn extent(&self) -> u32 {
-        todo!()
+        self.extent
     }
 
     /// The slot of the instance `key` in a world of `kind`, or `None` if the renderer
     /// holds no such instance.
     #[must_use]
     pub fn get(&self, kind: WorldKind, key: StableKey) -> Option<Slot> {
-        todo!()
+        self.index.get(&(kind, KeyBits::of(key))).copied().map(Slot)
     }
 
     /// The instance that holds `slot`, or `None` for a free slot and for one past the
     /// capacity.
     #[must_use]
     pub fn holder(&self, slot: Slot) -> Option<SlotHolder> {
-        todo!()
+        self.records.get(slot.0 as usize).and_then(|record| record.holder)
     }
 
     /// Every held slot with its holder, in ascending slot order.
     #[must_use]
     pub const fn iter(&self) -> SlotIter<'_> {
         SlotIter { table: self, next: 0 }
+    }
+
+    /// An empty table of `capacity` slots.
+    pub(crate) fn new(capacity: u32) -> Self {
+        Self {
+            capacity,
+            records: Vec::new(),
+            index: HashMap::new(),
+            free: BinaryHeap::new(),
+            extent: 0,
+        }
+    }
+
+    /// How many slot indices the table has ever given: every index below this.
+    pub(crate) fn given(&self) -> u32 {
+        // At most `capacity` records.
+        self.records.len() as u32
+    }
+
+    /// The slot of `key` in `kind`, from its number.
+    pub(crate) fn lookup(&self, kind: WorldKind, key: KeyBits) -> Option<u32> {
+        self.index.get(&(kind, key)).copied()
+    }
+
+    /// The record of a slot index the table has given.
+    pub(crate) fn record_mut(&mut self, slot: u32) -> &mut SlotRecord {
+        &mut self.records[slot as usize]
+    }
+
+    /// The records of every index the table has given, by index.
+    pub(crate) fn records(&self) -> &[SlotRecord] {
+        &self.records
+    }
+
+    /// Gives the lowest free slot to `holder`, born in `epoch`, or `None` when every slot
+    /// is held.
+    pub(crate) fn allocate(&mut self, holder: SlotHolder, epoch: u64) -> Option<u32> {
+        let slot = match self.free.pop() {
+            Some(Reverse(slot)) => slot,
+            None if self.given() < self.capacity => {
+                self.records.push(SlotRecord { holder: None, born: 0, base: None });
+                self.given() - 1
+            }
+            None => return None,
+        };
+        let previous = self.index.insert((holder.kind, KeyBits::of(holder.key)), slot);
+        assert!(previous.is_none(), "an instance holds two slots");
+        self.records[slot as usize] = SlotRecord { holder: Some(holder), born: epoch, base: None };
+        self.extent = self.extent.max(slot + 1);
+        Some(slot)
+    }
+
+    /// Frees a held slot.
+    pub(crate) fn release(&mut self, slot: u32) {
+        let record = &mut self.records[slot as usize];
+        let holder = record.holder.take().expect("a freed slot was held");
+        record.base = None;
+        self.index.remove(&(holder.kind, KeyBits::of(holder.key)));
+        self.free.push(Reverse(slot));
+        while self.extent > 0 && self.records[self.extent as usize - 1].holder.is_none() {
+            self.extent -= 1;
+        }
     }
 }
 
@@ -112,6 +199,13 @@ impl Iterator for SlotIter<'_> {
     type Item = (Slot, SlotHolder);
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        while self.next < self.table.extent {
+            let slot = self.next;
+            self.next += 1;
+            if let Some(holder) = self.table.records[slot as usize].holder {
+                return Some((Slot(slot), holder));
+            }
+        }
+        None
     }
 }

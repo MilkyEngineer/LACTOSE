@@ -1,19 +1,30 @@
 //! The renderer: what it is made with, and the steps a frame takes through it.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use lactose_core::Result;
+use lactose_core::{Error, ErrorKind, Result};
 use lactose_ecs::WorldKind;
-use lactose_render_graph::{BufferId, FrameDecl, ImageId, PassId};
-use lactose_rhi_api::{Device, Extent, TimelinePoint};
+use lactose_render_graph::{
+    BufferAccess, BufferId, BufferImport, BufferUse, ColourUse, ComputePassDecl, DepthUse,
+    FrameDecl, ImageId, PassId, RenderPassDecl, TransientImage,
+};
+use lactose_rhi_api::{
+    BufferDesc, BufferHandle, BufferState, BufferUsage, Device, Extent, IndexedIndirectArgs, Load,
+    MemoryClass, QueueRole, Rect, Sharing, StateOn, TimelinePoint, Viewport,
+};
 
-use crate::camera::{CameraLatch, LatchedCamera};
-use crate::feature::RenderFeature;
-use crate::scatter::ScatterBatch;
-use crate::shader::Shaders;
+use crate::batch::Builder;
+use crate::camera::{CameraData, CameraLatch, LatchedCamera};
+use crate::feature::{FeatureView, RenderFeature};
+use crate::pipeline::{self, DEPTH, Pipelines};
+use crate::scatter::{BatchRange, InstanceRecord, ScatterBatch, ScatterEntry, StagingRow};
+use crate::shader::{CLEAR, SCATTER_GROUP, Shaders, TRIANGLE};
 use crate::slots::SlotTable;
-use crate::staging::{ExtractSink, RemoteWriter, Staging};
+use crate::staging::{
+    ExtractSink, REGIONS_MAX, RemoteWriter, Staging, Unsealed, Use, kind_index, next_generation,
+};
 
 /// The target of the renderer's events: a frame's dropped rows and lost kinds at debug
 /// level, and an error from a destroy in the renderer's drop.
@@ -134,22 +145,6 @@ impl FrameStats {
     pub const fn unplaced_in(&self, kind: WorldKind) -> u32 {
         self.unplaced_by_kind[kind_index(kind)]
     }
-
-    /// The counts with `kind` marked lost. The renderer's plumbing.
-    pub(crate) const fn with_lost(mut self, kind: WorldKind) -> Self {
-        self.lost |= kind_bit(kind);
-        self
-    }
-}
-
-/// The index of `kind` among [`FrameStats`]'s counts by kind: the order of `WorldKind`'s
-/// variants, which is the order `prepare` applies the kinds in (`README.md`, "Slots").
-const fn kind_index(kind: WorldKind) -> usize {
-    match kind {
-        WorldKind::Server => 0,
-        WorldKind::Client => 1,
-        WorldKind::Prediction => 2,
-    }
 }
 
 /// The bit of [`FrameStats`]'s lost kinds that stands for `kind`.
@@ -228,6 +223,80 @@ pub struct Renderer {
     declared: AtomicU64,
     /// The providers, in registration order.
     features: Vec<Box<dyn RenderFeature>>,
+    /// The regions' buffers but their rows, which `staging` holds, and their states.
+    regions: Vec<Region>,
+    /// The open generation of the region opened last.
+    generation: u32,
+    /// The frame prepared and not yet ended.
+    frame: Option<Prepared>,
+    /// The batch of the frame last prepared.
+    entries: Vec<ScatterEntry>,
+    /// Its dispatches.
+    dispatches: Vec<BatchRange>,
+    /// What applies a sealed region to the slot table.
+    builder: Builder,
+    /// The persistent instance buffer: `instances` records in `MemoryClass::Device`.
+    instances: BufferHandle,
+    /// The built-in triangle's vertices.
+    vertices: BufferHandle,
+    /// The built-in triangle's indices.
+    indices: BufferHandle,
+    /// The pipelines, where the renderer was made with shaders.
+    pipelines: Option<Pipelines>,
+    /// Whether the next frame declared imports the instance buffer from `Undefined`: the
+    /// renderer's first, and the first after a torn frame.
+    fresh: bool,
+    /// The point of the last frame the renderer was told was submitted.
+    last: Option<TimelinePoint>,
+    /// How many frames were submitted, which orders the held regions.
+    submitted: u64,
+}
+
+/// One region of the ring, as the renderer holds it.
+struct Region {
+    /// The frame's batch: room for `instances + 2 * rows` entries.
+    entries: BufferHandle,
+    /// The draw's arguments.
+    args: BufferHandle,
+    /// The camera.
+    camera: BufferHandle,
+    state: RegionState,
+}
+
+/// Where a region is in its cycle (`README.md`, "Regions").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RegionState {
+    Free,
+    Open,
+    Sealed,
+    /// Submitted with `point`, the `order`th frame submitted.
+    Held {
+        point: TimelinePoint,
+        order: u64,
+    },
+    /// Left by a torn frame, until the next `submitted`.
+    Torn,
+}
+
+/// The frame prepared and not yet ended.
+#[derive(Clone, Copy, Debug)]
+struct Prepared {
+    /// Its region.
+    region: u32,
+    /// Whether its batch and arguments reached the device: a frame whose `prepare` failed
+    /// is not declared, and is ended with `torn`.
+    uploaded: bool,
+    /// Whether it was latched.
+    latched: bool,
+}
+
+/// `state` on the graphics queue, the one queue every buffer of the renderer is used on.
+const fn on_graphics<S>(state: S) -> StateOn<S> {
+    StateOn { state, queue: QueueRole::Graphics }
+}
+
+fn invalid(message: &'static str) -> Error {
+    Error::new(ErrorKind::InvalidData, message)
 }
 
 impl Renderer {
@@ -255,7 +324,73 @@ impl Renderer {
     /// the cooked format carries, is held to
     /// [`SCATTER_GROUP`](crate::shader::SCATTER_GROUP): `new` refuses any other.
     pub fn new(device: Arc<dyn Device>, desc: &RendererDesc<'_>) -> Result<Self> {
-        todo!()
+        if desc.instances == 0 || desc.rows == 0 {
+            return Err(invalid("a renderer holds at least one instance and one row"));
+        }
+        if !(2..=REGIONS_MAX).contains(&desc.regions) {
+            return Err(invalid("a renderer has from 2 to 65,535 regions"));
+        }
+        let batch = u64::from(desc.instances) + 2 * u64::from(desc.rows);
+        if let Some(shaders) = &desc.shaders {
+            pipeline::check(shaders)?;
+        }
+        let mut made = Made { device: &*device, buffers: Vec::new() };
+        let address = BufferUsage::DEVICE_ADDRESS;
+        let upload = MemoryClass::Upload;
+        let mut rows = Vec::new();
+        let mut regions = Vec::new();
+        for _ in 0..desc.regions {
+            let size = u64::from(desc.rows) * u64::from(StagingRow::BYTES);
+            rows.push(made.buffer("cheddar::rows", size, address, upload)?);
+            let size = batch * u64::from(ScatterEntry::BYTES);
+            let entries = made.buffer("cheddar::entries", size, address, upload)?;
+            let size = u64::from(IndexedIndirectArgs::BYTES);
+            let args = made.buffer("cheddar::args", size, BufferUsage::INDIRECT, upload)?;
+            let size = u64::from(CameraData::BYTES);
+            let camera = made.buffer("cheddar::camera", size, address, upload)?;
+            regions.push(Region { entries, args, camera, state: RegionState::Free });
+        }
+        regions[0].state = RegionState::Open;
+        let size = u64::from(desc.instances) * u64::from(InstanceRecord::BYTES);
+        let usage = address.union(BufferUsage::COPY_SOURCE);
+        let instances = made.buffer("cheddar::instances", size, usage, MemoryClass::Device)?;
+        let bytes: Vec<u8> = TRIANGLE.as_flattened().iter().flat_map(|v| v.to_le_bytes()).collect();
+        let vertices = made.buffer("cheddar::vertices", bytes.len() as u64, address, upload)?;
+        made.fill(vertices, &bytes)?;
+        let bytes: Vec<u8> = [0_u32, 1, 2].iter().flat_map(|i| i.to_le_bytes()).collect();
+        let indices =
+            made.buffer("cheddar::indices", bytes.len() as u64, BufferUsage::INDEX, upload)?;
+        made.fill(indices, &bytes)?;
+        let pipelines = match &desc.shaders {
+            Some(shaders) => Some(pipeline::make(&*device, shaders)?),
+            None => None,
+        };
+        made.buffers.clear();
+        drop(made);
+
+        let groups = device.capabilities().compute_groups[0].max(1);
+        let per_dispatch = groups.min(u32::MAX / SCATTER_GROUP) * SCATTER_GROUP;
+        let staging = Arc::new(Staging::new(Arc::clone(&device), desc.rows, &rows));
+        Ok(Self {
+            device,
+            staging,
+            slots: SlotTable::new(desc.instances),
+            declared: AtomicU64::new(0),
+            features: Vec::new(),
+            regions,
+            generation: 1,
+            frame: None,
+            entries: Vec::new(),
+            dispatches: Vec::new(),
+            builder: Builder::new(per_dispatch),
+            instances,
+            vertices,
+            indices,
+            pipelines,
+            fresh: true,
+            last: None,
+            submitted: 0,
+        })
     }
 
     /// The device the renderer was made for.
@@ -278,14 +413,14 @@ impl Renderer {
     /// preparable: its batch has no end note and is left out whole, its rows counted in
     /// [`FrameStats::remote_rows`] alone (`README.md`, "Slots").
     pub fn remote(&mut self) -> RemoteWriter<'_> {
-        todo!()
+        RemoteWriter::new(&self.staging)
     }
 
     /// Registers a provider. Its passes are declared in every frame from the next
     /// [`declare`](Self::declare) on, after the renderer's own and after those of the
     /// providers registered before it. Milestone 2 registers none.
     pub fn add_feature(&mut self, feature: Box<dyn RenderFeature>) {
-        todo!()
+        self.features.push(feature);
     }
 
     /// Opens a free region to the writers, or says which point frees one.
@@ -303,7 +438,33 @@ impl Renderer {
     ///
     /// What `Device::timeline_value` returns.
     pub fn open(&mut self) -> Result<Opened> {
-        todo!()
+        if self.regions.iter().any(|region| region.state == RegionState::Open) {
+            return Ok(Opened::Ready);
+        }
+        for region in &mut self.regions {
+            if let RegionState::Held { point, .. } = region.state
+                && self.device.timeline_value(point.timeline)? >= point.value
+            {
+                region.state = RegionState::Free;
+            }
+        }
+        if let Some(index) = self.regions.iter().position(|r| r.state == RegionState::Free) {
+            self.generation = next_generation(self.generation);
+            self.regions[index].state = RegionState::Open;
+            // Below `REGIONS_MAX`, which `new` holds the ring to.
+            let region = index as u32;
+            self.staging.open(Use { region, generation: self.generation });
+            return Ok(Opened::Ready);
+        }
+        let oldest = self
+            .regions
+            .iter()
+            .filter_map(|region| match region.state {
+                RegionState::Held { point, order } => Some((order, point)),
+                _ => None,
+            })
+            .min_by_key(|&(order, _)| order);
+        Ok(oldest.map_or(Opened::Unsubmitted, |(_, point)| Opened::Wait(point)))
     }
 
     /// Seals the open region and builds the frame's batch from what the writers left in
@@ -323,7 +484,87 @@ impl Renderer {
     /// nothing changes. What the device returns for a write or a flush, after which the
     /// frame is ended with [`torn`](Self::torn).
     pub fn prepare(&mut self) -> Result<FrameStats> {
-        todo!()
+        if self.frame.is_some() {
+            return Err(invalid("the frame prepared before this one is not ended"));
+        }
+        let sealed = self.staging.seal().map_err(|why| match why {
+            Unsealed::NotOpen => invalid("no region is open"),
+            Unsealed::PassOpen => invalid("a sink's pass is open"),
+        })?;
+        let at = sealed.at.region;
+        self.regions[at as usize].state = RegionState::Sealed;
+        *self.declared.get_mut() = 0;
+        self.frame = Some(Prepared { region: at, uploaded: false, latched: false });
+        let built = self.builder.build(
+            &mut self.slots,
+            self.staging.entries(&sealed),
+            &sealed.counts,
+            &mut self.entries,
+            &mut self.dispatches,
+        );
+        let saturate = |count: u64| u32::try_from(count).unwrap_or(u32::MAX);
+        let stats = FrameStats {
+            pass_rows: saturate(built.pass_rows),
+            remote_rows: saturate(built.remote_rows),
+            dropped: saturate(sealed.counts.dropped),
+            duplicates: saturate(built.duplicates),
+            unplaced: saturate(built.unplaced),
+            allocated: saturate(built.allocated),
+            freed: saturate(built.freed),
+            entries: saturate(self.entries.len() as u64),
+            live: self.slots.live(),
+            lost: built.lost,
+            dropped_by_kind: sealed.counts.dropped_by_kind.map(saturate),
+            unplaced_by_kind: built.unplaced_by_kind.map(saturate),
+        };
+        if stats.dropped != 0 || stats.unplaced != 0 || stats.any_lost() {
+            tracing::debug!(
+                target: LOG_TARGET,
+                dropped = stats.dropped,
+                unplaced = stats.unplaced,
+                lost = stats.lost,
+                "a frame's region dropped or left out rows, or lost a kind"
+            );
+        }
+        self.upload(at, sealed.len)?;
+        if let Some(frame) = &mut self.frame {
+            frame.uploaded = true;
+        }
+        Ok(stats)
+    }
+
+    /// Writes the batch's entries and the draw's arguments to region `at`, and flushes them
+    /// and the region's first `rows` rows.
+    fn upload(&self, at: u32, rows: u32) -> Result<()> {
+        let region = &self.regions[at as usize];
+        let device = &*self.device;
+        if !self.entries.is_empty() {
+            let len = self.entries.len() as u64 * u64::from(ScatterEntry::BYTES);
+            let mut fill = |bytes: &mut [u8]| {
+                let (chunks, _) = bytes.as_chunks_mut::<{ ScatterEntry::BYTES as usize }>();
+                for (out, entry) in chunks.iter_mut().zip(&self.entries) {
+                    *out = entry.to_bytes();
+                }
+            };
+            device.write_buffer(region.entries, 0, len, &mut fill)?;
+            device.flush_buffer(region.entries, 0, len)?;
+        }
+        let args = IndexedIndirectArgs {
+            index_count: 3,
+            instance_count: self.slots.extent(),
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        }
+        .to_bytes();
+        let len = u64::from(IndexedIndirectArgs::BYTES);
+        device.write_buffer(region.args, 0, len, &mut |bytes| bytes.copy_from_slice(&args))?;
+        device.flush_buffer(region.args, 0, len)?;
+        if rows != 0 {
+            let len = u64::from(rows) * u64::from(StagingRow::BYTES);
+            device.flush_buffer(self.staging.buffer(at), 0, len)?;
+        }
+        Ok(())
     }
 
     /// The slot table, as the last [`prepare`](Self::prepare) left it.
@@ -336,7 +577,7 @@ impl Renderer {
     /// [`torn`](Self::torn).
     #[must_use]
     pub fn batch(&self) -> ScatterBatch<'_> {
-        todo!()
+        ScatterBatch::new(&self.entries, &self.dispatches)
     }
 
     /// Declares the prepared frame's passes into `frame`: the scatter, where the batch
@@ -364,7 +605,147 @@ impl Renderer {
         frame: &mut FrameDecl<'f>,
         view: &FrameView,
     ) -> Result<DeclaredFrame> {
-        todo!()
+        let Some(prepared) = self.frame else { return Err(invalid("no frame is prepared")) };
+        if !prepared.uploaded {
+            return Err(invalid(
+                "the prepared frame's `prepare` failed, so it is ended with `torn`",
+            ));
+        }
+        let Some(pipelines) = self.pipelines else {
+            return Err(invalid("a renderer made without shaders declares nothing"));
+        };
+        let [width, height] = self.device.capabilities().viewport_extent;
+        let extent = view.extent;
+        if extent.width == 0 || extent.height == 0 || extent.width > width || extent.height > height
+        {
+            return Err(invalid("the frame's extent has a side of zero or beyond the viewport's"));
+        }
+        let word = u64::from(extent.width) << 32 | u64::from(extent.height);
+        if self.declared.compare_exchange(0, word, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return Err(invalid("the prepared frame is already declared"));
+        }
+
+        let region = &self.regions[prepared.region as usize];
+        let mut import = |label, buffer, initial, last| {
+            frame.import_buffer(&BufferImport {
+                label,
+                buffer,
+                sharing: Sharing::Exclusive,
+                initial: on_graphics(initial),
+                last: on_graphics(last),
+                ready: None,
+            })
+        };
+        use BufferState::{Index, Indirect, ShaderRead, Undefined};
+        let initial = if self.fresh { Undefined } else { ShaderRead };
+        let instances = import("cheddar::instances", self.instances, initial, ShaderRead);
+        let camera = import("cheddar::camera", region.camera, Undefined, ShaderRead);
+        let scattered = !self.entries.is_empty();
+        let reads_rows = self.entries.iter().any(|entry| entry.flags & ScatterEntry::FREE == 0);
+        let entries =
+            scattered.then(|| import("cheddar::entries", region.entries, Undefined, ShaderRead));
+        let rows = reads_rows.then(|| {
+            import("cheddar::rows", self.staging.buffer(prepared.region), Undefined, ShaderRead)
+        });
+        let drawn = (self.slots.extent() > 0).then(|| {
+            let vertices = import("cheddar::vertices", self.vertices, Undefined, ShaderRead);
+            let indices = import("cheddar::indices", self.indices, Undefined, Index);
+            let args = import("cheddar::args", region.args, Undefined, Indirect);
+            (vertices, indices, args)
+        });
+        let depth = frame.transient_image(&TransientImage {
+            label: "cheddar::depth",
+            format: DEPTH,
+            extent,
+            mips: 1,
+            layers: 1,
+        });
+
+        let read = |buffer| BufferUse { buffer, access: BufferAccess::Read };
+        let scatter = entries.map(|entries| {
+            let mut buffers =
+                vec![read(entries), BufferUse { buffer: instances, access: BufferAccess::Write }];
+            buffers.extend(rows.map(read));
+            let pass = ComputePassDecl {
+                label: "cheddar::scatter",
+                sampled: &[],
+                buffers: &buffers,
+                slots: &[],
+            };
+            let dispatches = &self.dispatches;
+            frame.compute_pass(&pass, move |recorder| {
+                recorder.bind_pipeline(pipelines.scatter);
+                for range in dispatches {
+                    match rows {
+                        Some(rows) => recorder.push_address(0, rows, 0),
+                        None => recorder.push_bytes(0, &[0; 8]),
+                    }
+                    let first = u64::from(range.first) * u64::from(ScatterEntry::BYTES);
+                    recorder.push_address(8, entries, first);
+                    recorder.push_address(16, instances, 0);
+                    let mut tail = [0; 8];
+                    tail[..4].copy_from_slice(&range.count.to_le_bytes());
+                    recorder.push_bytes(24, &tail);
+                    recorder.dispatch([range.count.div_ceil(SCATTER_GROUP), 1, 1]);
+                }
+            })
+        });
+
+        let mut buffers = Vec::new();
+        match drawn {
+            Some((vertices, indices, args)) => buffers.extend([
+                read(instances),
+                read(camera),
+                read(vertices),
+                BufferUse { buffer: indices, access: BufferAccess::Index },
+                BufferUse { buffer: args, access: BufferAccess::Indirect },
+            ]),
+            None if scatter.is_some() => buffers.push(read(instances)),
+            None => {}
+        }
+        let colour = [ColourUse {
+            image: view.target,
+            mip: 0,
+            layer: 0,
+            load: Load::Clear(CLEAR),
+            local_read: false,
+        }];
+        let pass = RenderPassDecl {
+            label: "cheddar::triangles",
+            colour: &colour,
+            depth: Some(DepthUse { image: depth, mip: 0, layer: 0, load: Load::Clear(1.0) }),
+            sampled: &[],
+            buffers: &buffers,
+            slots: &[],
+        };
+        let fraction = view.fraction;
+        let triangles = frame.render_pass(&pass, move |recorder| {
+            recorder.set_viewport(Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                near: 0.0,
+                far: 1.0,
+            });
+            recorder.set_scissor(Rect { x: 0, y: 0, extent });
+            let Some((vertices, indices, args)) = drawn else { return };
+            recorder.bind_pipeline(pipelines.triangles);
+            recorder.bind_index_buffer(indices, 0);
+            recorder.push_address(0, instances, 0);
+            recorder.push_address(8, camera, 0);
+            recorder.push_address(16, vertices, 0);
+            let mut tail = [0; 8];
+            tail[..4].copy_from_slice(&fraction.to_le_bytes());
+            recorder.push_bytes(24, &tail);
+            recorder.draw_indexed_indirect(args, 0, 1, IndexedIndirectArgs::BYTES);
+        });
+
+        let feature_view = FeatureView::new(view.target, depth, camera, extent);
+        for feature in &self.features {
+            feature.declare(frame, &feature_view);
+        }
+        Ok(DeclaredFrame { instances, camera, depth, scatter, triangles })
     }
 
     /// The late latch (architecture section 5.3): reads `latch.input` once, computes
@@ -384,7 +765,34 @@ impl Renderer {
     /// device returns for the write or the flush. After an error the frame is not
     /// submitted, and is ended with [`torn`](Self::torn).
     pub fn latch(&mut self, latch: &CameraLatch<'_>) -> Result<LatchedCamera> {
-        todo!()
+        let Some(prepared) = self.frame else { return Err(invalid("no frame is prepared")) };
+        let word = *self.declared.get_mut();
+        if word == 0 {
+            return Err(invalid("the prepared frame was not declared, so it has no extent"));
+        }
+        if prepared.latched {
+            return Err(invalid("the prepared frame was already latched"));
+        }
+        // The declared word's halves: the width above, the height below.
+        let extent = Extent { width: (word >> 32) as u32, height: word as u32 };
+        let sample = latch.input.read();
+        let data = CameraData::orbit(
+            latch.pivot,
+            sample.yaw,
+            sample.pitch,
+            latch.boom,
+            latch.projection,
+            extent,
+        );
+        let camera = self.regions[prepared.region as usize].camera;
+        let len = u64::from(CameraData::BYTES);
+        let bytes = data.to_bytes();
+        self.device.write_buffer(camera, 0, len, &mut |out| out.copy_from_slice(&bytes))?;
+        self.device.flush_buffer(camera, 0, len)?;
+        if let Some(frame) = &mut self.frame {
+            frame.latched = true;
+        }
+        Ok(LatchedCamera { data, yaw: sample.yaw, pitch: sample.pitch })
     }
 
     /// Ends the prepared frame: `RenderGraph::submit` returned `point` for it, or, in a
@@ -402,7 +810,38 @@ impl Renderer {
     /// region, which is free at `point`; on one made without, the instance buffer is
     /// read by nothing and the slot table stands.
     pub fn submitted(&mut self, point: TimelinePoint) {
-        todo!()
+        self.submitted += 1;
+        let held = RegionState::Held { point, order: self.submitted };
+        for region in &mut self.regions {
+            if region.state == RegionState::Torn {
+                region.state = held;
+            }
+        }
+        self.last = Some(point);
+        let Some(frame) = self.frame.take() else { return };
+        self.regions[frame.region as usize].state = held;
+        let declared = core::mem::take(self.declared.get_mut()) != 0;
+        if declared {
+            self.fresh = false;
+        } else if self.pipelines.is_some() {
+            // The batch never ran, so nothing the instance buffer holds is the table's.
+            self.forget();
+        }
+    }
+
+    /// What [`torn`](Self::torn) does but for the region: every slot freed, every base
+    /// and tick forgotten, the batch emptied, the next batch's first run freeing every
+    /// record a slot was ever given, and the next frame's import of the instance buffer
+    /// from `Undefined`.
+    fn forget(&mut self) {
+        let held: Vec<u32> = self.slots.iter().map(|(slot, _)| slot.index()).collect();
+        for slot in held {
+            self.slots.release(slot);
+        }
+        self.builder.torn();
+        self.entries.clear();
+        self.dispatches.clear();
+        self.fresh = true;
     }
 
     /// Ends the prepared frame as torn: it was not submitted, or its submit returned an
@@ -421,7 +860,10 @@ impl Renderer {
     /// [`submitted`](Self::submitted), because a submit of the torn frame may still read
     /// it. Does nothing when no frame is prepared.
     pub fn torn(&mut self) {
-        todo!()
+        let Some(frame) = self.frame.take() else { return };
+        self.regions[frame.region as usize].state = RegionState::Torn;
+        *self.declared.get_mut() = 0;
+        self.forget();
     }
 }
 
@@ -433,6 +875,71 @@ impl Drop for Renderer {
     /// under [`LOG_TARGET`] and the object is leaked. On a lost device the wait returns
     /// at once.
     fn drop(&mut self) {
-        todo!()
+        let device = &*self.device;
+        if !std::thread::panicking()
+            && let Some(point) = self.last
+            && let Err(error) = device.wait_timeline(point, Duration::MAX)
+        {
+            log("the wait for the last frame submitted", &error);
+        }
+        let mut buffers = vec![self.instances, self.vertices, self.indices];
+        for (index, region) in (0..).zip(&self.regions) {
+            let rows = self.staging.buffer(index);
+            buffers.extend([rows, region.entries, region.args, region.camera]);
+        }
+        for buffer in buffers {
+            if let Err(error) = device.destroy_buffer(buffer) {
+                log("a buffer's destroy", &error);
+            }
+        }
+        if let Some(pipelines) = self.pipelines {
+            if let Err(error) = device.destroy_compute_pipeline(pipelines.scatter) {
+                log("the scatter pipeline's destroy", &error);
+            }
+            if let Err(error) = device.destroy_graphics_pipeline(pipelines.triangles) {
+                log("the triangle pipeline's destroy", &error);
+            }
+        }
+    }
+}
+
+fn log(what: &str, error: &Error) {
+    tracing::warn!(target: LOG_TARGET, "{what} failed: {error}");
+}
+
+/// The buffers `Renderer::new` has made so far, destroyed if it returns early.
+struct Made<'d> {
+    device: &'d dyn Device,
+    buffers: Vec<BufferHandle>,
+}
+
+impl Made<'_> {
+    fn buffer(
+        &mut self,
+        label: &str,
+        size: u64,
+        usage: BufferUsage,
+        memory: MemoryClass,
+    ) -> Result<BufferHandle> {
+        let desc = BufferDesc { label, size, usage, memory, sharing: Sharing::Exclusive };
+        let buffer = self.device.create_buffer(&desc)?;
+        self.buffers.push(buffer);
+        Ok(buffer)
+    }
+
+    /// Writes `bytes` to the start of an `Upload` buffer and flushes them.
+    fn fill(&self, buffer: BufferHandle, bytes: &[u8]) -> Result<()> {
+        let len = bytes.len() as u64;
+        self.device.write_buffer(buffer, 0, len, &mut |out| out.copy_from_slice(bytes))?;
+        self.device.flush_buffer(buffer, 0, len)
+    }
+}
+
+impl Drop for Made<'_> {
+    fn drop(&mut self) {
+        for &buffer in &self.buffers {
+            // No submit has used them, so the device refuses none.
+            let _ = self.device.destroy_buffer(buffer);
+        }
     }
 }

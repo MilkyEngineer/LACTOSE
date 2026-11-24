@@ -6,10 +6,9 @@
 //! crate adds passes to the frame. It reaches a device through `lactose-rhi-api` and a
 //! frame through `lactose-render-graph`, and names no backend.
 //!
-//! **Status: facade.** Every signature is final for milestone 2's lanes and every body that
-//! decides anything is `todo!()`. What runs is plain data: a slot's index, a batch's
-//! accessors, a frame's counts. `README.md` is the contract, and every sentence under
-//! "Behaviour the signatures cannot express" is one a dependent crate may rely on.
+//! **Status: implemented, proved on the null backend.** `README.md` is the contract, and
+//! every sentence under "Behaviour the signatures cannot express" is one a dependent crate
+//! may rely on. The device tests, with the cooked shaders they run, are still owed.
 //!
 //! # Where to start
 //!
@@ -128,20 +127,20 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: every deciding body is `todo!()` until `renderer-impl` replaces it, \
-              and the parameters and fields it will use are declared now"
-)]
 
+mod batch;
 mod camera;
 mod feature;
 mod frame;
+mod key;
+#[cfg(all(test, feature = "loom"))]
+mod models;
+mod pipeline;
 mod scatter;
 pub mod shader;
 mod slots;
 mod staging;
+mod sync;
 
 /// What a pass provider names from `lactose-render-graph`, re-exported so that a crate
 /// `crate-tiers.toml` allows this crate and not that one (`lactose-terrain`,

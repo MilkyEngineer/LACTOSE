@@ -4,6 +4,7 @@
 
 use lactose_input_host::LatestSample;
 use lactose_math::render::RenderPosition;
+use lactose_math::{Scalar, Vec3};
 use lactose_rhi_api::Extent;
 
 /// A perspective projection, without its aspect ratio, which is the target's.
@@ -86,13 +87,45 @@ impl CameraData {
         projection: Projection,
         extent: Extent,
     ) -> Self {
-        todo!()
+        let (sin_y, cos_y) = Scalar::from_f32(yaw).sin_cos();
+        let (sin_p, cos_p) = Scalar::from_f32(pitch).sin_cos();
+        // `PlayerInput::aim`'s formula, each product rounded once.
+        let forward = Vec3::new(-(cos_p * sin_y), sin_p, -(cos_p * cos_y));
+        let up = Vec3::new(sin_p * sin_y, cos_p, sin_p * cos_y);
+        let right = forward.cross(up);
+        let [x, y, z] = pivot.offset.map(Scalar::from_f32);
+        let eye = Vec3::new(x, y, z) - forward * Scalar::from_f32(boom);
+
+        let focal = Scalar::ONE / (Scalar::from_f32(projection.fov_y) * Scalar::HALF).tan();
+        let aspect = Scalar::from_u32(extent.width) / Scalar::from_u32(extent.height);
+        let (near, far) = (Scalar::from_f32(projection.near), Scalar::from_f32(projection.far));
+        let depth = far / (near - far);
+        // The rows of clip space: x along the right, y along the up, depth from zero at the
+        // near plane to one at the far, and w the distance along the forward.
+        let row = |axis: Vec3, scale: Scalar| {
+            let [x, y, z] = (axis * scale).to_array();
+            [x, y, z, -(axis.dot(eye) * scale)]
+        };
+        let mut rows = [
+            row(right, focal / aspect),
+            row(up, focal),
+            row(-forward, depth),
+            row(forward, Scalar::ONE),
+        ];
+        rows[2][3] += near * depth;
+        let clip_from_cell = core::array::from_fn(|i| rows[i % 4][i / 4].to_f32());
+        Self { clip_from_cell, cell: pivot.cell }
     }
 
     /// The camera's bytes, as the buffer holds them.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 80] {
-        todo!()
+        let mut bytes = [0; 80];
+        let words = self.clip_from_cell.map(f32::to_le_bytes).into_iter();
+        for (at, word) in words.chain(self.cell.map(i32::to_le_bytes)).enumerate() {
+            bytes[4 * at..4 * at + 4].copy_from_slice(&word);
+        }
+        bytes
     }
 
     /// A position relative to the cell's centre, in clip space: `clip_from_cell * (x, y,
@@ -100,7 +133,9 @@ impl CameraData {
     /// writes as its position.
     #[must_use]
     pub fn clip(&self, position: [f32; 3]) -> [f32; 4] {
-        todo!()
+        let m = &self.clip_from_cell;
+        let [x, y, z] = position;
+        core::array::from_fn(|r| m[r] * x + m[4 + r] * y + m[8 + r] * z + m[12 + r])
     }
 }
 

@@ -106,6 +106,15 @@ jobs:
             key: render-graph-recording
             args: '-p lactose-render-graph --test integration -- recording::'
             miriflags: -Zmiri-many-seeds=0..4
+          # The renderer's staging ring: the open word, the regions' cursors and the
+          # renderer-wide record, which every writer and sealing reaches through atomics, under
+          # four seeds: the library's unit tests, those of `src/staging.rs`, which reach the
+          # ring's private functions, and of `src/key.rs`. Its loom models search the same
+          # functions' interleavings.
+          - name: renderer, staging
+            key: renderer-staging
+            args: -p lactose-renderer --lib
+            miriflags: -Zmiri-many-seeds=0..4
           # The platform crate's tests that open no window: the present thread's stop and drop
           # under queuing threads, its lane's close before the hand-back and its wake under a
           # call that parks, and the torn-size read, whose atomics Miri's weak-memory emulation
@@ -131,11 +140,12 @@ jobs:
 
   # Architecture section 5.1: the scope latch and the sleep-and-wake protocol are modelled
   # under loom, as are input-host's latest-sample sequence lock and net-host's interpolation
-  # slot sequence lock (architecture section 5.3), each switched on by a Cargo feature of its
-  # crate and never by a `--cfg` flag in the environment, which would replace the x86-64 pin.
+  # slot sequence lock (architecture section 5.3) and the renderer's staging ring, each
+  # switched on by a Cargo feature of its crate and never by a `--cfg` flag in the
+  # environment, which would replace the x86-64 pin.
   # Release, because the models' searches are long: every interleaving, or those loom reaches
-  # within a preemption bound where a model names one (eleven of task's, and input-host's and
-  # net-host's).
+  # within a preemption bound where a model names one (eleven of task's, and input-host's,
+  # net-host's and the renderer's).
   loom:
     name: loom
     runs-on: ubuntu-latest
@@ -147,6 +157,7 @@ jobs:
       - run: cargo test -p lactose-task --features loom --release --locked
       - run: cargo test -p lactose-input-host --features loom --release --locked
       - run: cargo test -p lactose-net-host --features loom --release --locked
+      - run: cargo test -p lactose-renderer --features loom --release --locked
 
   # SOUR, the determinism harness (architecture section 8.3): every mode, on every platform
   # of architecture mode. Each platform also emits its baseline hashes, which the next job

@@ -3,5 +3,12 @@
 
 #![forbid(unsafe_code)]
 
+mod camera;
+mod common;
 mod consumers;
+mod cost;
+mod frames;
+mod sequences;
+mod slots;
 mod values;
+mod writers;

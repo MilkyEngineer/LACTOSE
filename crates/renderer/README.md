@@ -16,10 +16,12 @@ binary name this crate; `lactose-app` never does (decision 5.11).
 | Determinism boundary | outside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: facade.** Every public signature is final for milestone 2's lanes and every body
-that decides anything is `todo!()`. What runs is plain data: a slot's index, a batch's
-accessors, a frame's counts. This file is the contract `renderer-impl` meets, and every
-sentence under "Behaviour the signatures cannot express" is one a dependent crate may rely on.
+**Status: implemented on null.** Every public signature is final for milestone 2's lanes and
+every body is written (D161's addendum at `renderer-impl`). The slot table, the sink, the
+ring, the batch and the frame's declaration are proved on null; the device tests and the
+cooked shaders they run are not yet written ("Proof"). This file is the contract
+`renderer-impl` meets, and every sentence under "Behaviour the signatures cannot express" is
+one a dependent crate may rely on.
 Architecture sections 3, 5.3, 12.4 and 12.5 are the design, with the milestone 2 plan's
 decisions 5.1 to 5.4, 5.11, 5.14 and 5.18; where this file and the architecture disagree, the
 architecture wins and this file is wrong. Decision D161 records the choices they left open.
@@ -68,7 +70,8 @@ writers share with the renderer ("Concurrency").
 | `lactose-terrain`, `lactose-debug-ui`, later `lactose-ui` | To add passes to the frame, the first two without naming `lactose-render-graph` (`crate-tiers.toml`); to test their `declare` on null with no renderer and no cooked shader | `RenderFeature`, `FeatureView`, `Renderer::add_feature`; module `graph`; `FeatureView::new` over ids of a declaration of the test's own |
 | The milestone 4 merge of a client's two worlds (verification, the row on section 9.4's shadowing) | The kind of every instance, so the prediction world's copy can shadow the replicated one | Slots are keyed by kind and key, and `SlotHolder::kind` says which |
 
-What `frame-design` must still decide, since no signature here does:
+What `frame-design` must still decide, since no signature here does. D162 decides each
+(`crates/app/README.md`, from "The shown frame" to "Counts, torn frames and resets"):
 
 - **Where the frame waits for a region.** `open` never waits. With `regions` regions the
   device may hold `regions - 1` frames; one more and `open` returns `Opened::Wait`. The
@@ -94,7 +97,8 @@ What `frame-design` must still decide, since no signature here does:
   `torn` it is every world shown. The remote batch's dropped and unplaced rows are in the
   totals alone and need nothing: its next batch writes every remote instance again.
 - **How `lactose-app` reaches these calls.** `lactose-app` names no `[server_denylist]`
-  crate, so it drives a `dyn` object of a foundation crate's trait that `lactose-app-client`
+  crate, so it drives a `dyn` object of a trait of its own over `-api` types,
+  `lactose_app::RenderSide` (D162), that `lactose-app-client`
   implements over a `Renderer` and a `RenderGraph` (graph, "What each consumer needs";
   D160). `RemoteWriter` borrows the renderer, so the object lends it to the presentation
   schedule inside one of its methods.
@@ -107,8 +111,9 @@ What `frame-design` must still decide, since no signature here does:
 ## A frame, by step
 
 1. **Open.** `Renderer::open` opens a free region to the writers, or returns the point that
-   frees one, which the frame waits for off the frame-critical workers before it calls
-   `open` again. A new renderer has region zero open. A frame that failed is followed by
+   frees one. The client's frame does not wait for it: it runs its ticks, defers its passes
+   and calls `open` again at its next frame (D162); a step-driven caller may wait for the
+   point on a thread of its own. A new renderer has region zero open. A frame that failed is followed by
    this step as any other is.
 2. **Write.** Extract's pass for each world shown writes through its `ExtractSink`, inside
    `Simulation::run_passes`. Then, once the `Client` world's pass has ended, the
@@ -843,7 +848,13 @@ amendment of the kind section 20 allows.
 
 ## Proof
 
-There is nothing to run against a facade but its plain data. `tests/consumers.rs` compiles
+The null proofs are modules of the `integration` binary: `tests/slots.rs`, the slot table
+through a world's sink and through passes by hand; `tests/frames.rs`, frames through a
+render graph on null; `tests/sequences.rs`, present-api's sequences through `ExtractSink`
+with the batch scattered on the host by `InstanceRecord::scatter`; `tests/writers.rs`,
+writes from several jobs; `tests/camera.rs`, the orbit against `lactose-input`; and
+`tests/cost.rs`, the steering figures, ignored. `src/staging.rs`'s unit tests, which Miri
+runs, and `src/models.rs`'s loom models hold the ring. `tests/consumers.rs` compiles
 what each consumer writes: `renderer-impl`'s proofs (slots through a world's sink, the batch
 on null, the instance buffer read back, frames held in flight, the CPU reference), the cost
 tests of the ring with no shader, the presentation schedule's remote upload from forked jobs,
