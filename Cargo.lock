@@ -1093,6 +1093,7 @@ dependencies = [
  "lactose-render-graph",
  "lactose-rhi-api",
  "lactose-rhi-null",
+ "lactose-rhi-vulkan",
  "lactose-sim",
  "lactose-task",
  "loom",

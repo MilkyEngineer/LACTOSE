@@ -7,6 +7,7 @@ mod camera;
 mod common;
 mod consumers;
 mod cost;
+mod device;
 mod frames;
 mod sequences;
 mod slots;

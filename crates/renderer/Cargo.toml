@@ -50,6 +50,9 @@ lactose-rhi-null.workspace = true
 lactose-input.workspace = true
 # `Transform`, the component a world's instance rows are extracted from.
 lactose-physics-api.workspace = true
+# The device the `device` tests run the renderer on, under `cargo xtask gpu`'s drivers and
+# validation; a plain run ignores them.
+lactose-rhi-vulkan.workspace = true
 
 [[test]]
 name = "integration"

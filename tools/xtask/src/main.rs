@@ -290,12 +290,13 @@ const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
 /// The device tests the Vulkan step runs: each package, its test target (`None` for its
 /// library's unit tests) and the prefix of the names taken, whose ignored tests are the ones
 /// that need a device. The library's are its `canary` module's alone: the thread-safety
-/// canary, whose unlocked driver call no safe call can make. The render graph's are its
-/// `device` module's.
-const DEVICE_TESTS: [(&str, Option<&str>, &str); 3] = [
+/// canary, whose unlocked driver call no safe call can make. The render graph's and the
+/// renderer's are their `device` modules'.
+const DEVICE_TESTS: [(&str, Option<&str>, &str); 4] = [
     ("lactose-rhi-vulkan", None, "canary::"),
     ("lactose-rhi-vulkan", Some("integration"), ""),
     ("lactose-render-graph", Some("integration"), "device::"),
+    ("lactose-renderer", Some("integration"), "device::"),
 ];
 
 /// What `gpu` was asked to run.

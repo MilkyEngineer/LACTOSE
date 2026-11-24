@@ -6,9 +6,9 @@
 //! crate adds passes to the frame. It reaches a device through `lactose-rhi-api` and a
 //! frame through `lactose-render-graph`, and names no backend.
 //!
-//! **Status: implemented, proved on the null backend.** `README.md` is the contract, and
-//! every sentence under "Behaviour the signatures cannot express" is one a dependent crate
-//! may rely on. The device tests, with the cooked shaders they run, are still owed.
+//! **Status: implemented, proved on the null backend and on Vulkan devices.** `README.md` is
+//! the contract, and every sentence under "Behaviour the signatures cannot express" is one a
+//! dependent crate may rely on.
 //!
 //! # Where to start
 //!

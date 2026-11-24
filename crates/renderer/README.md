@@ -16,12 +16,12 @@ binary name this crate; `lactose-app` never does (decision 5.11).
 | Determinism boundary | outside |
 | Unsafe | none, `#![forbid(unsafe_code)]` |
 
-**Status: implemented on null.** Every public signature is final for milestone 2's lanes and
-every body is written (D161's addendum at `renderer-impl`). The slot table, the sink, the
-ring, the batch and the frame's declaration are proved on null; the device tests and the
-cooked shaders they run are not yet written ("Proof"). This file is the contract
-`renderer-impl` meets, and every sentence under "Behaviour the signatures cannot express" is
-one a dependent crate may rely on.
+**Status: implemented.** Every public signature is final for milestone 2's lanes and every
+body is written (D161's addendum at `renderer-impl`). The slot table, the sink, the ring, the
+batch and the frame's declaration are proved on null, and the scatter, the triangle pass and
+the camera on Vulkan devices, with the shaders of `shaders/renderer/` ("Proof"). This file is
+the contract `renderer-impl` meets, and every sentence under "Behaviour the signatures cannot
+express" is one a dependent crate may rely on.
 Architecture sections 3, 5.3, 12.4 and 12.5 are the design, with the milestone 2 plan's
 decisions 5.1 to 5.4, 5.11, 5.14 and 5.18; where this file and the architecture disagree, the
 architecture wins and this file is wrong. Decision D161 records the choices they left open.
@@ -686,7 +686,12 @@ table, which already holds each instance's mesh; it adds no field to the row.
 
 ## The shader interface
 
-Three stages, cooked by RICOTTA for each target and handed over as `Shaders`. Every buffer
+Three stages, cooked by RICOTTA for each target and handed over as `Shaders`: the entries
+`cs_main` of `shaders/renderer/scatter.slang` and `vs_main` and `fs_main` of
+`shaders/renderer/triangle.slang`, which import the records from
+`shaders/modules/lactose/renderer.slang`, cooked as `renderer/scatter.cs_main` and so on.
+Each is a transcription of the host's statement of its rule: `InstanceRecord::scatter` and
+`free`, and `drawn`, `CellTransform::apply` and `CameraData::clip`. Every buffer
 is reached through a device address in the push block; no stage uses the heap. A shader
 reads `SV_VulkanVertexID` and `SV_VulkanInstanceID` (rhi-api, "Pipelines and the cooked
 shader format").
@@ -854,7 +859,13 @@ render graph on null; `tests/sequences.rs`, present-api's sequences through `Ext
 with the batch scattered on the host by `InstanceRecord::scatter`; `tests/writers.rs`,
 writes from several jobs; `tests/camera.rs`, the orbit against `lactose-input`; and
 `tests/cost.rs`, the steering figures, ignored. `src/staging.rs`'s unit tests, which Miri
-runs, and `src/models.rs`'s loom models hold the ring. `tests/consumers.rs` compiles
+runs, and `src/models.rs`'s loom models hold the ring. `tests/device.rs` holds the rows that
+need a shader to run, as ignored tests that `cargo xtask gpu` runs under its drivers and
+validation, with `shaders/renderer/` cooked: the instance buffer read back through a copy
+into a `Readback` buffer, frames held behind an import's `ready` point that the host signals
+once a later frame's writes are made and behind a dispatch of about a second at the frame's
+head, and each image against a reference computed on the CPU, with its three counts
+printed. `tests/consumers.rs` compiles
 what each consumer writes: `renderer-impl`'s proofs (slots through a world's sink, the batch
 on null, the instance buffer read back, frames held in flight, the CPU reference), the cost
 tests of the ring with no shader, the presentation schedule's remote upload from forked jobs,
@@ -876,12 +887,13 @@ description and report type to plain data, and each format to its size.
 | (the same) A `Client` pass lost after a batch stops it | The same region, with frame 2's `Client` pass lost for want of room: `lost(Client)`, and no slot of the kind held | One that applies the region's batches whatever kind is lost: frame 1's batch brings `gone` back |
 | (the same) A batch that overlaps a `Client` pass is left out | One frame that breaks its ordering, from an empty table: a `Client` pass begins, the batch writes `gone` and `kept`, and the pass removes `gone` and ends; and the batch first, then the pass. In both orders neither holds a slot, `remote_rows` is 2 and nothing is lost | One that compares the batch's opening with the `Client` begins alone: the pass-first order applies the batch over the removal, and `gone` is drawn with no count |
 | A batch names each slot once, resolved in batch order and asserted | On null: duplicate rows through `RemoteWriter::write`, then `ScatterBatch` and `FrameStats::duplicates`. Null's assertion is what proves the resolution | One without the resolution: the assertion fires |
-| Many duplicates in different workgroups of a large batch | On a device: slots made `LIVE` at a known placement `c0` by an earlier frame, then duplicates from a world pass at a new tick, entries `TAKE_BASE \| HAS_BASE`, each instance's two rows at least 2^15 entries apart (row `i` and row `n + i`); the instance buffer copied out, each record's `base` and `previous` equal to `c0` and `current` to the kept row. It shows that a resolved batch scatters right; an entry with neither flag reads nothing of its record, so remote rows on fresh slots cannot show it | Without the resolution and with the assertion off, the second entry of a slot lacks `TAKE_BASE`, and run in order its records match: the host's check of the flags fails that build. The records fail one that marks both entries `TAKE_BASE \| HAS_BASE`, at that spacing. Null's assertion is the proof of the resolution |
-| With the GPU made to lag, the ring never overwrites a region a frame in flight reads | Frames held behind an import's `ready` point; `Opened::Wait`; the readback of a held frame after later writes | One whose `open` ignores the point |
+| Many duplicates in different workgroups of a large batch | On a device: slots made `LIVE` at a known placement `c0` by an earlier frame, then duplicates from a world pass at a new tick, entries `TAKE_BASE \| HAS_BASE`, each instance's two rows at least 2^15 rows apart in the region (row `i` and row `n + i`); the instance buffer copied out, each record's `base` and `previous` equal to `c0` and `current` to the kept row. It shows that a resolved batch scatters right; an entry with neither flag reads nothing of its record, so remote rows on fresh slots cannot show it | Without the resolution and with the assertion off, the second entry of a slot lacks `TAKE_BASE`, and run in order its records match: the host's check of the flags fails that build. The records fail one that marks both entries `TAKE_BASE \| HAS_BASE`, at that spacing. Null's assertion is the proof of the resolution |
+| The scatter's dispatches each apply their own entries, all of them and no more | On a device: a batch of two runs, of 37 and 5 entries, each `TAKE_BASE \| HAS_BASE`, in a region whose earlier use had a longer batch; every record read back equal to `InstanceRecord::scatter`'s on the host | One that reads each dispatch's entries from the batch's first; one that pushes one entry too many; one that rounds the groups down; one that pushes no rows address |
+| With the GPU made to lag, the ring never overwrites a region a frame in flight reads | Frames held behind an import's `ready` point, and behind a dispatch of about a second at the frame's head; `Opened::Wait`; the readback of a held frame after later writes | One whose `open` ignores the point |
 | Frame N's readback shows N's camera after N + 1's has been written | The same, with two latches | One camera buffer for all regions |
 | An instance in the camera's cell and one in a neighbouring cell along an axis the scene is moved 2^25 + 1 cells on, its triangle covering pixels at the origin, render the pixels they render at the origin | Two scenes 2^25 + 1 cells apart on that axis, with instances in the camera's cell and the next along it: equal images | A shader that subtracts after converting to float: at 2^25 + 1 cells the neighbour's difference converts to zero cells. In one cell alone, below 2^24 cells, or with the neighbour along an axis the scene was not moved on, where every cell converts exactly, it renders the same pixels and fails nothing |
-| A record without `LIVE` produces no fragment | A slot freed in frame 2: its triangle's pixels are `CLEAR` | One that writes `(0, 0, 0, 0)`, whose result no specification defines |
-| A world stepped, extracted, rendered and compared with the CPU reference | `InstanceRecord::drawn`, `CellTransform::apply`, `CameraData::clip`, `shader::{TRIANGLE, PALETTE, CLEAR}`. Exact at each pixel whose centre is at least a quarter of a pixel inside or outside every edge the reference computes in `f64`, decision 5.1's margin, justified from four bits of sub-pixel snapping and 32-bit error at the scene's extent; the others accepted either way, and the three counts stated: surely drawn, surely clear, in the margin, with zero wrong | One that draws nothing; one that draws every instance in the clear colour |
+| A record without `LIVE` produces no fragment | A slot freed in frame 2, below the highest slot held: its triangle's pixels are `CLEAR`, and the highest slot's are drawn | One that ignores `LIVE`, which draws the freed record at the placement it last held; one that draws `SlotTable::live` instances, not `extent`. The record is placed at `(2, 2, 2, 1)` and not `(0, 0, 0, 0)`, whose result no specification defines, and which the M1 draws nothing for |
+| A world stepped, extracted, rendered and compared with the CPU reference, at a fraction strictly between 0 and 1 | `InstanceRecord::drawn`, `CellTransform::apply`, `CameraData::clip`, `shader::{TRIANGLE, PALETTE, CLEAR}`. Exact at each pixel whose centre is at least a quarter of a pixel inside or outside every edge the reference computes in `f64`, decision 5.1's margin, justified from four bits of sub-pixel snapping and 32-bit error at the scene's extent; the others accepted either way, and the three counts stated: surely drawn, surely clear, in the margin, with zero wrong | One that draws nothing; one that draws every instance in the clear colour; one that pushes a fraction of 1 |
 | The first frames on null | A renderer's first frame with nothing extracted, and a frame that frees every slot in a region no writer has used: each submitted, none refused (`undefined-read`) | One that declares the instance buffer or the rows in every frame |
 | The sink and the frame agree (present-api's proof row "A rollback in a frame with no step") | present-api's sequences run through `ExtractSink`, the records read back on a device or computed with `InstanceRecord::scatter` on null | One that sets `HAS_BASE` in a dropped tick; one that takes the base at every write |
 
@@ -889,8 +901,21 @@ description and report type to plain data, and each format to its size.
 the M1. A run with no device says that it skipped. Every dependency between the scatter and
 the draw passes through device addresses, which synchronisation validation does not track,
 and lavapipe runs each dispatch to completion before the next command, so neither shows a
-dropped barrier: the barrier mutations (the scatter-to-vertex barrier, the barrier between
-dispatches, the barrier across frames) are the desktop's, with the GPU made to lag.
+dropped barrier. The barrier between two dispatches of the scatter is the one that matters:
+nothing else orders them. Dropped, with the scatter's `FREE` path made to lag, it fails the
+test of `65,536` slots freed by one run and given by the next under KosmicKrisp, and the
+lag with the barrier kept passes it; without the lag it passes, and under MoltenVK, whose
+serial compute encoder orders the dispatches anyway, it passes with the lag. No shipped
+shader lags, so `cargo xtask gpu` alone cannot fail the mutation: the mutation and its lag
+are a script's, on the M1 and on the desktop. The other two, the
+scatter-to-vertex barrier and the barrier across frames, cannot fail as a frame is
+declared: dropping the instance buffer's transition leaves other imports' transitions from
+`Undefined` before the same pass (the entries' before the scatter; the camera's, the
+vertices', the indices' and the arguments' before the triangle pass), each a full execution
+dependency. Across frames, a write after a read, that is all the hazard needs, so the
+mutation is correct by the specification. Before the triangle pass the mutation drops the
+memory dependency on the instance buffer alone, which desktop drivers carry out as a global
+cache operation, so a desktop run in which it survives does not show the barrier unneeded.
 
 It also owes:
 
