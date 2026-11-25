@@ -52,7 +52,7 @@ const PIPELINES: u32 = 96;
 /// The colour target's side.
 const SIDE: u32 = 512;
 /// The variable naming the directory of the cooked salted source (`salted.vs_NN` and
-/// `salted.fs_NN`, as `ricotta --code` writes them) and its salt, the file `salt`.
+/// `salted.fs_NN`, as `ricotta --shaders` writes them) and its salt, the file `salt`.
 const SALTED_VAR: &str = "LACTOSE_MEASURE_SALTED";
 /// The variable naming the directory of the engine's cooked shaders, as `cargo xtask gpu` and
 /// `cargo xtask measure gpu-cost` set it.

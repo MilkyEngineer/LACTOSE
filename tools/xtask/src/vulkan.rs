@@ -615,6 +615,144 @@ fn lavapipe_icd(dir: &Path) -> Result<PathBuf, String> {
     Ok(first)
 }
 
+/// The Swift script of the Metal step.
+pub const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
+/// Builds the test target `target` of `package`, or its library's unit tests for `None`, and
+/// returns its binary.
+///
+/// # Errors
+/// If cargo cannot run, the build fails, or it builds no such binary.
+pub fn test_binary(
+    cargo: &str,
+    root: &Path,
+    package: &str,
+    target: Option<&str>,
+) -> Result<PathBuf, String> {
+    let selected = target.map_or(vec!["--lib"], |target| vec!["--test", target]);
+    let target = target.map_or_else(|| package.replace('-', "_"), str::to_owned);
+    let output = Command::new(cargo)
+        .current_dir(root)
+        .args(["test", "--locked", "--no-run", "--message-format", "json-render-diagnostics"])
+        .args(["--package", package])
+        .args(selected)
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("cannot run cargo: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the build of {package}'s {target} tests ended with {}",
+            output.status
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| message["target"]["name"] == target.as_str())
+        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+        .ok_or_else(|| format!("cargo built no binary of {package}'s {target} tests"))
+}
+
+/// The ignored tests of a libtest binary, by name.
+///
+/// # Errors
+/// If the binary cannot run or fails to list them.
+pub fn ignored_tests(binary: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new(binary)
+        .args(["--list", "--ignored", "--format", "terse"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
+    if !output.status.success() {
+        return Err(format!("{} --list ended with {}", binary.display(), output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
+        .collect())
+}
+
+/// Each validator's canary in the Metal script, every phrasing seen so far of what the
+/// validator says of it, and whether that aborts the process. Each phrasing names the
+/// canary's own misuse: no buffer bound at index 0, and the `canary` kernel's store at
+/// offset 4194304, the script's index `1 << 20` into a buffer of one `uint`.
+pub const METAL_CANARIES: [(&str, &[&str], bool); 2] = [
+    // Xcode 16.4 writes `buffer`, Xcode 26.6 and 27.2 `Buffer`: `said` ignores ASCII case.
+    ("api", &["missing Buffer binding at index 0"], true),
+    (
+        "shader",
+        &[
+            // Xcode 27.2.
+            "Invalid store in 'device' or 'constant' address space at offset 4194304, executing \
+             compute function: \"canary\"",
+            // Xcode 26.6.
+            "Invalid device store at offset 4194304, executing kernel function: \"canary\"",
+        ],
+        false,
+    ),
+];
+
+/// The text of `stderr` that is one of `phrasings`, compared without regard to ASCII case,
+/// as the validator wrote it.
+#[must_use]
+pub fn said<'a>(phrasings: &[&str], stderr: &'a str) -> Option<&'a str> {
+    // ASCII lowercase keeps every byte where it was, so a match's offsets hold in `stderr`.
+    let lower = stderr.to_ascii_lowercase();
+    phrasings.iter().find_map(|phrasing| {
+        let at = lower.find(&phrasing.to_ascii_lowercase())?;
+        Some(&stderr[at..at + phrasing.len()])
+    })
+}
+
+/// What one run of the Metal script printed.
+pub struct StepOutput {
+    /// How it ended.
+    pub status: std::process::ExitStatus,
+    /// Its standard output.
+    pub stdout: String,
+    /// Its standard error.
+    pub stderr: String,
+}
+
+/// Runs the Metal script, from the repository root `root`, under Metal API and shader
+/// validation ([`METAL_VALIDATION`]).
+///
+/// # Errors
+/// If `swift` cannot run.
+pub fn metal_step(root: &Path, args: &[&str]) -> Result<StepOutput, String> {
+    let output = Command::new("swift")
+        .current_dir(root)
+        .arg(METAL_SCRIPT)
+        .args(args)
+        .envs(METAL_VALIDATION)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run swift: {e}"))?;
+    Ok(StepOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+/// Under `out`, the directory `layers`, holding the pinned layer's implicit manifest for
+/// `sdk`, and the empty directory `no-layers`, as [`Run::environment`] takes them.
+///
+/// # Errors
+/// If a directory or the manifest cannot be written, or the SDK's manifest read.
+pub fn layer_dirs(sdk: &Sdk, out: &Path) -> Result<[PathBuf; 2], String> {
+    let layers = out.join("layers");
+    let no_layers = out.join("no-layers");
+    for dir in [&layers, &no_layers] {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let manifest = fs::read_to_string(&sdk.manifest)
+        .map_err(|e| format!("{}: {e}", sdk.manifest.display()))?;
+    let implicit = layers.join("VkLayer_khronos_validation.json");
+    fs::write(&implicit, implicit_manifest(&manifest, &sdk.library)?)
+        .map_err(|e| format!("{}: {e}", implicit.display()))?;
+    Ok([layers, no_layers])
+}
+
 /// What one device test's process came to.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Verdict {

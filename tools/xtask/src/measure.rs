@@ -83,6 +83,11 @@ pub enum Run {
         /// The test's path inside the file's module.
         test: &'static str,
     },
+    /// Criterion 1 (`triangle`): the client binary's fixed-frame run, in release, under every
+    /// validator the host's pinned layer has, and each validator's canary in a process of its
+    /// own beside it, once under each of [`Options::drivers`], judged by decision 5.10's rule
+    /// ([`vulkan::judge`]).
+    Triangle,
     /// The netcode spike's ten-minute replays (`REPLAYS`), ignored tests run in release one
     /// at a time, each of which prints its figures as one JSON object.
     SpikeReplays,
@@ -96,8 +101,8 @@ pub enum Run {
 
 impl Run {
     /// Whether `--short` cuts its repetitions, or the spike's replays, and so marks its files
-    /// as short. The headless run has none to cut, and edit-to-playing keeps its five so that
-    /// a runner's short run still yields the criterion's figure.
+    /// as short. The headless run has none to cut, and edit-to-playing keeps its five and
+    /// `triangle` its 600 frames so that a short run still yields the criterion's proof.
     #[must_use]
     pub const fn cut_by_short(self) -> bool {
         matches!(
@@ -113,7 +118,7 @@ impl Run {
     /// Whether it needs a Vulkan device.
     #[must_use]
     pub const fn on_device(self) -> bool {
-        matches!(self, Self::Device { .. } | Self::GpuCost { .. })
+        matches!(self, Self::Device { .. } | Self::GpuCost { .. } | Self::Triangle)
     }
 
     /// The package, file and test of an ignored test, on a device or not.
@@ -149,7 +154,7 @@ const fn device(package: &'static str, file: &'static str, test: &'static str) -
 }
 
 /// Every measurement, in the order `--all` runs them.
-pub const MEASUREMENTS: [Measurement; 16] = [
+pub const MEASUREMENTS: [Measurement; 17] = [
     Measurement {
         name: "tick-100k",
         what: "Criterion 1: the median step of the 100k scene on one frame worker and on N, S and the projected eight-core tick",
@@ -255,6 +260,12 @@ pub const MEASUREMENTS: [Measurement; 16] = [
             "crates/app-client/tests/stall.rs",
             "the_record_beside_the_physics_phase",
         ),
+    },
+    Measurement {
+        name: "triangle",
+        what: "Milestone 2's criterion 1: the client binary's fixed-frame run of 600 frames and seven instances under every validator the host's pinned layer has, the last frame's offscreen target read back and held to the CPU reference, and each validator's canary in a process of its own beside it",
+        threshold: "no pixel outside decision 5.1's margin wrong, each canary heard, no other message and nothing at warn or above (milestone 2 plan, section 4, criterion 1; decision 5.10)",
+        run: Run::Triangle,
     },
     Measurement {
         name: "gpu-cost",
@@ -1192,6 +1203,7 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
             Run::GpuCost { .. } => {
                 run_gpu_cost(workspace, options, &machine, m, &out, &mut devices)
             }
+            Run::Triangle => run_triangle(workspace, options, &machine, m, &out, &mut devices),
             Run::SpikeReplays => run_spike_replays(workspace, options, &machine, m, &out),
             Run::TaskBench => run_task_bench(workspace, options, &machine, &out),
             Run::Headless => run_headless(workspace, options, &machine, m, &out),
@@ -1541,9 +1553,13 @@ struct OnDevice {
 /// How long `vulkaninfo` may run.
 const VULKANINFO_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Each driver's [`OnDevice`], made once a run.
+/// What the runs on a device share, each made once a run: each driver's [`OnDevice`], and the
+/// engine's shaders cooked with the pinned Slang.
 #[derive(Default)]
-struct Devices(Vec<(vulkan::Driver, Result<OnDevice, String>)>);
+struct Devices {
+    made: Vec<(vulkan::Driver, Result<OnDevice, String>)>,
+    shaders: Option<Result<PathBuf, String>>,
+}
 
 impl Devices {
     fn get(
@@ -1552,14 +1568,20 @@ impl Devices {
         options: &Options,
         driver: vulkan::Driver,
     ) -> Result<&OnDevice, String> {
-        let at = match self.0.iter().position(|(made, _)| *made == driver) {
+        let at = match self.made.iter().position(|(made, _)| *made == driver) {
             Some(at) => at,
             None => {
-                self.0.push((driver, on_device(workspace, options, driver)));
-                self.0.len() - 1
+                self.made.push((driver, on_device(workspace, options, driver)));
+                self.made.len() - 1
             }
         };
-        self.0[at].1.as_ref().map_err(Clone::clone)
+        self.made[at].1.as_ref().map_err(Clone::clone)
+    }
+
+    /// The directory of the engine's whole cooked shaders, as `cargo xtask gpu` gives its
+    /// tests: `shaders` under `target/measure/shaders`.
+    fn shaders(&mut self, workspace: &Workspace) -> Result<PathBuf, String> {
+        self.shaders.get_or_insert_with(|| cook_engine_shaders(workspace)).clone()
     }
 }
 
@@ -1623,8 +1645,9 @@ fn run_test(
     run_test_with(workspace, options, machine, m, out, device, None, &[])
 }
 
-/// [`run_test`], its files named for `variant` where there is one, and the test given
-/// `extra`, which the header's command shows.
+/// [`run_test`], its files named for `variant` where there is one, and the test given the
+/// directories `dirs` by variable, each as its absolute path, which the header's command
+/// shows relative to the repository root.
 #[expect(clippy::too_many_arguments, reason = "run_test's, and the two a variant adds")]
 fn run_test_with(
     workspace: &Workspace,
@@ -1634,12 +1657,11 @@ fn run_test_with(
     out: &Path,
     device: Option<&OnDevice>,
     variant: Option<&'static str>,
-    extra: &[(&'static str, String)],
+    dirs: &[(&'static str, PathBuf)],
 ) -> Result<Vec<PathBuf>, String> {
     let args = nextest_args(m.run);
     build(workspace, &no_run(&args))?;
-    let mut env = short_env(options);
-    env.extend(extra.iter().cloned());
+    let env = short_env(options);
     let mut command = Command::new(&workspace.cargo);
     command.args(&args).current_dir(&workspace.root);
     // The device's environment first: it clears what it does not set.
@@ -1648,6 +1670,8 @@ fn run_test_with(
     }
     // A short run sets the variable; a full one makes sure the caller's does not leak in.
     command.env_remove(SHORT_VAR).envs(env.iter().map(|(name, value)| (name, value)));
+    // A test runs in its package's directory, so a directory is given whole.
+    command.envs(dirs.iter().map(|(name, dir)| (name, dir)));
     pass_workers(&mut command, machine);
     let sampler = Sampler::start();
     let output = capture(&mut command, |_, _| {});
@@ -1662,6 +1686,7 @@ fn run_test_with(
         .find(|(name, _)| name == "workers" || name == "frame_workers")
         .map_or_else(|| default_workers(machine), |(_, value)| value.clone());
     let mut shown = env.clone();
+    shown.extend(dirs.iter().map(|(name, dir)| (*name, shown_path(&workspace.root, dir))));
     if let Some(n) = machine.workers_override {
         shown.push((WORKERS_VAR, n.to_string()));
     }
@@ -1739,6 +1764,23 @@ fn shown_path(root: &Path, path: &Path) -> String {
     }
 }
 
+/// The pinned Slang compiler, installed under the target directory where it is not.
+fn slang_compiler(workspace: &Workspace) -> Result<PathBuf, String> {
+    let pin = crate::slang::Pin::parse(&read_file(&workspace.root.join(crate::slang::PIN_FILE))?)?;
+    crate::slang::install(&pin, &workspace.target_dir)
+}
+
+/// The engine's shaders cooked with the pinned Slang under `target/measure/shaders`, as
+/// `cargo xtask gpu` cooks them: the whole cooked shaders' directory.
+fn cook_engine_shaders(workspace: &Workspace) -> Result<PathBuf, String> {
+    let slangc = slang_compiler(workspace)?;
+    let dir = workspace.target_dir.join("measure").join("shaders");
+    eprintln!("measure: cooking {SHADER_SOURCES}");
+    let sources = workspace.root.join(SHADER_SOURCES);
+    crate::slang::cook(&workspace.cargo, &workspace.root, &slangc, &sources, &dir)?;
+    Ok(dir.join("shaders"))
+}
+
 /// `gpu-cost`: the engine's shaders cooked once, then under each driver a source salted for
 /// that run cooked and the test run, each driver's pair of files named for it. A salt is the
 /// clock's nanoseconds, folded to 24 bits, as the source folds it; the cook and the build
@@ -1751,12 +1793,9 @@ fn run_gpu_cost(
     out: &Path,
     devices: &mut Devices,
 ) -> Result<Vec<PathBuf>, String> {
-    let pin = crate::slang::Pin::parse(&read_file(&workspace.root.join(crate::slang::PIN_FILE))?)?;
-    let slangc = crate::slang::install(&pin, &workspace.target_dir)?;
+    let shaders = devices.shaders(workspace)?;
+    let slangc = slang_compiler(workspace)?;
     let dir = workspace.target_dir.join("measure").join("gpu-cost");
-    eprintln!("measure: cooking {SHADER_SOURCES} with Slang {}", pin.version);
-    let sources = workspace.root.join(SHADER_SOURCES);
-    let code = crate::slang::cook(&workspace.cargo, &workspace.root, &slangc, &sources, &dir)?;
     let mut written = Vec::new();
     for driver in options.drivers() {
         let device = devices.get(workspace, options, driver)?;
@@ -1776,14 +1815,12 @@ fn run_gpu_cost(
             fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
         }
         eprintln!("measure: cooking the source salted {salt} for {}", driver.name());
-        let cooked =
-            crate::slang::cook(&workspace.cargo, &workspace.root, &slangc, &source, &salted)?;
+        crate::slang::cook(&workspace.cargo, &workspace.root, &slangc, &source, &salted)?;
+        // The whole cooked shaders, as `cargo xtask gpu` gives the tests, not the code alone.
+        let cooked = salted.join("shaders");
         let file = cooked.join("salt");
         fs::write(&file, salt.to_string()).map_err(|e| format!("{}: {e}", file.display()))?;
-        let extra = [
-            (SHADERS_VAR, shown_path(&workspace.root, &code)),
-            (SALTED_VAR, shown_path(&workspace.root, &cooked)),
-        ];
+        let extra = [(SHADERS_VAR, shaders.clone()), (SALTED_VAR, cooked)];
         written.extend(run_test_with(
             workspace,
             options,
@@ -1796,6 +1833,323 @@ fn run_gpu_cost(
         )?);
     }
     Ok(written)
+}
+
+/// The frames of `triangle`'s fixed-frame run, criterion 1's.
+const TRIANGLE_FRAMES: &str = "600";
+
+/// How long `triangle`'s run of the client binary may take: the run is about 20 seconds on
+/// the M1 under its validators, so this is a margin for a loaded machine.
+const TRIANGLE_DEADLINE: Duration = Duration::from_secs(600);
+
+/// The client binary's package and binary.
+const CLIENT: &str = "lactose-app-client";
+
+/// The test binaries of `lactose-rhi-vulkan` that hold the layer's canaries: its library's
+/// unit tests and its `integration` target.
+const CANARY_BINARIES: [Option<&str>; 2] = [None, Some("integration")];
+
+/// The figures of the client binary's `Outcome` line, as its `Debug` prints it: each count
+/// under its field's name, the comparison's counts as `counts.<field>` and `surely` as its
+/// list, `none` for a field that is `None`. `None` where the line is not one.
+#[must_use]
+pub fn outcome_figures(line: &str) -> Option<Vec<(String, String)>> {
+    let body = line.trim().strip_prefix("Outcome { ")?.strip_suffix(" }")?;
+    // A field's value: what follows `name: ` at the start of `text` or after a `, ` or `{ `.
+    let field = |text: &str, name: &str| -> Option<String> {
+        let key = format!("{name}: ");
+        let at = text
+            .match_indices(&key)
+            .map(|(at, _)| at)
+            .find(|&at| at == 0 || text[..at].ends_with(", ") || text[..at].ends_with("{ "))?;
+        let rest = &text[at + key.len()..];
+        let end = if rest.starts_with("Some(") {
+            // To the parenthesis that closes `Some(`.
+            let mut depth = 0usize;
+            rest.char_indices().find_map(|(at, c)| match c {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    None
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    (depth == 0).then_some(at + 1)
+                }
+                _ => None,
+            })?
+        } else {
+            rest.find(", ").unwrap_or(rest.len())
+        };
+        Some(rest[..end].to_owned())
+    };
+    let mut found = Vec::new();
+    for name in ["frames", "drew", "held", "shed", "dropped", "busy", "messages"] {
+        let value = field(body, name)?;
+        value.parse::<u64>().ok()?;
+        found.push((name.to_owned(), value));
+    }
+    match field(body, "counts")?.as_str() {
+        "None" => found.push(("counts".to_owned(), "none".to_owned())),
+        counts => {
+            let inner = counts.strip_prefix("Some(Counts { ")?.strip_suffix(" })")?;
+            for name in ["drawn", "clear", "margin"] {
+                let value = field(inner, name)?;
+                value.parse::<u64>().ok()?;
+                found.push((format!("counts.{name}"), value));
+            }
+        }
+    }
+    match field(body, "surely")?.as_str() {
+        "None" => found.push(("surely".to_owned(), "none".to_owned())),
+        surely => {
+            let list = surely.strip_prefix("Some([")?.strip_suffix("])")?;
+            found.push(("surely".to_owned(), list.to_owned()));
+        }
+    }
+    Some(found)
+}
+
+/// Why the client binary's fixed-frame run fails criterion 1 beside what [`vulkan::judge`]
+/// reads: no `Outcome` line, the comparison not made, a slot with no pixel surely its
+/// colour, or a line its log wrote at warn or above.
+#[must_use]
+pub fn triangle_failures(output: &str) -> Vec<String> {
+    let mut failures = Vec::new();
+    let found = output.lines().find_map(outcome_figures);
+    match &found {
+        None => failures.push("the binary printed no `Outcome` line".to_owned()),
+        Some(found) => {
+            let get = |name: &str| found.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+            if get("counts") == Some("none") {
+                failures.push("the last frame was not compared with the reference".to_owned());
+            }
+            match get("surely") {
+                Some("none") | None => {
+                    failures.push("the run counted no pixels surely drawn".to_owned());
+                }
+                Some(list) => {
+                    if list.split(", ").any(|n| n == "0") {
+                        failures.push(format!("a slot has no pixel surely its colour: [{list}]"));
+                    }
+                }
+            }
+        }
+    }
+    // `tracing`'s format: the time, then the level.
+    let loud = output
+        .lines()
+        .filter(|line| {
+            let mut words = line.split_whitespace();
+            words.next().is_some_and(|time| time.ends_with('Z') && time.contains('T'))
+                && words.next().is_some_and(|level| level == "WARN" || level == "ERROR")
+        })
+        .count();
+    if loud > 0 {
+        failures.push(format!("{loud} line(s) of the binary's log at warn or above"));
+    }
+    failures
+}
+
+/// `triangle`: under each driver, the layer's canaries, Metal's API validation's canary under
+/// MoltenVK, then the client binary's fixed-frame run, each in a process of its own under the
+/// environment `cargo xtask gpu` gives its tests; each driver's pair of files named for it.
+/// Every run and canary is judged and recorded before the measurement fails on any of them.
+fn run_triangle(
+    workspace: &Workspace,
+    options: &Options,
+    machine: &Machine,
+    m: &'static Measurement,
+    out: &Path,
+    devices: &mut Devices,
+) -> Result<Vec<PathBuf>, String> {
+    let shaders = devices.shaders(workspace)?;
+    let pin = vulkan::Pin::parse(&read_file(&workspace.root.join(vulkan::PIN_FILE))?)?;
+    let sdk = vulkan::sdk(&pin, &workspace.target_dir)?;
+    let dir = workspace.target_dir.join("measure").join("triangle");
+    let [layers, no_layers] = vulkan::layer_dirs(&sdk, &dir)?;
+    let args: Vec<String> = ["build", "--locked", "--release", "-p", CLIENT, "--bin", CLIENT]
+        .map(str::to_owned)
+        .to_vec();
+    build(workspace, &args)?;
+    let binary = workspace
+        .target_dir
+        .join("release")
+        .join(format!("{CLIENT}{}", std::env::consts::EXE_SUFFIX));
+    let mut canary_binaries = Vec::new();
+    for target in CANARY_BINARIES {
+        let binary =
+            vulkan::test_binary(&workspace.cargo, &workspace.root, "lactose-rhi-vulkan", target)?;
+        let tests = vulkan::ignored_tests(&binary)?;
+        canary_binaries.push((binary, tests));
+    }
+    let mut written = Vec::new();
+    let mut failed = Vec::new();
+    for driver in options.drivers() {
+        // The device's identity, `vulkaninfo`'s under the measured environment.
+        let device = devices.get(workspace, options, driver)?;
+        let run = vulkan::Run::environment(
+            driver,
+            &sdk,
+            [&layers, &no_layers, &shaders],
+            vulkan::Validators::Plain,
+            options.adapter.as_deref(),
+        )?;
+        let mut found = Vec::new();
+        let mut output = String::new();
+        let mut failures = Vec::new();
+        // The canaries first: a layer that did not load reports nothing, and the run after
+        // would pass for clean.
+        for (canary, ids) in &run.canaries {
+            let name = canary.rsplit("::").next().unwrap_or(canary);
+            let Some((binary, _)) =
+                canary_binaries.iter().find(|(_, tests)| tests.iter().any(|t| t == canary))
+            else {
+                failures.push(format!("{canary}: a listed canary no test binary holds"));
+                found
+                    .push((format!("canary.{name}"), "FAILED, no test binary holds it".to_owned()));
+                continue;
+            };
+            let mut command = Command::new(binary);
+            run.apply(&mut command)
+                .args(["--exact", canary, "--ignored", "--nocapture", "--test-threads", "1"])
+                .stdin(Stdio::null());
+            let ended = vulkan::run_bounded(&mut command, vulkan::DEADLINE)
+                .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
+            let verdict = vulkan::judge_ended(canary, &ended, Some(ids), run.metal);
+            output.push_str(&vulkan::entry("lactose-rhi-vulkan", canary, &verdict, &ended));
+            let word = match (&verdict.failure, &verdict.said) {
+                (Some(_), _) => {
+                    failures.push(format!("{canary}: {}", verdict.word()));
+                    verdict.word()
+                }
+                // A canary skipped for what its device lacks, which it names.
+                (None, Some(said)) if said.starts_with("skipped, ") => said.clone(),
+                (None, _) => format!("heard {}", verdict.messages.len() + verdict.reports.len()),
+            };
+            found.push((format!("canary.{name}"), word));
+        }
+        if run.metal {
+            let (canary, phrasings, aborts) = vulkan::METAL_CANARIES[0];
+            let step = vulkan::metal_step(&workspace.root, &["--canary", canary])?;
+            let word = match vulkan::said(phrasings, &step.stderr) {
+                Some(says) if step.status.success() != aborts => format!("heard `{says}`"),
+                _ => {
+                    failures.push(format!(
+                        "Metal {canary} validation's canary was not heard: it ended with {}",
+                        step.status
+                    ));
+                    format!("FAILED, not heard; it ended with {}", step.status)
+                }
+            };
+            output.push_str(&format!("{} --canary {canary}: {word}\n", vulkan::METAL_SCRIPT));
+            found.push((format!("canary.metal_{canary}"), word));
+        }
+        let run_dir = dir.join(driver.name());
+        let _ = fs::remove_dir_all(&run_dir);
+        fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
+        let (cache, dump) = (run_dir.join("pipeline-cache.bin"), run_dir.join("dump"));
+        let run_args: Vec<String> = [
+            "--shaders".to_owned(),
+            shaders.to_string_lossy().into_owned(),
+            "--cache".to_owned(),
+            cache.to_string_lossy().into_owned(),
+            "--fixed".to_owned(),
+            TRIANGLE_FRAMES.to_owned(),
+            dump.to_string_lossy().into_owned(),
+        ]
+        .to_vec();
+        let mut command = Command::new(&binary);
+        run.apply(&mut command).args(&run_args).current_dir(&run_dir).stdin(Stdio::null());
+        pass_workers(&mut command, machine);
+        eprintln!("measure: triangle under {}, {TRIANGLE_FRAMES} frames", driver.name());
+        let sampler = Sampler::start();
+        let ended = vulkan::run_bounded(&mut command, TRIANGLE_DEADLINE);
+        let load = sampler.stop();
+        let ended = ended.map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
+        let text = ended.text();
+        let verdict = vulkan::judge_ended(CLIENT, &ended, None, run.metal);
+        let mut run_failures: Vec<String> = verdict.failure.iter().cloned().collect();
+        run_failures.extend(triangle_failures(&text));
+        found.push(("run".to_owned(), ended.status.clone()));
+        found.extend(text.lines().find_map(outcome_figures).unwrap_or_default());
+        found.push(("validator_messages".to_owned(), verdict.messages.len().to_string()));
+        found.push(("driver_lines".to_owned(), verdict.driver.len().to_string()));
+        failures.extend(run_failures.iter().map(|why| format!("the run: {why}")));
+        found.push((
+            "criterion".to_owned(),
+            if failures.is_empty() {
+                "met".to_owned()
+            } else {
+                format!("not met: {}", failures.join("; "))
+            },
+        ));
+        let shown: Vec<String> =
+            run_args.iter().map(|arg| shown_path(&workspace.root, Path::new(arg))).collect();
+        let ran = shell_line(&[], &format!("target/release/{CLIENT}"), &shown);
+        let mut header =
+            header(options, machine, m, "release", default_workers(machine), ran, load);
+        header.variant = Some(driver.name());
+        let adapter = text.lines().find_map(|line| {
+            let at = line.find("adapter: \"")? + "adapter: \"".len();
+            line[at..].split('"').next().map(str::to_owned)
+        });
+        header.notes.extend(device_notes(&device.setting, adapter.as_deref()));
+        // Paths inside the repository relative to its root, the SDK's from `<sdk>`.
+        let environment: Vec<String> = run
+            .set
+            .iter()
+            .map(|(name, value)| {
+                let value = if Path::new(value).starts_with(&workspace.root) {
+                    shown_path(&workspace.root, Path::new(value))
+                } else {
+                    redacted(value, sdk.loader.parent())
+                };
+                format!("`{name}={value}`")
+            })
+            .collect();
+        for (name, value) in &mut header.notes {
+            match name.as_str() {
+                "Validation" => {
+                    *value = format!(
+                        "the pinned layer {}'s core, synchronisation (with load after store) and \
+                         thread-safety validation{}, each canary run in a process of its own \
+                         first",
+                        pin.version,
+                        if run.metal { ", and Metal's API and shader validation" } else { "" },
+                    );
+                }
+                "Environment" => *value = environment.join(", "),
+                "Presentation" => {
+                    *value = "a window, the present thread drawing each frame's offscreen \
+                              target to the swapchain's image; the display held awake by the \
+                              caller"
+                        .to_owned();
+                }
+                _ => {}
+            }
+        }
+        header.notes.push((
+            "Present split".to_owned(),
+            "the frames that drew split between queued (`drew`), `held`, `shed` and `dropped` \
+             as this one run's present thread met them: another run splits them otherwise, and \
+             criterion 1 reads none of them"
+                .to_owned(),
+        ));
+        output.push_str(&vulkan::entry(CLIENT, "--fixed", &verdict, &ended));
+        output.push_str(&vulkan::output(CLIENT, &ended));
+        written.extend(write(out, &header, &found, &output)?);
+        if !failures.is_empty() {
+            failed.push(format!("under {}: {}", driver.name(), failures.join("; ")));
+        }
+    }
+    if failed.is_empty() {
+        Ok(written)
+    } else {
+        for file in &written {
+            eprintln!("measure: wrote {}", file.display());
+        }
+        Err(format!("criterion 1 is not met {}", failed.join(", and ")))
+    }
 }
 
 /// A file's text.
@@ -2647,6 +3001,63 @@ mod tests {
         }
     }
 
+    /// The client binary's `Outcome` line, as `frame-impl`'s run on the M1 printed it.
+    const OUTCOME: &str = "Outcome { packs: 0, frames: 600, drew: 571, held: 0, shed: 2, \
+                           dropped: 27, busy: 0, counts: Some(Counts { drawn: 1044, clear: \
+                           195304, margin: 260 }), surely: Some([140, 151, 149, 150, 152, 151, \
+                           151]), messages: 0 }";
+
+    #[test]
+    fn the_outcome_line_gives_each_count_and_the_comparison() {
+        let found = outcome_figures(OUTCOME).unwrap();
+        let get = |name: &str| found.iter().find(|(n, _)| n == name).unwrap().1.as_str();
+        assert_eq!(get("frames"), "600");
+        assert_eq!(get("drew"), "571");
+        assert_eq!(get("held"), "0");
+        assert_eq!(get("shed"), "2");
+        assert_eq!(get("dropped"), "27");
+        assert_eq!(get("messages"), "0");
+        assert_eq!(get("counts.drawn"), "1044");
+        assert_eq!(get("counts.clear"), "195304");
+        assert_eq!(get("counts.margin"), "260");
+        assert_eq!(get("surely"), "140, 151, 149, 150, 152, 151, 151");
+        let paced = OUTCOME
+            .replace("Some(Counts { drawn: 1044, clear: 195304, margin: 260 })", "None")
+            .replace("Some([140, 151, 149, 150, 152, 151, 151])", "None");
+        let found = outcome_figures(&paced).unwrap();
+        assert!(found.contains(&("counts".to_owned(), "none".to_owned())));
+        assert!(found.contains(&("surely".to_owned(), "none".to_owned())));
+        assert!(outcome_figures("Outcome { frames: 600 }").is_none(), "a field missing");
+        assert!(outcome_figures(&OUTCOME.replace("drew: 571", "drew: many")).is_none());
+        assert!(outcome_figures("a line of the log").is_none());
+    }
+
+    #[test]
+    fn the_run_fails_without_a_comparison_a_slot_unseen_or_a_warning() {
+        let log = "2026-11-25T03:00:00.000000Z  INFO lactose_app_client: started";
+        assert!(triangle_failures(&format!("{log}\n{OUTCOME}\n")).is_empty());
+        assert_eq!(triangle_failures(log), ["the binary printed no `Outcome` line"]);
+        let unseen = OUTCOME.replace("[140, 151", "[0, 151");
+        let failures = triangle_failures(&unseen);
+        assert!(failures[0].starts_with("a slot has no pixel surely its colour"), "{failures:?}");
+        let uncompared =
+            OUTCOME.replace("Some(Counts { drawn: 1044, clear: 195304, margin: 260 })", "None");
+        assert_eq!(
+            triangle_failures(&uncompared),
+            ["the last frame was not compared with the reference"]
+        );
+        for level in ["WARN", "ERROR"] {
+            let loud = format!("2026-11-25T03:00:00.000000Z  {level} lactose_app: late\n{OUTCOME}");
+            assert_eq!(
+                triangle_failures(&loud),
+                ["1 line(s) of the binary's log at warn or above"],
+                "{level}"
+            );
+        }
+        // A word in a message is not a level.
+        assert!(triangle_failures(&format!("the WARN word\n{OUTCOME}")).is_empty());
+    }
+
     #[test]
     fn the_arguments_select_measurements() {
         let all = parse(&["--all", "--short"]).unwrap();
@@ -2673,8 +3084,8 @@ mod tests {
         let names: Vec<&str> = all.selected.iter().map(|m| m.name).collect();
         assert!(names.contains(&"record-stall") && names.contains(&"tick-100k"), "{names:?}");
         assert!(!names.contains(&"extract-50k") && !names.contains(&"remote-upload-5k"));
-        assert!(!names.contains(&"gpu-cost"), "{names:?}");
-        assert_eq!(all.selected.len() + 3, MEASUREMENTS.len());
+        assert!(!names.contains(&"gpu-cost") && !names.contains(&"triangle"), "{names:?}");
+        assert_eq!(all.selected.len() + 4, MEASUREMENTS.len());
         let error = parse(&["extract-50k", "--no-device"]).unwrap_err();
         assert!(error.contains("`extract-50k`"), "{error}");
         let named = parse(&["extract-50k", "--driver", "kosmickrisp", "--adapter", "Apple M1"]);

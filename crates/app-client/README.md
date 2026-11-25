@@ -112,6 +112,10 @@ The three on a device run under the driver `cargo xtask measure --driver` names 
 and fail on any message the device sends; `cargo xtask gpu` runs them short under its
 validators and discards their figures. `LACTOSE_GPU_ADAPTER` names the adapter.
 
+`cargo xtask measure triangle` is criterion 1's file: the binary itself, `--fixed 600`, under
+the validators `cargo xtask gpu` turns on and beside their canaries, on the host's drivers
+(`docs/results/README.md`). It replaces running the binary by hand under the layer.
+
 ## What proves it
 
 | What | How |
