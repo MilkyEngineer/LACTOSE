@@ -1,16 +1,17 @@
 //! The wiring that ships, on `lactose-rhi-null`: the client's render side and present side
 //! stepped on each queue layout with the extent going E1, hidden, E2 and E1 again, through
-//! the presents null stalls, and refused nothing; every target made destroyed; the frame's
-//! wait for the present's last read of a target it takes back, with every read kept pending;
-//! the fixed-frame mode's readback and the placements it is held to; a clean shutdown that
-//! logs nothing; and a lost device, which ends the run with its error and leaves a shutdown
-//! that completes.
+//! the presents null stalls, and refused nothing; every target made destroyed, a target
+//! whose make failed among them; the frame's wait for the present's last read of a target it
+//! takes back, with every read kept pending; the fixed-frame mode's readback and the
+//! placements it is held to; a clean shutdown that logs nothing; and a lost device, which
+//! ends the run with its error and leaves a shutdown that completes.
 //!
-//! Null reaches drawn, hidden, held and dropped frames through this wiring. A frame that
-//! waits for a region and one torn by a refusal are not reached: null runs each submit as it
-//! is made, and its control offers a loss and a stall of presents alone, neither of which
-//! leaves a frame's point unreached or refuses a call. `lactose-app`'s `tests/frame/states.rs`
-//! drives both over a scripted render side.
+//! Null reaches drawn, hidden, held and dropped frames through this wiring, and the test's
+//! device tears a frame by refusing a target's make. A frame that waits for a region and one
+//! torn by a refused submit are not reached: null runs each submit as it is made, and its
+//! control offers a loss and a stall of presents alone, neither of which leaves a frame's
+//! point unreached or refuses a call. `lactose-app`'s `tests/frame/states.rs` drives both
+//! over a scripted render side.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -27,7 +28,7 @@ use lactose_platform::PresentThread;
 use lactose_renderer::InstanceRecord;
 use lactose_rhi_api::{Capabilities, Device, Extent, QueueLayout, SwapchainDesc};
 use lactose_rhi_null::Control;
-use lactose_task::{ExecutionLog, Executor};
+use lactose_task::{ExecutionLog, Executor, Lane};
 
 use crate::support::{
     Said, Watch, Watched, WatchedDevice, bounded, lock, null_device, null_shaders, warnings,
@@ -48,6 +49,8 @@ pub struct Run {
     present: Option<PresentThread<Box<dyn PresentSide>>>,
     frames: Frames,
     input: Arc<LatestSample>,
+    /// The present lane ([`Wired::barrier`]).
+    barrier: Lane<Box<dyn PresentSide>>,
     start: Instant,
     steps: u32,
 }
@@ -89,7 +92,7 @@ impl Run {
         let shaders = null_shaders();
         let wired =
             wire(&executor, &*platform, &device, swapchain, &shaders, world, setup.readback);
-        let Wired { shown, present, frames, input } = wired.expect("wired");
+        let Wired { shown, present, frames, input, barrier } = wired.expect("wired");
         Self {
             executor,
             control,
@@ -99,6 +102,7 @@ impl Run {
             present: Some(present),
             frames,
             input,
+            barrier,
             start: Instant::now(),
             steps: 0,
         }
@@ -129,15 +133,22 @@ impl Run {
         self.try_step(extent).unwrap_or_else(|failure| panic!("step {steps}: {:?}", failure.error))
     }
 
-    /// One step, then a wait until the present call of every frame queued so far has made
-    /// its last swapchain call ([`Watch::settle`]), so that the next step finds no call in
-    /// flight but in the moment between that call and the lane's reply. Asserted names
-    /// rest on it, never on a pace.
+    /// One step, then [`settle`](Self::settle): the next step finds no present call in
+    /// flight. Asserted names rest on it, never on a pace.
     pub fn settled(&mut self, extent: Option<Extent>) -> &'static str {
         let rendered = self.step(extent);
+        self.settle();
+        name(&rendered)
+    }
+
+    /// Waits until the present call of every frame queued so far has begun and made its
+    /// last swapchain call ([`Watch::settle`]), then for a call queued on the present lane
+    /// behind them, which runs once each of them has been replied to.
+    pub fn settle(&self) {
         let queued = usize::try_from(self.shown().stats().queued).expect("a count");
         self.watch.settle(queued);
-        name(&rendered)
+        let barrier = self.barrier.run(|_| ());
+        bounded(&self.executor, barrier, "the present lane's barrier").expect("the barrier");
     }
 
     /// [`stop`](Self::stop), reading the fixed-frame mode's last frame from the render side
@@ -215,10 +226,6 @@ pub fn name(rendered: &Rendered) -> &'static str {
     }
 }
 
-fn several() -> Capabilities {
-    Capabilities { queues: QueueLayout::SEVERAL, ..Capabilities::LEAST }
-}
-
 fn layouts() -> [(&'static str, Capabilities); 2] {
     [
         ("one queue", Capabilities { queues: QueueLayout::ONE, ..Capabilities::LEAST }),
@@ -270,8 +277,7 @@ fn each_layout_steps_e1_e2_e1_through_stalled_presents_and_refuses_nothing() {
             "{layout}: {stalled:?}"
         );
         assert!(run.control.stall(false), "{layout}: the device is gone");
-        let queued = usize::try_from(run.shown().stats().queued).expect("a count");
-        run.watch.settle(queued);
+        run.settle();
         let after: Vec<_> = (0..2).map(|_| run.settled(Some(E1))).collect();
         assert_eq!(after, ["drawn", "drawn"], "{layout}");
         assert_eq!(
@@ -311,20 +317,53 @@ fn each_layout_destroys_every_target_it_made() {
     }
 }
 
-/// On two queues, frames at E1 with every present's read kept pending until a wait sees it
+/// On each layout, frames at E1, then at E2 with the make of the frame's new target
+/// refused, then E2 and E1 again: the frame whose make failed is torn, and the target it
+/// retired is in no slot, so that no later frame retires it again or draws it; every later
+/// frame is drawn and queued, and every target made is destroyed by the end, with nothing
+/// refused (`r3-m3-slot-kept`).
+#[test]
+fn a_target_whose_make_fails_at_a_change_of_extent_leaves_its_old_image_in_no_slot() {
+    for (layout, capabilities) in layouts() {
+        let mut run = Run::new(capabilities, workers(), WorldConfig::shown());
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(run.settled(Some(E1)));
+        }
+        run.watch.fail_make.store(true, Ordering::Release);
+        seen.push(run.settled(Some(E2)));
+        for extent in [E2, E2, E2, E1, E1, E1] {
+            seen.push(run.settled(Some(extent)));
+        }
+        let watch = Arc::clone(&run.watch);
+        assert!(run.stop().is_none(), "no chaos, no log");
+        assert_eq!(seen[..4], ["drawn", "drawn", "drawn", "torn"], "{layout}: {seen:?}");
+        assert!(seen[4..].iter().all(|step| *step == "drawn"), "{layout}: {seen:?}");
+        let made = lock(&watch.made).clone();
+        let destroyed = lock(&watch.destroyed).clone();
+        let left: Vec<_> = made.iter().filter(|image| !destroyed.contains(image)).collect();
+        assert!(left.is_empty(), "{layout}: never destroyed: {left:?}");
+        assert_eq!(*lock(&watch.refusals), Vec::<String>::new(), "{layout}");
+    }
+}
+
+/// On each layout, frames at E1 with every present's read kept pending until a wait sees it
 /// ([`Watch::lag`]): from the third frame on, each frame takes back a target whose last read
 /// by a present is still pending, and its import waits for that read on the device, so null
 /// refuses nothing. A frame that took the target back with no wait would write it while the
 /// read is pending, which null refuses (`render-no-ready`).
 #[test]
 fn a_frame_that_takes_back_a_target_waits_for_its_last_read() {
-    let setup = Setup { lag: true, ..Setup::default() };
-    let mut run = Run::with(several(), workers(), WorldConfig::shown(), setup);
-    let seen: Vec<_> = (0..8).map(|_| run.settled(Some(E1))).collect();
-    assert_eq!(seen, ["drawn"; 8]);
-    assert_eq!(*lock(&run.watch.refusals), Vec::<String>::new());
-    assert_eq!(run.said.count.load(Ordering::Relaxed), 0, "{:?}", lock(&run.said.texts));
-    assert!(run.stop().is_none(), "no chaos, no log");
+    for (layout, capabilities) in layouts() {
+        let setup = Setup { lag: true, ..Setup::default() };
+        let mut run = Run::with(capabilities, workers(), WorldConfig::shown(), setup);
+        let seen: Vec<_> = (0..8).map(|_| run.settled(Some(E1))).collect();
+        assert_eq!(seen, ["drawn"; 8], "{layout}");
+        assert_eq!(*lock(&run.watch.refusals), Vec::<String>::new(), "{layout}");
+        let said = run.said.count.load(Ordering::Relaxed);
+        assert_eq!(said, 0, "{layout}: {:?}", lock(&run.said.texts));
+        assert!(run.stop().is_none(), "no chaos, no log");
+    }
 }
 
 /// On each layout, with the fixed-frame mode's readback at E1: after frames at E1 the last
@@ -361,9 +400,9 @@ fn the_readback_reads_the_last_frame_at_its_extent_with_the_scenes_placements() 
 /// with no image: the extent E1, hidden, E2 and E1 again, then more frames at E1. A target
 /// whose call made no submit was released toward the present role, on two queues, with no
 /// acquire to meet it, and the frame that draws it next takes it back from `Undefined`
-/// (D160's item 7 (c), verification row 230): null refuses nothing and says nothing. Every
-/// frame but the hidden one draws; whether it is queued, held or dropped is the present
-/// thread's pace and not asserted.
+/// (D160's item 7 (c), verification row 230): null refuses nothing and says nothing. Each
+/// step is settled ([`Run::settled`]), so every frame but the hidden one is drawn and queued,
+/// and each of their calls reaches its acquire, every second one answered with no image.
 #[test]
 fn each_layout_takes_back_the_targets_of_present_calls_that_made_no_submit() {
     for (layout, capabilities) in layouts() {
@@ -371,15 +410,14 @@ fn each_layout_takes_back_the_targets_of_present_calls_that_made_no_submit() {
         let mut run = Run::with(capabilities, workers(), WorldConfig::shown(), setup);
         let watch = Arc::clone(&run.watch);
         let extents = [Some(E1), Some(E1), None, Some(E2), Some(E2), Some(E1), Some(E1)];
-        let mut seen: Vec<_> = extents.into_iter().map(|extent| name(&run.step(extent))).collect();
-        seen.extend((0..8).map(|_| name(&run.step(Some(E1)))));
-        assert_eq!(seen[2], "hidden", "{layout}: {seen:?}");
-        let drew = seen.iter().filter(|name| ["drawn", "held", "dropped"].contains(name)).count();
-        assert_eq!(drew, seen.len() - 1, "{layout}: {seen:?}");
+        let mut seen: Vec<_> = extents.into_iter().map(|extent| run.settled(extent)).collect();
+        seen.extend((0..8).map(|_| run.settled(Some(E1))));
+        let drawn = seen.iter().filter(|name| **name == "drawn").count();
+        assert!(seen[2] == "hidden" && drawn == seen.len() - 1, "{layout}: {seen:?}");
         let said = run.said.count.load(Ordering::Relaxed);
         assert_eq!(said, 0, "{layout}: {:?}", lock(&run.said.texts));
         assert!(run.stop().is_none(), "no chaos, no log");
-        // The stop awaited every call; a call whose acquire was skipped made no submit.
+        // A call whose acquire was skipped made no submit.
         let skipped = watch.skipped.load(Ordering::Relaxed);
         assert!(skipped >= 3, "{layout}: {skipped} calls made no submit");
         assert_eq!(*lock(&watch.resizes), [E1, E2, E1], "{layout}");
@@ -387,9 +425,11 @@ fn each_layout_takes_back_the_targets_of_present_calls_that_made_no_submit() {
 }
 
 /// On each layout, three frames and a clean stop, the render side dropped on this thread
-/// after the present thread's stop: nothing on the way logs a warning. The renderer's drop
-/// once waited on the graph's timeline after the graph's drop had destroyed it, and warned
-/// under `cheddar` at every clean shutdown.
+/// after the present thread's stop: no thread logs a warning on the way, the present thread
+/// and the workers among them. The renderer's drop once waited on the graph's timeline after
+/// the graph's drop had destroyed it, and warned under `cheddar` at every clean shutdown; a
+/// present side's `close` that destroyed its timeline twice would warn on the present thread
+/// (`r3-close-warns-on-its-thread`).
 #[test]
 fn a_clean_shutdown_logs_no_warning() {
     for (layout, capabilities) in layouts() {

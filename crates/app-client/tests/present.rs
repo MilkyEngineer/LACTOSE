@@ -15,7 +15,7 @@ use lactose_core::ErrorKind;
 use lactose_rhi_api::{
     Capabilities, ColourAttachment, Device, Encoder, Extent, ImageDesc, ImageHandle, ImageMemory,
     ImageRange, ImageState, ImageTransition, ImageUsage, Load, PassReach, QueueLayout, QueueRole,
-    RenderPass, Sharing, StateOn, Store, Submit, SwapchainDesc, Target, TimelineHandle,
+    RenderPass, Rule, Sharing, StateOn, Store, Submit, SwapchainDesc, Target, TimelineHandle,
     TimelinePoint,
 };
 
@@ -26,10 +26,7 @@ use crate::support::{
 const E1: Extent = Extent { width: 64, height: 48 };
 const E2: Extent = Extent { width: 80, height: 40 };
 
-/// A target as a frame leaves it: made at `extent`, a colour attachment on the graphics
-/// role from a submit that signals the next value of `frames` and, where the present role
-/// has a queue of its own, releases the target toward it as the frame's hand-off does.
-/// Nothing here observes that value, so the submit stays pending until a wait sees it.
+/// A target as a frame leaves it: made at `extent` and drawn ([`draw`]).
 fn drawn(
     device: &dyn Device,
     frames: TimelineHandle,
@@ -48,6 +45,22 @@ fn drawn(
             sharing: Sharing::Exclusive,
         })
         .expect("a target");
+    let point = draw(device, frames, value, image, None);
+    (image, point)
+}
+
+/// `image` drawn as a frame draws a target, behind `ready` where it is given: taken from
+/// `Undefined` to a colour attachment on the graphics role by a submit that signals the next
+/// value of `frames` and, where the present role has a queue of its own, releases the target
+/// toward it as the frame's hand-off does. Nothing here observes that value, so the submit
+/// stays pending until a wait sees it.
+fn draw(
+    device: &dyn Device,
+    frames: TimelineHandle,
+    value: &mut u64,
+    image: ImageHandle,
+    ready: Option<TimelinePoint>,
+) -> TimelinePoint {
     let mut encoder: Box<dyn Encoder> =
         device.create_encoder(QueueRole::Graphics, "frame").expect("an encoder");
     encoder.transition_images(&[ImageTransition {
@@ -84,10 +97,10 @@ fn drawn(
     device
         .submit(
             QueueRole::Graphics,
-            Submit { encoders: &mut encoders, waits: &[], signals: &[point] },
+            Submit { encoders: &mut encoders, waits: ready.as_slice(), signals: &[point] },
         )
         .expect("the frame's submit");
-    (image, point)
+    point
 }
 
 /// A present side over a [`WatchedDevice`] on null with `queues`, its swapchain
@@ -124,6 +137,12 @@ impl Side {
         self.images.push(image);
         let target = TargetIndex::new(slot).expect("a target index");
         Finished { target, image, extent, point }
+    }
+
+    /// `finished`'s target drawn again behind `ready`, the read of its last present.
+    fn redrawn(&mut self, finished: Finished, ready: TimelinePoint) -> Finished {
+        let point = draw(&*self.device, self.frames, &mut self.value, finished.image, Some(ready));
+        Finished { point, ..finished }
     }
 
     fn call(&mut self, finished: Finished) -> lactose_core::Result<PresentReport> {
@@ -204,12 +223,17 @@ fn the_present_waits_for_the_frame_that_drew_its_target() {
     side.close();
 }
 
-/// With every present's read kept pending until a wait sees it, targets 0, 1 and 0 at E1,
-/// each a new image: the third call writes slot 0 anew with no resize before it, while the
-/// first present, which declared that slot, is pending unless a call waited for its read.
-/// Each slot's write waits for the last read first, so null refuses nothing; a slot written
-/// with no wait is refused (`uuwp-used`; `slot-no-wait`, `crates/app/README.md`, "The
-/// targets and the present thread").
+/// With every present's read kept pending until a wait sees it, at E1 with no resize after
+/// the first call, each slot written anew while a present that declared it may be pending
+/// unless a call waited for its read. Each slot's write waits for the last read first, so
+/// null refuses nothing; a slot written with no wait, or behind an earlier read, is refused
+/// (`uuwp-used`; `crates/app/README.md`, "The targets and the present thread").
+///
+/// Targets 0, 1 and 0, each a new image: the third call's write of slot 0 meets the first
+/// present pending (`slot-no-wait`). Then targets 0, 1 and 0 again: the first two images
+/// drawn again behind their reads, the second's present refused as pending, so that it makes
+/// no read, and a new image in slot 0, whose write meets pending the present that declared
+/// slot 0 last, which is now the last read and not the one before it (`slot-wait-stale`).
 #[test]
 fn a_heap_slot_is_written_anew_only_behind_the_last_read() {
     for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
@@ -219,6 +243,21 @@ fn a_heap_slot_is_written_anew_only_behind_the_last_read() {
             let report = side.call(finished).unwrap_or_else(|error| panic!("call {call}: {error}"));
             assert!(report.read.is_some(), "call {call}: {report:?}");
         }
+        side.close();
+
+        let mut side = Side::new(queues, true);
+        let a = side.finished(0, E1);
+        let a_read = side.call(a).expect("call 0").read.expect("call 0's read");
+        let b = side.finished(1, E1);
+        let b_read = side.call(b).expect("call 1").read.expect("call 1's read");
+        let again = side.redrawn(a, a_read);
+        assert!(side.call(again).expect("call 2").read.is_some(), "call 2");
+        let again = side.redrawn(b, b_read);
+        *lock(&side.watch.refuse_present) = Some(Rule::Pending);
+        assert_eq!(side.call(again).expect("call 3").read, None, "call 3, refused");
+        let c = side.finished(0, E1);
+        let report = side.call(c).unwrap_or_else(|error| panic!("{queues:?}: call 4: {error}"));
+        assert!(report.read.is_some(), "call 4: {report:?}");
         assert_eq!(*lock(&side.watch.resizes), [E1]);
         side.close();
     }
@@ -232,7 +271,7 @@ fn a_present_refused_as_pending_is_made_by_the_next_call_with_the_same_image() {
     let mut side = Side::new(QueueLayout::ONE, false);
     let finished = side.finished(0, E1);
     assert!(side.call(finished).expect("call 0").read.is_some());
-    side.watch.refuse_present.store(true, Ordering::Relaxed);
+    *lock(&side.watch.refuse_present) = Some(Rule::Pending);
     let finished = side.finished(1, E1);
     let report = side.call(finished).expect("call 1");
     assert_eq!(report.read, None, "the refused present made nothing");
@@ -241,6 +280,31 @@ fn a_present_refused_as_pending_is_made_by_the_next_call_with_the_same_image() {
     assert!(side.call(finished).expect("call 2").read.is_some());
     assert_eq!(side.watch.acquires.load(Ordering::Relaxed), 2, "no acquire of its own");
     assert_eq!(side.watch.presents(), 2);
+    side.close();
+}
+
+/// A present refused by a rule other than pending also leaves its image acquired (rhi-api,
+/// `Swapchain::present`): the call fails, and the next call presents that image with no
+/// acquire of its own, as does every call after it. A side that forgot it would acquire
+/// again, which null refuses while an image is acquired, at every call after
+/// (`refused-present-forgotten`).
+#[test]
+fn a_present_refused_by_another_rule_is_made_by_the_next_call_with_the_same_image() {
+    let mut side = Side::new(QueueLayout::ONE, false);
+    let finished = side.finished(0, E1);
+    assert!(side.call(finished).expect("call 0").read.is_some());
+    *lock(&side.watch.refuse_present) = Some(Rule::State);
+    let finished = side.finished(1, E1);
+    let refused = side.call(finished).expect_err("call 1, refused");
+    assert_eq!(Rule::of(&refused), Some(Rule::State), "{refused}");
+    assert_eq!(side.watch.acquires.load(Ordering::Relaxed), 2);
+    for call in 2..5 {
+        let finished = side.finished(call % 2, E1);
+        let report = side.call(finished).unwrap_or_else(|error| panic!("call {call}: {error}"));
+        assert!(report.read.is_some(), "call {call}: {report:?}");
+    }
+    assert_eq!(side.watch.acquires.load(Ordering::Relaxed), 4, "call 2 acquired nothing");
+    assert_eq!(side.watch.presents(), 4);
     side.close();
 }
 
@@ -255,7 +319,7 @@ fn a_resize_that_fails_gives_up_the_acquired_image() {
     let mut side = Side::new(QueueLayout::ONE, false);
     let finished = side.finished(0, E1);
     assert!(side.call(finished).expect("call 0").read.is_some());
-    side.watch.refuse_present.store(true, Ordering::Relaxed);
+    *lock(&side.watch.refuse_present) = Some(Rule::Pending);
     let finished = side.finished(1, E1);
     assert_eq!(side.call(finished).expect("call 1").read, None);
     let at_e2 = side.finished(0, E2);

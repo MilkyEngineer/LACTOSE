@@ -260,6 +260,10 @@ pub struct Wired {
     pub frames: Frames,
     /// What the frame's latch reads, which the binary publishes.
     pub input: Arc<LatestSample>,
+    /// The present lane, which the shutdown does not need: a call queued on it runs once
+    /// every call queued before it has run and been replied to, so a test awaits one as a
+    /// barrier behind the present calls so far.
+    pub barrier: Lane<Box<dyn PresentSide>>,
 }
 
 /// Wires the game onto `device`: the render side, the present side over `swapchain` on a
@@ -283,6 +287,7 @@ pub fn wire(
     let render = ClientRender::new(device, shaders, Arc::clone(&input), readback)?;
     let present = ClientPresent::new(Arc::clone(device), swapchain, shaders)?;
     let (lane, thread) = present_thread(platform, Box::new(present) as Box<dyn PresentSide>)?;
+    let barrier = lane.clone();
     let cooked = Arc::new(InMemory::new()?);
     let built = Frames::new(&cooked).and_then(|frames| {
         let cooked = cooked as Arc<dyn Cooked>;
@@ -291,10 +296,10 @@ pub fn wire(
         Ok((shown, frames))
     });
     match built {
-        Ok((shown, frames)) => Ok(Wired { shown, present: thread, frames, input }),
+        Ok((shown, frames)) => Ok(Wired { shown, present: thread, frames, input, barrier }),
         Err(error) => {
-            // The lane is gone with the failed build, and the present side's `close` was
-            // never called: its state comes back and drops here.
+            // The lane's calls are gone with the failed build, and the present side's
+            // `close` was never called: its state comes back and drops here.
             drop(executor.block_on(thread.stop()));
             Err(error)
         }
@@ -308,7 +313,7 @@ fn drive(
     platform: &Arc<dyn Platform>,
     options: &Options,
 ) -> Result<Outcome> {
-    let exit = ExitOnDrop(main.clone());
+    let exit_on_drop = ExitOnDrop(main.clone());
     let mut outcome = Outcome::default();
     let shaders = CookedShaders::read(&options.shaders)?;
     // The cooked pack set (D136). Nothing in it is read at milestone 2: the scene enters by
@@ -358,14 +363,16 @@ fn drive(
         let swapchain = match swapchain {
             Ok(swapchain) => swapchain,
             Err(error) => {
-                // Step 5 of "Shutdown" on this path too.
+                // Steps 1 and 5 of "Shutdown" on this path too.
+                exit(&main);
                 drop(executor.block_on(main.run(move |_: &mut MainThread| drop(device))));
                 return Err(error);
             }
         };
         let ran = run_on(executor, &main, &device, swapchain, &shaders, &cache, reports, options);
-        // Step 5 of "Shutdown": the last device, in a main-lane call, where its surface is
-        // dropped.
+        // Step 1, which `run_on` queued already on every path that ran frames, and step 5 of
+        // "Shutdown": the last device, in a main-lane call, where its surface is dropped.
+        exit(&main);
         let dropped = executor.block_on(main.run(move |_: &mut MainThread| drop(device)));
         drop(store);
         let counted = ran?;
@@ -378,14 +385,13 @@ fn drive(
         Ok(())
     });
     io.shutdown();
-    drop(exit);
+    drop(exit_on_drop);
     ran.map(|()| outcome)
 }
 
 /// Steps 4 to 7 of "What `lactose-app-client` wires" on `device`, then steps 1 to 4 of
-/// "Shutdown": every device clone but the caller's is gone when it returns, save those a
-/// render side whose drop outlived step 4's bound holds, and then the paced mode goes on
-/// and the fixed-frame mode ends the process.
+/// "Shutdown": every device clone but the caller's is gone when it returns. A render side
+/// whose drop outlives step 4's bound ends the process instead, in either mode.
 #[expect(clippy::too_many_arguments, reason = "the run's parts, each made by `drive`")]
 fn run_on(
     executor: &Executor,
@@ -400,7 +406,7 @@ fn run_on(
     let mut outcome = Outcome::default();
     let readback = matches!(options.mode, Mode::Fixed { .. }).then_some(FIXED_EXTENT);
     let world = WorldConfig::shown();
-    let Wired { shown, present, frames, input } =
+    let Wired { shown, present, frames, input, .. } =
         wire(executor, &**executor.platform(), device, swapchain, shaders, world, readback)?;
     // Written once the renderer's pipelines are made; a cache that cannot be written costs
     // the next run its pipelines' time and nothing else.
@@ -443,14 +449,11 @@ fn run_on(
             "the render side's drop did not end within {BOUND:?}{error}: the device is not \
              answering"
         );
-        if matches!(options.mode, Mode::Fixed { .. }) {
-            // What the drop holds keeps the window, so the pump never returns
-            // (`crates/platform/README.md`, "Shutdown"): the paced mode's window stays open
-            // under the pump's warning until it is closed, and the fixed-frame mode, which
-            // no one closes, ends the process here, its teardown not run.
-            eprintln!("lactose-app-client: the device did not answer within {BOUND:?}{error}");
-            std::process::exit(1);
-        }
+        // What the drop holds keeps the window, so the pump never returns
+        // (`crates/platform/README.md`, "Shutdown"): in either mode the process ends here,
+        // its teardown not run, rather than wait under the pump's warning to be killed.
+        eprintln!("lactose-app-client: the device did not answer within {BOUND:?}{error}");
+        std::process::exit(1);
     }
     if let Some(server) = server {
         server.shutdown();

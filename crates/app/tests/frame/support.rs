@@ -555,6 +555,11 @@ impl<W: Future> Future for Bounded<W> {
     type Output = Option<W::Output>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Read before the wait is polled: a wait that is ready only when the keeper's wake
+        // polls it, its own waker having woken nothing, fails at the bound.
+        if self.expiry.passed.load(Ordering::Acquire) {
+            return Poll::Ready(None);
+        }
         if let Poll::Ready(value) = self.wait.as_mut().poll(cx) {
             return Poll::Ready(Some(value));
         }

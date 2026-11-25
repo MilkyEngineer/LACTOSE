@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lactose_app::{Finished, PresentReport, PresentSide, TARGETS};
-use lactose_core::Result;
+use lactose_core::{ErrorKind, Result};
 use lactose_rhi_api::{
     Acquired, AddressMode, ColourAttachment, ColourTargetDesc, Cull, Device, DisplayTime, Encoder,
     Extent, Filter, GraphicsPipelineDesc, GraphicsPipelineHandle, HeapSlot, ImageHandle,
@@ -250,14 +250,17 @@ impl ClientPresent {
                     waiting,
                 })
             }
-            // Nothing was submitted and the image is still the acquired one: the frame's
-            // release of the target stays unmet, and the frame takes the target back from
-            // `Undefined` behind the read it already knows.
-            Err(error) if Rule::of(&error) == Some(Rule::Pending) => {
-                self.acquired = Some(image);
-                Ok(nothing)
+            // After a refusal nothing was submitted and the image is still the acquired one
+            // (rhi-api, `Swapchain::present`), kept for the next call: the frame's release
+            // of the target stays unmet, and the frame takes the target back from
+            // `Undefined` behind the read it already knows. A refusal as pending is the
+            // next call's to retry; any other fails the frame.
+            Err(error) => {
+                if error.kind() != ErrorKind::DeviceLost {
+                    self.acquired = Some(image);
+                }
+                if Rule::of(&error) == Some(Rule::Pending) { Ok(nothing) } else { Err(error) }
             }
-            Err(error) => Err(error),
         }
     }
 }

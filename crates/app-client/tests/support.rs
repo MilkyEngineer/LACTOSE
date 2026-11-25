@@ -8,12 +8,12 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use lactose_app_client::CookedShaders;
-use lactose_core::Result;
+use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::{
     Acquired, BufferDesc, BufferHandle, Capabilities, ComputePipelineDesc, ComputePipelineHandle,
     ConstantSlot, ConstantType, CookedShader, Device, DeviceInfo, DeviceRequest, DisplayTime,
@@ -127,8 +127,8 @@ pub struct Watch {
     pub skipped: AtomicUsize,
     /// The images presents were taken for, in order.
     pub presented: Mutex<Vec<ImageHandle>>,
-    /// Whether the next present is refused as pending without reaching null.
-    pub refuse_present: AtomicBool,
+    /// The rule the next present is refused by, without reaching null.
+    pub refuse_present: Mutex<Option<Rule>>,
     /// The present calls begun: each begins with `display_times`.
     pub begun: AtomicUsize,
     /// Those whose last swapchain call returned: an acquire that gave no image, a present,
@@ -147,6 +147,8 @@ pub struct Watch {
     /// Every refusal of a submit, a present, an acquire, a resize or a heap slot's write or
     /// clear, by rule and text.
     pub refusals: Mutex<Vec<String>>,
+    /// Whether a [`WatchedDevice`] refuses the next image's make, without asking null.
+    pub fail_make: AtomicBool,
     /// The images a [`WatchedDevice`] made, and those it destroyed.
     pub made: Mutex<Vec<ImageHandle>>,
     pub destroyed: Mutex<Vec<ImageHandle>>,
@@ -229,8 +231,8 @@ impl Swapchain for Watched {
     }
 
     fn present(&mut self, image: ImageHandle, submit: Submit<'_>) -> Result<Presented> {
-        if self.watch.refuse_present.swap(false, Ordering::Relaxed) {
-            return self.watch.end(Err(Rule::Pending.refuse("a present refused by the test")));
+        if let Some(rule) = lock(&self.watch.refuse_present).take() {
+            return self.watch.end(Err(rule.refuse("a present refused by the test")));
         }
         lock(&self.watch.reads).extend(submit.signals.iter().map(|point| point.timeline));
         let presented = self.watch.noted("a present", self.inner.present(image, submit));
@@ -257,8 +259,8 @@ impl Swapchain for Watched {
 }
 
 /// A device that passes every call to `inner`, noting each refusal of a submit or of a heap
-/// slot's write or clear and every image made and destroyed, and that answers the reads of
-/// the presents' timeline as [`Watch::lag`] says.
+/// slot's write or clear and every image made and destroyed, that refuses an image's make
+/// on request, and that answers the reads of the presents' timeline as [`Watch::lag`] says.
 pub struct WatchedDevice {
     pub inner: Arc<dyn Device>,
     pub watch: Arc<Watch>,
@@ -318,6 +320,9 @@ impl Device for WatchedDevice {
     }
 
     fn create_image(&self, desc: &ImageDesc<'_>) -> Result<ImageHandle> {
+        if self.watch.fail_make.swap(false, Ordering::AcqRel) {
+            return Err(Error::new(ErrorKind::ResourceExhausted, "a make refused by the test"));
+        }
         let image = self.inner.create_image(desc)?;
         lock(&self.watch.made).push(image);
         Ok(image)
@@ -454,16 +459,26 @@ impl std::io::Write for Captured {
     }
 }
 
-/// `body`'s value, and the events at `warn` or above that it logged on the calling thread.
+/// `body`'s value, and the events at `warn` or above that any thread logged while it ran,
+/// each with its thread's name: the capture is the process's subscriber, set at the first
+/// call, which nextest's process for each test makes the test's alone. Calls run one at a
+/// time.
 pub fn warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
-    let captured = Captured::default();
-    let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_max_level(tracing::Level::WARN)
-        .with_ansi(false)
-        .finish();
-    let value = tracing::subscriber::with_default(subscriber, body);
+    static CAPTURED: OnceLock<Captured> = OnceLock::new();
+    let captured = CAPTURED.get_or_init(|| {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_thread_names(true)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the process's subscriber");
+        captured
+    });
+    lock(&captured.0).clear();
+    let value = body();
     let text = String::from_utf8_lossy(&lock(&captured.0)).into_owned();
     (value, text)
 }
@@ -486,6 +501,11 @@ impl<W: Future> Future for Bounded<W> {
     type Output = Option<W::Output>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Read before the wait is polled: a wait that is ready only when the keeper's wake
+        // polls it, its own waker having woken nothing, fails at the bound.
+        if self.expiry.passed.load(Ordering::Acquire) {
+            return Poll::Ready(None);
+        }
         if let Poll::Ready(value) = self.wait.as_mut().poll(cx) {
             return Poll::Ready(Some(value));
         }

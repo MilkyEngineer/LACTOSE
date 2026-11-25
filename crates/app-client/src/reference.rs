@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use lactose_core::{Error, ErrorKind, Result};
+use lactose_present_api::RenderTransform;
 use lactose_renderer::shader::{PALETTE, TRIANGLE};
 use lactose_renderer::{CameraData, InstanceRecord};
 use lactose_rhi_api::Extent;
@@ -193,7 +194,8 @@ pub fn held_to(records: &[InstanceRecord], expected: &[InstanceRecord]) -> Resul
         let same = match (is_live(record), is_live(expected)) {
             (true, true) => {
                 live += 1;
-                record.previous == expected.previous && record.current == expected.current
+                bits(&record.previous) == bits(&expected.previous)
+                    && bits(&record.current) == bits(&expected.current)
             }
             (false, false) => true,
             _ => false,
@@ -205,6 +207,13 @@ pub fn held_to(records: &[InstanceRecord], expected: &[InstanceRecord]) -> Resul
         }
     }
     Ok(live)
+}
+
+/// `transform`'s bits: its cell, then its offset and its rotation as their floats' bits, so
+/// that a negative zero and a NaN compare as they were written.
+fn bits(transform: &RenderTransform) -> ([i32; 3], [u32; 3], [u32; 4]) {
+    let position = &transform.position;
+    (position.cell, position.offset.map(f32::to_bits), transform.rotation.map(f32::to_bits))
 }
 
 /// Where `point` lies against the triangle `window`, by its distance in pixels from each
@@ -336,7 +345,8 @@ mod tests {
     }
 
     /// The records read back are held to extract's slot for slot: liveness, and a live
-    /// record's previous and current placements; the base and a free record's bytes are
+    /// record's previous and current placements bit for bit, so that an offset of negative
+    /// zero, equal to zero as a float, is refused; the base and a free record's bytes are
     /// not compared.
     #[test]
     fn the_records_are_held_to_the_placements_slot_for_slot() {
@@ -353,5 +363,11 @@ mod tests {
         let extra = [record(true, 1, 2), record(true, 0, 0), record(true, 3, 4)];
         assert!(held_to(&extra, &expected).is_err(), "a slot live that extract left free");
         assert!(held_to(&expected[..2], &expected).is_err(), "a record short");
+        let mut negative = record(true, 1, 2);
+        let zero = negative.previous.position.offset[0];
+        negative.previous.position.offset[0] = -zero;
+        assert_eq!(negative.previous.position.offset[0], zero, "equal as floats");
+        let signed = [negative, record(false, 0, 0), record(true, 3, 4)];
+        assert!(held_to(&signed, &expected).is_err(), "an offset's sign differs");
     }
 }
