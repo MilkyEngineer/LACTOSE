@@ -22,13 +22,23 @@
 //! Where macOS runs the paced job moves the figures more than the upload does: a light job
 //! that sleeps most of each period is placed on an efficiency core at a low clock as often as
 //! not, frame-critical though its worker is, and at a clock less than half the fastest
-//! (`measure-m2`'s review, which read the cores the probe's jobs ran on). The test cannot ask
-//! which core it is on without `unsafe`, so each job first times a fixed chain of dependent
-//! multiply-adds, [`CHAIN`] long: its time is the clock the job meets. The file gives, beside
-//! the medians of every frame, each part's median within each clock band, the band read
-//! against the fastest chain of the run, and each band's share of the frames. The same frames
-//! are then run back to back with no timer, a control whose job stays busy and whose clock
-//! stays up, and given the same way under `unpaced.`.
+//! (`measure-m2`'s review, which read the cores the probe's jobs ran on). So the test runs in
+//! the foreground task role, which the shared support takes (`task_role`), and each job reads
+//! the class of the core it began on and the one it ended on through
+//! `lactose_task::current_core_class`, and times a fixed chain of dependent multiply-adds,
+//! [`CHAIN`] long, whose time is the clock the job meets. Criterion 5 reads the frames whose
+//! job began and ended on a performance core, at whatever clock (D164). The file gives the
+//! median, P99 and worst frame over every frame (`frame.*`), over those frames
+//! (`performance.*`) and over the rest (`rest.*`), each with its share of the frames and its
+//! split by clock band, the band read against the fastest chain of the run; how many frames
+//! ran in each placement (`placement.*`); and which figure the criterion reads and whether
+//! the run judges it (`criterion.*`). The same frames are then run back to back with no
+//! timer, a control whose job stays busy and whose clock stays up, and given the same way
+//! under `unpaced.`. The fastest chain on each class of core
+//! (`calibration.fastest_us.performance` and `.efficiency`), over the frames and the chains of
+//! a numbering probe that runs a `Background` thread on every logical CPU after them
+//! (`calibration.probe.*`), shows the CPU numbering the class call rests on: the efficiency
+//! cores' is the slower (`calibration.numbering`).
 //!
 //! The bands are relative to the run's fastest chain, not to a core's rated clock. The file
 //! flags a run whose control has under half its frames `full` (`calibration.flag`): a fastest
@@ -54,6 +64,7 @@ use lactose_net_host::interpolation::{
 use lactose_physics_api::Transform;
 use lactose_present_api::{InstanceRow, RenderTransform};
 use lactose_renderer::{Renderer, RendererDesc};
+use lactose_task::{CoreClass, current_core_class};
 
 use crate::support::{bounded, lock};
 use crate::timing::{
@@ -83,6 +94,47 @@ fn calibration() -> Duration {
     start.elapsed()
 }
 
+/// The chains each thread of [`numbering_probe`] times.
+const PROBE_CHAINS: usize = 400;
+
+/// The chain on every class of core, apart from the frames: a `Background` thread for each
+/// logical CPU, so that some run on the efficiency cores wherever the frames' job ran, each
+/// timing [`PROBE_CHAINS`] chains between two reads of its core's class. Each chain's
+/// [`placement`] and time.
+fn numbering_probe() -> Vec<(&'static str, Duration)> {
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let handles: Vec<_> = (0..threads)
+        .map(|_| {
+            std::thread::spawn(|| {
+                enter(ThreadClass::Background);
+                (0..PROBE_CHAINS)
+                    .map(|_| {
+                        let began = current_core_class();
+                        let chain = calibration();
+                        (placement(began, current_core_class()), chain)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    handles.into_iter().flat_map(|handle| handle.join().expect("a probe thread")).collect()
+}
+
+/// Where a job or a chain ran, from the class of the core it began on and the one it ended
+/// on: `performance` or `efficiency` where both are that class, `moved` where they differ,
+/// `unknown` where the platform could not tell.
+fn placement(began: Option<CoreClass>, ended: Option<CoreClass>) -> &'static str {
+    match (began, ended) {
+        (Some(CoreClass::Performance), Some(CoreClass::Performance)) => "performance",
+        (Some(CoreClass::Efficiency), Some(CoreClass::Efficiency)) => "efficiency",
+        (Some(_), Some(_)) => "moved",
+        _ => "unknown",
+    }
+}
+
+/// Every value of [`placement`].
+const PLACEMENTS: [&str; 4] = ["performance", "efficiency", "moved", "unknown"];
+
 /// The state the network thread pushes for slot `n` at server tick `tick`.
 fn state(tick: u32, n: u32) -> ReceivedState {
     let x = Scalar::from_f64(f64::from(n) + f64::from(tick) * 0.1);
@@ -100,9 +152,12 @@ struct Frame {
     rows: Vec<InstanceRow>,
 }
 
-/// What one frame's job took, by part, and its calibration chain's time.
+/// What one frame's job took, by part, its calibration chain's time, and the class of the
+/// core it began on and the one it ended on.
 #[derive(Clone, Copy)]
 struct Parts {
+    began: Option<CoreClass>,
+    ended: Option<CoreClass>,
     calibration: Duration,
     batch: Duration,
     convert: Duration,
@@ -113,11 +168,18 @@ impl Parts {
     fn frame(&self) -> Duration {
         self.batch + self.convert + self.write
     }
+
+    /// Where the job ran.
+    fn placement(&self) -> &'static str {
+        placement(self.began, self.ended)
+    }
 }
 
 impl Frame {
-    /// The calibration chain, then the schedule's remote upload at `at`, from a frame's job.
+    /// The class of the core, the calibration chain, then the schedule's remote upload at
+    /// `at`, from a frame's job, and the class of the core again.
     fn upload(&mut self, ctx: &mut lactose_task::JobContext<'_>, at: PresentationTime) -> Parts {
+        let began = current_core_class();
         let calibration = calibration();
         let start = Instant::now();
         self.reader.sample_batch(&self.slots, at, &mut self.samples);
@@ -136,6 +198,8 @@ impl Frame {
         }
         let written = Instant::now();
         Parts {
+            began,
+            ended: current_core_class(),
             calibration,
             batch: sampled - start,
             convert: converted - sampled,
@@ -197,8 +261,15 @@ fn band(calibration: Duration, fastest: Duration) -> &'static str {
     BANDS.iter().find(|&&(_, bound)| ratio < bound).map_or("half", |&(name, _)| name)
 }
 
+/// `part` of `whole` as a percentage, to a tenth.
+fn share(part: usize, whole: usize) -> String {
+    format!("{:.1}", part as f64 * 100.0 / whole as f64)
+}
+
 /// One run's figures under `prefix`: each part's spread over every frame, the calibration's,
-/// and each band's frames, share and part medians.
+/// and each band's frames, share and part medians; the same over the frames whose job began
+/// and ended on a performance core and over the rest, each with its share of the run; and
+/// how many frames ran in each placement.
 fn report(prefix: &str, parts: &[Parts], fastest: Duration) {
     let all = |part: fn(&Parts) -> Duration| parts.iter().map(part).collect::<Vec<_>>();
     spread(&format!("{prefix}frame"), all(Parts::frame));
@@ -206,13 +277,33 @@ fn report(prefix: &str, parts: &[Parts], fastest: Duration) {
     spread(&format!("{prefix}convert"), all(|p| p.convert));
     spread(&format!("{prefix}write"), all(|p| p.write));
     spread(&format!("{prefix}calibration"), all(|p| p.calibration));
+    bands(prefix, parts, fastest);
+    let (performance, rest): (Vec<Parts>, Vec<Parts>) =
+        parts.iter().partition(|p| p.placement() == "performance");
+    for (name, group) in [("performance", performance), ("rest", rest)] {
+        let at = format!("{prefix}{name}.");
+        figure(&format!("{at}frames"), group.len());
+        figure(&format!("{at}share_percent"), share(group.len(), parts.len()));
+        if group.is_empty() {
+            continue;
+        }
+        spread(&format!("{at}frame"), group.iter().map(Parts::frame).collect());
+        bands(&at, &group, fastest);
+    }
+    for name in PLACEMENTS {
+        let count = parts.iter().filter(|p| p.placement() == name).count();
+        figure(&format!("{prefix}placement.{name}.frames"), count);
+    }
+}
+
+/// Each band's frames under `prefix`, their share of `parts` and their part medians.
+fn bands(prefix: &str, parts: &[Parts], fastest: Duration) {
     for (name, _) in BANDS {
         let banded: Vec<&Parts> =
             parts.iter().filter(|p| band(p.calibration, fastest) == name).collect();
         let at = format!("{prefix}band.{name}");
         figure(&format!("{at}.frames"), banded.len());
-        let share = banded.len() as f64 * 100.0 / parts.len() as f64;
-        figure(&format!("{at}.share_percent"), format!("{share:.1}"));
+        figure(&format!("{at}.share_percent"), share(banded.len(), parts.len()));
         if banded.is_empty() {
             continue;
         }
@@ -232,6 +323,8 @@ fn cost_of_the_remote_upload_of_5k() {
     let frames = (RATE_HZ * seconds) as usize;
     let period = Duration::from_secs(1) / RATE_HZ;
     let n = measured_workers();
+    // The machine's classes are read at the first call: here, outside every frame.
+    let _ = current_core_class();
     let executor = start_executor(Workers { frame_workers: Some(n), ..Workers::default() })
         .expect("an executor");
     let (device, messages) = vulkan();
@@ -303,6 +396,7 @@ fn cost_of_the_remote_upload_of_5k() {
     drop(frame);
     drop(device);
     messages.assert_none();
+    let probed = numbering_probe();
 
     // One reference for both runs, so that a band means the same clock in each.
     let fastest = paced.iter().chain(&unpaced).map(|p| p.calibration).min().expect("frames");
@@ -312,8 +406,54 @@ fn cost_of_the_remote_upload_of_5k() {
         "calibration.bands",
         "full under 1.25x the fastest chain, reduced under 2x, half at 2x or over",
     );
+    // The numbering the class call rests on, shown on the machine: each class's fastest chain,
+    // over the frames of both runs and the probe's chains.
+    let fastest_on = |class| {
+        let frames = paced.iter().chain(&unpaced).map(|p| (p.placement(), p.calibration));
+        frames.chain(probed.iter().copied()).filter(|&(at, _)| at == class).map(|(_, c)| c).min()
+    };
+    figure("calibration.probe.chains", probed.len());
+    for name in PLACEMENTS {
+        let count = probed.iter().filter(|&&(at, _)| at == name).count();
+        figure(&format!("calibration.probe.placement.{name}.chains"), count);
+    }
+    let (on_performance, on_efficiency) = (fastest_on("performance"), fastest_on("efficiency"));
+    for (class, chain) in [("performance", on_performance), ("efficiency", on_efficiency)] {
+        let value = chain
+            .map_or_else(|| "none: no frame or probe chain ran on the class".to_owned(), micros);
+        figure(&format!("calibration.fastest_us.{class}"), value);
+    }
+    figure(
+        "calibration.numbering",
+        match (on_performance, on_efficiency) {
+            (Some(performance), Some(efficiency)) if efficiency > performance => {
+                "the efficiency cores' fastest chain is the slower, as the class call's \
+                 numbering assumes"
+            }
+            (Some(_), Some(_)) => {
+                "FLAGGED: the efficiency cores' fastest chain is not the slower: the class \
+                 call's numbering is in doubt"
+            }
+            _ => "not shown: no frame or probe chain ran on one of the classes",
+        },
+    );
     report("", &paced, fastest);
     report("unpaced.", &unpaced, fastest);
+    // Criterion 5 (D164): the paced frames whose job began and ended on a performance core,
+    // every core where the system reports one class; under a tenth of the frames, no verdict.
+    figure(
+        "criterion.reads",
+        "performance.frame.p50_us: the paced frames that began and ended on a performance core",
+    );
+    let counted = paced.iter().filter(|p| p.placement() == "performance").count();
+    figure(
+        "criterion.judges",
+        if counted * 10 < paced.len() {
+            "no: under a tenth of the paced frames ran on a performance core"
+        } else {
+            "yes"
+        },
+    );
     let full = unpaced.iter().filter(|p| band(p.calibration, fastest) == "full").count();
     figure(
         "calibration.flag",

@@ -1,12 +1,12 @@
 //! What the measurements share (`extract`, `upload`, `stall`, `gpu`): the figure lines `cargo xtask
-//! measure` reads, the short run, N, the percentiles, a Vulkan device whose messages the
-//! run's judge counts, and a frame's end with an empty submit.
+//! measure` reads, the short run, N and the task role, the percentiles, a Vulkan device whose
+//! messages the run's judge counts, and a frame's end with an empty submit.
 //!
 //! A measurement prints each figure once as `measure: <name> <value>` and asserts on counts
 //! alone, never on a time.
 
 use std::fmt::Display;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use lactose_core::ThreadClass;
@@ -16,7 +16,7 @@ use lactose_rhi_api::{
     Submit, TimelineHandle, TimelinePoint,
 };
 use lactose_rhi_vulkan::VulkanDevice;
-use lactose_task::{Platform, StdPlatform};
+use lactose_task::{Platform, StdPlatform, take_foreground_task_role};
 
 use crate::support::{WAIT_BOUND, lock};
 
@@ -70,7 +70,14 @@ pub fn median(mut spans: Vec<Duration>) -> Duration {
 /// overrides it. The one copy in this crate's tests, which `extract.rs`, `upload.rs` and
 /// `stall.rs` share; `crates/app/tests/cost.rs` and `crates/sim/tests/cost.rs` hold the
 /// other two copies of the rule (sim's also returns the topology), and the three must match.
+///
+/// The first call takes the foreground task role for the process and prints the role it ran
+/// in as the figure `task_role` (D164): the three tests call this before they start their
+/// executor, so each runs, and its file reads, in that role. The role is taken for the
+/// process and cannot be given back.
 pub fn measured_workers() -> u32 {
+    static ROLE: Once = Once::new();
+    ROLE.call_once(|| figure("task_role", take_foreground_task_role()));
     if let Some(value) = std::env::var_os(WORKERS_VAR).filter(|value| !value.is_empty()) {
         let value = value.to_string_lossy();
         return value
