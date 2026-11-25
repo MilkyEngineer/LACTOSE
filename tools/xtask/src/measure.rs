@@ -2291,10 +2291,11 @@ const READINGS: &str = "the lateness is the first tick's start against the deadl
     it; the frame before a late one is classed by what it deferred, or as `joined_at_limit` \
     where its call returned at or after this frame's deadline less `JOIN_MARGIN`, its join \
     having waited to its limit, or as `joined` where it returned sooner; reading 1 counts the \
-    submits that overlapped a present's driver call by the two spans' stamps, and reads them \
-    against the driver call on a shared queue and, on two queues, by their P99's excess over \
-    the P99 of the submits that overlapped none, a defect past the latter's P50-to-P99 spread; \
-    a missing `join_margin_ns` or `shed_depth` is written as unread; a present call's \
+    submits that began during a present's driver call by the two spans' stamps, a submit that \
+    began before a call and ran into it being its own cost, and reads them against the driver \
+    call on a shared queue and, on two queues, by their P99's excess over the P99 of the \
+    submits begun outside one, a defect past the latter's P50-to-P99 spread; a missing \
+    `join_margin_ns` or `shed_depth` is written as unread; a present call's \
     parts are its waits (for its last read, the resize and the encoder's drop, which waits for \
     the frame's GPU work and the blit), the acquire, the record (the encoder's creation and \
     the blit's recording), the driver's call (`Swapchain::present`: the wait for the image's \

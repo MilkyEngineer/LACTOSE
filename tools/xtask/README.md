@@ -701,8 +701,9 @@ unlocked and the display awake (`caffeinate -d` on macOS).
   the record (job start to `draw`'s return), its greatest width (`width.max`, and
   `width.at_frame_worker_count`, the records as wide as the frame-critical workers) and the
   longest closure (`longest_job`), both unread where `info recorders` reads `absent`; the
-  submit, those that overlapped a present's driver call (`submit.overlapping_driver`,
-  `submit.overlapping`) and the rest (`submit.alone`), and on a shared queue the hold
+  submit, those that began during a present's driver call (`submit.began_during_driver`,
+  `submit.began_during`) and the rest (`submit.began_outside`), and on a shared queue the
+  hold
   (`draw`'s return to the submit's entry); each present call's parts with P90: its waits (for
   its last read, the resize and the encoder's drop, which waits for the frame's GPU work and
   the blit), the acquire, the record (the encoder's creation and the blit's recording), the
@@ -714,13 +715,16 @@ unlocked and the display awake (`caffeinate -d` on macOS).
   half the floor's median dropped and counted, and the latches' phase against the refresh
   (`latch_phase`), on which the median age at the display depends. Each is P50, P99 and the
   greatest, in microseconds. Then the flag (`flag.waiting_stayed_low`) and D162's four
-  readings (`reading.*`): reading 1 fires only on the submits that overlapped a driver call,
-  on a shared queue where their P99 is as long as the driver call's, and on two queues, where
-  an overlap is no wait by itself, where their P99 exceeds the P99 of the submits that
-  overlapped none (`submit.overlapping.excess_p99_us`) by more than the latter's own spread
-  from P50 to P99, the submit's variation in the same run; a missing `info join_margin_ns` or
-  `info shed_depth` is written `unread: no join_margin_ns` or `unread: no shed_depth`, so a
-  file without it does not read as a run in which no join waited or nothing was shed;
+  readings (`reading.*`): reading 1 fires only on the submits that began during a driver
+  call, a submit that began before one and ran into it being chosen by its own length and so
+  its own cost: on a shared queue where their P99 is as long as the driver call's, and on two
+  queues, where beginning during one is no wait by itself, where their P99 exceeds the P99 of
+  the submits begun outside one (`submit.began_during.excess_p99_us`, negative where under)
+  by more than the latter's own spread from P50 to P99, the submit's variation in the same
+  run; a missing `info join_margin_ns` is written `unread: no join_margin_ns`, so that a file
+  without it does not read as a run in which no join waited to its limit, and a missing `info
+  shed_depth` is written `unread: no shed_depth`: it stops reading 3's comparison with
+  `SHED_DEPTH`, and nothing more;
   the lateness is read at its P99 against D144's 1 ms on Windows and D156's 50 µs on macOS,
   the frames over it counted beside it (`lateness.over_limit`, and
   `lateness.over_limit_by_the_wake`).

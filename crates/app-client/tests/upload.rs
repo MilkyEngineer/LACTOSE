@@ -30,11 +30,12 @@
 //! are then run back to back with no timer, a control whose job stays busy and whose clock
 //! stays up, and given the same way under `unpaced.`.
 //!
-//! The bands are relative to the run's fastest chain, not to a core's rated clock: a run whose
-//! cores never reach their full clock, under Low Power Mode or a thermal limit, classes its
-//! fastest frames `full` all the same. The control's clock stays up where the cores can reach
-//! it, so the file flags a run whose control has under half its frames `full`
-//! (`calibration.flag`).
+//! The bands are relative to the run's fastest chain, not to a core's rated clock. The file
+//! flags a run whose control has under half its frames `full` (`calibration.flag`): a fastest
+//! chain the busy control cannot hold, an outlier or a performance core's chain among
+//! efficiency cores' frames. A run slowed throughout, under Low Power Mode or a thermal limit,
+//! has a slow fastest chain and a control nearly all `full` against it: no band read against
+//! the run's own chains can tell it, and the flag reads `no`.
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -317,8 +318,8 @@ fn cost_of_the_remote_upload_of_5k() {
     figure(
         "calibration.flag",
         if full * 2 < unpaced.len() {
-            "FLAGGED: under half the control's frames are `full`: the run's fastest chain may \
-             not be a core's full clock"
+            "FLAGGED: under half the control's frames are `full`: the busy control cannot hold \
+             the run's fastest chain; a run slowed throughout is not flagged"
         } else {
             "no"
         },

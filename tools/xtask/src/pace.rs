@@ -618,9 +618,12 @@ pub fn figures(run: &str, stamps: &Stamps, against: Against) -> Vec<(String, Str
     }
     put(&mut f, "closures", stamps.closures.len().to_string());
 
-    // The submit, those that overlapped a present's driver call, and the hold on a shared
-    // queue. The present calls are one thread's, so their driver calls are disjoint and in
-    // order, and the last to begin before a submit's return is the one that can overlap it.
+    // The submit, those that began during a present's driver call, and the hold on a shared
+    // queue. A submit that may have waited behind a driver call is one that began inside it:
+    // one that began before a call and ran on into it is chosen by its own length, and on a
+    // serialising driver it is the call that would wait. The present calls are one thread's,
+    // so their driver calls are disjoint and in order, and the last to begin at or before a
+    // submit's entry is the one it can have begun inside.
     let cost = |s: &Submit| s.returned.saturating_sub(s.entered) as f64;
     let submits: Vec<f64> = stamps.submits.iter().map(cost).collect();
     spread(&mut f, &name("submit"), &submits, false);
@@ -630,21 +633,21 @@ pub fn figures(run: &str, stamps: &Stamps, against: Against) -> Vec<(String, Str
         .filter_map(|call| Some((call.driver_at?, call.driver_at? + call.driver)))
         .collect();
     spans.sort_unstable();
-    let overlaps = |s: &&Submit| {
-        let begun = spans.partition_point(|&(start, _)| start < s.returned);
+    let began_during = |s: &&Submit| {
+        let begun = spans.partition_point(|&(start, _)| start <= s.entered);
         spans[..begun].last().is_some_and(|&(_, end)| end > s.entered)
     };
-    let (overlapping, alone): (Vec<&Submit>, Vec<&Submit>) =
-        stamps.submits.iter().partition(overlaps);
-    let overlapping: Vec<f64> = overlapping.into_iter().map(cost).collect();
-    let alone: Vec<f64> = alone.into_iter().map(cost).collect();
-    put(&mut f, "submit.overlapping_driver", format!("{} of {}", overlapping.len(), submits.len()));
-    spread(&mut f, &name("submit.overlapping"), &overlapping, false);
-    spread(&mut f, &name("submit.alone"), &alone, false);
-    // On two queues an overlap is no wait by itself: the overlapping submits are read by how
-    // far their P99 exceeds that of the submits that overlapped none.
-    let excess = percentile(&overlapping, 0.99).zip(percentile(&alone, 0.99)).map(|(o, a)| o - a);
-    put(&mut f, "submit.overlapping.excess_p99_us", excess.map_or_else(|| "none".to_owned(), us));
+    let (during, outside): (Vec<&Submit>, Vec<&Submit>) =
+        stamps.submits.iter().partition(began_during);
+    let during: Vec<f64> = during.into_iter().map(cost).collect();
+    let outside: Vec<f64> = outside.into_iter().map(cost).collect();
+    put(&mut f, "submit.began_during_driver", format!("{} of {}", during.len(), submits.len()));
+    spread(&mut f, &name("submit.began_during"), &during, false);
+    spread(&mut f, &name("submit.began_outside"), &outside, false);
+    // On two queues a submit begun during a driver call has not waited by that alone: those
+    // submits are read by how far their P99 exceeds that of the others.
+    let excess = percentile(&during, 0.99).zip(percentile(&outside, 0.99)).map(|(d, o)| d - o);
+    put(&mut f, "submit.began_during.excess_p99_us", excess.map_or_else(|| "none".to_owned(), us));
     let holds: Vec<f64> = stamps
         .submits
         .iter()
@@ -757,45 +760,47 @@ pub fn figures(run: &str, stamps: &Stamps, against: Against) -> Vec<(String, Str
     // D162's four readings.
     let p99 = |values: &[f64]| percentile(values, 0.99);
     let layout = if shared { "on the queue the roles share" } else { "on two queues" };
-    let count = format!("{} of {}", overlapping.len(), submits.len());
-    // The margin on two queues: the spread of the submits that overlapped none, from their
-    // P50 to their P99. It is the submit's own variation in the same run, so an excess past
-    // it is more than the submit varies by beside no driver call.
-    let own_spread = percentile(&alone, 0.5).zip(p99(&alone)).map(|(median, tail)| tail - median);
-    let reading = match (p99(&overlapping), p99(&submits), p99(&driver)) {
+    let count = format!("{} of {}", during.len(), submits.len());
+    // The margin on two queues: the spread of the submits begun outside a driver call, from
+    // their P50 to their P99. It is the submit's own variation in the same run, so an excess
+    // past it is more than the submit varies by when it begins outside a driver call.
+    let own_spread =
+        percentile(&outside, 0.5).zip(p99(&outside)).map(|(median, tail)| tail - median);
+    let reading = match (p99(&during), p99(&submits), p99(&driver)) {
         (_, None, _) | (_, _, None) => "unread: no submit or no driver call".to_owned(),
         (Some(over), _, Some(call)) if shared && over >= call => format!(
-            "a defect to report: {count} submits overlapped a present's driver call {layout}, \
+            "a defect to report: {count} submits began during a present's driver call {layout}, \
              their P99 {} us as long as the driver call's {} us",
             us(over),
             us(call)
         ),
         (Some(over), _, Some(call)) if shared => format!(
-            "recorded: {count} submits overlapped a present's driver call {layout}, their P99 \
+            "recorded: {count} submits began during a present's driver call {layout}, their P99 \
              {} us under the driver call's {} us",
             us(over),
             us(call)
         ),
-        (Some(over), ..) => match (p99(&alone), excess.zip(own_spread)) {
+        (Some(over), ..) => match (p99(&outside), excess.zip(own_spread)) {
             (Some(own), Some((excess, spread))) => format!(
-                "{}: {count} submits overlapped a present's driver call {layout}{}: their P99 {} \
-                 us is {} us over the {} us of the submits that overlapped none, {} the latter's \
+                "{}: {count} submits began during a present's driver call {layout}{}: their P99 \
+                 {} us is {} us {} the {} us of the submits begun outside one, {} the latter's \
                  P50-to-P99 spread of {} us",
                 if excess > spread { "a defect to report" } else { "recorded" },
                 if excess > spread { " and may have waited behind it" } else { "" },
                 us(over),
-                us(excess),
+                us(excess.abs()),
+                if excess < 0.0 { "under" } else { "over" },
                 us(own),
                 if excess > spread { "past" } else { "within" },
                 us(spread)
             ),
             _ => format!(
-                "unread: every submit ({count}) overlapped a present's driver call {layout}, \
-                 and none is left beside no driver call to read them against"
+                "unread: every submit ({count}) began during a present's driver call {layout}, \
+                 and none is left begun outside one to read them against"
             ),
         },
         (None, Some(all), Some(call)) => format!(
-            "recorded: no submit overlapped a present's driver call ({count}) {layout}: the \
+            "recorded: no submit began during a present's driver call ({count}) {layout}: the \
              submit's P99 {} us beside the driver call's {} us is the submit's own",
             us(all),
             us(call)
@@ -1251,11 +1256,11 @@ mod tests {
         assert!(get(&figures, "real.latch_phase").ends_with("of a refresh after a display"));
     }
 
-    /// The reviewers' probes of reading 1: submits as long as the driver call that overlap
-    /// none are recorded as their own, and a few that waited inside a driver call on the
-    /// shared queue are the defect, though the P99 of all the submits stays at their cost.
+    /// The reviewers' probes of reading 1: submits as long as the driver call that begin
+    /// outside one are recorded as their own, and a few that began inside a driver call on
+    /// the shared queue are the defect, though the P99 of all the submits stays at their cost.
     #[test]
-    fn reading_one_reads_the_submits_that_overlapped_a_driver_call() {
+    fn reading_one_reads_the_submits_that_began_during_a_driver_call() {
         let mut text = head(false, true);
         for n in 0..600u64 {
             let at = n * 16_666_666;
@@ -1264,8 +1269,8 @@ mod tests {
         let stamps = Stamps::parse(&text).expect("the stamps");
         let figures = figures("real", &stamps, Against::default());
         let reading = get(&figures, "real.reading.submit_against_driver");
-        assert!(reading.starts_with("recorded: no submit overlapped"), "{reading}");
-        assert_eq!(get(&figures, "real.submit.overlapping_driver"), "0 of 600");
+        assert!(reading.starts_with("recorded: no submit began during"), "{reading}");
+        assert_eq!(get(&figures, "real.submit.began_during_driver"), "0 of 600");
 
         let mut text = head(true, true);
         for n in 0..1000u64 {
@@ -1286,17 +1291,17 @@ mod tests {
         assert_eq!(get(&figures, "real.submit.p99_us"), "300.0");
     }
 
-    /// Two queues, each submit's cost its own encoding: 1,000 frames whose submits that
-    /// overlap no driver call take `alone(n)`, and 5 that overlap one take `overlapping`.
-    fn two_queues(alone: impl Fn(u64) -> u64, overlapping: u64) -> Vec<(String, String)> {
+    /// Two queues, each submit's cost its own encoding: 1,000 frames whose submits begun
+    /// before the driver call take `outside(n)`, and 5 begun inside one take `during`.
+    fn two_queues(outside: impl Fn(u64) -> u64, during: u64) -> Vec<(String, String)> {
         let mut text = head(false, true);
         for n in 0..1000u64 {
             let at = n * 16_666_666;
             let mut frame = apart(at);
-            frame.submit = (MS, MS + alone(n));
+            frame.submit = (MS, MS + outside(n));
             frame.driver = (2 * MS + 200_000, 2 * MS + 788_000);
             if n % 200 == 7 {
-                frame.submit = (2 * MS + 250_000, 2 * MS + 250_000 + overlapping);
+                frame.submit = (2 * MS + 250_000, 2 * MS + 250_000 + during);
             }
             shot(&mut text, n, at, &frame);
         }
@@ -1304,33 +1309,64 @@ mod tests {
     }
 
     /// The diff review's probe of reading 1 on two queues: every submit at 794 us of its own
-    /// encoding beside a driver call of 588 us, 5 of them overlapping one, is recorded; an
-    /// overlapping P99 over the others' by less than their own P50-to-P99 spread is recorded
-    /// too, and by more is the defect.
+    /// encoding beside a driver call of 588 us, 5 of them begun inside one, is recorded; a
+    /// P99 of those over the others' by less than the others' own P50-to-P99 spread is
+    /// recorded too, and by more is the defect.
     #[test]
-    fn an_overlap_on_two_queues_is_read_against_the_submits_that_overlapped_none() {
+    fn a_submit_begun_during_a_driver_call_on_two_queues_is_read_against_the_others() {
         let figures = two_queues(|_| 794_000, 794_000);
-        assert_eq!(get(&figures, "real.submit.overlapping_driver"), "5 of 1000");
+        assert_eq!(get(&figures, "real.submit.began_during_driver"), "5 of 1000");
         assert_eq!(get(&figures, "real.present.driver.p99_us"), "588.0");
-        assert_eq!(get(&figures, "real.submit.overlapping.excess_p99_us"), "0.0");
+        assert_eq!(get(&figures, "real.submit.began_during.excess_p99_us"), "0.0");
         let reading = get(&figures, "real.reading.submit_against_driver");
-        assert!(reading.starts_with("recorded: 5 of 1000 submits overlapped"), "{reading}");
+        assert!(reading.starts_with("recorded: 5 of 1000 submits began during"), "{reading}");
 
-        // The submits that overlapped none spread from 700 us to 794 us: P50 745, P99 794.
+        // The submits begun outside a driver call spread from 700 us to 794 us: P50 745, P99
+        // 794.
         let spread = |n: u64| 700_000 + (n % 95) * 1_000;
         let figures = two_queues(spread, 824_000);
-        assert_eq!(get(&figures, "real.submit.alone.p50_us"), "745.0");
-        assert_eq!(get(&figures, "real.submit.alone.p99_us"), "794.0");
-        assert_eq!(get(&figures, "real.submit.overlapping.excess_p99_us"), "30.0");
+        assert_eq!(get(&figures, "real.submit.began_outside.p50_us"), "745.0");
+        assert_eq!(get(&figures, "real.submit.began_outside.p99_us"), "794.0");
+        assert_eq!(get(&figures, "real.submit.began_during.excess_p99_us"), "30.0");
         let reading = get(&figures, "real.reading.submit_against_driver");
         assert!(reading.starts_with("recorded:"), "{reading}");
         assert!(reading.contains("within the latter's P50-to-P99 spread of 49.0 us"), "{reading}");
 
         let figures = two_queues(spread, 1_094_000);
-        assert_eq!(get(&figures, "real.submit.overlapping.excess_p99_us"), "300.0");
+        assert_eq!(get(&figures, "real.submit.began_during.excess_p99_us"), "300.0");
         let reading = get(&figures, "real.reading.submit_against_driver");
         assert!(reading.starts_with("a defect to report: 5 of 1000"), "{reading}");
         assert!(reading.contains("may have waited behind it"), "{reading}");
+
+        // Those begun during a call shorter than the others: their excess is written as under.
+        let figures = two_queues(spread, 100_000);
+        assert_eq!(get(&figures, "real.submit.began_during.excess_p99_us"), "-694.0");
+        let reading = get(&figures, "real.reading.submit_against_driver");
+        assert!(reading.contains("is 694.0 us under the 794.0 us"), "{reading}");
+        assert!(!reading.contains("-694"), "{reading}");
+    }
+
+    /// The diff review's probe of the selection: on two queues, every submit begins 1.2 ms
+    /// before the driver call, its own cost 150 to 250 us, and 5 of 1,000 take 2 ms of their
+    /// own and so run on into the call. None began during it, so none is read as having
+    /// waited: a submit that ran into a call is chosen by its own length.
+    #[test]
+    fn a_submit_that_ran_into_a_driver_call_by_its_length_is_its_own_cost() {
+        let mut text = head(false, true);
+        for n in 0..1000u64 {
+            let at = n * 16_666_666;
+            let mut frame = apart(at);
+            let own = if n % 200 == 3 { 2_000_000 } else { 150_000 + (n % 101) * 1_000 };
+            frame.submit = (MS, MS + own);
+            frame.driver = (2 * MS + 200_000, 2 * MS + 788_000);
+            shot(&mut text, n, at, &frame);
+        }
+        let figures =
+            figures("real", &Stamps::parse(&text).expect("the stamps"), Against::default());
+        assert_eq!(get(&figures, "real.submit.began_during_driver"), "0 of 1000");
+        assert_eq!(get(&figures, "real.submit.max_us"), "2000.0");
+        let reading = get(&figures, "real.reading.submit_against_driver");
+        assert!(reading.starts_with("recorded: no submit began during"), "{reading}");
     }
 
     /// The reviewers' probe of the lateness: one frame of 600 at 51 us is counted, and the
@@ -1377,9 +1413,10 @@ mod tests {
     }
 
     /// `figures` classes the frame before by the file's `JOIN_MARGIN`, and says where the
-    /// file has none rather than class every frame `joined`.
+    /// file has none rather than class every frame `joined`; it says so of `SHED_DEPTH` too,
+    /// without which reading 3 makes no comparison with it.
     #[test]
-    fn the_join_margin_is_read_from_the_file() {
+    fn the_margins_are_read_from_the_file() {
         let frames = |head: String| {
             let mut text = head;
             for n in 0..600u64 {
@@ -1399,6 +1436,10 @@ mod tests {
         let figures = frames(head(false, true).replace("info join_margin_ns 2000000\n", ""));
         assert_eq!(get(&figures, "real.join_margin_ns"), "unread: no join_margin_ns");
         assert_eq!(get(&figures, "real.lateness.after_joined_at_limit.count"), "absent");
+
+        let figures = frames(head(false, true).replace("info shed_depth 3\n", ""));
+        assert_eq!(get(&figures, "real.shed_depth"), "unread: no shed_depth");
+        assert_eq!(get(&figures, "real.join_margin_ns"), "2000000");
     }
 
     /// A present displayed before the next call begins and reported only at it is no image
@@ -1541,7 +1582,7 @@ mod tests {
                 acquire: 2 * MS,
                 record: 0,
                 driver: MS,
-                driver_at: Some(at + 6 * MS),
+                driver_at: Some(at + 5 * MS - 500_000),
                 returned: at + 11 * MS,
                 waiting: Some(1),
                 source: true,
