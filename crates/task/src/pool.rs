@@ -1345,10 +1345,11 @@ mod tests {
     }
 
     /// A worker over the limit that takes a task after shutdown began, before the sweep
-    /// reached it, puts it back and sweeps it itself: shutdown's one sweep may already have
-    /// passed, so the task is cancelled, and the queue empty, before `execute` returns. Inside
-    /// a job on the one frame-critical worker, with the gate closed, a task is spawned, taken
-    /// out of the pool's queue and executed once the shutdown flag is set.
+    /// reached it, puts it back and sweeps it itself: shutdown's first sweep may already have
+    /// passed, and a shutdown that does not join sweeps only once, so the task is cancelled,
+    /// and the queue empty, before `execute` returns. Inside a job on the one frame-critical
+    /// worker, with the gate closed, a task is spawned, taken out of the pool's queue and
+    /// executed once the shutdown flag is set.
     #[test]
     fn a_task_taken_after_shutdown_began_is_swept_by_its_put_back() {
         let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();

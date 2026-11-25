@@ -470,10 +470,11 @@ Correctness:
   task taken at a closed gate, and a task its timer woke and the firing worker kept on its
   deque, each put back unstarted or unpolled, the tasks on the pool's queue; a job taken after
   shutdown began, and a task taken then over the limit, swept by its own put-back, since
-  shutdown's one sweep may have passed; and a job, a task and a graph's range each queued as
-  shutdown begins, the flag set between the push and the read by a hook that only its tests
-  compile, and swept by the submission itself. `tests/job_alloc.rs` counts a call's
-  allocations, in a binary of its own because it installs a global allocator.
+  shutdown's first sweep may have passed and a shutdown that does not join sweeps only once;
+  and a job, a task and a graph's range each queued as shutdown begins, the flag set between
+  the push and the read by a hook that only its tests compile, and swept by the submission
+  itself. `tests/job_alloc.rs` counts a call's allocations, in a binary of its own because it
+  installs a global allocator.
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it
   would run on loom primitives, which panic outside a loom model.
