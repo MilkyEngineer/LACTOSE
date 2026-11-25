@@ -180,7 +180,8 @@ images are colour attachments and nothing else, and nothing that ships turns it 
   waits and the image's present semaphore among its signals, and `vkQueuePresentKHR` under
   the same lock. Where the submit's driver call fails and the device is not lost, the stamp
   is reached by an empty batch that waits for the acquire's semaphore, and the image stays
-  acquired for a retry that waits for nothing. The present's fence is taken before the
+  acquired for a retry that waits for nothing; where that batch fails too, the semaphore
+  stays signalled and the retry waits for it. The present's fence is taken before the
   submit. A present's failure after its submit is taken is `DeviceLost` for
   `VK_ERROR_DEVICE_LOST` and `Presented::Stale`, with an id, for every other (6(i) of the
   frame's design), the swapchain stale until a `resize`. What the present fence does after
@@ -197,8 +198,10 @@ images are colour attachments and nothing else, and nothing that ships turns it 
   with nothing enqueued, out of memory and an unlisted error. The enqueued errors and the
   late signal of an unlisted one are by inspection.
 - **`resize`** waits for every pending present fence within the bound and is refused
-  `pending` past it; it spends an acquired image's semaphore with an empty batch, which holds
-  a count of the old driver swapchain until it completes, as the drop's batches do, makes the
+  `pending` past it; it spends every acquire semaphore no batch has waited for, an acquired
+  image's or one whose batches failed, with an empty batch, which holds a count of the old
+  driver swapchain until it completes, as the drop's batches do, and is refused with the
+  driver's error, before it gives up the old swapchain, where one fails; it makes the
   new swapchain from the old (`oldSwapchain`), drains the old one's display times, lets go of
   it and forgets its images' handles, which are then `destroyed`. An extent is clamped to the
   surface's minimum and maximum as queried just before. Where `vkCreateSwapchainKHR` or the
@@ -213,17 +216,17 @@ images are colour attachments and nothing else, and nothing that ships turns it 
   surface's capabilities.
 - **The drop** waits, for at most three seconds, for the pending present fences, which the
   presentation engine signals, and while its thread unwinds a panic waits for nothing. It
-  spends an acquired image's semaphore with an empty batch and waits for no batch of the
-  present queue: it hands the acquire and present semaphores to the device with the stamp
-  of the last batch that waits for one, the batch after a present the driver did not take
-  included, and a count of the driver swapchain, and they are destroyed once the present
-  queue reaches that stamp, or at the device's last drop. So a
-  submit held by a host point on a queue the present role shares, as on a driver of one
-  queue such as lavapipe, neither holds the drop nor leaks the device, and a
+  spends every acquire semaphore no batch has waited for with an empty batch, as `resize`
+  does, and waits for no batch of the present queue: it hands the acquire and present
+  semaphores to the device with the stamp of the last batch that waits for one, the batch
+  after a present the driver did not take included, and a count of the driver swapchain,
+  and they are destroyed once the present queue reaches that stamp, or at the device's last
+  drop. So a submit held by a host point on a queue the present role shares, as on a driver
+  of one queue such as lavapipe, neither holds the drop nor leaks the device, and a
   `create_swapchain` after it is made from the old driver swapchain. Where a present may
-  still be in the presentation engine's use, its fence not signalled within the wait, or
-  while unwinding an acquire's semaphore is left with no batch to wait for it, the drop
-  leaks the device (`Raw::leak`), as the device's last holder does with a submit pending:
+  still be in the presentation engine's use, its fence not signalled within the wait, or an
+  acquire's semaphore is left with no batch to wait for it, while unwinding or where its
+  empty batch failed, so that the acquire's signal may be pending, the drop leaks the device (`Raw::leak`), as the device's last holder does with a submit pending:
   nothing of the swapchain or the device is destroyed under that use, at the cost of the
   device's memory, and the records keep the swapchain's mark, so a second
   `create_swapchain` is refused (`swapchain`) and never reaches the driver with the surface
@@ -347,10 +350,10 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   is read back there against the frame's colour, each present shown with the next id and none
   stale; a shutdown with three frames in flight, again with an image acquired and never
   presented; an encoder that recorded the acquired image recording it again after a `resize`,
-  and after the drop with a second swapchain made, and a graphics submit held on a host point
-  that writes the acquired image across the same two, each silent under the layer; and a request
-  that names a window refused by `headless` with `InvalidData`, which needs no driver. In
-  `src/swapchain.rs`, unit tests, since no safe call makes their failures: an acquire semaphore
+  and after the drop with a second swapchain made, silent under the layer; and a request that
+  names a window refused by `headless` with `InvalidData`, which needs no driver. In
+  `src/swapchain.rs`, unit tests, since no safe call makes their failures or waits for an
+  acquire: an acquire semaphore
   taken again while a batch's wait for it is held, which the layer must report
   (`VUID-vkAcquireNextImageKHR-semaphore-01779`), heard by a sink that prints nothing, a core
   validation check, so the GPU-assisted run, which turns core validation off, skips it; a drop
@@ -363,7 +366,16 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   until a `resize`, the unlisted error's fence and semaphore destroyed and the layer silent, and
   after such a present, behind released slow work, a drop that hands the semaphores over with a
   stamp at or past the batch that waits for the present semaphore, as a test-only record of the
-  stamp shows whether or not the batch has completed, the layer silent; on the device whose
+  stamp shows whether or not the batch has completed, the layer silent; an acquire semaphore
+  whose batches failed out of host memory, injected (`submit::FAILING`), left signalled and
+  waited for by the image's next present, after a present whose submit and empty batch both
+  failed, and by the next `resize`, after a `resize` refused for its empty batch with its
+  driver swapchain kept, the layer silent; a drop whose empty batch for an acquire fails,
+  which leaks the device and refuses a second swapchain, the layer silent; a graphics submit
+  held by a host point that writes the acquired image, submitted once the host has seen a
+  batch that waits for the image's acquire complete, pending across a `resize` and across the
+  drop with a second swapchain made, the image's object and its driver swapchain kept until
+  the submit is known complete and let go after, with no message; on the device whose
   present role the graphics queue serves, an acquired image given up by `resize` and by the drop
   behind a held submit that names no image, the driver swapchain kept by the count handed over
   with the batch's stamp alone until the point is signalled, and let go after; a frame submit

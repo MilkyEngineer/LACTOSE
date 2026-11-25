@@ -98,7 +98,17 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   submit; every signal its semaphore depends on has been submitted, as the present's walk
   decided before the submit was stamped (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
 - An image given up while acquired, at `resize` or the drop, has its semaphore waited for by
-  an empty batch, so that no signalled semaphore is destroyed or reused unwaited. The drop
+  an empty batch, so that no signalled semaphore is destroyed or reused unwaited. An acquire
+  semaphore whose batches fail with the device not lost (a present's submit and the empty
+  batch after it, or the empty batch alone) stays signalled, with no wait pending, since a
+  failed `vkQueueSubmit2` leaves its semaphores as they were: the image's next present waits
+  for it, and `resize` and the drop wait for every one left with an empty batch. A `resize`
+  whose batch fails is refused before it gives up the driver swapchain that signalled it,
+  and a drop whose batch fails leaks the device (below), so every acquire semaphore the
+  swapchain destroys has had its acquire's signal waited for by a batch that has completed,
+  except after a loss. The Vulkan guide's "Swapchain Semaphore Reuse" asks it; no
+  valid-usage rule found names it, since an acquire is not a submitted batch
+  (VUID-vkDestroySemaphore-semaphore-05149 is of batches alone). The drop
   waits for no batch of the present queue, which a submit held by a host point ahead of it
   on a shared queue holds: it hands its acquire and present semaphores to the device
   (`Left::spent`) with the stamp of the last batch that waits for one, after waiting for its
@@ -141,9 +151,9 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   presented again. The one known source is MoltenVK 1.4.2's present with no command buffer
   (`MVKQueue.mm` 739–750), which takes neither the waits nor the fence. Its drawable timeout
   (`MVKImage.mm` 1625), the same error, signals the fence, which is reaped as any other.
-- A drop whose waits do not end within three seconds, or that unwinds a panic with
-  something of the swapchain pending, leaks the device (`Raw::leak`), and the records keep
-  the swapchain's mark, so no second swapchain is made on the surface while the leaked one
+- A drop whose waits do not end within three seconds, that unwinds a panic with something of
+  the swapchain pending, or whose empty batch for an acquire semaphore fails, leaks the
+  device (`Raw::leak`), and the records keep the swapchain's mark, so no second swapchain is made on the surface while the leaked one
   may be in use. A holder that sees the flag destroys nothing: the device's last holder
   (`let_go`) lets go of what `Shared::left` holds and returns, with no wait for idle and
   no sampler or orphaned pool destroyed, and the device and its surface are not destroyed.
