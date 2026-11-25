@@ -4,10 +4,12 @@
 //! binary: a key enters the world hash, so renaming one moves every recorded stream of the
 //! sketch.
 
+use lactose_asset_api::{AssetId, AssetRef};
 use lactose_core::{PlayerId, Result, StableKey};
 use lactose_ecs::{ClaimedBy, Ctx, Mut, World, system};
 use lactose_math::{Quat, Scalar, Vec3};
 use lactose_physics_api::Transform;
+use lactose_present_api::MeshInstance;
 use lactose_reflect::component;
 use lactose_sim::{Registration, SessionApplier, SessionEvent, Stage, StreamingAnchor, TypeTable};
 
@@ -116,5 +118,43 @@ impl SessionApplier for Sessions {
                 Ok(())
             }
         }
+    }
+}
+
+/// The rows of the client's fixed-frame scene (decision 5.1): seven, each its own colour.
+pub const SCENE_ROWS: u32 = 7;
+
+/// The scene's period in ticks: seven seconds at sixty ticks a second, so that each row's
+/// phase is a whole number of ticks.
+pub const SCENE_PERIOD: u32 = 420;
+
+/// The scene's session applier, the client binary's `sessions` (`crates/app/README.md`, "The
+/// mover of the local world"). A join spawns [`SCENE_ROWS`] rows in the join's region, each
+/// under a key from `World::allocate_net_id`, with an [`Orbit`] round the origin at four
+/// metres, of one period and phases a seventh of it apart, a `Transform` that the first tick's
+/// `orbit` places, and a `MeshInstance` of the mesh `1`. Each join spawns them again; a leave
+/// does nothing. No row is claimed or anchored.
+#[must_use]
+pub fn scene() -> Box<dyn SessionApplier> {
+    Box::new(Scene)
+}
+
+struct Scene;
+
+impl SessionApplier for Scene {
+    fn apply(&mut self, world: &mut World, _player: PlayerId, event: SessionEvent) -> Result<()> {
+        let SessionEvent::Join { region } = event else { return Ok(()) };
+        for row in 0..SCENE_ROWS {
+            let key = StableKey::Net(world.allocate_net_id()?);
+            let orbit = Orbit {
+                centre: Vec3::ZERO,
+                radius: Scalar::from_i32(4),
+                period: SCENE_PERIOD,
+                phase: row * (SCENE_PERIOD / SCENE_ROWS),
+            };
+            let mesh = MeshInstance::new(AssetRef::new(AssetId::from_bits(1)));
+            world.spawn(key, region, (Transform::at(Vec3::ZERO), mesh, orbit))?;
+        }
+        Ok(())
     }
 }

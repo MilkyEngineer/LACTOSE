@@ -729,9 +729,12 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
     let (published, loaded) = cook_and_load(&env, &root().join("shaders"));
     let targets: &[&str] =
         if cfg!(target_os = "macos") { &["metallib", "msl", "spirv"] } else { &["msl", "spirv"] };
-    // `shaders/conformance/`'s entries, which the RHI suites run, and `shaders/renderer/`'s,
-    // which `lactose-renderer` runs, cook into the pack beside the surface's, in name order.
+    // `shaders/client/`'s entries, which `lactose-app-client` runs, `shaders/conformance/`'s,
+    // which the RHI suites run, and `shaders/renderer/`'s, which `lactose-renderer` runs, cook
+    // into the pack beside the surface's, in name order.
     let entries = [
+        "client/present.fs_main",
+        "client/present.vs_main",
         "conformance/address.fs_main",
         "conformance/address.vs_main",
         "conformance/constant.fs_main",
@@ -787,9 +790,10 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
         let entry = asset.name.split('.').nth(1).unwrap();
         assert_eq!(shader.entry, entry);
         if !asset.name.starts_with("surface.") {
-            // The RHI suites hold a conformance shader's reflection to what they run, and
+            // The RHI suites hold a conformance shader's reflection to what they run,
             // `lactose-renderer`'s `Renderer::new` a renderer shader's, which its `graph` and
-            // `device` tests hold.
+            // `device` tests hold, and the device a client shader's when `lactose-app-client`
+            // makes its present pass, which its binary's fixed-frame run makes.
             let stage = match &entry[..3] {
                 "cs_" => ShaderStage::Compute,
                 "vs_" => ShaderStage::Vertex,

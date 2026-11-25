@@ -21,6 +21,7 @@ decision 5.18). The game arrives at milestone 5 (section 22).
 | `register_types` | A registration's `types`: registers `Counter` and `Orbit` |
 | `register_systems` | A registration's `systems`: adds to `Stage::Simulation`, in the server and prediction worlds, `game_sim::count`, which adds one to every `Counter` each tick, wrapping, and `game_sim::orbit`, which writes the `Transform` of every row with an `Orbit` each tick (below) |
 | `sessions` | A `Game`'s `sessions`: the session applier, which meets `crates/sim/README.md`'s contract ("What `SessionApplier::apply` must do"). A `Join` spawns the player's row in the join's region, under a key from `World::allocate_net_id`: a `Counter` at zero, `ClaimedBy` and `StreamingAnchor`. A `Leave` removes the claim and the anchor from that row and keeps the row |
+| `scene`, `SCENE_ROWS`, `SCENE_PERIOD` | The client binary's `sessions`, the scene of decision 5.1's fixed-frame mode: a `Join` spawns `SCENE_ROWS` (seven) rows in the join's region, each under a key from `World::allocate_net_id`, with an `Orbit` round the origin at four metres of `SCENE_PERIOD` (420) ticks and phases a seventh of it apart, a `Transform` the first tick's `orbit` places, and a `MeshInstance` of the mesh `1`. Each join spawns them again; a `Leave` does nothing; no row is claimed or anchored |
 
 ## Rules a caller should know
 
@@ -38,6 +39,8 @@ decision 5.18). The game arrives at milestone 5 (section 22).
   `sessions` included, through a join, a leave and a second join with a sample every tick, and
   checks after every tick that the player resolves to one claimed row that holds the sample.
   The unrecorded tests of that file and the headless binary's own run call `sessions` too.
+  `crates/app-client/tests/recorded.rs` runs `game_sim::orbit` and `scene` as the client binary
+  ships them, a shown world beside the same world unshown.
 - `game_sim::orbit` is a function of the row and the tick. With `t` the tick being run
   (`Ctx::tick`): `step = (t + phase) mod period`, the addition wrapping; `angle = TAU × step /
   period`, both made `Scalar` before the division; `(sin, cos) = Scalar::sin_cos(angle)`;
@@ -47,6 +50,7 @@ decision 5.18). The game arrives at milestone 5 (section 22).
   No state accumulates, so a rollback, a save and a load, and a full pass place the row where
   an unbroken run does; at the tick's wrap the row jumps unless `period` divides 2^32. A row
   with `Orbit` has no body. Its arithmetic is `lactose-math`'s alone.
-- Its dependencies are `lactose-core`, `lactose-ecs`, `lactose-math`, `lactose-physics-api`,
-  `lactose-reflect` and `lactose-sim`, all admitted to a boundary crate without an allowlist
-  entry.
+- Its dependencies are `lactose-asset-api` (the scene's `AssetRef`), `lactose-core`,
+  `lactose-ecs`, `lactose-math`, `lactose-physics-api`, `lactose-present-api` (the scene's
+  `MeshInstance`), `lactose-reflect` and `lactose-sim`, all admitted to a boundary crate
+  without an allowlist entry.

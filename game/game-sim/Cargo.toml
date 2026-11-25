@@ -8,6 +8,8 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+# `AssetRef` of the scene's mesh.
+lactose-asset-api.workspace = true
 lactose-core.workspace = true
 # The world the applier spawns into, `ClaimedBy`, and the `#[system]` macro.
 lactose-ecs.workspace = true
@@ -15,6 +17,8 @@ lactose-ecs.workspace = true
 lactose-math.workspace = true
 # `Transform`, which the mover writes.
 lactose-physics-api.workspace = true
+# `MeshInstance`, which the scene's rows carry for extract.
+lactose-present-api.workspace = true
 # The `#[component]` attribute; metadata only (architecture section 8.1).
 lactose-reflect.workspace = true
 # `Registration`, `TypeTable`, `Stage` and the session applier's trait and event.
