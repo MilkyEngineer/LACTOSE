@@ -52,11 +52,10 @@ unmarked. CI runs `--all --short --no-device` by hand only (`.github/workflows/m
 keep the command working on linux-x64 and windows-x64; it keeps the edit-to-playing files,
 named for the runner, and discards the rest.
 
-A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`, `gpu-cost`; `triangle`
-below) runs under the
-driver `--driver` names (`moltenvk`, the default on macOS, `kosmickrisp`, `lavapipe`, or
-`system`, the default elsewhere) on the adapter `--adapter` names or the loader's first, with no layer: every
-implicit layer is disabled and no Metal validation is set. Its header adds the device's
+A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`, `gpu-cost`; `triangle` below)
+runs under the driver `--driver` names (`moltenvk`, the default on macOS, `kosmickrisp`, `lavapipe`,
+or `system`, the default elsewhere) on the adapter `--adapter` names or the loader's first, with no
+layer: every implicit layer is disabled and no Metal validation is set. Its header adds the device's
 identity as `vulkaninfo` reports it under the same environment: the device's name and vendor
 and device ids, the driver's name, information and version, the device's and the instance's
 API versions, the loader (the pinned SDK's, or the system's), the validation (off), the

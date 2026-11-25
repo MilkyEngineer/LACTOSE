@@ -565,8 +565,8 @@ standard error as it comes.
   test's whole output. A test that prints no figure, a figure line that does not read, or a
   figure named twice fails its measurement. nextest runs it with `--retries 0`, so that no
   failed attempt's output or time is read.
-- A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`, `gpu-cost`) runs under the driver
-  `--driver` names, `moltenvk` by default on macOS and `system` elsewhere, on the adapter
+- A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`, `gpu-cost`) runs under the
+  driver `--driver` names, `moltenvk` by default on macOS and `system` elsewhere, on the adapter
   `--adapter` names or the loader's first, with no layer: the inherited variables `gpu`
   clears are cleared, every implicit layer is disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~`)
   and no Metal validation is set. The loader is the pinned SDK's (`vulkan-layer.toml`) on
@@ -681,9 +681,9 @@ unlocked and the display awake (`caffeinate -d` on macOS).
   (`--minimised`).
 - **The reading** (`src/pace.rs`). A display report earlier than its present's return is no
   display and is dropped and counted (`display.dropped_before_return`); a present with no
-  report kept is counted (`display.missing`), those dropped by order and the last calls'
-  among them, whose reports no later call reads. The floor run's refresh is fitted freely to its display times from the
-  reported refresh by least squares against each time's refresh index, the window doubling
+  report kept is counted (`display.missing`), those dropped by order and the last calls' among them,
+  whose reports no later call reads. The floor run's refresh is fitted freely to its display times
+  from the reported refresh by least squares against each time's refresh index, the window doubling
   from 32 periods so a report off by a part in a hundred keeps each time on its own refresh
   (`fit.hz`, and `fit.from_reported_parts_per_10000`). The sweeps are the latches' phase
   against that refresh, unwrapped from one latch to the next. The grid test is D162's
