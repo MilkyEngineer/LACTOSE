@@ -18,9 +18,8 @@ wires").
 
 | Item | Contents |
 |---|---|
-| `ClientRender` | The `RenderSide`: the graph, the renderer and the presentation schedule over two offscreen targets of `TARGET_FORMAT`, each made at the frame's extent and replaced when it changes, the old image destroyed once its last draw and the present thread's last read of it are reached. `draw` uploads the remote batch, prepares, imports the target from `Undefined` behind `Draw::ready` with its hand-off to the present role, declares the renderer's passes, compiles and records; `submit` latches the camera from the `LatestSample` and submits. With a readback extent, a frame at that extent also copies its target and the renderer's instance records into buffers of its own, in a copy pass of its own declaration after the triangles and before the hand-off. `last_frame` reads the last submitted frame's |
-| `ClientPresent` | The `PresentSide`, the state of the present thread's lane: the swapchain, made beside the device; the present pass of `shaders/client/present.slang`, which samples the target through a heap slot (`HEAP`, slots 0 and 1) over the whole acquired image; a timeline of its own whose next value each present signals as its `read`. A resize behind the last read, a slot written behind it when the image is new, the acquire, a present refused as pending kept for the next call, `Stale` taken as a submit. `close` waits, within a bound, for its last read, empties its slots and drops the swapchain |
-| `Waiting` | `PresentReport::waiting`, the count the frame sheds by, taken as a call begins: of the presents made before it, those whose read is reached and that no display-time report has named, neither they nor a later one; `None` where the swapchain has no source of display times |
+| `ClientRender` | The `RenderSide`: the graph, the renderer and the presentation schedule over two offscreen targets of `TARGET_FORMAT`, each made at the frame's extent and replaced when it changes, the old image destroyed once its last draw and the present thread's last read of it are reached. `draw` uploads the remote batch, prepares, imports the target from `Undefined` behind `Draw::ready` with its hand-off to the present role, declares the renderer's passes, compiles and records; `submit` latches the camera from the `LatestSample` and submits. With a readback extent, a frame at that extent also copies its target and the renderer's instance records into buffers of its own, in a copy pass of its own declaration after the triangles and before the hand-off. `last_frame` reads the last submitted frame's pixels and records, its latched camera and fraction, and the placements extract handed the renderer for it (what the client's recording sink mirrors of the sink's contract, `crates/present-api/README.md`, "What the sink keeps"), where that frame was at the readback's extent; `None` where it was not, or no frame was submitted |
+| `ClientPresent` | The `PresentSide`, the state of the present thread's lane: the swapchain, made beside the device; the present pass of `shaders/client/present.slang`, which samples the target through a heap slot (`HEAP`, slots 0 and 1) over the whole acquired image; a timeline of its own whose next value each present signals as its `read`. A resize behind the last read, a slot written behind it when the image is new, the acquire, a present refused as pending kept for the next call, a resize that fails with a driver's error forgetting the acquired image, which the driver gave up (`lactose-rhi-api`, `Swapchain::resize`), `Stale` taken as a submit. Its count, `PresentReport::waiting`, the count the frame sheds by, is taken as a call begins: of the presents made before it, those whose read is reached and that no display-time report has named, neither they nor a later one; `None` where the swapchain has no source of display times. `close` waits, within a bound, for its last read, empties its slots, drops the swapchain and destroys its pipeline, sampler and timeline, logging each refusal at `warn` |
 | `GAME`, `InMemory`, `Frames`, `REGION` | The game: `game-sim`'s registration with `game_sim::scene` as its sessions, so a join spawns the scene's seven orbiting rows. The cooked content of one region, an empty baseline and one asset, in memory; the input of each tick, the region and player 1's join in the first |
 | `CookedShaders`, `PipelineCache` | The five stages read from the cooked shaders' directory (`<source>.<entry>.spirv`); the pipeline cache file, read into the device's request and written back, by a rename over the old file, once the renderer's pipelines are made |
 | `wire`, `Wired` | Steps 4 to 6 of "What `lactose-app-client` wires" on any device and swapchain: what the binary and the null tests both run |
@@ -37,7 +36,10 @@ lactose-app-client --shaders DIR [--packs DIR] [--cache FILE] --fixed FRAMES DUM
 `DIR` for `--shaders` is the cooked shaders' directory, which `cargo xtask gpu` writes under
 `target/gpu/shaders`. `--packs` names a directory of cooked packs, each mounted at start;
 nothing in them is read at milestone 2, since the scene enters by `game-sim`'s session
-applier and its mesh is the renderer's one triangle. The cache file is `pipeline-cache.bin`
+applier and its mesh is the renderer's one triangle. No test or run here passes `--packs`:
+the mount is `lactose-asset`'s `pack_set` and `Store::mount`, proven in that crate, and with
+nothing read from a pack no frame here would show it. A flag given twice, or `--seconds`
+with `--fixed`, is refused as malformed. The cache file is `pipeline-cache.bin`
 in the working directory unless named. Paced, the run ends when the window is closed or
 after `N` seconds. `--fixed` runs `FRAMES` steps at 512 by 384 and writes the dump into the
 directory `DUMP`. The run prints its `Outcome` and exits 0; it exits 1 with the error, or
@@ -73,7 +75,18 @@ is a multiple of 30 every triangle is at least about 13 degrees from edge-on, an
 - It is a feature root and a harness package: its boundary feature tree, with its
   dev-dependencies, must equal the other roots' (`cargo xtask features`).
 - `wire` and the shutdown are called off the workers: the present thread's stop and the
-  render side's drop block, each within a bound.
+  render side's drop block, each within a bound. `exit` is queued as the frames end, on
+  every path, so a stall after it is under the pump's warning. The render side's drop runs
+  on a thread of its own, made through `Executor::platform`, within 10 s (step 4 of
+  `crates/platform/README.md`, "Shutdown"); past it the thread and what it holds are left,
+  which keeps the window: the paced mode then stays under the pump's warning until it is
+  closed, and the fixed-frame mode, which no one closes, logs the error and ends the process
+  with exit status 1, its teardown not run. A fixed frame whose point is not reached within
+  10 s stops the world and fails the run the same way.
+- The present side samples the targets through the heap's first two slots (`HEAP`). The
+  heap's slots are the device's, shared by every user of it, and milestone 2 has no
+  allocator for them: the renderer writes no slot, and a user beside the present side takes
+  slots from the third on.
 - The device is asked for the heap and sampler table the cooked shaders are compiled for
   (`HEAP_SLOTS_DEFAULT`, `SAMPLERS_DEFAULT`), since a pipeline's heap arrays must match them.
 - A validator's message fails the run: `Outcome::messages` counts them, each logged at

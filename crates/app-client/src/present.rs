@@ -23,7 +23,11 @@ use crate::shaders::CookedShaders;
 /// The bound the present side gives its own waits, on the present thread alone.
 const PRESENT_WAIT: Duration = Duration::from_millis(100);
 
-/// The heap slots the present pass samples the targets through, one a target.
+/// The heap slots the present pass samples the targets through, one a target: the device's
+/// first two, which the client reserves for the present side. The heap's slots are the
+/// device's to give out to every user of one device, and milestone 2 has no allocator for
+/// them; the renderer writes no slot at milestone 2, and a user of the heap beside this side
+/// takes slots from the third on (`README.md`, "Rules a caller should know").
 pub const HEAP: [HeapSlot; TARGETS] = [HeapSlot(0), HeapSlot(1)];
 
 const NOTHING: PresentReport = PresentReport { read: None, shown: false, waiting: None };
@@ -44,7 +48,7 @@ fn on<S>(state: S, queue: QueueRole) -> StateOn<S> {
 /// rule"): of the presents made before a call, those finished on the device and not named
 /// displayed, neither they nor a later one, by the swapchain's display-time report.
 #[derive(Default, Debug)]
-pub struct Waiting {
+struct Waiting {
     /// The presents made and not yet known displayed, each with the value its `read`
     /// signals, oldest first.
     made: VecDeque<(PresentId, u64)>,
@@ -52,13 +56,12 @@ pub struct Waiting {
 
 impl Waiting {
     /// No present made.
-    #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
     /// The present `present` was made, its read signalling `read` on the side's timeline.
-    pub fn presented(&mut self, present: PresentId, read: u64) {
+    fn presented(&mut self, present: PresentId, read: u64) {
         self.made.push_back((present, read));
     }
 
@@ -67,7 +70,7 @@ impl Waiting {
     /// read value is `reached` or less, the reads' timeline as one read of it gave it, of
     /// those that `displayed`, the reports since the last call, has not named and that no
     /// later named present follows.
-    pub fn take(&mut self, source: bool, displayed: &[DisplayTime], reached: u64) -> Option<u32> {
+    fn take(&mut self, source: bool, displayed: &[DisplayTime], reached: u64) -> Option<u32> {
         if !source {
             self.made.clear();
             return None;
@@ -82,8 +85,8 @@ impl Waiting {
     }
 
     /// How many presents are kept.
-    #[must_use]
-    pub fn kept(&self) -> usize {
+    #[cfg(test)]
+    fn kept(&self) -> usize {
         self.made.len()
     }
 }
@@ -181,7 +184,12 @@ impl ClientPresent {
             match swapchain.resize(finished.extent) {
                 Ok(()) => {}
                 Err(error) if Rule::of(&error) == Some(Rule::Pending) => return Ok(nothing),
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // A driver's error has given up the acquired image (rhi-api, `resize`):
+                    // the next call acquires anew.
+                    self.acquired = None;
+                    return Err(error);
+                }
             }
             // A resize destroys every handle the swapchain gave before it. At an empty
             // surface it keeps its images and stays stale, which the acquire below says.
@@ -315,19 +323,115 @@ impl PresentSide for ClientPresent {
         // last read, so the render side's drop may destroy the targets. Past the bound the
         // device refuses the clear (`uuwp-used`) and the slot is left: the device then
         // refuses the destroy of the target it holds, and that image is freed with the
-        // device. Nothing here retries. On a lost device the wait returns at once.
+        // device. Nothing here retries; each refusal and error is logged. On a lost device
+        // the wait returns at once.
         let Some(device) = self.device.take() else { return };
-        if let Some(last) = self.last {
-            let _ = device.wait_timeline(last, PRESENT_WAIT);
+        if let Some(last) = self.last
+            && let Err(error) = device.wait_timeline(last, PRESENT_WAIT)
+        {
+            warn("the wait for the last read", &error);
         }
         for (slot, held) in HEAP.iter().zip(&mut self.slots) {
-            if held.take().is_some() {
-                let _ = device.clear_heap_slot(*slot);
+            if held.take().is_some()
+                && let Err(error) = device.clear_heap_slot(*slot)
+            {
+                warn("a heap slot's clear", &error);
             }
         }
         // The swapchain's drop waits for the submits that use its images.
         drop(self.swapchain.take());
-        let _ = device.destroy_graphics_pipeline(self.pipeline);
-        let _ = device.destroy_timeline(self.reads);
+        if let Err(error) = device.destroy_graphics_pipeline(self.pipeline) {
+            warn("the present pipeline's destroy", &error);
+        }
+        if let Err(error) = device.destroy_sampler(self.sampler) {
+            warn("the sampler's destroy", &error);
+        }
+        if let Err(error) = device.destroy_timeline(self.reads) {
+            warn("the reads' timeline's destroy", &error);
+        }
+    }
+}
+
+fn warn(what: &str, error: &lactose_core::Error) {
+    tracing::warn!(target: crate::LOG_TARGET, "the present side's close: {what} failed: {error}");
+}
+
+/// The present side's count, `PresentReport::waiting`, over scripted display-time reports
+/// and timeline values (`crates/app/README.md`, "The shedding rule", *The signal*).
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use lactose_rhi_api::{DisplayTime, PresentId};
+
+    use super::Waiting;
+
+    fn shown(present: u64) -> DisplayTime {
+        DisplayTime { present: PresentId(present), shown: Instant::now() }
+    }
+
+    /// Presents 1 to `n`, the read of present `k` signalling `k`.
+    fn made(n: u64) -> Waiting {
+        let mut waiting = Waiting::new();
+        for k in 1..=n {
+            waiting.presented(PresentId(k), k);
+        }
+        waiting
+    }
+
+    #[test]
+    fn no_source_of_display_times_counts_nothing_and_keeps_nothing() {
+        let mut waiting = made(5);
+        assert_eq!(waiting.take(false, &[], 5), None);
+        assert_eq!(waiting.kept(), 0);
+        // Reports that arrive with no source are not read.
+        let mut waiting = made(5);
+        assert_eq!(waiting.take(false, &[shown(5)], 5), None);
+    }
+
+    #[test]
+    fn a_present_still_behind_the_gpu_is_not_counted() {
+        let mut waiting = made(4);
+        // Reads 1 and 2 reached, 3 and 4 not: two finished, none displayed.
+        assert_eq!(waiting.take(true, &[], 2), Some(2));
+        assert_eq!(waiting.take(true, &[], 4), Some(4));
+        assert_eq!(waiting.kept(), 4);
+    }
+
+    #[test]
+    fn a_displayed_present_covers_itself_and_every_earlier_one() {
+        let mut waiting = made(5);
+        // Present 3 named displayed: 1 to 3 are gone, whether or not 1 and 2 were named.
+        assert_eq!(waiting.take(true, &[shown(3)], 5), Some(2));
+        assert_eq!(waiting.kept(), 2);
+        // Reports since the last call only: none, and the two remain.
+        assert_eq!(waiting.take(true, &[], 5), Some(2));
+        // Several reports in one call, oldest first: the newest decides.
+        assert_eq!(waiting.take(true, &[shown(4), shown(5)], 5), Some(0));
+        assert_eq!(waiting.kept(), 0);
+    }
+
+    #[test]
+    fn the_count_rises_one_a_frame_while_the_display_takes_nothing() {
+        let mut waiting = Waiting::new();
+        let mut counts = Vec::new();
+        for k in 1..=4_u64 {
+            // A call begins: every earlier read reached, nothing displayed.
+            counts.push(waiting.take(true, &[], k - 1));
+            waiting.presented(PresentId(k), k);
+        }
+        assert_eq!(counts, [Some(0), Some(1), Some(2), Some(3)]);
+        // The display takes present 4: nothing is left waiting.
+        assert_eq!(waiting.take(true, &[shown(4)], 4), Some(0));
+    }
+
+    #[test]
+    fn a_report_of_a_present_never_made_here_drops_nothing_later() {
+        let mut waiting = Waiting::new();
+        waiting.presented(PresentId(7), 1);
+        waiting.presented(PresentId(8), 2);
+        // An id below every kept one changes nothing.
+        assert_eq!(waiting.take(true, &[shown(6)], 2), Some(2));
+        assert_eq!(waiting.kept(), 2);
     }
 }

@@ -16,7 +16,7 @@ use lactose_app::{
     Stopped, TICK_PERIOD, Workers, WorldConfig, build_shown, start_executor,
 };
 use lactose_asset::{Store, pack_set};
-use lactose_core::{Error, ErrorKind, Result, Tick};
+use lactose_core::{Error, ErrorKind, Result, ThreadClass, Tick};
 use lactose_input_host::{LatestSample, RawSample};
 use lactose_io::{Io, IoConfig};
 use lactose_platform::{
@@ -28,7 +28,7 @@ use lactose_rhi_api::{
     Swapchain, SwapchainDesc,
 };
 use lactose_rhi_vulkan::VulkanDevice;
-use lactose_task::{Executor, Lane, Platform, WorkerClass};
+use lactose_task::{Executor, Lane, Platform, ThreadSpec, WorkerClass};
 
 use crate::game::{Frames, GAME, InMemory};
 use crate::present::ClientPresent;
@@ -50,8 +50,8 @@ pub const FIXED_FRACTION: f32 = 0.5;
 /// radians, so that the scene's circle is seen from above its plane.
 pub const FIXED_SAMPLE: RawSample = RawSample { yaw: 0.0, pitch: -0.5, ..RawSample::IDLE };
 
-/// The bound of each wait for a frame's point in the fixed-frame mode, and of the root's
-/// wait after the pump stopped with an error.
+/// The bound of each wait for a frame's point in the fixed-frame mode, of the render side's
+/// drop (step 4 of "Shutdown"), and of the root's wait after the pump stopped with an error.
 const BOUND: Duration = Duration::from_secs(10);
 
 /// How the binary runs its frames.
@@ -86,7 +86,8 @@ pub struct Options {
     pub mode: Mode,
 }
 
-/// What a run did.
+/// What a run did. The four counts of frames that drew are the present side's, in both
+/// modes: each such frame is queued, held, shed or dropped.
 #[derive(Clone, Debug, Default)]
 pub struct Outcome {
     /// The packs mounted.
@@ -138,8 +139,36 @@ struct ExitOnDrop(Lane<MainThread>);
 
 impl Drop for ExitOnDrop {
     fn drop(&mut self) {
-        drop(self.0.run(MainThread::exit));
+        exit(&self.0);
     }
+}
+
+/// Queues the pump's `exit`, step 1 of "Shutdown", as the frames end: from here on the pump
+/// warns of a stall in the steps after it. It is not awaited; a second call does nothing.
+fn exit(main: &Lane<MainThread>) {
+    drop(main.run(MainThread::exit));
+}
+
+/// Drops `value` on a thread of its own, made through `platform`, and waits within `bound`
+/// for the drop to end: step 4 of "Shutdown", since the drop may block and no worker may.
+/// Returns whether it ended. Past the bound the thread is left with `value`, which is never
+/// freed. If the platform makes no thread, `value` is dropped on the calling thread, where
+/// the drop may block.
+fn drop_within<T: Send + 'static>(platform: &dyn Platform, value: T, bound: Duration) -> bool {
+    let (dropped, ended) = mpsc::channel();
+    let spec = ThreadSpec {
+        name: "render-drop".to_owned(),
+        class: ThreadClass::Background,
+        index_in_class: 0,
+    };
+    let body = Box::new(move || {
+        drop(value);
+        let _ = dropped.send(());
+    });
+    // A platform that makes no thread drops the body, and `value` with it, before it
+    // returns: the sender is gone, and the wait below ends at once.
+    drop(platform.spawn_thread(spec, body));
+    !matches!(ended.recv_timeout(bound), Err(mpsc::RecvTimeoutError::Timeout))
 }
 
 /// The window's size as it is made: the fixed-frame mode's extent, or 1280 by 720.
@@ -182,7 +211,8 @@ pub fn run(options: Options) -> Result<Outcome> {
     drop(main);
     let pumped = pump.run();
     // After an error from `run` the steps' main-lane calls resolve as cancelled, and the
-    // driver ends within its own bounds; past this one `main` returns without it.
+    // driver ends within its own bounds, a frame's wait and step 4's each `BOUND`, a step's
+    // and `Shown::stop`'s each the present side's: past this one `main` returns without it.
     let outcome = match receiver.recv_timeout(3 * BOUND) {
         Ok(outcome) => {
             let _ = driver.join();
@@ -333,7 +363,7 @@ fn drive(
                 return Err(error);
             }
         };
-        let ran = run_on(executor, &device, swapchain, &shaders, &cache, reports, options);
+        let ran = run_on(executor, &main, &device, swapchain, &shaders, &cache, reports, options);
         // Step 5 of "Shutdown": the last device, in a main-lane call, where its surface is
         // dropped.
         let dropped = executor.block_on(main.run(move |_: &mut MainThread| drop(device)));
@@ -352,10 +382,14 @@ fn drive(
     ran.map(|()| outcome)
 }
 
-/// Steps 4 to 7 of "What `lactose-app-client` wires" on `device`, then steps 2 to 4 of
-/// "Shutdown": every device clone but the caller's is gone when it returns.
+/// Steps 4 to 7 of "What `lactose-app-client` wires" on `device`, then steps 1 to 4 of
+/// "Shutdown": every device clone but the caller's is gone when it returns, save those a
+/// render side whose drop outlived step 4's bound holds, and then the paced mode goes on
+/// and the fixed-frame mode ends the process.
+#[expect(clippy::too_many_arguments, reason = "the run's parts, each made by `drive`")]
 fn run_on(
     executor: &Executor,
+    main: &Lane<MainThread>,
     device: &Arc<dyn Device>,
     swapchain: Box<dyn Swapchain>,
     shaders: &CookedShaders,
@@ -375,10 +409,10 @@ fn run_on(
     }
     let ran = match &options.mode {
         Mode::Fixed { frames: steps, .. } => {
-            fixed_frames(executor, &**device, shown, &input, frames, *steps, &mut outcome)
+            fixed_frames(executor, main, &**device, shown, &input, frames, *steps, &mut outcome)
         }
         Mode::Paced { seconds } => {
-            let root = paced(executor.clone(), shown, reports, frames, *seconds);
+            let root = paced(executor.clone(), main.clone(), shown, reports, frames, *seconds);
             executor.block_on(executor.spawn(WorkerClass::FrameCritical, root)).and_then(|result| {
                 let (ended, counted) = result?;
                 outcome = counted;
@@ -386,8 +420,10 @@ fn run_on(
             })
         }
     };
-    // "Shutdown", step 2 was `Shown::stop`, whose last present-thread call was
-    // `PresentSide::close`. Step 3: the present thread.
+    // "Shutdown": step 1, `exit`, was queued as the frames ended, and step 2 was
+    // `Shown::stop`, whose last present-thread call was `PresentSide::close`. Step 3: the
+    // present thread. A root that failed to join queues `exit` here.
+    exit(main);
     drop(executor.block_on(present.stop()));
     let Ended { server, render, error } = ran?;
     let compared = match (&options.mode, &render) {
@@ -396,9 +432,26 @@ fn run_on(
         }
         _ => Ok(()),
     };
-    // Step 4, on this thread, which is no worker: the render side's drop waits, within a
-    // bound, for its last points.
-    drop(render);
+    // Step 4: the render side's drop, which waits for its last points (the graph's drop
+    // waits for its timeline with no bound), on a thread of its own within `BOUND`.
+    if let Some(render) = render
+        && !drop_within(&**executor.platform(), render, BOUND)
+    {
+        let error = error.as_ref().map_or_else(String::new, |error| format!(" after {error}"));
+        tracing::error!(
+            target: LOG_TARGET,
+            "the render side's drop did not end within {BOUND:?}{error}: the device is not \
+             answering"
+        );
+        if matches!(options.mode, Mode::Fixed { .. }) {
+            // What the drop holds keeps the window, so the pump never returns
+            // (`crates/platform/README.md`, "Shutdown"): the paced mode's window stays open
+            // under the pump's warning until it is closed, and the fixed-frame mode, which
+            // no one closes, ends the process here, its teardown not run.
+            eprintln!("lactose-app-client: the device did not answer within {BOUND:?}{error}");
+            std::process::exit(1);
+        }
+    }
     if let Some(server) = server {
         server.shutdown();
     }
@@ -408,11 +461,21 @@ fn run_on(
     compared.map(|()| outcome)
 }
 
+/// What a run of frames leaves where it ends early with `error` and the world is still
+/// whole: `Shown::stop`'s.
+fn stop_with(executor: &Executor, shown: Shown, error: Error) -> Result<Ended> {
+    let Stopped { server, render } = executor.block_on(shown.stop())?;
+    Ok(Ended { server: Some(server), render: Some(render), error: Some(error) })
+}
+
 /// The fixed-frame mode's steps: one step and its frame at a time, each joined and its point
 /// waited for, so that a region is free at every step and every tick's frame is drawn. A
-/// step that did not draw fails the mode.
+/// step that did not draw fails the mode, as does a frame whose point is not reached within
+/// `BOUND`; on every path `exit` is queued as the frames end and the world stopped.
+#[expect(clippy::too_many_arguments, reason = "the run's parts, each made by `run_on`")]
 fn fixed_frames(
     executor: &Executor,
+    main: &Lane<MainThread>,
     device: &dyn Device,
     mut shown: Shown,
     input: &LatestSample,
@@ -430,31 +493,54 @@ fn fixed_frames(
             executor.block_on(shown.step(executor, frames.next(tick), time, Some(FIXED_EXTENT)));
         let (next, _output, rendered) = match stepped {
             Ok(stepped) => stepped,
-            Err(failure) => return executor.block_on(ended(failure)),
+            Err(failure) => {
+                exit(main);
+                return executor.block_on(ended(failure));
+            }
         };
         shown = next;
         outcome.frames += 1;
-        let Rendered::Drew { point, .. } = rendered else {
-            let Stopped { server, render } = executor.block_on(shown.stop())?;
+        let Rendered::Drew { point, queued, held, shed, .. } = rendered else {
+            exit(main);
             let error = Error::new(
                 ErrorKind::Unsupported,
                 format!("fixed frame {step} drew nothing: {rendered:?}"),
             );
-            return Ok(Ended { server: Some(server), render: Some(render), error: Some(error) });
+            return stop_with(executor, shown, error);
         };
-        outcome.drew += 1;
-        if !device.wait_timeline(point, BOUND)? {
-            return Err(Error::new(
-                ErrorKind::Cancelled,
-                format!("fixed frame {step}'s point was not reached"),
-            ));
+        outcome.count(queued, held, shed);
+        let waited = device.wait_timeline(point, BOUND).and_then(|reached| {
+            reached.then_some(()).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Cancelled,
+                    format!("fixed frame {step}'s point was not reached within {BOUND:?}"),
+                )
+            })
+        });
+        if let Err(error) = waited {
+            exit(main);
+            return stop_with(executor, shown, error);
         }
     }
+    exit(main);
     let Stopped { server, render } = executor.block_on(shown.stop())?;
     Ok(Ended { server: Some(server), render: Some(render), error: None })
 }
 
-/// Decision 5.1's comparison: the last frame dumped, rasterised and compared.
+impl Outcome {
+    /// A frame that drew, as the present side took it.
+    fn count(&mut self, queued: bool, held: bool, shed: bool) {
+        self.drew += u64::from(queued);
+        self.held += u64::from(held);
+        self.shed += u64::from(shed);
+        self.dropped += u64::from(!(queued || held || shed));
+    }
+}
+
+/// Decision 5.1's comparison: the last frame dumped; the records the device's scatter wrote
+/// held to the placements extract handed the renderer, of which the scene's
+/// `game_sim::SCENE_ROWS` are live; the reference rasterised from those placements, every
+/// instance surely drawn somewhere in it; and the pixels compared.
 fn compare_last(
     render: &dyn RenderSide,
     dump: &std::path::Path,
@@ -468,16 +554,33 @@ fn compare_last(
         .last_frame()?
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no fixed frame was drawn"))?;
     reference::dump(&last, dump)?;
-    let expected = reference::reference(&last.records, &last.camera, last.fraction, last.extent)?;
-    outcome.surely = Some(reference::surely_drawn(&expected));
+    let live = reference::held_to(&last.records, &last.expected)?;
+    if live != game_sim::SCENE_ROWS as usize {
+        let rows = game_sim::SCENE_ROWS;
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("{live} instances are live, not the scene's {rows}"),
+        ));
+    }
+    let expected = reference::reference(&last.expected, &last.camera, last.fraction, last.extent)?;
+    let surely = reference::surely_drawn(&expected);
+    outcome.surely = Some(surely);
+    if surely.contains(&0) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("an instance is surely drawn at no pixel: {surely:?}"),
+        ));
+    }
     outcome.counts = Some(reference::compare(&last.pixels, &expected, last.extent)?);
     Ok(())
 }
 
 /// The paced mode's root, on a frame-critical worker: one sleep to the next tick's deadline,
-/// one frame, until the window is closed or the run's seconds have passed.
+/// one frame, until the window is closed or the run's seconds have passed. On every path
+/// `exit` is queued as the frames end and the world stopped.
 async fn paced(
     executor: Executor,
+    main: Lane<MainThread>,
     mut shown: Shown,
     reports: WindowReports,
     mut frames: Frames,
@@ -488,7 +591,12 @@ async fn paced(
     let mut next = move |tick: Tick| Some(frames.next(tick));
     let mut deadline = Instant::now();
     loop {
-        executor.sleep_until(deadline).await?;
+        if let Err(error) = executor.sleep_until(deadline).await {
+            exit(&main);
+            let Stopped { server, render } = shown.stop().await?;
+            let ended = Ended { server: Some(server), render: Some(render), error: Some(error) };
+            return Ok((ended, outcome));
+        }
         if reports.close_requested() || until.is_some_and(|until| Instant::now() >= until) {
             break;
         }
@@ -499,16 +607,59 @@ async fn paced(
                 outcome.frames += 1;
                 deadline = output.world.next_deadline;
                 if let Some(Rendered::Drew { queued, held, shed, .. }) = output.joined {
-                    outcome.drew += u64::from(queued);
-                    outcome.held += u64::from(held);
-                    outcome.shed += u64::from(shed);
-                    outcome.dropped += u64::from(!(queued || held || shed));
+                    outcome.count(queued, held, shed);
                 }
                 outcome.busy += u64::from(matches!(output.deferred, Some(Rendered::Busy)));
             }
-            Err(failure) => return Ok((ended(failure).await?, outcome)),
+            Err(failure) => {
+                exit(&main);
+                return Ok((ended(failure).await?, outcome));
+            }
         }
     }
+    exit(&main);
     let Stopped { server, render } = shown.stop().await?;
     Ok((Ended { server: Some(server), render: Some(render), error: None }, outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use lactose_task::StdPlatform;
+
+    use super::drop_within;
+
+    /// A value whose drop waits for a word on a channel, then says it ended.
+    struct Blocking {
+        go: mpsc::Receiver<()>,
+        ended: mpsc::Sender<()>,
+    }
+
+    impl Drop for Blocking {
+        fn drop(&mut self) {
+            let _ = self.go.recv();
+            let _ = self.ended.send(());
+        }
+    }
+
+    /// Step 4's bound: a drop that ends is waited for; one that blocks past the bound is
+    /// left on its thread, which ends with it once it is let go.
+    #[test]
+    fn a_drop_is_waited_for_within_its_bound_and_left_past_it() {
+        let (go, wait) = mpsc::channel();
+        let (sent, ended) = mpsc::channel();
+        go.send(()).expect("a word");
+        let value = Blocking { go: wait, ended: sent.clone() };
+        assert!(drop_within(&StdPlatform, value, Duration::from_secs(60)));
+        ended.try_recv().expect("the drop ended before the wait did");
+
+        let (go, wait) = mpsc::channel();
+        let value = Blocking { go: wait, ended: sent };
+        assert!(!drop_within(&StdPlatform, value, Duration::from_millis(50)));
+        assert!(ended.try_recv().is_err(), "the drop is still blocked");
+        go.send(()).expect("the blocked drop let go");
+        ended.recv_timeout(Duration::from_secs(60)).expect("the left thread ends");
+    }
 }

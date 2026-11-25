@@ -1,7 +1,10 @@
 //! The wiring that ships, on `lactose-rhi-null`: the client's render side and present side
 //! stepped on each queue layout with the extent going E1, hidden, E2 and E1 again, through
-//! the presents null stalls, and refused nothing; and a lost device, which ends the run with
-//! its error and leaves a shutdown that completes.
+//! the presents null stalls, and refused nothing; every target made destroyed; the frame's
+//! wait for the present's last read of a target it takes back, with every read kept pending;
+//! the fixed-frame mode's readback and the placements it is held to; a clean shutdown that
+//! logs nothing; and a lost device, which ends the run with its error and leaves a shutdown
+//! that completes.
 //!
 //! Null reaches drawn, hidden, held and dropped frames through this wiring. A frame that
 //! waits for a region and one torn by a refusal are not reached: null runs each submit as it
@@ -17,15 +20,18 @@ use lactose_app::{
     PresentSide, RenderSide, Rendered, Shown, ShownError, ShownKept, Stopped, TICK_PERIOD, Workers,
     WorldConfig, start_executor,
 };
-use lactose_app_client::{FIXED_SAMPLE, Frames, Wired, wire};
-use lactose_core::ErrorKind;
+use lactose_app_client::{ClientRender, FIXED_SAMPLE, Frames, LastFrame, Wired, wire};
+use lactose_core::{ErrorKind, Result};
 use lactose_input_host::LatestSample;
 use lactose_platform::PresentThread;
-use lactose_rhi_api::{Capabilities, Extent, QueueLayout, SwapchainDesc};
+use lactose_renderer::InstanceRecord;
+use lactose_rhi_api::{Capabilities, Device, Extent, QueueLayout, SwapchainDesc};
 use lactose_rhi_null::Control;
 use lactose_task::{ExecutionLog, Executor};
 
-use crate::support::{Said, Watch, Watched, bounded, lock, null_device, null_shaders, warnings};
+use crate::support::{
+    Said, Watch, Watched, WatchedDevice, bounded, lock, null_device, null_shaders, warnings,
+};
 
 const E1: Extent = Extent { width: 64, height: 48 };
 const E2: Extent = Extent { width: 80, height: 40 };
@@ -36,6 +42,8 @@ pub struct Run {
     pub executor: Executor,
     pub control: Control,
     pub said: Arc<Said>,
+    /// What the swapchain and the device were asked.
+    pub watch: Arc<Watch>,
     shown: Option<Shown>,
     present: Option<PresentThread<Box<dyn PresentSide>>>,
     frames: Frames,
@@ -44,41 +52,56 @@ pub struct Run {
     steps: u32,
 }
 
+/// How a [`Run`] is made beside its layout.
+#[derive(Clone, Copy, Default)]
+pub struct Setup {
+    /// Every second acquire answered with no image.
+    pub skip: bool,
+    /// Every present's read kept pending until a wait sees it ([`Watch::lag`]).
+    pub lag: bool,
+    /// The fixed-frame mode's readback, at this extent.
+    pub readback: Option<Extent>,
+}
+
 impl Run {
     pub fn new(capabilities: Capabilities, workers: Workers, world: WorldConfig) -> Self {
-        Self::watched(capabilities, workers, world, false).0
+        Self::with(capabilities, workers, world, Setup::default())
     }
 
-    /// A run whose swapchain is [`Watched`], answering every second acquire with no image
-    /// where `skip` is set.
-    pub fn watched(
+    /// A run whose device is a [`WatchedDevice`] and whose swapchain is [`Watched`], as
+    /// `setup` says.
+    pub fn with(
         capabilities: Capabilities,
         workers: Workers,
         world: WorldConfig,
-        skip: bool,
-    ) -> (Self, Arc<Watch>) {
+        setup: Setup,
+    ) -> Self {
         let executor = start_executor(workers).expect("an executor");
-        let (device, control, said) = null_device(capabilities);
+        let (inner, control, said) = null_device(capabilities);
         let platform = Arc::clone(executor.platform());
-        // As the binary makes it, beside the device, at the window's first size.
-        let inner = device.create_swapchain(&SwapchainDesc { extent: E1 }).expect("a swapchain");
         let watch = Arc::new(Watch::default());
-        let swapchain = Box::new(Watched { inner, watch: Arc::clone(&watch), skip });
+        watch.lag.store(setup.lag, Ordering::Release);
+        let device: Arc<dyn Device> =
+            Arc::new(WatchedDevice { inner: Arc::clone(&inner), watch: Arc::clone(&watch) });
+        // As the binary makes it, beside the device, at the window's first size.
+        let inner = inner.create_swapchain(&SwapchainDesc { extent: E1 }).expect("a swapchain");
+        let swapchain = Box::new(Watched { inner, watch: Arc::clone(&watch), skip: setup.skip });
         let shaders = null_shaders();
-        let Wired { shown, present, frames, input } =
-            wire(&executor, &*platform, &device, swapchain, &shaders, world, None).expect("wired");
-        let run = Self {
+        let wired =
+            wire(&executor, &*platform, &device, swapchain, &shaders, world, setup.readback);
+        let Wired { shown, present, frames, input } = wired.expect("wired");
+        Self {
             executor,
             control,
             said,
+            watch,
             shown: Some(shown),
             present: Some(present),
             frames,
             input,
             start: Instant::now(),
             steps: 0,
-        };
-        (run, watch)
+        }
     }
 
     pub fn shown(&self) -> &Shown {
@@ -104,6 +127,32 @@ impl Run {
     pub fn step(&mut self, extent: Option<Extent>) -> Rendered {
         let steps = self.steps;
         self.try_step(extent).unwrap_or_else(|failure| panic!("step {steps}: {:?}", failure.error))
+    }
+
+    /// One step, then a wait until the present call of every frame queued so far has made
+    /// its last swapchain call ([`Watch::settle`]), so that the next step finds no call in
+    /// flight but in the moment between that call and the lane's reply. Asserted names
+    /// rest on it, never on a pace.
+    pub fn settled(&mut self, extent: Option<Extent>) -> &'static str {
+        let rendered = self.step(extent);
+        let queued = usize::try_from(self.shown().stats().queued).expect("a count");
+        self.watch.settle(queued);
+        name(&rendered)
+    }
+
+    /// [`stop`](Self::stop), reading the fixed-frame mode's last frame from the render side
+    /// after `Shown::stop` and before its drop, as the binary does.
+    pub fn stop_reading(mut self) -> Result<Option<LastFrame>> {
+        let shown = self.shown.take().expect("a shown world");
+        let stopped = bounded(&self.executor, shown.stop(), "the stop").expect("stopped");
+        if let Some(present) = self.present.take() {
+            drop(bounded(&self.executor, present.stop(), "the present thread's stop"));
+        }
+        let render: &dyn std::any::Any = &*stopped.render;
+        let last = render.downcast_ref::<ClientRender>().expect("the client's render side");
+        let read = last.last_frame();
+        self.finish(Some(stopped));
+        read
     }
 
     /// The shutdown's order: `Shown::stop`, the present thread, the render side's drop on
@@ -166,6 +215,10 @@ pub fn name(rendered: &Rendered) -> &'static str {
     }
 }
 
+fn several() -> Capabilities {
+    Capabilities { queues: QueueLayout::SEVERAL, ..Capabilities::LEAST }
+}
+
 fn layouts() -> [(&'static str, Capabilities); 2] {
     [
         ("one queue", Capabilities { queues: QueueLayout::ONE, ..Capabilities::LEAST }),
@@ -185,9 +238,11 @@ fn workers() -> Workers {
 /// sheds one, since null reports no display time; then the stall let go and frames queued
 /// again. Null refuses nothing and says nothing throughout.
 ///
-/// A stalled present's acquire finds no image and returns at null's bound, a second, so a
-/// call is in flight for a second at a time while eight steps run: what is asserted is that
-/// some frame was held or dropped among them, never which.
+/// Before the stall and after it each step waits for the present calls to end
+/// ([`Run::settled`]), so each frame is queued. A stalled present's acquire finds no image
+/// and returns at null's bound, a second, so a call is in flight for a second at a time
+/// while eight steps run: what is asserted there is that some frame was held or dropped
+/// among them, never which.
 #[test]
 fn each_layout_steps_e1_e2_e1_through_stalled_presents_and_refuses_nothing() {
     for (layout, capabilities) in layouts() {
@@ -195,7 +250,7 @@ fn each_layout_steps_e1_e2_e1_through_stalled_presents_and_refuses_nothing() {
         let mut seen = Vec::new();
         let extents = [Some(E1), Some(E1), Some(E1), None, Some(E2), Some(E2), Some(E1), Some(E1)];
         for extent in extents {
-            seen.push(name(&run.step(extent)));
+            seen.push(run.settled(extent));
         }
         assert_eq!(
             seen,
@@ -215,15 +270,90 @@ fn each_layout_steps_e1_e2_e1_through_stalled_presents_and_refuses_nothing() {
             "{layout}: {stalled:?}"
         );
         assert!(run.control.stall(false), "{layout}: the device is gone");
-        let after: Vec<_> = (0..4).map(|_| name(&run.step(Some(E1)))).collect();
-        assert_eq!(after.last(), Some(&"drawn"), "{layout}: {after:?}");
+        let queued = usize::try_from(run.shown().stats().queued).expect("a count");
+        run.watch.settle(queued);
+        let after: Vec<_> = (0..2).map(|_| run.settled(Some(E1))).collect();
+        assert_eq!(after, ["drawn", "drawn"], "{layout}");
         assert_eq!(
             run.said.count.load(Ordering::Relaxed),
             0,
             "{layout}: {:?}",
             lock(&run.said.texts)
         );
+        // A stalled present holds the resize or the present after it past null's bound,
+        // which the side meets as pending and takes back; nothing else is refused.
+        let refusals = lock(&run.watch.refusals).clone();
+        let other: Vec<_> = refusals.iter().filter(|text| !text.contains(": Pending: ")).collect();
+        assert!(other.is_empty(), "{layout}: {other:?}");
         assert!(run.stop().is_none(), "no chaos, no log");
+    }
+}
+
+/// On each layout, E1, E2 and E1 again, each extent's frames queued: every target the render
+/// side made is destroyed by the time the render side is dropped, the old one of each change
+/// of extent among them, since a target that was retired and never destroyed would be
+/// destroyed by nothing (`retired-never-destroyed`).
+#[test]
+fn each_layout_destroys_every_target_it_made() {
+    for (layout, capabilities) in layouts() {
+        let mut run = Run::new(capabilities, workers(), WorldConfig::shown());
+        for extent in [E1, E1, E1, E2, E2, E2, E1, E1, E1] {
+            assert_eq!(run.settled(Some(extent)), "drawn", "{layout}");
+        }
+        let watch = Arc::clone(&run.watch);
+        assert!(run.stop().is_none(), "no chaos, no log");
+        let made = lock(&watch.made).clone();
+        let destroyed = lock(&watch.destroyed).clone();
+        assert!(made.len() >= 6, "{layout}: two targets at each of three extents: {made:?}");
+        let left: Vec<_> = made.iter().filter(|image| !destroyed.contains(image)).collect();
+        assert!(left.is_empty(), "{layout}: never destroyed: {left:?}");
+        assert_eq!(*lock(&watch.refusals), Vec::<String>::new(), "{layout}");
+    }
+}
+
+/// On two queues, frames at E1 with every present's read kept pending until a wait sees it
+/// ([`Watch::lag`]): from the third frame on, each frame takes back a target whose last read
+/// by a present is still pending, and its import waits for that read on the device, so null
+/// refuses nothing. A frame that took the target back with no wait would write it while the
+/// read is pending, which null refuses (`render-no-ready`).
+#[test]
+fn a_frame_that_takes_back_a_target_waits_for_its_last_read() {
+    let setup = Setup { lag: true, ..Setup::default() };
+    let mut run = Run::with(several(), workers(), WorldConfig::shown(), setup);
+    let seen: Vec<_> = (0..8).map(|_| run.settled(Some(E1))).collect();
+    assert_eq!(seen, ["drawn"; 8]);
+    assert_eq!(*lock(&run.watch.refusals), Vec::<String>::new());
+    assert_eq!(run.said.count.load(Ordering::Relaxed), 0, "{:?}", lock(&run.said.texts));
+    assert!(run.stop().is_none(), "no chaos, no log");
+}
+
+/// On each layout, with the fixed-frame mode's readback at E1: after frames at E1 the last
+/// frame is read with the placements extract handed the renderer known, and the scene's
+/// seven instances live in them (decision 5.1: "the scene is seven instances"), each in a
+/// slot of its own below the slot table's extent; a join suppressed, or a scene of six, is
+/// told apart here. After a last frame at E2, which copies nothing, no last frame is read
+/// (`readback-any-extent`). Null runs no shader, so the records it read back are not held
+/// to the placements here: the device run does that.
+#[test]
+fn the_readback_reads_the_last_frame_at_its_extent_with_the_scenes_placements() {
+    for (layout, capabilities) in layouts() {
+        let setup = Setup { readback: Some(E1), ..Setup::default() };
+        let mut run = Run::with(capabilities, workers(), WorldConfig::shown(), setup);
+        for _ in 0..4 {
+            assert_eq!(run.settled(Some(E1)), "drawn", "{layout}");
+        }
+        let last = run.stop_reading().expect("read").expect("a last frame");
+        assert_eq!(last.extent, E1, "{layout}");
+        assert_eq!(last.pixels.len(), 64 * 48, "{layout}");
+        assert_eq!(last.expected.len(), last.records.len(), "{layout}");
+        let live = |record: &&InstanceRecord| record.flags & InstanceRecord::LIVE != 0;
+        assert_eq!(last.expected.iter().filter(live).count(), 7, "{layout}");
+
+        let mut run = Run::with(capabilities, workers(), WorldConfig::shown(), setup);
+        for extent in [E1, E1, E2] {
+            assert_eq!(run.settled(Some(extent)), "drawn", "{layout}");
+        }
+        assert!(run.stop_reading().expect("read").is_none(), "{layout}: a frame at E2");
     }
 }
 
@@ -237,7 +367,9 @@ fn each_layout_steps_e1_e2_e1_through_stalled_presents_and_refuses_nothing() {
 #[test]
 fn each_layout_takes_back_the_targets_of_present_calls_that_made_no_submit() {
     for (layout, capabilities) in layouts() {
-        let (mut run, watch) = Run::watched(capabilities, workers(), WorldConfig::shown(), true);
+        let setup = Setup { skip: true, ..Setup::default() };
+        let mut run = Run::with(capabilities, workers(), WorldConfig::shown(), setup);
+        let watch = Arc::clone(&run.watch);
         let extents = [Some(E1), Some(E1), None, Some(E2), Some(E2), Some(E1), Some(E1)];
         let mut seen: Vec<_> = extents.into_iter().map(|extent| name(&run.step(extent))).collect();
         seen.extend((0..8).map(|_| name(&run.step(Some(E1)))));
@@ -264,7 +396,7 @@ fn a_clean_shutdown_logs_no_warning() {
         let ((), logged) = warnings(|| {
             let mut run = Run::new(capabilities, workers(), WorldConfig::shown());
             for _ in 0..3 {
-                assert_eq!(name(&run.step(Some(E1))), "drawn", "{layout}");
+                assert_eq!(run.settled(Some(E1)), "drawn", "{layout}");
             }
             assert!(run.stop().is_none(), "no chaos, no log");
         });
@@ -279,7 +411,7 @@ fn a_lost_device_ends_the_run_with_its_error_and_the_shutdown_completes() {
     for (layout, capabilities) in layouts() {
         let mut run = Run::new(capabilities, workers(), WorldConfig::shown());
         for _ in 0..3 {
-            assert_eq!(name(&run.step(Some(E1))), "drawn", "{layout}");
+            assert_eq!(run.settled(Some(E1)), "drawn", "{layout}");
         }
         assert!(run.control.lose(), "{layout}: the device is gone");
         let failure = run.try_step(Some(E1)).expect_err("a step on a lost device");

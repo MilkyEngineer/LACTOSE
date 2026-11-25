@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod extracted;
 mod game;
 mod present;
 pub mod reference;
@@ -18,7 +19,7 @@ mod run;
 mod shaders;
 
 pub use game::{Frames, GAME, InMemory, REGION};
-pub use present::{ClientPresent, HEAP, Waiting};
+pub use present::{ClientPresent, HEAP};
 pub use render::{BOOM, ClientRender, INSTANCES, LastFrame, PROJECTION, TARGET_FORMAT};
 pub use run::{
     FIXED_EXTENT, FIXED_FRACTION, FIXED_SAMPLE, LOG_TARGET, Mode, Options, Outcome, Wired, run,

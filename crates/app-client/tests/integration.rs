@@ -15,7 +15,6 @@
 #[allow(dead_code, reason = "the runner's module as written; a test uses what it needs")]
 mod protocol;
 
-mod count;
 mod null;
 mod present;
 mod recorded;

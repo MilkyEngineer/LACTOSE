@@ -19,8 +19,8 @@ use lactose_render_graph::{
     BufferImport, CopyPassDecl, FrameDecl, GraphDesc, ImageImport, RecordedFrame, RenderGraph,
 };
 use lactose_renderer::{
-    CameraData, CameraLatch, FrameStats, FrameView, Opened, Projection, Renderer, RendererDesc,
-    Shaders,
+    CameraData, CameraLatch, FrameStats, FrameView, InstanceRecord, Opened, Projection, Renderer,
+    RendererDesc, Shaders,
 };
 use lactose_rhi_api::{
     BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferState, BufferUsage, Device,
@@ -29,6 +29,7 @@ use lactose_rhi_api::{
 };
 use lactose_task::JobContext;
 
+use crate::extracted::Extracted;
 use crate::shaders::CookedShaders;
 
 /// The offscreen targets' format: the renderer's pipelines are made for it.
@@ -80,13 +81,32 @@ struct Retired {
 }
 
 /// The fixed-frame mode's copies of a frame: its target's pixels and the renderer's instance
-/// records, each frame into the buffers of the target it drew.
+/// records, each frame at the readback's extent into the buffers of the target it drew.
 struct Readback {
     extent: Extent,
     pixels: [BufferHandle; TARGETS],
     records: [BufferHandle; TARGETS],
-    /// The camera and the fraction each target was last drawn with.
-    drawn: [Option<(CameraData, f32)>; TARGETS],
+    /// What each target's buffers were last copied from, `None` where the last frame that
+    /// drew the target was at another extent and copied nothing.
+    drawn: [Option<Copied>; TARGETS],
+    /// The placements extract handed the renderer.
+    extracted: Extracted,
+}
+
+/// What a frame copied into its target's buffers was drawn with.
+#[derive(Clone)]
+struct Copied {
+    camera: CameraData,
+    fraction: f32,
+    /// The records the scatter should have written, or why they are not known.
+    expected: core::result::Result<Vec<InstanceRecord>, String>,
+}
+
+/// The frame recorded and not yet submitted.
+struct Recorded {
+    frame: RecordedFrame,
+    target: TargetIndex,
+    extent: Extent,
 }
 
 /// What a fixed frame drew with and what it drew: decision 5.1's dump and the image read.
@@ -96,8 +116,13 @@ pub struct LastFrame {
     pub extent: Extent,
     /// The target's pixels, row by row from the top left.
     pub pixels: Vec<[u8; 4]>,
-    /// The renderer's instance records the frame drew from, slot by slot.
-    pub records: Vec<lactose_renderer::InstanceRecord>,
+    /// The renderer's instance records the frame drew from, slot by slot, as the device's
+    /// scatter wrote them.
+    pub records: Vec<InstanceRecord>,
+    /// The records the placements extract handed the renderer give, slot by slot over the
+    /// same slots: what the scatter should have written, and what the reference is
+    /// rasterised from (decision 5.1).
+    pub expected: Vec<InstanceRecord>,
     /// The camera the frame latched.
     pub camera: CameraData,
     /// The interpolation fraction.
@@ -118,8 +143,8 @@ impl EventSink for NoEvents {
 pub struct ClientRender {
     graph: RenderGraph,
     renderer: Renderer,
-    /// The frame recorded and not yet submitted, and the target it drew.
-    recorded: Option<(RecordedFrame, TargetIndex)>,
+    /// The frame recorded and not yet submitted.
+    recorded: Option<Recorded>,
     /// What the binary publishes and the latch reads.
     input: Arc<LatestSample>,
     schedule: Presentation,
@@ -128,6 +153,9 @@ pub struct ClientRender {
     fraction: f32,
     /// The target the last submitted frame drew.
     last: Option<TargetIndex>,
+    /// With a readback, the records the frame recorded and not yet submitted should leave,
+    /// or why they are not known.
+    expected: Option<core::result::Result<Vec<InstanceRecord>, String>>,
     /// Last, so that the graph that submitted the renderer's frames and then the renderer
     /// are dropped before the images and buffers are destroyed (renderer, "Errors and
     /// drops").
@@ -208,6 +236,7 @@ impl ClientRender {
             boom: BOOM,
             fraction: 0.0,
             last: None,
+            expected: None,
             images: Images {
                 device: Arc::clone(device),
                 targets: [None; TARGETS],
@@ -229,17 +258,22 @@ impl ClientRender {
     ///
     /// # Errors
     ///
-    /// The device's, and `Cancelled` where the frame's point is not reached within a second.
+    /// The device's; `Cancelled` where the frame's point is not reached within a second; and
+    /// `InvalidData` where the placements extract handed the renderer are not known at the
+    /// last frame, naming why.
     pub fn last_frame(&self) -> Result<Option<LastFrame>> {
         let (Some(readback), Some(target)) = (&self.images.readback, self.last) else {
             return Ok(None);
         };
         let at = target.index();
-        let (Some(drawn), Some((camera, fraction))) =
-            (self.images.targets[at].and_then(|target| target.drawn), readback.drawn[at])
+        let (Some(drawn), Some(copied)) =
+            (self.images.targets[at].and_then(|target| target.drawn), &readback.drawn[at])
         else {
             return Ok(None);
         };
+        let expected = copied.expected.clone().map_err(|why| {
+            Error::new(ErrorKind::InvalidData, format!("the extracted placements: {why}"))
+        })?;
         let device = self.device();
         if !device.wait_timeline(drawn, std::time::Duration::from_secs(1))? {
             return Err(Error::new(ErrorKind::Cancelled, "the last frame's point was not reached"));
@@ -250,11 +284,10 @@ impl ClientRender {
         })?;
         let mut records = Vec::new();
         read(&**device, readback.records[at], Readback::record_bytes(), |bytes| {
-            records.extend(
-                bytes.as_chunks::<128>().0.iter().map(lactose_renderer::InstanceRecord::from_bytes),
-            );
+            records.extend(bytes.as_chunks::<128>().0.iter().map(InstanceRecord::from_bytes));
         })?;
-        Ok(Some(LastFrame { extent: readback.extent, pixels, records, camera, fraction }))
+        let (camera, fraction) = (copied.camera, copied.fraction);
+        Ok(Some(LastFrame { extent: readback.extent, pixels, records, expected, camera, fraction }))
     }
 
     /// The image of `draw.target` at `draw.extent`, and whether it is new. A retired image is
@@ -262,48 +295,76 @@ impl ClientRender {
     /// have both completed, which `timeline_value` says without a wait; the device refuses
     /// the destroy while a heap slot holds the image, and the present side's slot lets go at
     /// the first call that names another image for the index, or at `close`.
+    ///
+    /// A retired image whose points cannot be read or whose destroy fails with an error other
+    /// than a refusal as pending stays retired, and the first such error is returned once
+    /// every retired image was tried. The old image of `draw.target` is retired before the
+    /// new one is made, so a failed make leaves the slot empty, and the next frame that
+    /// draws the target makes it as new.
     fn target(&mut self, draw: Draw) -> Result<(ImageHandle, bool)> {
         let device = Arc::clone(self.graph.device());
         let mut kept = Vec::new();
+        let mut failed = None;
         for retired in self.images.retired.drain(..) {
-            if !(reached(&*device, retired.drawn)? && reached(&*device, retired.read)?) {
-                kept.push(retired);
-                continue;
-            }
-            match device.destroy_image(retired.image) {
-                Ok(()) => {}
-                Err(error) if Rule::of(&error) == Some(Rule::Pending) => kept.push(retired),
-                Err(error) => return Err(error),
+            let done = reached(&*device, retired.drawn)
+                .and_then(|drawn| Ok(drawn && reached(&*device, retired.read)?))
+                .and_then(|done| {
+                    if done {
+                        device.destroy_image(retired.image).map(|()| true)
+                    } else {
+                        Ok(false)
+                    }
+                });
+            match done {
+                Ok(true) => {}
+                Ok(false) => kept.push(retired),
+                Err(error) => {
+                    if Rule::of(&error) != Some(Rule::Pending) {
+                        failed.get_or_insert(error);
+                    }
+                    kept.push(retired);
+                }
             }
         }
         self.images.retired = kept;
+        if let Some(error) = failed {
+            return Err(error);
+        }
         let slot = &mut self.images.targets[draw.target.index()];
-        match *slot {
-            Some(target) if target.extent == draw.extent => Ok((target.image, false)),
-            old => {
-                if let Some(old) = old {
-                    // `draw.ready` is the present thread's last read of the old image.
-                    self.images.retired.push(Retired {
-                        image: old.image,
-                        drawn: old.drawn,
-                        read: draw.ready,
-                    });
-                }
-                let image = device.create_image(&ImageDesc {
-                    label: "target",
-                    format: TARGET_FORMAT,
-                    extent: draw.extent,
-                    mips: 1,
-                    layers: 1,
-                    usage: ImageUsage::COLOUR
-                        .union(ImageUsage::SAMPLED)
-                        .union(ImageUsage::COPY_SOURCE),
-                    memory: ImageMemory::Own,
-                    sharing: Sharing::Exclusive,
-                })?;
-                *slot = Some(Target { image, extent: draw.extent, drawn: None });
-                Ok((image, true))
-            }
+        if let Some(target) = *slot
+            && target.extent == draw.extent
+        {
+            return Ok((target.image, false));
+        }
+        if let Some(old) = slot.take() {
+            // `draw.ready` is the present thread's last read of the old image.
+            self.images.retired.push(Retired {
+                image: old.image,
+                drawn: old.drawn,
+                read: draw.ready,
+            });
+        }
+        let image = device.create_image(&ImageDesc {
+            label: "target",
+            format: TARGET_FORMAT,
+            extent: draw.extent,
+            mips: 1,
+            layers: 1,
+            usage: ImageUsage::COLOUR.union(ImageUsage::SAMPLED).union(ImageUsage::COPY_SOURCE),
+            memory: ImageMemory::Own,
+            sharing: Sharing::Exclusive,
+        })?;
+        *slot = Some(Target { image, extent: draw.extent, drawn: None });
+        Ok((image, true))
+    }
+
+    /// Ends the prepared frame as torn. The placements extract handed the renderer are
+    /// not known from then on: the renderer forgets them, and extract writes them again.
+    fn torn(&mut self) {
+        self.renderer.torn();
+        self.expected = None;
+        if let Some(readback) = &mut self.images.readback {
+            readback.extracted.break_for("a torn frame");
         }
     }
 
@@ -391,7 +452,8 @@ impl Readback {
                 buffer("records", Self::record_bytes())?,
                 buffer("records", Self::record_bytes())?,
             ],
-            drawn: [None; TARGETS],
+            drawn: core::array::from_fn(|_| None),
+            extracted: Extracted::new(),
         })
     }
 
@@ -400,7 +462,7 @@ impl Readback {
     }
 
     const fn record_bytes() -> u64 {
-        INSTANCES as u64 * lactose_renderer::InstanceRecord::BYTES as u64
+        INSTANCES as u64 * InstanceRecord::BYTES as u64
     }
 }
 
@@ -452,7 +514,11 @@ impl RenderSide for ClientRender {
     }
 
     fn sink(&mut self) -> Box<dyn InstanceSink> {
-        Box::new(self.renderer.sink())
+        let sink = self.renderer.sink();
+        match &mut self.images.readback {
+            Some(readback) => Box::new(readback.extracted.recording(sink)),
+            None => Box::new(sink),
+        }
     }
 
     fn present(
@@ -481,15 +547,28 @@ impl RenderSide for ClientRender {
             let writer = self.renderer.remote();
             lactose_presentation::upload(ctx, self.schedule.remote(), |rows| writer.write(rows));
         }
+        if let Some(readback) = &mut self.images.readback {
+            readback.extracted.before_prepare();
+        }
         let stats = match self.renderer.prepare() {
             Ok(stats) => stats,
             Err(error) => {
                 // A device's error left the frame prepared, to be ended here; after a
                 // refusal `torn` does nothing (renderer, "Errors and drops").
-                self.renderer.torn();
+                self.torn();
                 return Err(error);
             }
         };
+        let expected = self.images.readback.as_mut().map(|readback| {
+            let extracted = &mut readback.extracted;
+            if stats.any_lost() || stats.dropped > 0 || stats.unplaced > 0 || stats.duplicates > 0 {
+                extracted
+                    .break_for(format!("a frame lost, dropped or did not place rows: {stats:?}"));
+            }
+            extracted
+                .records(self.renderer.slots(), INSTANCES as usize)
+                .ok_or_else(|| extracted.broken().unwrap_or_default().to_owned())
+        });
         // Taken from `Undefined` in a submit that waits for the present thread's last read
         // of this image, and handed on to the present role (rhi-api, "The present thread";
         // graph, "Imports"). A new image has no read to wait for.
@@ -514,23 +593,25 @@ impl RenderSide for ClientRender {
             (draw.extent, self.fraction),
             readback,
         ) {
-            Ok(recorded) => {
-                self.recorded = Some((recorded, draw.target));
+            Ok(frame) => {
+                self.recorded = Some(Recorded { frame, target: draw.target, extent: draw.extent });
+                self.expected = expected;
                 Ok(counts_of(&stats))
             }
             Err(error) => {
                 // The frame was prepared and will not be submitted.
-                self.renderer.torn();
+                self.torn();
                 Err(error)
             }
         }
     }
 
     fn submit(&mut self) -> Result<Submitted> {
-        let (recorded, target) = self
+        let Recorded { frame, target, extent } = self
             .recorded
             .take()
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no frame is recorded"))?;
+        let expected = self.expected.take();
         let latch = CameraLatch {
             pivot: self.pivot,
             input: &self.input,
@@ -540,14 +621,14 @@ impl RenderSide for ClientRender {
         let latched = match self.renderer.latch(&latch) {
             Ok(latched) => latched,
             Err(error) => {
-                self.renderer.torn();
+                self.torn();
                 return Err(error);
             }
         };
-        let point = match self.graph.submit(recorded) {
+        let point = match self.graph.submit(frame) {
             Ok(point) => point,
             Err(error) => {
-                self.renderer.torn();
+                self.torn();
                 return Err(error);
             }
         };
@@ -557,7 +638,10 @@ impl RenderSide for ClientRender {
         slot.drawn = Some(point);
         let image = slot.image;
         if let Some(readback) = &mut self.images.readback {
-            readback.drawn[at] = Some((latched.data, self.fraction));
+            // A frame at another extent copied nothing into the target's buffers.
+            readback.drawn[at] = expected
+                .filter(|_| extent == readback.extent)
+                .map(|expected| Copied { camera: latched.data, fraction: self.fraction, expected });
         }
         self.last = Some(target);
         // The next frame's region. After a `submitted` every held region has a point, so
