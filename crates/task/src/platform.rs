@@ -946,13 +946,24 @@ mod tests {
         assert_eq!(linux_topology(&cpus, None, None), Some(topology(4, 4)));
     }
 
+    /// A temporary directory, removed when dropped, so that a test that fails leaves none.
+    struct TempTree(std::path::PathBuf);
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Writes a sysfs CPU tree under a fresh temporary directory: each CPU's files as
     /// `(cpu, [(relative path, contents)])`, plus the entries of the real directory that are
     /// not CPUs.
-    fn sysfs_tree(name: &str, cpus: &[(u32, Vec<(&str, &str)>)]) -> std::path::PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("lactose-task-sysfs-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn sysfs_tree(name: &str, cpus: &[(u32, Vec<(&str, &str)>)]) -> TempTree {
+        let tree = TempTree(
+            std::env::temp_dir().join(format!("lactose-task-sysfs-{name}-{}", std::process::id())),
+        );
+        let root = &tree.0;
+        let _ = std::fs::remove_dir_all(root);
         std::fs::create_dir_all(root.join("cpuidle")).unwrap();
         std::fs::create_dir_all(root.join("cpufreq")).unwrap();
         std::fs::write(root.join("online"), "0-7\n").unwrap();
@@ -965,7 +976,7 @@ mod tests {
                 std::fs::write(path, contents).unwrap();
             }
         }
-        root
+        tree
     }
 
     #[test]
@@ -973,10 +984,9 @@ mod tests {
     fn linux_sysfs_is_read_with_and_without_cluster_ids() {
         use CoreClass::{Efficiency, Performance};
 
-        let read = |root: &std::path::Path| {
-            let mut cpus = super::detect::linux_cpus(root).unwrap();
+        let read = |tree: TempTree| {
+            let mut cpus = super::detect::linux_cpus(&tree.0).unwrap();
             cpus.sort_by_key(|cpu| cpu.cpu);
-            std::fs::remove_dir_all(root).unwrap();
             cpus
         };
         let cpu = |cpu, package, cluster, core, capacity| LinuxCpu {
@@ -1014,7 +1024,7 @@ mod tests {
                 ("topology/cluster_id", "-1"),
             ],
         ));
-        let cpus = read(&sysfs_tree("clusters", &tree));
+        let cpus = read(sysfs_tree("clusters", &tree));
         let mut expected: Vec<LinuxCpu> = (0..4).map(|n| cpu(n, 0, 0, n, Some(446))).collect();
         expected.extend((4..8).map(|n| cpu(n, 0, 1, n - 4, Some(1024))));
         expected.push(cpu(9, 1, 0, 0, None));
@@ -1034,7 +1044,7 @@ mod tests {
                 )
             })
             .collect();
-        let cpus = read(&sysfs_tree("no-clusters", &tree));
+        let cpus = read(sysfs_tree("no-clusters", &tree));
         assert_eq!(cpus, (0..4).map(|n| cpu(n, 0, 0, n, None)).collect::<Vec<_>>());
         assert!(super::detect::linux_cpus(std::path::Path::new("/nonexistent-sysfs")).is_none());
     }

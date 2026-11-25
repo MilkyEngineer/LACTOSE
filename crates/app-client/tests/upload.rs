@@ -27,18 +27,25 @@
 //! the class of the core it began on and the one it ended on through
 //! `lactose_task::current_core_class`, and times a fixed chain of dependent multiply-adds,
 //! [`CHAIN`] long, whose time is the clock the job meets. Criterion 5 reads the frames whose
-//! job began and ended on a performance core, at whatever clock (D164). The file gives the
-//! median, P99 and worst frame over every frame (`frame.*`), over those frames
-//! (`performance.*`) and over the rest (`rest.*`), each with its share of the frames and its
-//! split by clock band, the band read against the fastest chain of the run; how many frames
-//! ran in each placement (`placement.*`); and which figure the criterion reads and whether
-//! the run judges it (`criterion.*`). The same frames are then run back to back with no
-//! timer, a control whose job stays busy and whose clock stays up, and given the same way
-//! under `unpaced.`. The fastest chain on each class of core
-//! (`calibration.fastest_us.performance` and `.efficiency`), over the frames and the chains of
-//! a numbering probe that runs a `Background` thread on every logical CPU after them
-//! (`calibration.probe.*`), shows the CPU numbering the class call rests on: the efficiency
-//! cores' is the slower (`calibration.numbering`).
+//! job began and ended on a performance core, at whatever clock, and every frame on a machine
+//! with one class of core (D164). The file gives the median, P99 and worst frame over every
+//! frame (`frame.*`), over the performance-core frames (`performance.*`) and over the rest
+//! (`rest.*`), each with its share of the frames and its split by clock band, the band read
+//! against the fastest chain of the run; how many frames ran in each placement
+//! (`placement.*`); and which figure the criterion reads and whether the run judges it
+//! (`criterion.*`). The same frames are then run back to back with no timer, a control whose
+//! job stays busy and whose clock stays up, and given the same way under `unpaced.`.
+//!
+//! The fastest chain on each class of core (`calibration.fastest_us.performance` and
+//! `.efficiency`), over the frames and the chains of a numbering probe that runs a
+//! `Background` thread on every logical CPU after them (`calibration.probe.*`), shows the CPU
+//! numbering the class call rests on: the efficiency cores' is at least [`NUMBERING_MARGIN`]
+//! times the performance cores', or the file flags the numbering and the criterion judges
+//! nothing (`calibration.numbering`). The check catches a whole swap of the classes and a tie,
+//! which a performance core numbered among the efficiency cores gives, not every wrong map:
+//! an efficiency core numbered among the performance cores hides behind their faster chains,
+//! and a CPU that ran no chain shows nothing. The real check of the numbering is
+//! `lactose-task`'s `the_apple_numbering_is_the_device_trees`.
 //!
 //! The bands are relative to the run's fastest chain, not to a core's rated clock. The file
 //! flags a run whose control has under half its frames `full` (`calibration.flag`): a fastest
@@ -64,7 +71,7 @@ use lactose_net_host::interpolation::{
 use lactose_physics_api::Transform;
 use lactose_present_api::{InstanceRow, RenderTransform};
 use lactose_renderer::{Renderer, RendererDesc};
-use lactose_task::{CoreClass, current_core_class};
+use lactose_task::{CoreClass, Platform, StdPlatform, current_core_class};
 
 use crate::support::{bounded, lock};
 use crate::timing::{
@@ -134,6 +141,87 @@ fn placement(began: Option<CoreClass>, ended: Option<CoreClass>) -> &'static str
 
 /// Every value of [`placement`].
 const PLACEMENTS: [&str; 4] = ["performance", "efficiency", "moved", "unknown"];
+
+/// The least ratio of the efficiency cores' fastest chain to the performance cores' that
+/// shows the numbering. A whole swap of the classes reads under 1 and one CPU of each class
+/// swapped about 1.00; the M1's map reads 1.13 within the probe alone.
+const NUMBERING_MARGIN: f64 = 1.05;
+
+/// What the fastest chain on each class of core shows of the class call's numbering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Numbering {
+    /// The efficiency cores' fastest chain is at least [`NUMBERING_MARGIN`] times the
+    /// performance cores'.
+    Shown,
+    /// It is not: the numbering is in doubt.
+    Flagged,
+    /// No frame or probe chain ran on one of the classes.
+    NotShown,
+}
+
+impl Numbering {
+    /// The numbering from each class's fastest chain.
+    fn of(performance: Option<Duration>, efficiency: Option<Duration>) -> Self {
+        match (performance, efficiency) {
+            (Some(performance), Some(efficiency)) => {
+                if efficiency.as_secs_f64() >= NUMBERING_MARGIN * performance.as_secs_f64() {
+                    Self::Shown
+                } else {
+                    Self::Flagged
+                }
+            }
+            _ => Self::NotShown,
+        }
+    }
+
+    /// The figure `calibration.numbering`.
+    fn text(self) -> &'static str {
+        match self {
+            Self::Shown => {
+                "the efficiency cores' fastest chain is at least 1.05 times the performance \
+                 cores', as the class call's numbering assumes"
+            }
+            Self::Flagged => {
+                "FLAGGED: the efficiency cores' fastest chain is under 1.05 times the \
+                 performance cores': the class call's numbering is in doubt"
+            }
+            Self::NotShown => "not shown: no frame or probe chain ran on one of the classes",
+        }
+    }
+}
+
+/// What criterion 5 reads and whether the run judges it (D164), as the figures
+/// `criterion.reads` and `criterion.judges`, from the placements of the paced frames: the
+/// frames that began and ended on a performance core, or every frame where the platform
+/// reports one class of core (`one_class`), whatever the class call reads there. No verdict
+/// with the numbering flagged, with no frame's class read on a machine of two classes, or
+/// with under a tenth of the frames counted.
+fn criterion(
+    one_class: bool,
+    numbering: Numbering,
+    placements: &[&str],
+) -> (&'static str, &'static str) {
+    let reads = if one_class {
+        "frame.p50_us: every paced frame, the machine having one class of core"
+    } else {
+        "performance.frame.p50_us: the paced frames that began and ended on a performance core"
+    };
+    let counted = if one_class {
+        placements.len()
+    } else {
+        placements.iter().filter(|&&at| at == "performance").count()
+    };
+    let judges = if numbering == Numbering::Flagged {
+        "no: the numbering is flagged, so the performance-core frames may be another class's"
+    } else if !one_class && placements.iter().all(|&at| at == "unknown") {
+        "no: the platform reports two classes of core and the class call read no frame's"
+    } else if counted * 10 < placements.len() {
+        "no: under a tenth of the paced frames ran on a performance core"
+    } else {
+        "yes"
+    };
+    (reads, judges)
+}
 
 /// The state the network thread pushes for slot `n` at server tick `tick`.
 fn state(tick: u32, n: u32) -> ReceivedState {
@@ -423,37 +511,19 @@ fn cost_of_the_remote_upload_of_5k() {
             .map_or_else(|| "none: no frame or probe chain ran on the class".to_owned(), micros);
         figure(&format!("calibration.fastest_us.{class}"), value);
     }
-    figure(
-        "calibration.numbering",
-        match (on_performance, on_efficiency) {
-            (Some(performance), Some(efficiency)) if efficiency > performance => {
-                "the efficiency cores' fastest chain is the slower, as the class call's \
-                 numbering assumes"
-            }
-            (Some(_), Some(_)) => {
-                "FLAGGED: the efficiency cores' fastest chain is not the slower: the class \
-                 call's numbering is in doubt"
-            }
-            _ => "not shown: no frame or probe chain ran on one of the classes",
-        },
-    );
+    if let (Some(performance), Some(efficiency)) = (on_performance, on_efficiency) {
+        let ratio = efficiency.as_secs_f64() / performance.as_secs_f64();
+        figure("calibration.numbering_ratio", format!("{ratio:.2}"));
+    }
+    let numbering = Numbering::of(on_performance, on_efficiency);
+    figure("calibration.numbering", numbering.text());
     report("", &paced, fastest);
     report("unpaced.", &unpaced, fastest);
-    // Criterion 5 (D164): the paced frames whose job began and ended on a performance core,
-    // every core where the system reports one class; under a tenth of the frames, no verdict.
-    figure(
-        "criterion.reads",
-        "performance.frame.p50_us: the paced frames that began and ended on a performance core",
-    );
-    let counted = paced.iter().filter(|p| p.placement() == "performance").count();
-    figure(
-        "criterion.judges",
-        if counted * 10 < paced.len() {
-            "no: under a tenth of the paced frames ran on a performance core"
-        } else {
-            "yes"
-        },
-    );
+    let one_class = StdPlatform.topology().efficiency == 0;
+    let placements: Vec<&str> = paced.iter().map(Parts::placement).collect();
+    let (reads, judges) = criterion(one_class, numbering, &placements);
+    figure("criterion.reads", reads);
+    figure("criterion.judges", judges);
     let full = unpaced.iter().filter(|p| band(p.calibration, fastest) == "full").count();
     figure(
         "calibration.flag",
@@ -484,4 +554,59 @@ fn cost_of_the_remote_upload_of_5k() {
     figure("ring.regions", RING_REGIONS);
     paced_waits.report("ring");
     unpaced_waits.report("unpaced.ring");
+}
+
+#[test]
+fn the_numbering_flags_a_swap_and_a_tie() {
+    let us = |n: u64| Some(Duration::from_micros(n));
+    assert_eq!(Numbering::of(us(100), us(113)), Numbering::Shown);
+    assert_eq!(Numbering::of(us(100), us(105)), Numbering::Shown);
+    // One CPU of each class swapped: the two fastest chains tie.
+    assert_eq!(Numbering::of(us(100), us(101)), Numbering::Flagged);
+    assert_eq!(Numbering::of(us(100), us(100)), Numbering::Flagged);
+    // The classes swapped whole.
+    assert_eq!(Numbering::of(us(113), us(100)), Numbering::Flagged);
+    assert_eq!(Numbering::of(us(100), None), Numbering::NotShown);
+    assert_eq!(Numbering::of(None, us(100)), Numbering::NotShown);
+}
+
+#[test]
+fn criterion_5_judges_the_frames_of_the_classes_the_platform_reports() {
+    let frames = |performance: usize, other: &'static str, others: usize| {
+        let mut placements = vec!["performance"; performance];
+        placements.extend(std::iter::repeat_n(other, others));
+        placements
+    };
+    let reads = |one_class, numbering, placements: &[&str]| {
+        let (reads, _) = criterion(one_class, numbering, placements);
+        reads.split(':').next().unwrap()
+    };
+    let judges = |one_class, numbering, placements: &[&str]| {
+        let (_, judges) = criterion(one_class, numbering, placements);
+        judges
+    };
+
+    // Two classes: the performance-core frames, at least a tenth of the run.
+    let run = frames(144, "efficiency", 1_296);
+    assert_eq!(reads(false, Numbering::Shown, &run), "performance.frame.p50_us");
+    assert_eq!(judges(false, Numbering::Shown, &run), "yes");
+    assert_eq!(judges(false, Numbering::NotShown, &run), "yes");
+    let run = frames(143, "moved", 1_297);
+    assert!(judges(false, Numbering::Shown, &run).starts_with("no: under a tenth"));
+    // A flagged numbering judges nothing, however many frames it calls performance-core.
+    let run = frames(1_440, "efficiency", 0);
+    assert!(judges(false, Numbering::Flagged, &run).starts_with("no: the numbering is flagged"));
+    // Two classes reported, and no frame's class read.
+    let run = frames(0, "unknown", 1_440);
+    assert!(judges(false, Numbering::NotShown, &run).starts_with("no: the platform reports"));
+
+    // One class, which the class call reports as performance (macOS, Windows).
+    let run = frames(1_440, "unknown", 0);
+    assert_eq!(reads(true, Numbering::NotShown, &run), "frame.p50_us");
+    assert_eq!(judges(true, Numbering::NotShown, &run), "yes");
+    // One class, and no class known (a Linux part that exports no capacity): every frame.
+    let run = frames(0, "unknown", 1_440);
+    assert_eq!(reads(true, Numbering::NotShown, &run), "frame.p50_us");
+    assert_eq!(judges(true, Numbering::NotShown, &run), "yes");
+    assert!(judges(true, Numbering::Flagged, &run).starts_with("no: the numbering is flagged"));
 }

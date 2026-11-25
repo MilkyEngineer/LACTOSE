@@ -143,9 +143,10 @@ jobs:
       # What the macOS runner grants a measurement run: the role read-back test prints the
       # user-interactive priority before and after the request, and the class-map tests print
       # the performance levels the runner reports. nextest hides a passing test's output, so
-      # this runs them again with it shown (crates/task/README.md, "Measurement calls").
+      # this runs them again with it shown (crates/task/README.md, "Measurement calls"), and
+      # also when Test failed, the case its output explains.
       - name: Task role and core classes on this runner
-        if: matrix.os == 'macos-latest' && matrix.group == 'base'
+        if: ${{ !cancelled() && steps.group.outcome == 'success' && matrix.os == 'macos-latest' && matrix.group == 'base' }}
         run: >-
           cargo nextest run --locked -p lactose-task --no-capture
           -E 'test(=measure::tests::the_foreground_role_is_taken_and_read_back)
