@@ -128,7 +128,7 @@ pub(crate) struct PresentStamp {
     pub waits: Duration,
     /// The acquire's time.
     pub acquire: Duration,
-    /// The time of the encoder's creation and the blit's recording.
+    /// The time of the encoder's reset or creation and the blit's recording.
     pub record: Duration,
     /// The time of `Swapchain::present`: the wait for the image's last-present fence, then
     /// the driver's submit and present under the queue's lock.
