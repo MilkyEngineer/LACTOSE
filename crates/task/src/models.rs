@@ -37,10 +37,12 @@
 //!   `a_range_queued_as_shutdown_begins_is_dropped`, each with shutdown set between the push
 //!   and the read);
 //! - `execute`'s put-back of a task taken over the limit (`pool.rs`); the put-back model
-//!   pushes the task back and goes round the loop
-//!   (`pool::tests::a_task_taken_at_a_closed_gate_is_put_back_unpolled`, and
+//!   pushes the task back, waking nobody, and goes round the loop
+//!   (`pool::tests::a_task_taken_at_a_closed_gate_is_put_back_unpolled`,
 //!   `executor::gate_tests::a_task_put_back_over_the_limit_runs_on_the_reservations_worker`
-//!   for the worker that takes it).
+//!   for the worker that takes it, and `a_task_put_back_over_the_limit_wakes_no_sleeper`).
+//!   Its sweep under shutdown is not modelled
+//!   (`pool::tests::a_task_taken_after_shutdown_began_is_swept_by_its_put_back`).
 //!
 //! The parking lane's two weakened models, `weakened_a_parked_lane_woken_by_*`, run copies
 //! of `parking.rs`'s wake and wait with one side removed (`parking::WeakenedSignal`), on a
@@ -806,60 +808,109 @@ fn an_idle_release_wakes_nobody_and_loses_no_work() {
     });
 }
 
-/// The worker loop as a ready task meets it at a closed gate, over a queue that is a count
-/// of tasks: the check of the gate at the top of the loop (`Gate::release_if_over`, which
-/// `keep_permit` skips), the take, and the poll; a worker that finds nothing gives its
-/// permit up as an idle worker does and sleeps through `gate::idle_park`. Notes in `over`
-/// a take over the limit, for the model to assert on once both threads are joined: a panic
-/// on a model thread while the other is parked aborts the run. Returns once the task has
-/// been polled.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the model's shared state, passed as `work` takes it"
-)]
-fn poll_within_the_limit(
-    gate: &Gate,
-    sleep: &Sleep,
-    queue: &AtomicUsize,
-    polled: &AtomicBool,
-    over: &AtomicBool,
-    me: usize,
-    wake: &PoolWake,
-    keep_permit: bool,
-) {
-    let mut permit = true;
-    while !polled.load(Ordering::SeqCst) {
-        if !permit {
-            permit = gate.try_acquire();
-        } else if !keep_permit && gate.release_if_over() {
-            permit = false;
+/// How the put-back model's first worker puts the task back, and who else holds a permit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PutBack {
+    /// As the pool does: back on the queue before the worker goes round its loop, whose
+    /// check of the gate (`Gate::release_if_over`) comes next.
+    Shipped,
+    /// As `Shipped`, beside a third worker that retakes a permit regardless of the limit,
+    /// as an opener whose latch is set does: a take over the limit then puts the task back
+    /// again, as `execute` does.
+    BesideARetakingOpener,
+    /// Weakened: the worker skips the check of the gate after the put-back.
+    KeepsThePermit,
+    /// Weakened: the task goes back between the worker's look round and its park, after the
+    /// look that would have seen it.
+    BetweenTheLookAndThePark,
+}
+
+/// The put-back model's shared state. Held in `std`'s `Arc`, not loom's: the weakened
+/// model fails by deadlock, unwinding with its threads' handles live, and dropping a loom
+/// `Arc` then panics in loom's runtime, which aborts the test binary.
+struct PutBackModel {
+    gate: Gate,
+    sleep: Sleep,
+    /// The pool's queue, a count of tasks.
+    queue: AtomicUsize,
+    polled: AtomicBool,
+    /// Whether a worker took the task over the limit and did not put it back, for the model
+    /// to assert on once every thread is joined: a panic on a model thread while another is
+    /// parked aborts the run.
+    over: AtomicBool,
+    /// Each worker's thread, entered by the worker itself before it can sleep.
+    threads: std::sync::Mutex<Vec<Option<Thread>>>,
+}
+
+impl Wake for PutBackModel {
+    fn idle_one(&self) {
+        if let Some(worker) = self.sleep.notify_one() {
+            self.sleep.wake_worker(worker, || self.unpark(worker));
         }
-        if permit {
-            let take = |tasks: usize| tasks.checked_sub(1);
-            if queue.fetch_update(Ordering::AcqRel, Ordering::Acquire, take).is_ok() {
-                if gate.over_limit() {
-                    over.store(true, Ordering::SeqCst);
-                }
-                polled.store(true, Ordering::SeqCst);
-                // Stands for shutdown, as in `work`: lets the other model thread end.
-                sleep.notify_all(|_| {});
-                (0..wake.threads.len())
-                    .for_each(|worker| sleep.wake_worker(worker, || wake.unpark(worker)));
-                break;
+    }
+
+    fn unpark(&self, worker: usize) {
+        let thread = self.threads.lock().unwrap()[worker].clone();
+        if let Some(thread) = thread {
+            thread.unpark();
+        }
+    }
+}
+
+impl PutBackModel {
+    /// The worker loop as a ready task meets it at a closed gate, entered holding a permit:
+    /// the check of the gate at the top of the loop, the take, and the poll; a worker that
+    /// finds nothing gives its permit up as an idle worker does and sleeps through
+    /// `gate::idle_park`. With `BesideARetakingOpener` a take over the limit puts the task
+    /// back and goes round, as `execute` does; otherwise, where the put-back under test
+    /// leaves none, such a take is noted in `over`. Returns once the task is polled.
+    fn work(&self, me: usize, put_back: PutBack) {
+        self.threads.lock().unwrap()[me] = Some(thread::current());
+        let mut permit = true;
+        let mut late = me == 0 && put_back == PutBack::BetweenTheLookAndThePark;
+        while !self.polled.load(Ordering::SeqCst) {
+            if !permit {
+                permit = self.gate.try_acquire();
+            } else if !(me == 0 && put_back == PutBack::KeepsThePermit)
+                && self.gate.release_if_over()
+            {
+                permit = false;
             }
-            gate.release_idle(wake);
-            permit = false;
+            if permit {
+                let take = |tasks: usize| tasks.checked_sub(1);
+                if self.queue.fetch_update(Ordering::AcqRel, Ordering::Acquire, take).is_ok() {
+                    if self.gate.over_limit() {
+                        if put_back == PutBack::BesideARetakingOpener {
+                            self.queue.fetch_add(1, Ordering::Release);
+                            continue;
+                        }
+                        self.over.store(true, Ordering::SeqCst);
+                    }
+                    self.polled.store(true, Ordering::SeqCst);
+                    // Stands for shutdown, as in `work`: lets the other model threads end.
+                    self.sleep.notify_all(|_| {});
+                    let workers = self.threads.lock().unwrap().len();
+                    (0..workers)
+                        .for_each(|worker| self.sleep.wake_worker(worker, || self.unpark(worker)));
+                    break;
+                }
+                self.gate.release_idle(self);
+                permit = false;
+            }
+            gate::idle_park(&self.gate, &self.sleep, me, || {
+                let seen = if self.polled.load(Ordering::SeqCst) {
+                    gate::Look::Stop
+                } else if self.queue.load(Ordering::Acquire) != 0 {
+                    gate::Look::Work
+                } else {
+                    gate::Look::Nothing
+                };
+                if core::mem::take(&mut late) {
+                    self.queue.fetch_add(1, Ordering::Release);
+                }
+                (seen, None)
+            });
         }
-        gate::idle_park(gate, sleep, me, || {
-            let seen = if polled.load(Ordering::SeqCst) {
-                gate::Look::Stop
-            } else if queue.load(Ordering::Acquire) != 0 {
-                gate::Look::Work
-            } else {
-                gate::Look::Nothing
-            };
-            (seen, None)
-        });
     }
 }
 
@@ -870,50 +921,67 @@ fn poll_within_the_limit(
 /// it to sleep. Whatever the interleaving, the task is polled, and by a worker within the
 /// limit: the put-back frees no permit, so either the second worker still holds one and is
 /// awake to find the task, or it gave its permit up and the first worker's own check of the
-/// gate finds it within the limit. `keep_permit` drops that check.
-fn a_task_put_back_at_a_closed_gate(keep_permit: bool) {
-    loom::model(move || {
-        let gate = Arc::new(gate_with(2, 2, Some(1)));
-        let sleep = Arc::new(Sleep::new(2));
-        let queue = Arc::new(AtomicUsize::new(0));
-        let polled = Arc::new(AtomicBool::new(false));
-        let over = Arc::new(AtomicBool::new(false));
-        let ended = Arc::new(AtomicBool::new(false));
-        let first = thread::current();
-
-        let other = {
-            let (gate, sleep, queue, polled, over, ended, first) = (
-                gate.clone(),
-                sleep.clone(),
-                queue.clone(),
-                polled.clone(),
-                over.clone(),
-                ended.clone(),
-                first.clone(),
-            );
-            thread::spawn(move || {
-                let wake =
-                    PoolWake { sleep: sleep.clone(), threads: vec![first, thread::current()] };
-                poll_within_the_limit(&gate, &sleep, &queue, &polled, &over, 1, &wake, false);
-                ended.store(true, Ordering::SeqCst);
+/// gate finds it within the limit. A lost wake-up shows as a deadlock.
+fn a_task_put_back_at_a_closed_gate(put_back: PutBack) {
+    let workers = if put_back == PutBack::BesideARetakingOpener { 3 } else { 2 };
+    let model = move || {
+        let model = std::sync::Arc::new(PutBackModel {
+            gate: gate_with(workers, 2, Some(1)),
+            sleep: Sleep::new(workers),
+            queue: AtomicUsize::new(0),
+            polled: AtomicBool::new(false),
+            over: AtomicBool::new(false),
+            threads: std::sync::Mutex::new(vec![None; workers]),
+        });
+        let others: Vec<_> = (1..workers)
+            .map(|me| {
+                let (model, ended) = (model.clone(), std::sync::Arc::new(AtomicBool::new(false)));
+                let done = ended.clone();
+                let thread = thread::spawn(move || {
+                    // The third worker holds no permit and retakes one regardless of the limit.
+                    if me == 2 {
+                        model.gate.retake();
+                    }
+                    model.work(me, put_back);
+                    done.store(true, Ordering::SeqCst);
+                });
+                (thread, ended)
             })
-        };
-        let wake = PoolWake { sleep: sleep.clone(), threads: vec![first, other.thread().clone()] };
-        // The put-back: the task goes back on the queue and nobody is woken.
-        queue.fetch_add(1, Ordering::Release);
-        poll_within_the_limit(&gate, &sleep, &queue, &polled, &over, 0, &wake, keep_permit);
-        // loom cannot have a thread unparked while it is blocked in `join`.
-        while !ended.load(Ordering::SeqCst) {
-            thread::yield_now();
+            .collect();
+        if put_back != PutBack::BetweenTheLookAndThePark {
+            // The put-back: the task goes back on the queue and nobody is woken.
+            model.queue.fetch_add(1, Ordering::Release);
         }
-        other.join().unwrap();
-        assert!(!over.load(Ordering::SeqCst), "a worker over the limit took the task");
-    });
+        model.work(0, put_back);
+        for (thread, ended) in others {
+            // loom cannot have a thread unparked while it is blocked in `join`.
+            while !ended.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            thread.join().unwrap();
+        }
+        assert!(!model.over.load(Ordering::SeqCst), "a worker over the limit took the task");
+    };
+    if workers > 2 {
+        // Four preemptions: 220,312 executions in under a minute, where five takes 1,627,558
+        // and four minutes.
+        bounded(THREE_THREAD_BOUND - 1, model);
+    } else {
+        loom::model(model);
+    }
 }
 
 #[test]
 fn a_task_put_back_at_a_closed_gate_is_polled_within_the_limit() {
-    a_task_put_back_at_a_closed_gate(false);
+    a_task_put_back_at_a_closed_gate(PutBack::Shipped);
+}
+
+/// With a third worker that retakes a permit regardless of the limit, a worker may take the
+/// task over the limit again and put it back again; the task is still polled, within the
+/// limit.
+#[test]
+fn a_task_put_back_beside_a_retaking_opener_is_polled_within_the_limit() {
+    a_task_put_back_at_a_closed_gate(PutBack::BesideARetakingOpener);
 }
 
 /// The put-back without the check of the gate after it: the worker that put the task back
@@ -921,7 +989,15 @@ fn a_task_put_back_at_a_closed_gate_is_polled_within_the_limit() {
 #[test]
 #[should_panic(expected = "a worker over the limit took the task")]
 fn weakened_a_put_back_that_keeps_the_permit() {
-    a_task_put_back_at_a_closed_gate(true);
+    a_task_put_back_at_a_closed_gate(PutBack::KeepsThePermit);
+}
+
+/// The put-back made after the look that would have seen it: the worker parks beside the
+/// task, and so may the other, which gave its permit up having found nothing.
+#[test]
+#[should_panic(expected = "deadlock")]
+fn weakened_a_put_back_between_the_look_and_the_park() {
+    a_task_put_back_at_a_closed_gate(PutBack::BetweenTheLookAndThePark);
 }
 
 /// During shutdown an opener whose remaining child is running on another worker has

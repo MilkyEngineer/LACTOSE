@@ -4,7 +4,7 @@
 //! otherwise not before the gate opens; and its wake is not lost. The task is woken from a
 //! thread that is no worker, by a job beside the block and by its timer; the wake, and the
 //! gate's opening, are landed between a worker's look round and its park; and a worker that
-//! takes the task over the limit puts it back and goes to the gate.
+//! takes the task over the limit puts it back, waking nobody, and goes to the gate.
 //!
 //! Every assertion is about an order or a count. The orders are made by the pool's own
 //! counts and by two hooks only tests compile: one a worker calls just before it parks
@@ -202,7 +202,7 @@ struct Unhook<'a>(&'a Pool);
 impl Drop for Unhook<'_> {
     fn drop(&mut self) {
         self.0.set_before_park(None);
-        *lock(&self.0.before_find) = None;
+        self.0.before_find.set(None);
     }
 }
 
@@ -672,7 +672,7 @@ fn a_task_taken_as_the_gate_closes(reserved: u32) {
                         }
                     })
                 };
-                *lock(&frame.before_find) = Some(hook);
+                frame.before_find.set(Some(hook));
                 frame.wake(worker);
                 if !failures
                     .wait("the other worker holds a permit and is about to look for work", || {
@@ -726,6 +726,129 @@ fn a_task_taken_over_the_limit_is_put_back_once_and_waits_for_the_gate() {
 #[test]
 fn a_task_taken_within_the_reservation_as_the_gate_closes_is_polled() {
     a_task_taken_as_the_gate_closes(1);
+}
+
+/// A put-back wakes nobody. Of three workers one blocks with no permit reserved, one holds a
+/// permit and has passed its check of the gate, and the third sleeps. A task woken as the
+/// gate closes claims the sleeper, which finds the task and no permit and is held just
+/// before it parks, its sleep announced; the second worker then takes the task over the
+/// limit and puts it back. Once that worker is about to park in turn, the third's sleep is
+/// still announced: no wake claimed it.
+#[test]
+fn a_task_put_back_over_the_limit_wakes_no_sleeper() {
+    let executor = executor(3);
+    let shared = executor.owner.shared.clone();
+    let frame = shared.frame();
+    for _ in 0..ROUNDS {
+        let (woken, task) = Woken::spawn(&executor);
+        let failures = Arc::new(Failures::default());
+        let put_back_before = frame.tasks_put_back.load(Ordering::SeqCst);
+        let _unhook = Unhook(frame);
+        {
+            let (shared, woken, failures) = (shared.clone(), woken.clone(), failures.clone());
+            run_on_a_worker(&executor, move |ctx| {
+                let frame = shared.frame();
+                let blocker = ctx.slot() as usize;
+                let (taker, sleeper) = if blocker == 0 { (1, 2) } else { (0, 3 - blocker) };
+                if !failures.wait("the other workers sleep", || frame.sleepers() == 2) {
+                    return;
+                }
+                let put_back = || frame.tasks_put_back.load(Ordering::SeqCst) - put_back_before;
+                let (at_find, go) =
+                    (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+                let find = {
+                    let (failures, at_find, go) = (failures.clone(), at_find.clone(), go.clone());
+                    Arc::new(move |looking: usize| {
+                        if looking == taker && !at_find.swap(true, Ordering::SeqCst) {
+                            failures.wait("the gate closes and the task is woken", || {
+                                go.load(Ordering::SeqCst)
+                            });
+                        }
+                    })
+                };
+                // The sleeper's holds so far, and how many of them have been let go.
+                let (holds, released, taker_parks) = (
+                    Arc::new(AtomicU32::new(0)),
+                    Arc::new(AtomicU32::new(0)),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let park = {
+                    let (failures, holds, released, taker_parks, shared) = (
+                        failures.clone(),
+                        holds.clone(),
+                        released.clone(),
+                        taker_parks.clone(),
+                        shared.clone(),
+                    );
+                    Arc::new(move |parking: usize, seen: Look| {
+                        if seen != Look::Work {
+                            return;
+                        }
+                        if parking == sleeper {
+                            let hold = holds.fetch_add(1, Ordering::SeqCst) + 1;
+                            failures.wait("the sleeper is let park", || {
+                                released.load(Ordering::SeqCst) >= hold
+                            });
+                        } else if parking == taker
+                            && shared.frame().tasks_put_back.load(Ordering::SeqCst)
+                                > put_back_before
+                        {
+                            taker_parks.store(true, Ordering::SeqCst);
+                        }
+                    })
+                };
+                frame.set_before_park(Some(park));
+                frame.before_find.set(Some(find));
+                frame.wake(taker);
+                if !failures.wait("the taker holds a permit and is about to look for work", || {
+                    at_find.load(Ordering::SeqCst)
+                }) {
+                    go.store(true, Ordering::SeqCst);
+                    released.store(u32::MAX, Ordering::SeqCst);
+                    return;
+                }
+                ctx.block_in_place(0, || {
+                    woken.wake_from_another_thread();
+                    // The gate's close and the wake may each claim the sleeper, the wake
+                    // perhaps between its announcement and its hold. A hold whose sleep is no
+                    // longer announced is let go, to park, return at once and be held again.
+                    // Both claims are made by now, and the sleeper is the only worker that
+                    // can be announced.
+                    let mut sleeping = false;
+                    for hold in 1..=3 {
+                        if !failures.wait("the sleeper finds the task and no permit", || {
+                            holds.load(Ordering::SeqCst) >= hold
+                        }) {
+                            break;
+                        }
+                        if frame.sleepers() == 1 {
+                            sleeping = true;
+                            break;
+                        }
+                        released.store(hold, Ordering::SeqCst);
+                    }
+                    failures.check(sleeping, "the sleeper is held with its sleep announced");
+                    go.store(true, Ordering::SeqCst);
+                    if sleeping
+                        && failures
+                            .wait("the taker puts the task back and is about to park", || {
+                                taker_parks.load(Ordering::SeqCst)
+                            })
+                    {
+                        failures.check(put_back() == 1, "the task was put back more than once");
+                        failures
+                            .check(woken.polls() == 1, "a worker over the limit polled the task");
+                        failures.check(frame.sleepers() == 2, "the put-back woke the sleeper");
+                    }
+                    released.store(u32::MAX, Ordering::SeqCst);
+                });
+                failures.wait("the task is polled", || woken.polls() == 2);
+            });
+        }
+        failures.assert_none();
+        finish(&executor, task);
+    }
+    executor.shutdown();
 }
 
 /// With one permit reserved and held by a job of `run_job` that began before the block,
@@ -788,7 +911,7 @@ fn a_task_put_back_over_the_limit_runs_on_the_reservations_worker() {
                         }
                     })
                 };
-                *lock(&frame.before_find) = Some(hook);
+                frame.before_find.set(Some(hook));
                 frame.wake(third);
                 if !failures
                     .wait("the third worker holds a permit and is about to look for work", || {

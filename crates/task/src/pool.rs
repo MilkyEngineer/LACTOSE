@@ -220,7 +220,7 @@ pub(crate) struct Pool {
     /// Called on a worker that holds a permit, after its check of the gate at the top of its
     /// loop and before it looks for work, for the tests that close the gate in between.
     #[cfg(all(test, not(feature = "loom")))]
-    pub(crate) before_find: Mutex<Option<BeforeFind>>,
+    pub(crate) before_find: gate::Hook<BeforeFind>,
     /// How many tasks a worker of this pool has put back unpolled ([`Shared::requeue_task`]).
     #[cfg(all(test, not(feature = "loom")))]
     pub(crate) tasks_put_back: core::sync::atomic::AtomicU32,
@@ -245,7 +245,7 @@ impl Pool {
             #[cfg(all(test, not(feature = "loom")))]
             parked_openers: core::sync::atomic::AtomicU32::new(0),
             #[cfg(all(test, not(feature = "loom")))]
-            before_find: Mutex::new(None),
+            before_find: gate::Hook::new(),
             #[cfg(all(test, not(feature = "loom")))]
             tasks_put_back: core::sync::atomic::AtomicU32::new(0),
         }
@@ -260,7 +260,7 @@ impl Pool {
     /// Sets what a worker of this pool calls just before it parks ([`Gate::before_park`]).
     #[cfg(all(test, not(feature = "loom")))]
     pub(crate) fn set_before_park(&self, hook: Option<gate::BeforePark>) {
-        *lock(&self.gate.before_park) = hook;
+        self.gate.before_park.set(hook);
     }
 
     /// Whether work waits in this pool's queue or on a worker's deque.
@@ -632,9 +632,11 @@ impl Shared {
     }
 
     /// Puts back a task a worker took while a `block_in_place` wanted it parked, behind the
-    /// tasks of its class that are queued. Nobody is woken: no permit came free, every
+    /// tasks of its class that are queued. Nobody is woken, since no permit came free: every
     /// worker that holds one is awake and looks at the queue before it sleeps
-    /// (`gate::idle_park`), and the gate's opening wakes every worker.
+    /// (`gate::idle_park`), an opener that holds one comes back to the queue when its scope
+    /// ends, one that gave way to the gate is woken when a permit comes free
+    /// ([`Gate::release`]), and the gate's opening wakes every worker.
     fn requeue_task(&self, class: WorkerClass, task: Arc<dyn RawTask>) {
         #[cfg(all(test, not(feature = "loom")))]
         self.pool(class).tasks_put_back.fetch_add(1, Ordering::SeqCst);
@@ -929,11 +931,8 @@ fn worker_loop(local: &WorkerLocal) {
         }
         if permit {
             #[cfg(all(test, not(feature = "loom")))]
-            {
-                let hook = lock(&pool.before_find).clone();
-                if let Some(hook) = hook {
-                    hook(local.index);
-                }
+            if let Some(hook) = pool.before_find.get() {
+                hook(local.index);
             }
             if let Some(found) = find_work(local) {
                 scanning_since = None;
@@ -1343,6 +1342,56 @@ mod tests {
         let cancelled = executor.block_on(run).expect_err("the job never started");
         assert_eq!(cancelled.kind(), lactose_core::ErrorKind::Cancelled);
         executor.shutdown();
+    }
+
+    /// A worker over the limit that takes a task after shutdown began, before the sweep
+    /// reached it, puts it back and sweeps it itself: shutdown's one sweep may already have
+    /// passed, so the task is cancelled, and the queue empty, before `execute` returns. Inside
+    /// a job on the one frame-critical worker, with the gate closed, a task is spawned, taken
+    /// out of the pool's queue and executed once the shutdown flag is set.
+    #[test]
+    fn a_task_taken_after_shutdown_began_is_swept_by_its_put_back() {
+        let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let (task, emptied) = {
+            let ran = ran.clone();
+            executor
+                .block_on(executor.run_job(move |_ctx| {
+                    with_local(|local| {
+                        let local = local.expect("a job runs on a worker");
+                        let (shared, pool) = (&*local.shared, local.pool());
+                        pool.gate.close(0, pool);
+                        pool.gate.retake();
+                        assert!(pool.over_limit());
+                        let task = crate::task::spawn(
+                            &local.shared,
+                            WorkerClass::FrameCritical,
+                            async move { ran.store(true, Ordering::SeqCst) },
+                        );
+                        let entry = Wide::take(&shared.frame.injector).expect("the task is queued");
+                        assert!(matches!(entry, Entry::Task(_)));
+                        // Shutdown has begun; its sweep has not reached this entry.
+                        shared.shutdown.set();
+                        execute(local, &mut Arenas::default(), entry, 0);
+                        let emptied = shared.frame.injector.is_empty();
+                        // What `block_in_place` does when its closure returns.
+                        pool.gate.release(pool);
+                        pool.gate.open(0, pool);
+                        (task, emptied)
+                    })
+                }))
+                .unwrap()
+        };
+        // Polled before `shutdown` runs a sweep of its own.
+        let resolved = poll_now(task);
+        executor.shutdown();
+        assert!(emptied, "a task put back after shutdown began stayed queued");
+        match resolved {
+            Poll::Ready(Err(error)) => assert_eq!(error.kind(), ErrorKind::Cancelled),
+            Poll::Ready(Ok(())) => panic!("a task put back after shutdown began ran"),
+            Poll::Pending => panic!("a task put back after shutdown began was not swept"),
+        }
+        assert!(!ran.load(Ordering::SeqCst), "a task put back after shutdown began was polled");
     }
 
     /// A worker that takes a job of `run_job` while a `block_in_place` wants it parked puts
