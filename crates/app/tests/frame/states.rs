@@ -229,6 +229,45 @@ fn a_starved_frame_whose_open_fails_is_hidden_and_torn() {
     starves(Answer::Fail(ErrorKind::ResourceExhausted));
 }
 
+/// Each frame that runs its passes hands the render side the presentation events of every
+/// tick since the last frame that did (`lactose-sim`'s `keep_present_events`): one a tick
+/// for each row here, so `ROWS` a tick, and twice that after a frame that deferred.
+#[test]
+fn the_frame_carries_the_presentation_events_of_its_ticks() {
+    let mut rig = Rig::new(2, false);
+    let events = |calls: &[Call]| -> Vec<usize> {
+        calls
+            .iter()
+            .filter_map(|call| match call {
+                Call::Present { events, .. } => Some(*events),
+                _ => None,
+            })
+            .collect()
+    };
+    let rows = super::support::ROWS as usize;
+    // The rows join in the first tick; from the second, every row marks every tick.
+    step(&mut rig, Some(E1));
+    for _ in 0..2 {
+        rig.settle();
+        rig.step(Some(E1));
+        assert_eq!(events(&rig.script.take_calls()), vec![rows]);
+    }
+    // A frame that waits for a region defers its passes and presents nothing; the next
+    // frame carries both ticks' events.
+    rig.script.submit_answers([Ok(Region::Wait(super::support::point(50)))]);
+    rig.settle();
+    rig.step(Some(E1));
+    rig.script.take_calls();
+    rig.script.open_answers(&[Answer::Wait]);
+    rig.settle();
+    assert!(matches!(rig.step(Some(E1)), Rendered::Waited(_)));
+    assert!(events(&rig.script.take_calls()).is_empty());
+    rig.settle();
+    drew(Some(rig.step(Some(E1))));
+    assert_eq!(events(&rig.script.take_calls()), vec![2 * rows]);
+    rig.stop();
+}
+
 /// What the frame adds is no hashed state ("Determinism of a shown world"): the same game
 /// built shown and unshown, stepped with the same frames through drawn, hidden, waited and
 /// torn frames, hashes alike at every tick. Criterion 3(c) records the same under SOUR.

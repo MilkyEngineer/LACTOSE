@@ -25,10 +25,12 @@ use lactose_app::{
 };
 use lactose_asset_api::{AssetId, AssetRef};
 use lactose_core::{Error, ErrorKind, Handle, PlayerId, Result, StableKey, Tick};
-use lactose_ecs::{Ctx, RegionId, Res, World, system};
+use lactose_ecs::{Ctx, PresentEvents, RegionId, Res, StableKeyOf, World, system};
 use lactose_math::{Scalar, Vec3};
 use lactose_physics_api::Transform;
-use lactose_present_api::{ExtractPass, InstanceRow, InstanceSink, MeshInstance, PresentFrame};
+use lactose_present_api::{
+    DebugShape, ExtractPass, InstanceRow, InstanceSink, MeshInstance, PresentFrame,
+};
 use lactose_rhi_api::{Extent, ImageHandle, QueuePath, TimelineHandle, TimelinePoint};
 use lactose_sim::{
     Registration, SessionApplier, SessionEvent, Stage, TickInput, TimeScale, TypeTable,
@@ -97,12 +99,19 @@ fn log_tick(ctx: Ctx, _scale: Res<TimeScale>) {
     }
 }
 
+/// One presentation event a tick from each row that orbits, so that a test can count what
+/// reaches the frame.
+#[system(name = "frame_test::mark", worlds = [server])]
+fn mark(present: PresentEvents, key: StableKeyOf, _orbit: &Orbit) {
+    present.emit(*key, DebugShape::line(Vec3::ZERO, Vec3::ZERO, 0));
+}
+
 fn no_types(_: &mut TypeTable) -> Result<()> {
     Ok(())
 }
 
 fn register_log_tick(registration: &mut Registration) {
-    registration.stage(Stage::Simulation).add(&LOG_TICK);
+    registration.stage(Stage::Simulation).add(&LOG_TICK).add(&MARK);
 }
 
 static FRAME_TEST: CrateRegistration = CrateRegistration {
@@ -171,8 +180,9 @@ pub enum Call {
     End { rows: u32 },
     /// `RenderSide::open`.
     Open,
-    /// `RenderSide::present`: the newer snapshot's tick and the frame's time.
-    Present { newer: Tick, time: FrameTime },
+    /// `RenderSide::present`: the newer snapshot's tick, the frame's time, and how many
+    /// presentation events the frame carried.
+    Present { newer: Tick, time: FrameTime, events: usize },
     /// `RenderSide::draw`.
     Draw(Draw),
     /// `RenderSide::submit`, of the frame that drew `target`, at `point`.
@@ -437,7 +447,8 @@ impl RenderSide for ScriptedRender {
         frame: &PresentFrame<'_>,
         time: FrameTime,
     ) -> Result<()> {
-        self.script.log(Call::Present { newer: frame.newer().tick(), time });
+        let events = frame.events().emitted.len();
+        self.script.log(Call::Present { newer: frame.newer().tick(), time, events });
         Ok(())
     }
 
@@ -786,6 +797,9 @@ impl Rig {
     pub fn stop(mut self) -> Box<dyn RenderSide> {
         let shown = self.shown.take().expect("the rig holds its world");
         let stopped = bounded(&self.executor, shown.stop(), "the stop").expect("the stop");
+        // The present thread ends at `close`: waited for within the bound, so that a stop
+        // that never closes fails here and does not hang at the join.
+        self.script.until("the present side's close", |plan| plan.closed);
         if let Some(present) = self.present.take() {
             present.join().expect("the present thread");
         }
