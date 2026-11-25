@@ -28,6 +28,7 @@ use lactose_rhi_api::{
     Swapchain, SwapchainDesc,
 };
 use lactose_rhi_vulkan::VulkanDevice;
+use lactose_sim::TimeScale;
 use lactose_task::{Executor, Lane, LaneCall, Platform, ThreadSpec, WorkerClass};
 
 use crate::game::{Frames, GAME, InMemory};
@@ -62,6 +63,16 @@ pub enum Mode {
     Paced {
         /// The run's length, or `None` to run until the window is closed.
         seconds: Option<u32>,
+        /// The world's time scale from the first frame, or `None` for real time. A frame
+        /// starts at each tick's deadline, so the scale sets the frames' rate too:
+        /// `frame-pace`'s floor run slows them below half the display's rate.
+        scale: Option<TimeScale>,
+        /// Whether the window is minimised before the first frame
+        /// (`MainThread::set_minimised`).
+        minimised: bool,
+        /// Where `frame-pace`'s stamps are written once the frames end, or `None` to take
+        /// none (`README.md`, "Stamps").
+        stamps: Option<PathBuf>,
     },
     /// Decision 5.1's fixed-frame mode: `frames` steps at [`FIXED_EXTENT`], each drawn, then
     /// the last frame dumped into `dump` and held to the CPU reference.
@@ -427,7 +438,7 @@ fn run_on(
         Mode::Fixed { frames: steps, .. } => {
             fixed_frames(executor, main, &**device, shown, &input, frames, *steps, &mut outcome)
         }
-        Mode::Paced { seconds } => {
+        Mode::Paced { seconds, .. } => {
             let root = paced(executor.clone(), main.clone(), shown, reports, frames, *seconds);
             executor.block_on(executor.spawn(WorkerClass::FrameCritical, root)).and_then(|result| {
                 let (ended, counted) = result?;
