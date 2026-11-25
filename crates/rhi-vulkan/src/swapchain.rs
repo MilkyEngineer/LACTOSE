@@ -1361,6 +1361,7 @@ mod tests {
         BOUND, DRAIN_MOST, Fail, HANDED, HISTORY, Timing, UNDECIDED, Use, VulkanSwapchain, empty,
         read_history, usage, widen,
     };
+    use crate::encoder::VulkanEncoder;
     use crate::submit::{FAILING, SPARED};
     use crate::{VulkanDevice, lock};
 
@@ -1966,11 +1967,11 @@ mod tests {
 
     /// A present the driver did not take (out of host memory, injected) whose empty batch
     /// for the image's present semaphore fails too (injected, the present's own submit let
-    /// through) leaves that semaphore to the submit that signals it, here held by a host
-    /// point: a `resize` before the submit completes is refused `pending` past the bound,
-    /// rather than destroy the semaphore under it (VUID-vkDestroySemaphore-semaphore-05149),
-    /// and one after it is made. On the present role's own queue, where the device gives it
-    /// one, and on the graphics queue. The layer says nothing.
+    /// through) leaves that semaphore to the submit that signals it, here behind released slow
+    /// work: a `resize` returns only once the present queue has reached that submit's stamp,
+    /// rather than destroy the semaphore under it (VUID-vkDestroySemaphore-semaphore-05149).
+    /// On the present role's own queue, where the device gives it one, and on the graphics
+    /// queue. The layer says nothing.
     #[test]
     #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
     fn a_present_semaphore_whose_batch_failed_outlives_the_submit_that_signals_it() {
@@ -1984,38 +1985,38 @@ mod tests {
             let shared = Arc::clone(device.shared());
             let shares = shared.queue_of(P) == shared.queue_of(G);
             assert!(shares || !on_graphics, "the present role has its own queue");
-            eprintln!("{test}: the present role shares the graphics queue: {shares}");
             let mut swapchain = VulkanSwapchain::new(&shared, SMALL).expect("a swapchain");
             let first = image(&mut swapchain);
-            let gate = device.create_timeline(0).expect("a timeline");
-            let held = device.create_timeline(0).expect("a timeline");
-            let mut hold = [device.create_encoder(G, "hold").expect("an encoder")];
-            let waits = [at(gate, 1)];
-            let signals = [at(held, 1)];
-            let submit = Submit { encoders: &mut hold, waits: &waits, signals: &signals };
-            device.submit(G, submit).expect("the held submit");
+            let slow = device.create_timeline(0).expect("a timeline");
+            let busy = slow_submit(&device, at(slow, 1));
             let mut encoders = [presentable(&device, first)];
             swapchain.fail = Some(Fail::Present(vk::Result::ERROR_OUT_OF_HOST_MEMORY));
             SPARED.set(1);
             FAILING.set(1);
-            let submit = Submit { encoders: &mut encoders, waits: &signals, signals: &[] };
+            let submit = Submit { encoders: &mut encoders, waits: &[at(slow, 1)], signals: &[] };
             let presented = swapchain.present(first, submit).expect("the present");
             swapchain.fail = None;
             assert_eq!(presented, Presented::Stale);
             assert_eq!((SPARED.get(), FAILING.get()), (0, 0), "the present made no empty batch");
-            let early = swapchain.resize(Extent { width: 96, height: 48 });
-            device.signal_timeline(waits[0]).expect("the gate");
-            let later = swapchain.resize(Extent { width: 96, height: 48 });
+            let any: &dyn core::any::Any = &*encoders[0];
+            let encoder = any.downcast_ref::<VulkanEncoder>().expect("a Vulkan encoder");
+            let (_, stamp) = encoder.submitted.expect("the present's submit was stamped");
+            let before = shared.settled().queues[swapchain.queue].known;
+            swapchain.resize(Extent { width: 96, height: 48 }).expect("the resize");
+            let after = shared.settled().queues[swapchain.queue].known;
+            eprintln!(
+                "{test}: shared {shares}: the present's stamp {stamp}, the present queue at \
+                 {before} before the resize and {after} after it"
+            );
+            assert!(device.wait_timeline(at(slow, 1), BOUND * 10).expect("the wait"), "slow work");
             drop(swapchain);
             drop(encoders);
-            drop(hold);
+            drop(busy);
             drop(shared);
             drop(device);
             let heard = breaches(&kept);
             assert_eq!(heard, Vec::<String>::new(), "on the graphics queue: {on_graphics}");
-            let early = early.expect_err("the resize under the pending submit was made");
-            assert_eq!(Rule::of(&early), Some(Rule::Pending), "{early}");
-            later.expect("the resize after the submit");
+            assert!(after >= stamp, "the resize returned with the present's submit pending");
         }
     }
 
