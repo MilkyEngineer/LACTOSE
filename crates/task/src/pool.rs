@@ -16,7 +16,7 @@ use lactose_core::Arena;
 
 use crate::chaos::{Chaos, ChaosConfig, ChaosRng, Filter, Wake};
 use crate::gate::{self, Gate, Look, Opener};
-use crate::graph::{self, RunState};
+use crate::graph::{self, RunControl, RunState};
 use crate::guard::abort_on_unwind;
 use crate::job::{self, ChildHeader, ScopeCore};
 use crate::job_run::JobEntry;
@@ -491,8 +491,9 @@ pub(crate) struct Shared {
     /// execution log.
     runs: AtomicU64,
     /// Graph runs that have started and not finished, so shutdown can resolve their
-    /// futures.
-    live_runs: Mutex<HashMap<u64, Weak<RunState>>>,
+    /// futures. A run's control, not its graph: the sweep's reference must not hold a graph
+    /// that its run has handed back.
+    live_runs: Mutex<HashMap<u64, Weak<RunControl>>>,
     /// Every unfinished task, so shutdown can cancel the ones no queue holds.
     tasks: Mutex<HashMap<u64, Weak<dyn RawTask>>>,
     next_task: AtomicU64,
@@ -552,7 +553,7 @@ impl Shared {
     }
 
     /// Notes the start of a graph run and returns its ordinal.
-    pub(crate) fn begin_run(&self, run: &Arc<RunState>) -> u64 {
+    pub(crate) fn begin_run(&self, run: &Arc<RunControl>) -> u64 {
         let ordinal = self.next_run_ordinal();
         lock(&self.live_runs).insert(ordinal, Arc::downgrade(run));
         ordinal
@@ -1024,7 +1025,7 @@ fn execute(local: &WorkerLocal, arenas: &mut Arenas, entry: Entry, position: u64
     let shared = &*local.shared;
     abort_on_unwind(|| match entry {
         Entry::Range { run, node, units, root } => {
-            graph::run_range(local, arenas, &run, node, units, root, position);
+            graph::run_range(local, arenas, run, node, units, root, position);
         }
         Entry::Child { scope, job, units } => {
             job::run_child(local, scope, job, units, &mut arenas.child);

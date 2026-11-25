@@ -6,13 +6,14 @@
 //! functions the executor ships: `gate::wait_for_children` is the opener's wait,
 //! `Sleep::announce_entry` is what a worker does after queueing work, `Sleep::wake_worker`
 //! is how it wakes a worker, `Timers::fire_due`
-//! is how a deadline reaches its task, `Quiesce` is what holds a run's future back,
+//! is how a deadline reaches its task, `Quiesce` is what holds a run's future back and
+//! `Quiesce::leave` how a job drops its reference to the graph before it leaves the run,
 //! `ShutdownFlag::queue` is how work is queued against shutdown's sweep, `JobSlot` is where a
 //! job's value waits for its future, `Width` is what bounds the workers such jobs occupy,
 //! `ParkingPump::wait` is how a parking lane's thread waits and `parking_lane`'s wake is how a
 //! queued call ends that wait.
 //! What a model supplies is only what loom does not model: a deque is a counter, a worker is a
-//! loom thread, and a scope's children are a number.
+//! loom thread, a run's graph is an `Arc<()>`, and a scope's children are a number.
 //!
 //! Five terms are copies in the models, because loom cannot run the types they live in
 //! (`WorkerLocal`, `Shared`), and each is held by a native test instead:
@@ -496,6 +497,63 @@ fn a_run_resolves_only_when_no_job_of_it_is_executing() {
         }
         assert!(resolved.load(Ordering::SeqCst) >= 1, "the run never resolved");
         assert!(!jobs.close(), "closing twice must not report quiet again");
+    });
+}
+
+/// A finished run: two jobs, each holding a reference to the run as a graph run's entries
+/// hold its graph, leave it through `Quiesce::leave`, and the last unit's job closes it. The
+/// main thread waits for the resolution as `GraphRun` does, holding the graph, and is then
+/// the graph's only holder. `leave` is the shipped function or a weakened copy.
+fn the_references_at_resolution(leave: fn(&Quiesce, Arc<()>) -> bool) {
+    loom::model(move || {
+        let graph = Arc::new(());
+        let jobs = Arc::new(Quiesce::new());
+        let units = Arc::new(AtomicUsize::new(2));
+        let resolved = Arc::new(AtomicBool::new(false));
+        let main = thread::current();
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let held = graph.clone();
+                let (jobs, units, resolved) = (jobs.clone(), units.clone(), resolved.clone());
+                let main = main.clone();
+                thread::spawn(move || {
+                    assert_eq!(jobs.enter(), Entry::Entered, "the run closes after its last unit");
+                    if units.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        // The last unit and its finalize: the run closes with this job inside.
+                        assert!(!jobs.close(), "quiet with a job registered");
+                    }
+                    if leave(&jobs, held) {
+                        resolved.store(true, Ordering::SeqCst);
+                        main.unpark();
+                    }
+                })
+            })
+            .collect();
+        while !resolved.load(Ordering::SeqCst) {
+            thread::park();
+        }
+        assert_eq!(Arc::strong_count(&graph), 1, "a job held the graph after the run resolved");
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+}
+
+/// When a run resolves, every job of it has dropped its reference to the graph.
+#[test]
+fn a_run_resolves_only_when_its_jobs_have_dropped_the_graph() {
+    the_references_at_resolution(Quiesce::leave);
+}
+
+/// `Quiesce::leave` with its two steps the other way round: a job that left first may still
+/// hold the graph when the last to leave resolves the run.
+#[test]
+#[should_panic(expected = "a job held the graph after the run resolved")]
+fn weakened_a_job_that_drops_the_graph_after_it_leaves() {
+    the_references_at_resolution(|jobs, held| {
+        let quiet = jobs.exit();
+        drop(held);
+        quiet
     });
 }
 

@@ -35,9 +35,12 @@ and list what changed, because `lactose-ecs` is written against this surface.
 
 - **`GraphRun`.** When it resolves, with `Ok` or with `Cancelled`, no unit, scope child or
   `finalize` of that run is executing or ever will, and everything they wrote happens before
-  the resolution. With `Ok` every node has finalized and the graph is handed back. After
-  `Cancelled` the run is torn: some nodes finalized, some ran in part, their dependents never
-  ran, and the graph is not handed back. A job looks for shutdown before each unit and before
+  the resolution. With `Ok` every node has finalized and the graph is handed back, and the
+  run holds no reference to it any more: every job dropped its own before it left the run,
+  so a caller that drops the graph drops each node no one else holds, on its own thread.
+  After `Cancelled` the run is torn: some nodes finalized, some ran in part, their dependents
+  never ran, and the graph is not handed back; work that shutdown left queued may hold it
+  past the resolution, until that work is dropped. A job looks for shutdown before each unit and before
   `finalize`, so once shutdown has begun none of those starts, except one that was already
   past its check; jobs already running finish, including the scopes they have open, and the
   run resolves when the last of them has returned. This holds however the
@@ -374,8 +377,10 @@ Correctness:
   and with them what is built on them: the opener's wait with its permit and the
   `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, the
   timer keeper's hand-off, the task kept by the worker that fires its timer, the
-  quiescence of a cancelled run (`src/quiesce.rs`), and a parking lane's wait under a call
-  that takes its thread's unpark (`src/parking.rs`). The models call the shipped functions.
+  quiescence of a cancelled run (`src/quiesce.rs`), a finished run's jobs dropping their
+  references to the graph before it resolves (`Quiesce::leave`), and a parking lane's wait
+  under a call that takes its thread's unpark (`src/parking.rs`). The models call the
+  shipped functions.
   Under loom a timed park waits on a flag that only `Sleep::wake_worker` sets and that an
   unpark alone does not satisfy, as the Windows wait is not ended by an unpark, so a waker
   that skips it fails the keeper hand-off model.
@@ -383,9 +388,10 @@ Correctness:
   feature on this crate that switches an internal `sync` shim, and run with
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
-  Eleven models are explored exhaustively. The three with three threads are bounded at five
+  Twelve models are explored exhaustively. The three with three threads are bounded at five
   preemptions, the idle-release one at four, the parking lane's at three
-  (`LOOM_MAX_PREEMPTIONS` overrides the bounds).
+  (`LOOM_MAX_PREEMPTIONS` overrides the bounds). The references' model runs beside a
+  weakened copy of `Quiesce::leave` that leaves before it drops, which fails it.
   Eight more hold `run_job`: the completion slot against a dropped `JobRun`, exhaustively; a
   worker taking the job against shutdown beginning, at five preemptions; the width in three
   configurations with the sleep protocol, at two: a width of one, two workers beside a main

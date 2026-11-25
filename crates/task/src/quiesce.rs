@@ -53,6 +53,17 @@ impl Quiesce {
         self.state.fetch_sub(ONE_JOB, Ordering::SeqCst) == ONE_JOB | CLOSING
     }
 
+    /// Unregisters a job as [`Quiesce::exit`] does, once `held`, the job's reference to what
+    /// the run works on, has been dropped. Returns whether that left the run quiet, in which
+    /// case the caller resolves the future: no job holds such a reference by then.
+    #[must_use]
+    pub(crate) fn leave<T>(&self, held: T) -> bool {
+        // First: a job that has left may be passed by the last to leave, which resolves the
+        // future at once, and the caller then drops what it was handed back.
+        drop(held);
+        self.exit()
+    }
+
     /// Declares that no further job may start. Returns whether the run is quiet already, in
     /// which case the caller resolves the future; otherwise the last job to leave does.
     #[must_use]
