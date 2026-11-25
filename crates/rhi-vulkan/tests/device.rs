@@ -3,7 +3,7 @@
 //! engine's shader, a workgroup or an entry point the module does not declare, a heap past
 //! the driver's support and a resource past the device's size, the pipeline cache's start
 //! from bytes that fail each check and a cache directory that cannot be written, the drops
-//! while a thread unwinds, and each validator's canary but thread safety's, which is a unit
+//! while a thread unwinds, timestamps around a lagging dispatch, and each validator's canary but thread safety's, which is a unit
 //! test (`src/canary.rs`). `cargo xtask gpu` runs every canary in a process of its own and
 //! checks that it said its known message and nothing else.
 
@@ -22,7 +22,7 @@ use lactose_rhi_api::{
     MemoryClass, PassReach, QueuePath, QueueRole, Rect, RenderPass, Rule, SamplerDesc, Sharing,
     StageDesc, StateOn, Store, Submit, Target, TimelinePoint, WriteMask,
 };
-use lactose_rhi_vulkan::VulkanDevice;
+use lactose_rhi_vulkan::{Timestamps, VulkanDevice};
 
 use crate::{Counting, engine_shader, request, suite_shader};
 
@@ -972,5 +972,146 @@ fn an_encoder_dropped_while_unwinding_hands_its_pools_to_the_last_holder() {
     device.signal_timeline(gate).expect("the gate's signal");
     drop(Arc::into_inner(device).expect("the last count of the device"));
     assert_eq!(Arc::strong_count(&sink), 1, "the device's count of the sink was kept");
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+/// The rule a refused call was refused by, or `None` for a call that was not refused.
+fn refused_by(result: lactose_core::Result<()>) -> Option<Rule> {
+    result.err().and_then(|error| Rule::of(&error))
+}
+
+/// `stamps` read until its first `n` timestamps are all written, or for 10 s: a driver may
+/// make a result available a moment after the submit's signal is seen (MoltenVK makes it in
+/// the command buffer's completion handler). Every timestamp, where the queue keeps no valid
+/// bits, at once.
+fn written(stamps: &Timestamps, n: usize) -> Vec<Option<u64>> {
+    let bound = Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    let mut polls = 0_u32;
+    loop {
+        let read = stamps.read().expect("the read");
+        polls += 1;
+        if stamps.valid_bits() == 0 || read[..n].iter().all(Option::is_some) {
+            eprintln!(
+                "the timestamps read at poll {polls}, {:?} after the wait",
+                started.elapsed()
+            );
+            return read;
+        }
+        assert!(started.elapsed() < bound, "timestamps not available within {bound:?}: {read:?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Timestamps around a lagging dispatch, the first written in an encoder of its own submitted
+/// before the dispatch's and the second in the dispatch's encoder after its pass: unwritten
+/// ones read `None`, the two read the lag between them, within the host's wait for the
+/// submit, and the first encoder, reset and written again, reads the later write. Each misuse
+/// is refused, the encoder left recording.
+///
+/// The layout is the one that brackets the work under both M1 drivers. Each of the others was
+/// seen to read a second's dispatch as a millisecond or less: both timestamps in encoders of
+/// their own (MoltenVK), both in the dispatch's encoder (KosmicKrisp), and the first in the
+/// dispatch's encoder with the second in one of its own after it (both).
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn timestamps_around_a_lagging_dispatch_read_its_lag() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    let zero = device.create_timestamps(QueueRole::Graphics, 0).map(|_| ());
+    assert_eq!(zero.map_err(|error| error.kind()), Err(ErrorKind::InvalidData));
+    let stamps = device.create_timestamps(QueueRole::Graphics, 3).expect("a timestamp pool");
+    let bits = stamps.valid_bits();
+    eprintln!("the graphics queue keeps {bits} valid bits");
+    assert_eq!(stamps.read().expect("the read"), [None; 3], "a timestamp read unwritten");
+
+    let compute = device.create_timestamps(QueueRole::Compute, 1).expect("a compute pool");
+    let mut first = device.create_encoder(QueueRole::Graphics, "first").expect("an encoder");
+    let encoding = Some(Rule::Encoding);
+    assert_eq!(refused_by(stamps.write(&mut *first, 3)), encoding, "an index past the pool");
+    assert_eq!(refused_by(compute.write(&mut *first, 0)), encoding, "a pool of another role");
+    first.begin_compute_pass(&ComputePass { label: "open", reach: PassReach::NOTHING });
+    assert_eq!(refused_by(stamps.write(&mut *first, 0)), encoding, "a write inside a pass");
+    first.end_pass();
+
+    let mut earlier = None;
+    let mut kept = Some(first);
+    for round in 0..2 {
+        let mut first = kept.take().expect("the first encoder, reset");
+        stamps.write(&mut *first, 0).expect("the first write");
+        let mut lag = lagging(&device, QueueRole::Graphics);
+        stamps.write(&mut *lag, 1).expect("the write after the lag");
+        let mut submitted = [first, lag];
+        let timeline = device.create_timeline(0).expect("a timeline");
+        let done = TimelinePoint { timeline, value: 1 };
+        let started = std::time::Instant::now();
+        device
+            .submit(
+                QueueRole::Graphics,
+                Submit { encoders: &mut submitted, waits: &[], signals: &[done] },
+            )
+            .expect("the submit");
+        assert!(device.wait_timeline(done, PATIENCE).expect("the wait"), "the lag never ended");
+        let host = started.elapsed();
+        let again = stamps.write(&mut *submitted[0], 0);
+        assert_eq!(refused_by(again), encoding, "a write into a submitted encoder");
+        let read = written(&stamps, 2);
+        if bits == 0 {
+            assert_eq!(read, [None; 3], "a queue with no valid bits wrote a timestamp");
+            eprintln!("no valid bits: host time alone, {host:?}");
+            break;
+        }
+        let (Some(start), Some(end), None) = (read[0], read[1], read[2]) else {
+            panic!("round {round}: the written timestamps did not both read: {read:?}");
+        };
+        let gpu = Duration::from_nanos(end.saturating_sub(start));
+        eprintln!("round {round}: the lag took {gpu:?} on the GPU and {host:?} on the host");
+        assert!(start <= end, "round {round}: the second timestamp is before the first");
+        assert!(gpu <= host, "round {round}: {gpu:?} on the GPU, past the host's {host:?}");
+        assert!(gpu >= host / 4, "round {round}: {gpu:?} on the GPU, the lag not in it");
+        if let Some(earlier) = earlier {
+            assert!(start > earlier, "the encoder reset and written again read its first write");
+        }
+        earlier = Some(end);
+        let [mut first, _] = submitted;
+        first.reset().expect("the reset of the completed encoder");
+        kept = Some(first);
+    }
+    drop(kept);
+    drop(stamps);
+    drop(compute);
+    drop(device);
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+/// An encoder that wrote a timestamp and is dropped while its thread unwinds, with its
+/// submit pending and the pool's own count dropped first, hands the pool's count to the
+/// device with its command pool: the layer hears no destroy of a pool in use.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn an_unwinding_encoder_holds_its_timestamps_until_the_device_is_idle() {
+    let sink = Arc::new(Counting::default());
+    let device = Arc::new(device(&sink));
+    let timeline = device.create_timeline(0).expect("a timeline");
+    let gate = TimelinePoint { timeline, value: 1 };
+    let worker = Arc::clone(&device);
+    let unwound = std::thread::spawn(move || {
+        let stamps = worker.create_timestamps(QueueRole::Graphics, 1).expect("a pool");
+        let mut encoder = worker.create_encoder(QueueRole::Graphics, "held").expect("an encoder");
+        stamps.write(&mut *encoder, 0).expect("the write");
+        let mut encoders = [encoder];
+        worker
+            .submit(
+                QueueRole::Graphics,
+                Submit { encoders: &mut encoders, waits: &[gate], signals: &[] },
+            )
+            .expect("the submit, held by its wait");
+        drop(stamps);
+        panic!("the test's panic, with its encoder's submit held");
+    })
+    .join();
+    assert!(unwound.is_err());
+    device.signal_timeline(gate).expect("the gate's signal");
+    drop(Arc::into_inner(device).expect("the last count of the device"));
     assert_eq!(sink.count(), 0, "{:?}", sink.texts());
 }

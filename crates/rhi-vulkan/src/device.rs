@@ -31,6 +31,7 @@ use crate::records::{
 use crate::surface::Target;
 use crate::swapchain::{Left, SwapchainObj, VulkanSwapchain};
 use crate::table::Table;
+use crate::timestamps::QueryObj;
 use crate::{lock, submit};
 
 /// Host memory a buffer's allocation is mapped to for as long as the buffer lives.
@@ -325,8 +326,8 @@ struct HeapState {
     retired: Vec<(Stamps, vk::Sampler)>,
     /// The command pool and input set pools of each encoder dropped while its thread
     /// unwound with its submit pending, which the last holder destroys once the device is
-    /// idle.
-    orphans: Vec<(vk::CommandPool, Vec<vk::DescriptorPool>)>,
+    /// idle, and the counts of the timestamp pools it wrote, let go then.
+    orphans: Vec<(vk::CommandPool, Vec<vk::DescriptorPool>, Vec<Arc<QueryObj>>)>,
 }
 
 /// What a device, its encoders and its submits share.
@@ -383,8 +384,13 @@ impl Shared {
 
     /// Takes an unwinding encoder's pools, its submit pending, for the last holder to
     /// destroy once the device is idle.
-    pub(crate) fn orphan(&self, pool: vk::CommandPool, inputs: Vec<vk::DescriptorPool>) {
-        lock(&self.heap_state).orphans.push((pool, inputs));
+    pub(crate) fn orphan(
+        &self,
+        pool: vk::CommandPool,
+        inputs: Vec<vk::DescriptorPool>,
+        timestamps: Vec<Arc<QueryObj>>,
+    ) {
+        lock(&self.heap_state).orphans.push((pool, inputs, timestamps));
     }
 
     /// A holder's drop. The last waits for the device to idle, as the contract's last drop
@@ -429,7 +435,8 @@ impl Shared {
             // SAFETY: the device is idle.
             unsafe { device.destroy_sampler(sampler, None) };
         }
-        for (pool, inputs) in state.orphans.drain(..) {
+        let mut timestamps = Vec::new();
+        for (pool, inputs, held) in state.orphans.drain(..) {
             // SAFETY: as above; the pools are an encoder's that is gone.
             unsafe {
                 for inputs in inputs {
@@ -437,8 +444,11 @@ impl Shared {
                 }
                 device.destroy_command_pool(pool, None);
             }
+            timestamps.extend(held);
         }
         drop(guard);
+        // As above, and after the heap's lock is given up.
+        drop(timestamps);
         // As above: no submit names the images, and no present reads them.
         let left = core::mem::take(&mut *lock(&self.left));
         drop(left);

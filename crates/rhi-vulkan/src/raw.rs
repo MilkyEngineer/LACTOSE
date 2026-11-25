@@ -51,6 +51,8 @@ pub(crate) struct Queue {
     pub(crate) family: u32,
     pub(crate) graphics: bool,
     pub(crate) timeline: vk::Semaphore,
+    /// Its family's `timestampValidBits`: zero where it writes no timestamps.
+    pub(crate) timestamp_bits: u32,
 }
 
 /// The memory types the device allocates from.
@@ -140,6 +142,8 @@ pub(crate) struct Raw {
     pub(crate) properties: vk::PhysicalDeviceProperties,
     /// What a device made with a surface presents through.
     pub(crate) presents: Option<Presents>,
+    /// Whether `hostQueryReset` is on: offered, it is turned on for `Timestamps` alone.
+    pub(crate) host_query_reset: bool,
     /// Set by a drop that unwinds a panic with work maybe in flight, or by a swapchain's
     /// drop whose presents may not have ended: what may be in the GPU's or the presentation
     /// engine's use is then leaked, never destroyed under it.
@@ -784,6 +788,7 @@ fn device(
     let multi_draw = core.multi_draw_indirect == vk::TRUE;
     let indirect_count = v12.draw_indirect_count == vk::TRUE;
     let atomics64 = v12.shader_buffer_int64_atomics == vk::TRUE;
+    let host_query_reset = v12.host_query_reset == vk::TRUE;
     let enable_core = vk::PhysicalDeviceFeatures::default()
         .independent_blend(true)
         .shader_int64(true)
@@ -798,7 +803,8 @@ fn device(
         .shader_sampled_image_array_non_uniform_indexing(true)
         .timeline_semaphore(true)
         .draw_indirect_count(indirect_count)
-        .shader_buffer_int64_atomics(atomics64);
+        .shader_buffer_int64_atomics(atomics64)
+        .host_query_reset(host_query_reset);
     let mut enable_v13 = vk::PhysicalDeviceVulkan13Features::default()
         .synchronization2(true)
         .dynamic_rendering(true);
@@ -935,9 +941,11 @@ fn device(
     let make_queue = |family: u32, index: u32, queues: &mut Vec<Queue>| -> Result<()> {
         // SAFETY: the family and index are among those the device was made with.
         let queue = unsafe { device.get_device_queue(family, index) };
-        let graphics = family_props[family as usize].queue_flags.contains(vk::QueueFlags::GRAPHICS);
+        let props = &family_props[family as usize];
+        let graphics = props.queue_flags.contains(vk::QueueFlags::GRAPHICS);
         let semaphore = timeline(&device)?;
-        queues.push(Queue { queue, family, graphics, timeline: semaphore });
+        let timestamp_bits = props.timestamp_valid_bits;
+        queues.push(Queue { queue, family, graphics, timeline: semaphore, timestamp_bits });
         Ok(())
     };
     let made =
@@ -987,6 +995,7 @@ fn device(
         memory,
         properties,
         presents,
+        host_query_reset,
         leaking: AtomicBool::new(false),
     };
     let roles = [0, compute_index, present_index];

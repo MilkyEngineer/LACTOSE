@@ -5,21 +5,55 @@
 //! reset on the host once made, each written by an encoder of that role outside any pass and
 //! read back once its submit has completed.
 
+use core::any::Any;
 use std::sync::Arc;
 
-use lactose_core::Result;
-use lactose_rhi_api::{Encoder, QueueRole};
+use ash::vk;
+use lactose_core::{Error, ErrorKind, Result};
+use lactose_rhi_api::{Encoder, QueueRole, Rule};
 
-use crate::device::{Shared, VulkanDevice};
+use crate::device::{Shared, VulkanDevice, alive};
+use crate::encoder::VulkanEncoder;
+use crate::raw::{Raw, driver, unsupported};
+
+/// A query pool of timestamps, destroyed in the drop of its last count: the [`Timestamps`]'
+/// and each encoder's that recorded a write into it, which lasts until its submit is seen
+/// complete.
+pub(crate) struct QueryObj {
+    raw: Arc<Raw>,
+    pool: vk::QueryPool,
+    count: u32,
+}
+
+impl Drop for QueryObj {
+    fn drop(&mut self) {
+        if self.raw.leaking() {
+            return;
+        }
+        // SAFETY: the last count of the pool is gone, so no encoder that recorded a write
+        // into it holds it, and no submit that writes it is pending.
+        unsafe { self.raw.device.destroy_query_pool(self.pool, None) };
+    }
+}
 
 /// A pool of timestamps for the encoders of one queue role: each written by
 /// [`write`](Self::write) into an encoder, outside any pass, when every command recorded
 /// before it in the queue's order has completed, and read by [`read`](Self::read) in
-/// nanoseconds of the GPU's clock. Two timestamps of the same pool, written around whole
-/// passes, give the GPU time between them; the queue keeps [`valid_bits`](Self::valid_bits)
-/// of each, and none where it writes no timestamps.
+/// nanoseconds of the GPU's clock. The queue keeps [`valid_bits`](Self::valid_bits) of each,
+/// and none where it writes no timestamps.
+///
+/// Both M1 drivers latch a timestamp at a boundary of a Metal pass near its write rather
+/// than where the queue's order puts it, so only one layout was seen to bracket the work
+/// between two under both: the first written in an encoder of its own, submitted before the
+/// work's, and the second in the work's encoder after its last pass (the device test). And
+/// MoltenVK makes a result available in the command buffer's completion handler, which may
+/// run a moment after a wait sees the submit's signal, so a reader polls
+/// [`read`](Self::read) until the timestamps it wrote are `Some`.
 pub struct Timestamps {
     shared: Arc<Shared>,
+    role: QueueRole,
+    bits: u32,
+    query: Arc<QueryObj>,
 }
 
 impl VulkanDevice {
@@ -32,8 +66,28 @@ impl VulkanDevice {
     /// device does not offer `hostQueryReset`, which resets the pool on the host; a lost
     /// device's error; a driver's failure as its kind.
     pub fn create_timestamps(&self, role: QueueRole, count: u32) -> Result<Timestamps> {
-        let _ = (role, count);
-        todo!()
+        let shared = &self.shared;
+        alive(&shared.records())?;
+        if count == 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "a pool of no timestamps".to_owned()));
+        }
+        let raw = &shared.raw;
+        if !raw.host_query_reset {
+            return Err(unsupported("timestamps on a device with no hostQueryReset"));
+        }
+        let bits = shared.queue(shared.queue_of(role)).timestamp_bits;
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(count);
+        // SAFETY: the device is live and the info valid: a timestamp pool of `count` above
+        // zero.
+        let pool = unsafe { raw.device.create_query_pool(&info, None) }
+            .map_err(|e| driver(e, "vkCreateQueryPool"))?;
+        let query = Arc::new(QueryObj { raw: Arc::clone(raw), pool, count });
+        // SAFETY: `hostQueryReset` is on, the queries are the pool's, and no command buffer
+        // names the pool, which is this call's alone.
+        unsafe { raw.device.reset_query_pool(pool, 0, count) };
+        Ok(Timestamps { shared: Arc::clone(shared), role, bits, query })
     }
 }
 
@@ -42,7 +96,7 @@ impl Timestamps {
     /// `timestampValidBits`: zero where it writes none.
     #[must_use]
     pub fn valid_bits(&self) -> u32 {
-        todo!()
+        self.bits
     }
 
     /// Records into `encoder` the write of timestamp `index` once every command before it
@@ -57,20 +111,96 @@ impl Timestamps {
     /// role, one inside a pass, one taken by a submit and not reset since, and an index past
     /// the pool's count.
     pub fn write(&self, encoder: &mut dyn Encoder, index: u32) -> Result<()> {
-        let _ = (encoder, index, &self.shared);
-        todo!()
+        let any: &mut dyn Any = encoder;
+        let Some(encoder) = any.downcast_mut::<VulkanEncoder>() else {
+            return Err(Rule::Encoding.refuse("a timestamp into an encoder of another backend"));
+        };
+        if !Arc::ptr_eq(&encoder.shared, &self.shared) {
+            return Err(Rule::Encoding.refuse("a timestamp into an encoder of another device"));
+        }
+        if encoder.role != self.role {
+            return Err(Rule::Encoding.refuse(format!(
+                "a timestamp of the {:?} role into an encoder of the {:?} role",
+                self.role, encoder.role
+            )));
+        }
+        if encoder.submitted.is_some() {
+            return Err(Rule::Encoding.refuse("a timestamp into an encoder submitted, not reset"));
+        }
+        if encoder.open() {
+            return Err(Rule::Encoding.refuse("a timestamp inside a pass"));
+        }
+        if index >= self.query.count {
+            return Err(Rule::Encoding
+                .refuse(format!("timestamp {index} of a pool of {}", self.query.count)));
+        }
+        if self.bits == 0 || !encoder.recording() {
+            return Ok(());
+        }
+        let device = &self.shared.raw.device;
+        // SAFETY: the command buffer is recording, outside any pass, and this encoder's alone
+        // (`&mut`); the query is the pool's, which the encoder holds from here until its
+        // submit is seen complete; the role's queue keeps valid bits, so its family writes
+        // timestamps.
+        unsafe {
+            device.cmd_reset_query_pool(encoder.command_buffer, self.query.pool, index, 1);
+            device.cmd_write_timestamp2(
+                encoder.command_buffer,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                self.query.pool,
+                index,
+            );
+        }
+        if !encoder.timestamps.iter().any(|held| Arc::ptr_eq(held, &self.query)) {
+            encoder.timestamps.push(Arc::clone(&self.query));
+        }
+        Ok(())
     }
 
     /// Each timestamp, in nanoseconds of the GPU's clock (its ticks, masked to the valid
-    /// bits, times the device's `timestampPeriod`), where its last write has completed;
-    /// `None` for one unwritten, written by a submit not yet complete, or on a queue with no
-    /// valid bits. Waits for nothing. A difference of two is the GPU time between them while
-    /// the clock does not wrap past the valid bits between their writes.
+    /// bits, times the device's `timestampPeriod`), as its last write the GPU has
+    /// completed left it; `None` for one unwritten, one the GPU has reset for a write it has
+    /// not yet completed or not yet made available, and every one on a queue with no valid
+    /// bits. Once it reads `Some` after the submit that wrote it is seen complete, a
+    /// timestamp is that write's. Waits for nothing. A
+    /// difference of two is the GPU time between them while the clock does not wrap past the
+    /// valid bits between their writes.
     ///
     /// # Errors
     ///
     /// A lost device's error; a driver's failure as its kind.
     pub fn read(&self) -> Result<Vec<Option<u64>>> {
-        todo!()
+        alive(&self.shared.records())?;
+        let count = self.query.count as usize;
+        if self.bits == 0 {
+            return Ok(vec![None; count]);
+        }
+        let mut data = vec![[0_u64; 2]; count];
+        let flags = vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY;
+        let device = &self.shared.raw.device;
+        // SAFETY: the pool lives (`query`), its queries were reset on the host at its making,
+        // and `data` holds a value and its availability, 64 bits each, for every query.
+        let read = unsafe { device.get_query_pool_results(self.query.pool, 0, &mut data, flags) };
+        match read {
+            Ok(()) | Err(vk::Result::NOT_READY) => {}
+            Err(error) => {
+                self.shared.lost_on(error);
+                return Err(driver(error, "vkGetQueryPoolResults"));
+            }
+        }
+        let mask = if self.bits >= 64 { u64::MAX } else { (1_u64 << self.bits) - 1 };
+        // The period in 32.32 fixed point, so that a tick count of any size scales with no
+        // loss of its low bits, as an `f64` product would past 2^53, and a period of one
+        // gives the ticks themselves.
+        let period = f64::from(self.shared.raw.properties.limits.timestamp_period);
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let scale = (period * 4_294_967_296.0).round() as u128;
+        Ok(data
+            .iter()
+            .map(|&[ticks, available]| {
+                let nanos = (u128::from(ticks & mask) * scale) >> 32;
+                (available != 0).then(|| u64::try_from(nanos).unwrap_or(u64::MAX))
+            })
+            .collect())
     }
 }
