@@ -2,8 +2,9 @@
 //! instances in four archetypes and sixteen regions, half of which move every tick, a stated
 //! count of them presented rows the snapshot holds, extracted to a null sink that only counts.
 //! The presented rows' keys follow no chunk order: they are interleaved across the chunks of
-//! both presented archetypes and of every region, as `extract-50k`'s scene lays them out
-//! (D164), so the snapshot's fill is measured where an order is work to find. Asserted on what
+//! both presented archetypes and across the regions, a column of each chunk, as
+//! `extract-50k`'s scene lays them out (D164), so the snapshot's fill is measured where an
+//! order is work to find. Asserted on what
 //! does not depend on the machine (how many rows each pass writes, and the snapshot's rows);
 //! the times are measured by an ignored test, run by hand in release, and reported, never
 //! asserted:
@@ -60,7 +61,8 @@ fn region(n: u64) -> RegionId {
 /// A server world of `rows` instances in sixteen regions, row `n` in region `1 + n % 16`, the
 /// even rows walking one unit a tick, and `presented` of them carrying `Shown`: those at 1 and
 /// 2 modulo `2 * rows / presented`, so half the presented rows walk, and each presented
-/// archetype's chunks interleave their keys with the other's and every region's. A null sink
+/// archetype's chunks interleave their keys with the other's, every chunk holding rows of
+/// every region. A null sink
 /// and, if `snapshot`, a snapshot channel are installed.
 fn scene(rows: u64, presented: u64, snapshot: bool, workers: u32) -> (Rig, NullSink) {
     let period = 2 * rows / presented;
@@ -114,16 +116,20 @@ fn a_pass_writes_the_moved_rows_and_the_snapshot_holds_the_presented_ones() {
         assert_eq!(frame(&mut rig, &sink), 1_000, "the rows that moved");
     }
     let frame = rig.reader.acquire().unwrap();
-    assert_eq!(frame.newer().rows::<Shown>().len(), 200);
-    assert_eq!(frame.newer().rows::<Walker>().len(), 100, "half the presented rows walk");
-    // No chunk order is key order: some chunk holds keys on both sides of another chunk's.
+    let shown: Vec<StableKey> = frame.newer().rows::<Shown>().map(|(key, _)| key).collect();
+    assert_eq!(shown.len(), 200);
+    let walking = shown.iter().filter(|&&key| rig.world().get::<Walker>(key).is_some()).count();
+    assert_eq!(walking, 100, "half the presented rows walk");
+    // No chunk order is key order: the first presented chunk holds keys on both sides of the
+    // second's first key. A row's region is a column of its chunk, so the regions interleave
+    // within each chunk.
     let chunks: Vec<Vec<StableKey>> = rig
         .world()
         .chunks()
         .filter(|chunk| chunk.column(<Shown as lactose_reflect::Reflect>::KEY).is_some())
         .map(|chunk| chunk.keys().to_vec())
         .collect();
-    assert!(chunks.len() >= 2 * usize::try_from(REGIONS).unwrap(), "{} chunks", chunks.len());
+    assert!(chunks.len() >= 2, "{} chunks", chunks.len());
     let (first, second) = (&chunks[0], &chunks[1]);
     assert!(first.iter().any(|key| key < &second[0]) && first.iter().any(|key| key > &second[0]));
 }
@@ -179,8 +185,11 @@ fn extract_at_fifty_thousand_moved_among_a_hundred_thousand() {
                     times.push(start.elapsed());
                     rig.publish();
                     let written = sink.0.swap(0, Ordering::Relaxed);
-                    let forced = usize::from(arm == Arm::Sorting);
-                    assert_eq!(written, MOVING + forced, "the moved rows and a spawned one");
+                    // The sorting arm also writes the row it spawned, and once more, at the
+                    // settling write, the row it spawned the frame before.
+                    let spawned =
+                        if arm == Arm::Sorting { 1 + usize::from(spawned > 1) } else { 0 };
+                    assert_eq!(written, MOVING + spawned, "the moved rows and the spawned ones");
                     if arm != Arm::Ring {
                         let frame = rig.reader.acquire().unwrap();
                         let held = frame.newer().rows::<Shown>().len();
