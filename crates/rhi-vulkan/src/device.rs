@@ -622,7 +622,7 @@ pub(crate) fn range(offset: u64, len: u64, size: u64, what: &str) -> Result<u64>
 /// reporting what it offers of the optional one, every rule of the contract's "Every
 /// backend" column checked before the driver call it guards.
 pub struct VulkanDevice {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 impl VulkanDevice {
