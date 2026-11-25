@@ -17,7 +17,7 @@
 //! writing the ring and the snapshot, the figure criterion 4 holds to 1 ms on the device;
 //! the ring alone, with no snapshot installed; and the snapshot alone, beside a sink that
 //! counts the rows and keeps nothing. The snapshot's part is the first less the second, and
-//! the ring's the first less the third. The first again on one worker gives the cost per
+//! the ring's the first less the third, signed. The first again on one worker gives the cost per
 //! dirty row. Each is the median of 60 passes (6 in a short run) after a full pass.
 
 use std::sync::Arc;
@@ -257,8 +257,10 @@ fn measure(prefix: &str, device: &Arc<dyn Device>, n: u32, passes: usize) {
     figure(&format!("{prefix}.pass_us"), micros(both));
     figure(&format!("{prefix}.ring_alone_us"), micros(ring));
     figure(&format!("{prefix}.snapshot_alone_us"), micros(snapshot));
-    figure(&format!("{prefix}.ring_part_us"), micros(both.saturating_sub(snapshot)));
-    figure(&format!("{prefix}.snapshot_part_us"), micros(both.saturating_sub(ring)));
+    // Signed: a part below zero is the noise between two medians, larger than the part.
+    let part = |less: Duration| format!("{:.1}", (both.as_secs_f64() - less.as_secs_f64()) * 1e6);
+    figure(&format!("{prefix}.ring_part_us"), part(snapshot));
+    figure(&format!("{prefix}.snapshot_part_us"), part(ring));
     figure(&format!("{prefix}.w1.pass_us"), micros(single));
     let per_row = single.as_secs_f64() * 1e9 / MOVED as f64;
     figure(&format!("{prefix}.w1.dirty_row_ns"), format!("{per_row:.1}"));
