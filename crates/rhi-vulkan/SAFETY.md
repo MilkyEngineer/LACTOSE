@@ -98,7 +98,17 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   submit; every signal its semaphore depends on has been submitted, as the present's walk
   decided before the submit was stamped (VUID-vkQueuePresentKHR-pWaitSemaphores-03268).
 - An image given up while acquired, at `resize` or the drop, has its semaphore waited for by
-  an empty batch, so that no signalled semaphore is destroyed or reused unwaited. The drop
+  an empty batch, so that no signalled semaphore is destroyed or reused unwaited. An acquire
+  semaphore whose batches fail with the device not lost (a present's submit and the empty
+  batch after it, or the empty batch alone) stays signalled, with no wait pending, since a
+  failed `vkQueueSubmit2` leaves its semaphores as they were: the image's next present waits
+  for it, and `resize` and the drop wait for every one left with an empty batch. A `resize`
+  whose batch fails is refused before it gives up the driver swapchain that signalled it,
+  and a drop whose batch fails leaks the device (below), so every acquire semaphore the
+  swapchain destroys has had its acquire's signal waited for by a batch that has completed,
+  except after a loss. The Vulkan guide's "Swapchain Semaphore Reuse" asks it; no
+  valid-usage rule found names it, since an acquire is not a submitted batch
+  (VUID-vkDestroySemaphore-semaphore-05149 is of batches alone). The drop
   waits for no batch of the present queue, which a submit held by a host point ahead of it
   on a shared queue holds: it hands its acquire and present semaphores to the device
   (`Left::spent`) with the stamp of the last batch that waits for one, after waiting for its
@@ -132,7 +142,11 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   that wait for them are complete; it is retired whether its replacement's creation
   succeeds or not. A present fence never signals after an error that enqueued nothing (out
   of memory): the fence is reused, and the image's present semaphore, left signalled, is
-  waited for by an empty batch before the semaphore is signalled again or destroyed. A fence
+  waited for by an empty batch before the semaphore is signalled again or destroyed. Where
+  that batch fails too, the semaphore is destroyed with its chain only after the present's
+  submit that signals it has completed (`unsignalled`, which `resize` waits for and the
+  drop hands over), signalled with no wait pending; the swapchain is stale, so the image is
+  not presented again before it. A fence
   of a present that failed with an error the spec does not list is waited for a bound after
   its present with the present queue idle, then destroyed: the bound with the queue idle is
   taken to show that the present enqueued nothing, so that no wait for the image's present
@@ -141,12 +155,13 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   presented again. The one known source is MoltenVK 1.4.2's present with no command buffer
   (`MVKQueue.mm` 739–750), which takes neither the waits nor the fence. Its drawable timeout
   (`MVKImage.mm` 1625), the same error, signals the fence, which is reaped as any other.
-- A drop whose waits do not end within three seconds, or that unwinds a panic with
-  something of the swapchain pending, leaks the device (`Raw::leak`), and the records keep
-  the swapchain's mark, so no second swapchain is made on the surface while the leaked one
-  may be in use. A holder that sees the flag destroys nothing: the device's last holder
-  (`let_go`) lets go of what `Shared::left` holds and returns, with no wait for idle and
-  no sampler or orphaned pool destroyed, and the device and its surface are not destroyed.
+- A drop whose waits do not end within three seconds, that unwinds a panic with something of
+  the swapchain pending, or whose empty batch for an acquire semaphore fails, leaks the
+  device (`Raw::leak`), and the records keep the swapchain's mark, so no second swapchain
+  is made on the surface while the leaked one may be in use. A holder that sees the flag
+  destroys nothing: the device's last holder (`let_go`) lets go of what `Shared::left`
+  holds and returns, with no wait for idle and no sampler or orphaned pool destroyed, and
+  the device and its surface are not destroyed.
   Two reads must see it, and do, the load being `Relaxed`: the leaked driver swapchain's
   drop, ordered after the store by its `Arc`'s release sequence, since the swapchain's drop
   lets its chain's count go after the store; and what `Shared::left` holds, drained by the
@@ -218,9 +233,13 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   render pass, inside a compute pass with a pipeline bound, outside a pass), with every
   resource it names held by the encoder and every range inside its resource.
 - A reset, and the drop that frees the pool, come after the encoder's submit is seen complete,
-  or after the device is lost. A drop that would wait while the thread unwinds a panic hands
-  its pools to the device instead (`Shared::orphan`), whose last holder destroys them after
-  the device is idle, or leaks them with the device.
+  or after the device is lost, or at once where the submit's driver call failed with no
+  command buffer pending (`unsent`): its `vkEndCommandBuffer` failed, or `vkQueueSubmit2`
+  failed out of memory, and "VK_ERROR_OUT_OF_*_MEMORY errors do not modify any currently
+  existing Vulkan objects" (the spec's "VkResult Return Codes"), so each command buffer is
+  as it was, executable or invalid, and never pending. A drop that would wait while the
+  thread unwinds a panic hands its pools to the device instead (`Shared::orphan`), whose
+  last holder destroys them after the device is idle, or leaks them with the device.
 
 ### Submission and waits (`submit.rs`, `device.rs`)
 
