@@ -207,6 +207,13 @@ impl SnapshotWriter {
         snapshot
     }
 
+    /// The buffer the passes since the last publication wrote, if one did: what the unit
+    /// tests compare.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> Option<&PresentSnapshot> {
+        self.pending.as_deref()
+    }
+
     /// Publishes the unpublished snapshot, if there is one, and adds `events` to those the
     /// reader's next acquire returns, in one exchange (`README.md`, "The triple buffer" and
     /// "Events and publication"). A batch no reader will take is dropped once the lock is
@@ -412,6 +419,7 @@ pub struct PresentSnapshot {
 /// One component's rows in a snapshot: the keys in ascending order and the values'
 /// bytes in the same order.
 #[derive(Debug, Default)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 struct SnapshotColumn {
     keys: Vec<StableKey>,
     bytes: Vec<u8>,
@@ -470,12 +478,12 @@ impl PresentSnapshot {
     }
 
     /// A buffer no pass has written yet.
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self { kind: WorldKind::Server, tick: Tick(0), cut: false, columns: BTreeMap::new() }
     }
 
-    /// Makes the snapshot `kind`'s at `tick`, holding `columns`: per component, its rows'
-    /// keys and values' bytes, in any order. The rows are sorted by key here, and the
+    /// Makes the snapshot `kind`'s at `tick`, holding for each of `components` the rows
+    /// `copy` appends to the component's keys and values' bytes, in ascending key order; the
     /// columns' allocations are kept for the next pass. `cut` makes it a cut; a snapshot a
     /// pass made one stays one until it is published.
     pub(crate) fn fill(
@@ -483,7 +491,8 @@ impl PresentSnapshot {
         kind: WorldKind,
         tick: Tick,
         cut: bool,
-        columns: BTreeMap<ComponentKey, Vec<(StableKey, &[u8])>>,
+        components: &[ComponentKey],
+        mut copy: impl FnMut(ComponentKey, &mut Vec<StableKey>, &mut Vec<u8>),
     ) {
         self.kind = kind;
         self.tick = tick;
@@ -492,15 +501,18 @@ impl PresentSnapshot {
             column.keys.clear();
             column.bytes.clear();
         }
-        for (component, mut rows) in columns {
-            rows.sort_unstable_by_key(|&(key, _)| key);
+        for &component in components {
             let column = self.columns.entry(component).or_default();
-            column.keys.extend(rows.iter().map(|&(key, _)| key));
-            for (_, bytes) in rows {
-                column.bytes.extend_from_slice(bytes);
-            }
+            copy(component, &mut column.keys, &mut column.bytes);
+            debug_assert!(column.keys.is_sorted_by(|a, b| a < b), "rows in ascending key order");
         }
         self.columns.retain(|_, column| !column.keys.is_empty());
+    }
+
+    /// Whether the two hold the same world kind, tick and rows, whatever their cuts.
+    #[cfg(test)]
+    pub(crate) fn same_rows(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.tick == other.tick && self.columns == other.columns
     }
 }
 
