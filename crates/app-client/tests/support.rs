@@ -171,6 +171,37 @@ impl Swapchain for Watched {
     }
 }
 
+// ---- Warnings ----
+
+/// What a [`warnings`] capture writes into.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        lock(&self.0).extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `body`'s value, and the events at `warn` or above that it logged on the calling thread.
+pub fn warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let text = String::from_utf8_lossy(&lock(&captured.0)).into_owned();
+    (value, text)
+}
+
 // ---- Bounded waits ----
 
 /// What a bounded wait shares with the thread that keeps its bound.

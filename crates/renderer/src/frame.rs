@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use lactose_core::{Error, ErrorKind, Result};
 use lactose_ecs::WorldKind;
@@ -206,11 +205,10 @@ pub struct DeclaredFrame {
 /// which is also the mark that the prepared frame is declared (`README.md`,
 /// "Concurrency").
 ///
-/// Its drop waits, with no bound, for the point of the last frame it was told was
-/// submitted, then destroys its buffers and pipelines. It is dropped off the
-/// frame-critical workers, as a device's objects are, after the graph that submitted its
-/// frames. A drop made while the thread unwinds a panic waits for nothing, and an object
-/// a submit still uses is leaked, not destroyed (`README.md`, "Errors and drops").
+/// Its drop waits for nothing and destroys its buffers and pipelines. It is dropped off
+/// the frame-critical workers, as a device's objects are, after the graph that submitted
+/// its frames, whose drop waited for every submit it made; an object a submit still uses
+/// is leaked, not destroyed (`README.md`, "Errors and drops").
 pub struct Renderer {
     /// The device every call reaches.
     device: Arc<dyn Device>,
@@ -249,8 +247,6 @@ pub struct Renderer {
     /// Whether the next frame declared imports the instance buffer from `Undefined`: the
     /// renderer's first, and the first after a torn frame.
     fresh: bool,
-    /// The point of the last frame the renderer was told was submitted.
-    last: Option<TimelinePoint>,
     /// How many frames were submitted, which orders the held regions.
     submitted: u64,
 }
@@ -405,7 +401,6 @@ impl Renderer {
             indices,
             pipelines,
             fresh: true,
-            last: None,
             submitted: 0,
         })
     }
@@ -834,7 +829,6 @@ impl Renderer {
                 region.state = held;
             }
         }
-        self.last = Some(point);
         let Some(frame) = self.frame.take() else { return };
         self.regions[frame.region as usize].state = held;
         let declared = core::mem::take(self.declared.get_mut()) != 0;
@@ -885,20 +879,13 @@ impl Renderer {
 }
 
 impl Drop for Renderer {
-    /// Waits for the point of the last frame the renderer was told was submitted, unless
-    /// the thread is unwinding a panic, then destroys what the renderer made. The device
-    /// refuses a destroy under a submit that is still pending: one of a frame the
-    /// renderer was told no point for, or any while unwinding. Such an error is logged
-    /// under [`LOG_TARGET`] and the object is leaked. On a lost device the wait returns
-    /// at once.
+    /// Destroys what the renderer made, and waits for nothing: it is dropped after the
+    /// `RenderGraph` whose frames used its buffers, whose drop has waited for every submit
+    /// it made (`README.md`, "Errors and drops"). The device refuses a destroy under a
+    /// submit that is still pending, as under a frame dropped in another order or while
+    /// unwinding. Such an error is logged under [`LOG_TARGET`] and the object is leaked.
     fn drop(&mut self) {
         let device = &*self.device;
-        if !std::thread::panicking()
-            && let Some(point) = self.last
-            && let Err(error) = device.wait_timeline(point, Duration::MAX)
-        {
-            log("the wait for the last frame submitted", &error);
-        }
         let mut buffers = vec![self.instances, self.vertices, self.indices];
         for (index, region) in (0..).zip(&self.regions) {
             let rows = self.staging.buffer(index);

@@ -695,7 +695,7 @@ table, which already holds each instance's mesh; it adds no field to the row.
 - A recorder captures handles and counts by value and reads the renderer through `&`. It
   blocks on nothing (graph, "Recording").
 - Nothing here waits. `Device::wait_timeline` is called by the frame, on `Opened::Wait`,
-  and by the renderer's drop.
+  and the renderer's drop waits for nothing.
 
 ### Determinism
 
@@ -734,20 +734,20 @@ table, which already holds each instance's mesh; it adds no field to the row.
 - A frame prepared and then ended by `submitted` without a `declare`, on a renderer made
   with shaders, never ran its batch, and is ended as `torn` ends it, but that its region is
   free at the point given.
-- `Renderer`'s drop waits for the point of the last frame it was told was submitted, then
-  destroys its buffers and pipelines. It is dropped after the `RenderGraph` whose frames
-  used its buffers, off the frame-critical workers; the graph's drop has by then waited for
-  every submit it made, a torn frame's among them (graph, "Errors and drops"). A destroy
-  the device refuses because a submit is still pending (rhi-api, "Handles and lifetimes"),
-  which is one of a frame the renderer was told no point for, is logged under `cheddar` and
-  the object is leaked. While the thread unwinds a panic the drop waits for nothing and
-  destroys what the device lets it.
+- `Renderer`'s drop waits for nothing and destroys its buffers and pipelines. It is dropped
+  after the `RenderGraph` whose frames used its buffers, off the frame-critical workers; the
+  graph's drop has by then waited for every submit it made, a torn frame's among them
+  (graph, "Errors and drops"), so no wait of its own is needed, and the graph's timeline,
+  which the last frame's point is on, is destroyed by then. A destroy the device refuses
+  because a submit is still pending (rhi-api, "Handles and lifetimes"), as after a drop in
+  another order or while the thread unwinds a panic, is logged under `cheddar` and the
+  object is leaked.
 - Two lifetime paths are reached by no test, and neither matters at milestone 2. A torn
   frame's region is held until the next `submitted`'s point; were it freed at once, no
   submit would read it, since a renderer's frame is one submit and on one queue a torn
   frame made none: it matters only with a provider's pass on another queue, which
-  milestone 2 has none of. A drop without the wait for the last point would destroy under
-  a pending submit, which the device refuses: the drop logs a leak, never a use after free.
+  milestone 2 has none of. A drop before the graph's would destroy under a pending submit,
+  which the device refuses: the drop logs a leak, never a use after free.
 - A sink dropped with a pass open leaves that pass lost and gives back its count
   ("Writers").
 
@@ -855,7 +855,7 @@ native Metal as the calls it makes are. The backend columns are those of rhi-api
 | `declare`: the scatter | `compute_pass`; `ComputeRecorder::{bind_pipeline, push_address, push_bytes, dispatch}` | Typed pushes against the declaration; runs nothing | `dispatchThreadgroups` on a serial encoder, the buffers declared with their usage | `vkCmdDispatch`, a shader-write barrier between dispatches | RHI item 2; Metal item 2 |
 | `declare`: the triangles | `render_pass`; `RenderRecorder::{bind_pipeline, bind_index_buffer, push_address, push_bytes, draw_indexed_indirect}`, the draw only where `SlotTable::extent` is above zero | Checks states and declarations; draws nothing | `drawIndexedPrimitives` with an indirect buffer, one record | `vkCmdDrawIndexedIndirect`, count one | RHI items 9 and 10; Metal items 5 and 12 |
 | `latch` | `write_buffer`, `flush_buffer` on the frame's camera buffer | Judged at the submit, after the write | A write into shared memory | A write into the mapping | graph, "A frame, by step"; rhi-api, "Buffers and host access" |
-| The renderer's drop | `wait_timeline`, the destroys | Refuses a destroy while pending | Objects released | Objects destroyed | rhi-api, "Handles and lifetimes" |
+| The renderer's drop | The destroys | Refuses a destroy while pending | Objects released | Objects destroyed | rhi-api, "Handles and lifetimes" |
 
 Null runs no shader. On null `renderer-impl` proves the batch from `Renderer::batch`, with
 `InstanceRecord::scatter` standing for the shader; the writers' ranges from null's

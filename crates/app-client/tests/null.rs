@@ -25,7 +25,7 @@ use lactose_rhi_api::{Capabilities, Extent, QueueLayout, SwapchainDesc};
 use lactose_rhi_null::Control;
 use lactose_task::{ExecutionLog, Executor};
 
-use crate::support::{Said, Watch, Watched, bounded, lock, null_device, null_shaders};
+use crate::support::{Said, Watch, Watched, bounded, lock, null_device, null_shaders, warnings};
 
 const E1: Extent = Extent { width: 64, height: 48 };
 const E2: Extent = Extent { width: 80, height: 40 };
@@ -251,6 +251,24 @@ fn each_layout_takes_back_the_targets_of_present_calls_that_made_no_submit() {
         let skipped = watch.skipped.load(Ordering::Relaxed);
         assert!(skipped >= 3, "{layout}: {skipped} calls made no submit");
         assert_eq!(*lock(&watch.resizes), [E1, E2, E1], "{layout}");
+    }
+}
+
+/// On each layout, three frames and a clean stop, the render side dropped on this thread
+/// after the present thread's stop: nothing on the way logs a warning. The renderer's drop
+/// once waited on the graph's timeline after the graph's drop had destroyed it, and warned
+/// under `cheddar` at every clean shutdown.
+#[test]
+fn a_clean_shutdown_logs_no_warning() {
+    for (layout, capabilities) in layouts() {
+        let ((), logged) = warnings(|| {
+            let mut run = Run::new(capabilities, workers(), WorldConfig::shown());
+            for _ in 0..3 {
+                assert_eq!(name(&run.step(Some(E1))), "drawn", "{layout}");
+            }
+            assert!(run.stop().is_none(), "no chaos, no log");
+        });
+        assert!(logged.is_empty(), "{layout}: {logged}");
     }
 }
 
