@@ -150,6 +150,13 @@ for the query live out-pointers for the role, the count and the default flag. Th
 only through those pointers, and the role is read only if the query returned 0 with a count
 of one.
 
+What the role grants is read on a thread the call spawns, after its class is entered:
+`thread_info` with `THREAD_EXTENDED_INFO` on the port `pthread_mach_thread_np` returns for the
+calling thread, which adds no reference and stays valid while the thread runs, a pointer to a
+live `thread_extended_info` built by its `Default`, and its size in integers as the count. The
+call writes at most that many integers through the pointer and the new count through the
+count, and the priority is read only if it returned 0.
+
 ## Process-CPU calls (`benches/whisk.rs`, `tests/idle_cpu.rs`)
 
 - `getrusage` is called on Unix with a pointer to a zeroed `rusage`, which is read only if

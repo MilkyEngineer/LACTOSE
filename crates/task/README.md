@@ -347,11 +347,17 @@ reads the class around the work it times, never inside it.
 
 **The task role.** On macOS `take_foreground_task_role` asks for
 `TASK_FOREGROUND_APPLICATION` with `task_policy_set` on the process's own task, the category
-flavor, and returns what `task_policy_get` then reports: a `TaskRole` whose `Display` is the
-role's name in `<mach/task_policy.h>` and the two calls' results, the text a result file
-records. A process started from a terminal is in `TASK_UNSPECIFIED`, where user-interactive
-QoS is clamped to priority 31; in the foreground role it runs at 47. Every other target has
-no task roles: the call asks nothing and returns `TaskRole::NotApplicable`.
+flavor, and returns what `task_policy_get` then reports, with what the role grants: the
+scheduled priority (`thread_info`, `THREAD_EXTENDED_INFO`, `pth_priority`) of a thread it then
+starts in the frame-critical class, user-interactive QoS. `TaskRole`'s `Display` is the role's
+name in `<mach/task_policy.h>`, the two calls' results and that priority, the text a result
+file records. The role read back is the request: macOS accepts it from a process under any
+clamp, so `is_foreground` holds under `taskpolicy -b` or `-c` and in a launchd background job
+alike, and only the priority shows what was granted. A process started from a terminal is in
+`TASK_UNSPECIFIED`, where user-interactive QoS is clamped to priority 31. On the M1 under
+macOS 27.2 the priority after the request is 47 from a terminal (31 before it), 20 under
+`taskpolicy -c utility` and 4 under `taskpolicy -b` (20 and 4 before it too). Every other
+target has no task roles: the call asks nothing and returns `TaskRole::NotApplicable`.
 
 The role cannot be given back. On the Apple M1 under macOS 27.2 a request for
 `TASK_UNSPECIFIED` returns `KERN_INVALID_ARGUMENT` (4) and the role stays as it was;
@@ -365,9 +371,9 @@ process. The map follows the rule `CoreTopology` counts by, so the two agree on 
 
 | Target | Current CPU | Its class |
 |---|---|---|
-| macOS | `pthread_cpu_number_np` | The logical CPUs of each performance level, `hw.perflevel<n>.logicalcpu`: level 0 is the performance class and every other level the efficiency class |
+| macOS | `pthread_cpu_number_np` | The logical CPUs of each performance level at boot, `hw.perflevel<n>.logicalcpu_max`: level 0 is the performance class and every other level the efficiency class |
 | Windows | `GetCurrentProcessorNumberEx`, its group and number | The efficiency class of its core, from the group masks of the core records `GetLogicalProcessorInformationEx` reports; the lowest class is the efficiency class and every class above it the performance class |
-| Linux | `sched_getcpu` | The `cpu_capacity` of its core in sysfs, by the same rule, or on an Intel hybrid part the CPU lists of the `cpu_core` and `cpu_atom` PMUs |
+| Linux | `sched_getcpu` | The `cpu_capacity` of its core in sysfs, by the same rule, or on an Intel hybrid part the CPU lists of the `cpu_core` and `cpu_atom` PMUs. A core is its package, cluster and core id (`topology/cluster_id`, 0 where the kernel has none): device-tree arm64 kernels put every CPU in package 0 and restart core ids in each cluster |
 
 Where the system reports every core as one class (one performance level, equal efficiency
 classes, equal capacities), every core is `CoreClass::Performance`. The call returns `None`
@@ -380,7 +386,10 @@ up, efficiency cores first. macOS documents no map from a CPU number to its leve
 tree of Apple silicon reports one (`ioreg -p IODeviceTree -n cpus`: each CPU's
 `logical-cpu-id` and `cluster-type`, `E` or `P`), and on the M1 it names CPUs 0 to 3 `E` and
 4 to 7 `P`. The test `the_apple_numbering_is_the_device_trees` holds the map against the device
-tree on every Mac it runs on that reports two levels; the call itself reads only the sysctls.
+tree on every Mac it runs on that reports two levels, and fails there if the tree does not
+parse; the call itself reads only the sysctls. The counts are the boot's (`logicalcpu_max`),
+not the current power mode's (`logicalcpu`): a CPU's number is fixed in `[0, hw.ncpu)`, so a
+CPU taken offline must not shift the numbers above it.
 
 ## Proof for milestone 0
 
@@ -551,13 +560,15 @@ Correctness:
   finalize, a scope child, a scope body, a task or the drop of a cancelled task's future
   aborts the process, and that an unfollowable replay log does.
 - `src/measure.rs` holds the measurement calls: on macOS the foreground role taken and read
-  back, and again with no change; the class map against the device tree's (above) and against
+  back with the priority it grants, 47 where the process started at 31, never below the
+  priority before it, and again with no change; the class map against the device tree's (above) and against
   the topology's counts; a class read on every call on four threads wherever the system reports
   the cores' types; on a Mac with two levels, as many spinning user-interactive threads as CPUs
   reading both classes between them, since macOS cannot pin and the performance cores alone
   cannot hold them all; and on Linux and Windows a thread pinned to each CPU the process may
   use in turn, where every reading is the same and is that CPU's. `src/platform.rs` holds the maps
-  built from hand-made input: Apple levels, Linux capacities and PMU lists, and Windows core
+  built from hand-made input: Apple levels, Linux capacities and PMU lists (a device-tree arm64
+machine whose clusters restart their core ids among them), and Windows core
   records with their group masks, on any host. The tests that call the system are ignored
   under Miri.
 

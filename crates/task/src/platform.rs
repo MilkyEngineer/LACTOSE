@@ -225,10 +225,21 @@ mod detect {
         pub(super) cpu: u32,
         /// `topology/physical_package_id`.
         pub(super) package: u32,
-        /// `topology/core_id`.
+        /// `topology/cluster_id`, 0 where the kernel has none (before 5.16). Device-tree
+        /// arm64 kernels give every CPU package 0 and restart `core_id` in each cluster, so
+        /// a core is known only by all three.
+        pub(super) cluster: u32,
+        /// `topology/core_id`, unique within its package and cluster.
         pub(super) core: u32,
         /// `cpu_capacity`, where the kernel exports it (arm64, RISC-V).
         pub(super) capacity: Option<u32>,
+    }
+
+    impl LinuxCpu {
+        /// The physical core this CPU is a thread of.
+        fn core_key(&self) -> (u32, u32, u32) {
+            (self.package, self.cluster, self.core)
+        }
     }
 
     /// Parses a sysfs CPU list such as `0-15,24,26-27`. Malformed parts are skipped.
@@ -278,16 +289,17 @@ mod detect {
         }
         let ratings: Vec<u32> = cores.values().copied().collect();
         let class = classifier(&ratings);
-        cpus.iter().map(|cpu| (cpu.cpu, class(cores[&(cpu.package, cpu.core)]))).collect()
+        cpus.iter().map(|cpu| (cpu.cpu, class(cores[&cpu.core_key()]))).collect()
     }
 
-    /// One rating per physical core, keyed by package and core id, and whether the ratings
-    /// came from the kernel's capacities or the hybrid PMUs' lists rather than from nothing.
+    /// One rating per physical core, keyed by package, cluster and core id, and whether the
+    /// ratings came from the kernel's capacities or the hybrid PMUs' lists rather than from
+    /// nothing.
     fn linux_core_ratings(
         cpus: &[LinuxCpu],
         performance_cpus: Option<&str>,
         efficiency_cpus: Option<&str>,
-    ) -> (BTreeMap<(u32, u32), u32>, bool) {
+    ) -> (BTreeMap<(u32, u32, u32), u32>, bool) {
         let has_capacity = cpus.iter().any(|cpu| cpu.capacity.is_some());
         let fast = performance_cpus.map(parse_cpu_list).unwrap_or_default();
         let slow = efficiency_cpus.map(parse_cpu_list).unwrap_or_default();
@@ -303,7 +315,7 @@ mod detect {
             } else {
                 0
             };
-            let best = cores.entry((cpu.package, cpu.core)).or_insert(0);
+            let best = cores.entry(cpu.core_key()).or_insert(0);
             *best = rating.max(*best);
         }
         (cores, has_capacity || hybrid)
@@ -452,18 +464,20 @@ mod os {
 
     /// The class of each logical CPU from the logical CPUs of each performance level; one
     /// level, the performance class, where the kernel reports no levels, as `topology`
-    /// does.
+    /// does. The counts are the boot's (`logicalcpu_max`), not the current power mode's
+    /// (`logicalcpu`): a CPU's number is fixed in `[0, hw.ncpu)`, and a CPU taken offline
+    /// would otherwise shift every number above it.
     pub(super) fn cpu_classes() -> BTreeMap<u32, CoreClass> {
         let levels = sysctl(c"hw.nperflevels").unwrap_or(1);
         let counts: Option<Vec<u32>> = if levels >= 2 {
             (0..levels)
                 .map(|level| {
-                    let name = format!("hw.perflevel{level}.logicalcpu\0");
+                    let name = format!("hw.perflevel{level}.logicalcpu_max\0");
                     sysctl(core::ffi::CStr::from_bytes_with_nul(name.as_bytes()).ok()?)
                 })
                 .collect()
         } else {
-            sysctl(c"hw.logicalcpu").map(|count| vec![count])
+            sysctl(c"hw.logicalcpu_max").map(|count| vec![count])
         };
         counts.map_or_else(BTreeMap::new, |counts| apple_cpu_classes(&counts))
     }
@@ -527,8 +541,9 @@ mod os {
             ) else {
                 continue;
             };
+            let cluster = read_u32(&path.join("topology/cluster_id")).unwrap_or(0);
             let capacity = read_u32(&path.join("cpu_capacity"));
-            cpus.push(LinuxCpu { cpu, package, core, capacity });
+            cpus.push(LinuxCpu { cpu, package, cluster, core, capacity });
         }
         Some(cpus)
     }
@@ -817,7 +832,13 @@ mod tests {
     /// `count` logical CPUs starting at `first`, `threads` per core.
     fn cpus(first: u32, count: u32, threads: u32, capacity: Option<u32>) -> Vec<LinuxCpu> {
         (first..first + count)
-            .map(|cpu| LinuxCpu { cpu, package: 0, core: cpu / threads * threads, capacity })
+            .map(|cpu| LinuxCpu {
+                cpu,
+                package: 0,
+                cluster: 0,
+                core: cpu / threads * threads,
+                capacity,
+            })
             .collect()
     }
 
@@ -892,6 +913,30 @@ mod tests {
         assert!(linux_cpu_classes(&intel, None, None).is_empty());
         assert!(linux_cpu_classes(&intel, Some("0-15"), None).is_empty());
         assert!(linux_cpu_classes(&[], None, None).is_empty());
+    }
+
+    #[test]
+    fn linux_device_tree_clusters_restart_core_ids() {
+        use CoreClass::{Efficiency, Performance};
+
+        // Device-tree arm64 (drivers/base/arch_topology.c): every CPU in package 0, and
+        // `core_id` restarting at 0 in each cluster. Four little cores in cluster 0, four
+        // big ones in cluster 1.
+        let mut cpus: Vec<LinuxCpu> = (0..4)
+            .map(|cpu| LinuxCpu { cpu, package: 0, cluster: 0, core: cpu, capacity: Some(446) })
+            .collect();
+        cpus.extend((4..8).map(|cpu| LinuxCpu {
+            cpu,
+            package: 0,
+            cluster: 1,
+            core: cpu - 4,
+            capacity: Some(1024),
+        }));
+        assert_eq!(
+            linux_cpu_classes(&cpus, None, None),
+            spans(&[(0, 3, Efficiency), (4, 7, Performance)])
+        );
+        assert_eq!(linux_topology(&cpus, None, None), Some(topology(4, 4)));
     }
 
     #[test]

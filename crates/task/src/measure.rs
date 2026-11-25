@@ -14,8 +14,9 @@ use crate::platform::{self, CoreClass};
 /// tell. For measurement: the thread may move to another core as soon as the call returns.
 ///
 /// - macOS: the CPU number from `pthread_cpu_number_np`, read against the logical CPUs of
-///   each performance level (`hw.perflevel<n>.logicalcpu`). Level 0 is the performance
-///   class and every other level the efficiency class, as [`CoreTopology`] counts them.
+///   each performance level at boot (`hw.perflevel<n>.logicalcpu_max`). Level 0 is the
+///   performance class and every other level the efficiency class, as [`CoreTopology`]
+///   counts them.
 ///   macOS documents no map from a CPU number to its level: the call assumes that the
 ///   numbering runs from the slowest level up, efficiency cores first, as the device tree of
 ///   Apple silicon reports it (`README.md`, "Measurement calls").
@@ -42,7 +43,15 @@ pub fn current_core_class() -> Option<CoreClass> {
     classes.get(&platform::current_cpu()?).copied()
 }
 
-/// The task role of the process, as [`take_foreground_task_role`] found it.
+/// The task role of the process, as [`take_foreground_task_role`] found it, and what it
+/// grants.
+///
+/// `priority` is the scheduled priority (`pth_priority` of `THREAD_EXTENDED_INFO`) of a
+/// thread started after the request in [`ThreadClass::FrameCritical`], user-interactive QoS:
+/// 47 where the foreground role holds, 31 in `TASK_UNSPECIFIED`, lower under a clamp.
+/// `None` where the thread could not take its class or the query failed.
+///
+/// [`ThreadClass::FrameCritical`]: lactose_core::ThreadClass::FrameCritical
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskRole {
     /// The target has no task roles: every target but macOS. Nothing was asked.
@@ -50,10 +59,13 @@ pub enum TaskRole {
     /// The role macOS reports after the request.
     Reported {
         /// A `task_role_t` of `<mach/task_policy.h>`: 1, `TASK_FOREGROUND_APPLICATION`,
-        /// where the request was honoured.
+        /// where the request was accepted. This is the role as requested: a clamp on the
+        /// process (`taskpolicy -b` or `-c`, a launchd background job) does not show in it.
         role: i32,
         /// The request's `kern_return_t`: 0 where it was accepted.
         request: i32,
+        /// What the role grants, as [`TaskRole`] describes it.
+        priority: Option<i32>,
     },
     /// macOS reported no role.
     Unreported {
@@ -61,11 +73,14 @@ pub enum TaskRole {
         request: i32,
         /// The query's `kern_return_t`.
         query: i32,
+        /// What the role grants, as [`TaskRole`] describes it.
+        priority: Option<i32>,
     },
 }
 
 impl TaskRole {
-    /// Whether the process is in the foreground-application role.
+    /// Whether the role reads back as the foreground-application role: whether the request
+    /// was recorded, not what it granted, which `priority` shows.
     #[must_use]
     pub fn is_foreground(self) -> bool {
         matches!(self, Self::Reported { role: FOREGROUND_APPLICATION, .. })
@@ -81,7 +96,7 @@ impl fmt::Display for TaskRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::NotApplicable => formatter.write_str("not applicable"),
-            Self::Reported { role, request } => {
+            Self::Reported { role, request, priority } => {
                 let name = match role {
                     -1 => "TASK_RENICED",
                     0 => "TASK_UNSPECIFIED",
@@ -95,28 +110,38 @@ impl fmt::Display for TaskRole {
                     8 => "TASK_DARWINBG_APPLICATION",
                     9 => "TASK_USER_INIT_APPLICATION",
                     _ => {
-                        return write!(
-                            formatter,
-                            "role {role} (set returned {request}, get returned 0)"
-                        );
+                        write!(formatter, "role {role} (set returned {request}, get returned 0)")?;
+                        return write_priority(formatter, priority);
                     }
                 };
-                write!(formatter, "{name} (set returned {request}, get returned 0)")
+                write!(formatter, "{name} (set returned {request}, get returned 0)")?;
+                write_priority(formatter, priority)
             }
-            Self::Unreported { request, query } => {
-                write!(formatter, "unknown (set returned {request}, get returned {query})")
+            Self::Unreported { request, query, priority } => {
+                write!(formatter, "unknown (set returned {request}, get returned {query})")?;
+                write_priority(formatter, priority)
             }
         }
     }
 }
 
+fn write_priority(formatter: &mut fmt::Formatter<'_>, priority: Option<i32>) -> fmt::Result {
+    match priority {
+        Some(priority) => write!(formatter, ", user-interactive priority {priority}"),
+        None => formatter.write_str(", user-interactive priority unknown"),
+    }
+}
+
 /// Asks for the task role of the frontmost application on macOS and returns the role the
-/// system then reports. For measurement: a cost test or a benchmark takes it once, before
-/// it times anything.
+/// system then reports, with the priority a user-interactive thread is then given. For
+/// measurement: a cost test or a benchmark takes it once, before it times anything, and
+/// records both.
 ///
 /// A process started from a terminal is in `TASK_UNSPECIFIED`, where user-interactive QoS is
-/// clamped to priority 31; in the foreground role it runs at 47 (`docs/verification.md`,
-/// the task role). The role is the whole process's. It cannot be given back: macOS refuses
+/// clamped to priority 31 (`docs/verification.md`, the task role). The role read back is the
+/// request, which macOS accepts from a process under any clamp; the priority is what was
+/// granted, 47 where nothing clamps the process. The role is the whole process's. It cannot
+/// be given back: macOS refuses
 /// a request for `TASK_UNSPECIFIED`, so a case that needs that role runs in a process of its
 /// own (`README.md`, "Measurement calls"). Every other target has no task roles and returns
 /// [`TaskRole::NotApplicable`] without asking.
@@ -127,6 +152,8 @@ pub fn take_foreground_task_role() -> TaskRole {
 
 #[cfg(target_os = "macos")]
 mod os {
+    use lactose_core::ThreadClass;
+
     use super::{FOREGROUND_APPLICATION, TaskRole};
 
     /// `TASK_CATEGORY_POLICY`, whose policy is one `integer_t`, the role.
@@ -174,11 +201,38 @@ mod os {
             );
             (request, query)
         };
+        let priority = user_interactive_priority();
         if query == 0 && count == 1 {
-            TaskRole::Reported { role: current, request }
+            TaskRole::Reported { role: current, request, priority }
         } else {
-            TaskRole::Unreported { request, query }
+            TaskRole::Unreported { request, query, priority }
         }
+    }
+
+    /// The scheduled priority of a new thread in the frame-critical class, which the
+    /// process's role and any clamp on it decide.
+    pub(super) fn user_interactive_priority() -> Option<i32> {
+        std::thread::spawn(|| {
+            ThreadClass::FrameCritical.enter().ok()?;
+            let mut info = libc::thread_extended_info::default();
+            let mut count = libc::THREAD_EXTENDED_INFO_COUNT;
+            // SAFETY: `pthread_mach_thread_np` returns the calling thread's port without
+            // adding a reference, live while the thread runs. `thread_info` writes at most
+            // `count` integers through `info`, a live `thread_extended_info` of that size,
+            // and the new count through `count`.
+            let status = unsafe {
+                libc::thread_info(
+                    libc::pthread_mach_thread_np(libc::pthread_self()),
+                    libc::THREAD_EXTENDED_INFO as libc::thread_flavor_t,
+                    (&raw mut info).cast(),
+                    &raw mut count,
+                )
+            };
+            (status == 0).then_some(info.pth_priority)
+        })
+        .join()
+        .ok()
+        .flatten()
     }
 }
 
@@ -197,26 +251,38 @@ mod tests {
 
     #[test]
     fn a_role_is_recorded_by_its_name_and_the_calls_results() {
-        let foreground = TaskRole::Reported { role: 1, request: 0 };
+        let foreground = TaskRole::Reported { role: 1, request: 0, priority: Some(47) };
         assert!(foreground.is_foreground());
         assert_eq!(
             foreground.to_string(),
-            "TASK_FOREGROUND_APPLICATION (set returned 0, get returned 0)"
+            "TASK_FOREGROUND_APPLICATION (set returned 0, get returned 0), user-interactive \
+             priority 47"
         );
-        let refused = TaskRole::Reported { role: 0, request: 4 };
+        // A clamped process reads back the role it asked for; the priority shows the clamp.
+        let clamped = TaskRole::Reported { role: 1, request: 0, priority: Some(4) };
+        assert!(clamped.is_foreground());
+        assert!(clamped.to_string().ends_with("user-interactive priority 4"), "{clamped}");
+        let refused = TaskRole::Reported { role: 0, request: 4, priority: Some(31) };
         assert!(!refused.is_foreground());
-        assert_eq!(refused.to_string(), "TASK_UNSPECIFIED (set returned 4, get returned 0)");
         assert_eq!(
-            TaskRole::Reported { role: 7, request: 0 }.to_string(),
-            "TASK_DEFAULT_APPLICATION (set returned 0, get returned 0)"
+            refused.to_string(),
+            "TASK_UNSPECIFIED (set returned 4, get returned 0), user-interactive priority 31"
         );
         assert_eq!(
-            TaskRole::Reported { role: 42, request: 0 }.to_string(),
-            "role 42 (set returned 0, get returned 0)"
+            TaskRole::Reported { role: 7, request: 0, priority: None }.to_string(),
+            "TASK_DEFAULT_APPLICATION (set returned 0, get returned 0), user-interactive \
+             priority unknown"
         );
-        let unreported = TaskRole::Unreported { request: 0, query: 5 };
+        assert_eq!(
+            TaskRole::Reported { role: 42, request: 0, priority: Some(46) }.to_string(),
+            "role 42 (set returned 0, get returned 0), user-interactive priority 46"
+        );
+        let unreported = TaskRole::Unreported { request: 0, query: 5, priority: None };
         assert!(!unreported.is_foreground());
-        assert_eq!(unreported.to_string(), "unknown (set returned 0, get returned 5)");
+        assert_eq!(
+            unreported.to_string(),
+            "unknown (set returned 0, get returned 5), user-interactive priority unknown"
+        );
         assert!(!TaskRole::NotApplicable.is_foreground());
         assert_eq!(TaskRole::NotApplicable.to_string(), "not applicable");
     }
@@ -224,14 +290,28 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "asks the operating system for the task role")]
     fn the_foreground_role_is_taken_and_read_back() {
-        let role = take_foreground_task_role();
-        if cfg!(target_os = "macos") {
-            assert_eq!(role, TaskRole::Reported { role: 1, request: 0 }, "{role}");
+        #[cfg(target_os = "macos")]
+        {
+            // nextest runs each test in a process of its own, so this is the role the
+            // process started in.
+            let before = os::user_interactive_priority();
+            let role = take_foreground_task_role();
+            eprintln!("before the role: user-interactive priority {before:?}; after: {role}");
+            let TaskRole::Reported { role: 1, request: 0, priority: Some(priority) } = role else {
+                panic!("the foreground role was not read back with a priority: {role}");
+            };
+            // A clamp the process started under stays and is seen here, not in the role.
+            assert!(Some(priority) >= before, "{role}, {before:?} before it");
+            // From a terminal, `TASK_UNSPECIFIED` holds user-interactive QoS at 31; the role
+            // lifts it to the class's own priority.
+            if before == Some(31) {
+                assert_eq!(priority, 47, "{role}");
+            }
             // Taking it again changes nothing.
             assert_eq!(take_foreground_task_role(), role);
-        } else {
-            assert_eq!(role, TaskRole::NotApplicable);
         }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(take_foreground_task_role(), TaskRole::NotApplicable);
     }
 
     #[test]
@@ -333,10 +413,13 @@ mod tests {
         let tree = device_tree_classes(&String::from_utf8_lossy(&output.stdout));
         let classes = platform::cpu_classes();
         let levels = classes.values().any(|&class| class == CoreClass::Efficiency);
-        if tree.is_empty() || !levels {
-            eprintln!("one performance level or no cluster types; the numbering is not checked");
+        if !levels {
+            eprintln!("one performance level; the numbering is not checked");
             return;
         }
+        // With two levels the tree must parse: a change in ioreg's format fails here rather
+        // than turning the check off.
+        assert!(!tree.is_empty(), "two performance levels but no cluster types parsed");
         assert_eq!(classes, tree);
     }
 
