@@ -152,6 +152,8 @@ pub struct Watch {
     /// Whether a [`WatchedDevice`] refuses the next encoder of the present role, without
     /// asking null.
     pub fail_encoder: AtomicBool,
+    /// The encoders of the present role a [`WatchedDevice`] made.
+    pub encoders: AtomicUsize,
     /// The images a [`WatchedDevice`] made, and those it destroyed.
     pub made: Mutex<Vec<ImageHandle>>,
     pub destroyed: Mutex<Vec<ImageHandle>>,
@@ -436,7 +438,11 @@ impl Device for WatchedDevice {
         if queue == QueueRole::Present && self.watch.fail_encoder.swap(false, Ordering::AcqRel) {
             return Err(Error::new(ErrorKind::ResourceExhausted, "an encoder refused by the test"));
         }
-        self.inner.create_encoder(queue, label)
+        let made = self.inner.create_encoder(queue, label)?;
+        if queue == QueueRole::Present {
+            self.watch.encoders.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(made)
     }
 
     fn submit(&self, queue: QueueRole, submit: Submit<'_>) -> Result<()> {

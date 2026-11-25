@@ -123,8 +123,8 @@ pub(crate) struct FrameStamp {
 pub(crate) struct PresentStamp {
     /// Its start.
     pub began: Instant,
-    /// The time of its own waits: for its last read, the resize, and the encoder's drop,
-    /// which waits for the present's submit and so for the frame's GPU work and the blit.
+    /// The time of its own waits: for its last read, the resize, and, where the side holds
+    /// its bound of encoders, the oldest one's read. None waits for this present's submit.
     pub waits: Duration,
     /// The acquire's time.
     pub acquire: Duration,

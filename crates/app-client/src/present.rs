@@ -31,6 +31,14 @@ const PRESENT_WAIT: Duration = Duration::from_millis(100);
 /// takes slots from the third on (`README.md`, "Rules a caller should know").
 pub const HEAP: [HeapSlot; TARGETS] = [HeapSlot(0), HeapSlot(1)];
 
+/// How many present encoders the side holds, the bound at which a call waits, within
+/// `PRESENT_WAIT`, for the oldest one's read before it records. A present waits on the device
+/// for its frame's point; that frame, which drew the target the call before last named,
+/// waited for that call's read; and the renderer's two regions open a frame only once the
+/// point of the frame two submits before it is reached. So where every call presents, three
+/// reads at most are pending as a call begins, and the call's own encoder is the fourth.
+const ENCODERS: usize = 4;
+
 const NOTHING: PresentReport = PresentReport { read: None, shown: false, waiting: None };
 
 const LINEAR: SamplerDesc = SamplerDesc {
@@ -92,6 +100,79 @@ impl Waiting {
     }
 }
 
+/// The present encoders the side holds, each its own pool (`lactose-rhi-api`'s README,
+/// "Recording and submitting"), so that a call neither makes one nor drops one that is pending,
+/// whose drop waits for its submit and so for the frame's GPU work. [`ENCODERS`] at most.
+#[derive(Default)]
+struct Encoders {
+    /// Those given to a submit, each with the value its read signals, oldest first.
+    submitted: VecDeque<(u64, Box<dyn Encoder>)>,
+    /// One reset and not submitted since.
+    spare: Option<Box<dyn Encoder>>,
+}
+
+impl Encoders {
+    /// The read a call waits for before it takes an encoder: the oldest one's, where the
+    /// side holds its bound, none spare and none whose read is `reached` or less.
+    fn behind(&self, reached: u64) -> Option<u64> {
+        if self.spare.is_some() || self.submitted.len() < ENCODERS {
+            return None;
+        }
+        self.submitted.front().map(|&(read, _)| read).filter(|&read| read > reached)
+    }
+
+    /// An encoder to record into: the spare; else the oldest submitted, reset, where its
+    /// read is `reached` or less or the side holds its bound; else a new one.
+    ///
+    /// # Errors
+    ///
+    /// The device's; the reset's, which keeps the encoder it refused: refused as pending
+    /// (`Rule::Pending`) where the oldest one's read is not reached.
+    fn take(&mut self, device: &dyn Device, reached: u64) -> Result<Box<dyn Encoder>> {
+        if let Some(encoder) = self.spare.take() {
+            return Ok(encoder);
+        }
+        let reuse = self.submitted.len() >= ENCODERS
+            || self.submitted.front().is_some_and(|&(read, _)| read <= reached);
+        if reuse && let Some((read, mut encoder)) = self.submitted.pop_front() {
+            return match encoder.reset() {
+                Ok(()) => Ok(encoder),
+                Err(error) => {
+                    self.submitted.push_front((read, encoder));
+                    Err(error)
+                }
+            };
+        }
+        device.create_encoder(QueueRole::Present, "present")
+    }
+
+    /// `encoder`, taken by a present whose submit signals `read`.
+    fn submitted(&mut self, read: u64, encoder: Box<dyn Encoder>) {
+        self.submitted.push_back((read, encoder));
+    }
+
+    /// `encoder`, back from a present that failed, which submitted nothing unless the device
+    /// is lost (`Swapchain::present`): reset at once and kept spare. Kept behind `read` where
+    /// the reset is refused as pending, as only a submit made would be; dropped where the
+    /// reset fails otherwise, which leaves nothing of it pending.
+    fn unsubmitted(&mut self, read: u64, mut encoder: Box<dyn Encoder>) {
+        match encoder.reset() {
+            Ok(()) => self.spare = Some(encoder),
+            Err(error) if Rule::of(&error) == Some(Rule::Pending) => self.submitted(read, encoder),
+            Err(_) => {}
+        }
+    }
+
+    /// Every encoder reset, which a lost device accepts, and dropped, so that no drop waits.
+    fn lost(&mut self) {
+        let spare = self.spare.take();
+        for (_, mut encoder) in self.submitted.drain(..).chain(spare.map(|spare| (0, spare))) {
+            // A lost device's encoders reset (`Encoder::reset`): nothing is left to fail.
+            let _ = encoder.reset();
+        }
+    }
+}
+
 /// The state of the present thread's lane: `Send` and not `Sync`, as the swapchain is.
 pub struct ClientPresent {
     device: Option<Arc<dyn Device>>,
@@ -116,6 +197,7 @@ pub struct ClientPresent {
     /// The image this side last put in each heap slot.
     slots: [Option<ImageHandle>; TARGETS],
     waiting: Waiting,
+    encoders: Encoders,
     times: Vec<DisplayTime>,
     /// Where a run takes stamps, the call's timings so far, and the image count last stamped.
     timed: Timed,
@@ -183,6 +265,7 @@ impl ClientPresent {
             acquired: None,
             slots: [None; TARGETS],
             waiting: Waiting::new(),
+            encoders: Encoders::default(),
             times: Vec::new(),
             timed: Timed::default(),
             images: None,
@@ -197,7 +280,7 @@ impl ClientPresent {
     ) -> Result<PresentReport> {
         // The count is taken as the call begins, before its waits and its acquire.
         let source = swapchain.display_times(&mut self.times);
-        let reached = device.timeline_value(self.reads)?;
+        let mut reached = device.timeline_value(self.reads)?;
         let waiting = self.waiting.take(source, &self.times, reached);
         if stamps::on() {
             self.timed.times = source;
@@ -210,10 +293,11 @@ impl ClientPresent {
         if self.stale || self.asked != Some(finished.extent) {
             // The caller's wait before a resize is for its own points (rhi-api, "The
             // swapchain"). A timeout or a refusal as pending is the next call's to retry.
-            if let Some(last) = self.last
-                && !timed(&mut self.timed.waits, || device.wait_timeline(last, PRESENT_WAIT))?
-            {
-                return Ok(nothing);
+            if let Some(last) = self.last {
+                if !timed(&mut self.timed.waits, || device.wait_timeline(last, PRESENT_WAIT))? {
+                    return Ok(nothing);
+                }
+                reached = last.value;
             }
             match timed(&mut self.timed.waits, || swapchain.resize(finished.extent)) {
                 Ok(()) => {}
@@ -237,13 +321,23 @@ impl ClientPresent {
         // changed and came back, the frame between dropped or torn.
         let slot = finished.target.index();
         if self.slots[slot] != Some(finished.image) {
-            if let Some(last) = self.last
-                && !timed(&mut self.timed.waits, || device.wait_timeline(last, PRESENT_WAIT))?
-            {
-                return Ok(nothing);
+            if let Some(last) = self.last {
+                if !timed(&mut self.timed.waits, || device.wait_timeline(last, PRESENT_WAIT))? {
+                    return Ok(nothing);
+                }
+                reached = last.value;
             }
             device.write_heap_slot(HEAP[slot], finished.image)?;
             self.slots[slot] = Some(finished.image);
+        }
+        // At its bound the side waits for its oldest present's read before the acquire, so
+        // that no image is held through the wait.
+        if let Some(value) = self.encoders.behind(reached) {
+            let oldest = TimelinePoint { timeline: self.reads, value };
+            if !timed(&mut self.timed.waits, || device.wait_timeline(oldest, PRESENT_WAIT))? {
+                return Ok(nothing);
+            }
+            reached = value;
         }
         let image = match self.acquired.take() {
             Some(image) => image,
@@ -258,8 +352,9 @@ impl ClientPresent {
         };
         let extent = swapchain.extent();
         let (pipeline, sampler) = (self.pipeline, self.sampler);
+        let encoders = &mut self.encoders;
         let recorded = timed(&mut self.timed.record, || {
-            let mut encoder = device.create_encoder(QueueRole::Present, "present")?;
+            let mut encoder = encoders.take(&**device, reached)?;
             // The acquire half of the hand-off the frame's submit released, with equal
             // values; where one queue serves both roles it is the whole change (graph,
             // "Imports").
@@ -287,8 +382,10 @@ impl ClientPresent {
         if let Some(at) = self.timed.driver_at {
             self.timed.driver = at.elapsed();
         }
+        let [encoder] = encoders;
         let report = match presented {
             Ok(presented) => {
+                self.encoders.submitted(read.value, encoder);
                 self.next += 1;
                 self.last = Some(read);
                 self.stale = presented == Presented::Stale;
@@ -310,14 +407,15 @@ impl ClientPresent {
             // already knows. A refusal as pending is the next call's to retry; any other
             // fails the frame.
             Err(error) => {
+                self.encoders.unsubmitted(read.value, encoder);
                 self.keep_unless_lost(image, &error);
                 if Rule::of(&error) == Some(Rule::Pending) { Ok(nothing) } else { Err(error) }
             }
         };
-        // The encoder's drop waits for its submit, which waits for the frame's point: the
-        // call's wait for the frame's GPU work and the blit (`lactose-rhi-api`'s README,
-        // "Behaviour the signatures cannot express").
-        timed(&mut self.timed.waits, move || drop(encoders));
+        // The encoder is kept, not dropped: a pending encoder's drop waits for its submit,
+        // which waits for the frame's point (`lactose-rhi-api`'s README, "Handles and
+        // lifetimes"). So no wait of the call's is for this frame's GPU work or the blit; the
+        // one at the bound is for the read of the present `ENCODERS` calls before.
         report
     }
 
@@ -327,6 +425,13 @@ impl ClientPresent {
     fn keep_unless_lost(&mut self, image: ImageHandle, error: &Error) {
         if error.kind() != ErrorKind::DeviceLost {
             self.acquired = Some(image);
+        }
+    }
+
+    /// Lets the encoders go where `report` says the device is lost.
+    fn forget_if_lost(&mut self, report: &Result<PresentReport>) {
+        if report.as_ref().is_err_and(|error| error.kind() == ErrorKind::DeviceLost) {
+            self.encoders.lost();
         }
     }
 }
@@ -384,6 +489,7 @@ impl PresentSide for ClientPresent {
         };
         let Some(began) = stamps::now() else {
             let report = self.call(&device, &mut *swapchain, finished);
+            self.forget_if_lost(&report);
             self.swapchain = Some(swapchain);
             return report;
         };
@@ -391,6 +497,7 @@ impl PresentSide for ClientPresent {
         let point = finished.point.value;
         let report = self.call(&device, &mut *swapchain, finished);
         let returned = Instant::now();
+        self.forget_if_lost(&report);
         let Timed { waits, acquire, record, driver, driver_at, id, times } = self.timed;
         let (waiting, shown) = report.as_ref().map_or((None, false), |r| (r.waiting, r.shown));
         stamps::stamp(Stamp::Present(PresentStamp {
@@ -436,7 +543,10 @@ impl PresentSide for ClientPresent {
                 warn("a heap slot's clear", &error);
             }
         }
-        // The swapchain's drop waits for the submits that use its images.
+        // Then the encoders: past the bound a pending one's drop waits for its submit, as a
+        // call's did before it kept them (`README.md`, `ClientPresent`), and on a lost device
+        // for nothing. The swapchain's drop waits for the submits that use its images.
+        drop(core::mem::take(&mut self.encoders));
         drop(self.swapchain.take());
         if let Err(error) = device.destroy_graphics_pipeline(self.pipeline) {
             warn("the present pipeline's destroy", &error);
