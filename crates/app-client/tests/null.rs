@@ -25,7 +25,7 @@ use lactose_rhi_api::{Capabilities, Extent, QueueLayout, SwapchainDesc};
 use lactose_rhi_null::Control;
 use lactose_task::{ExecutionLog, Executor};
 
-use crate::support::{Said, bounded, lock, null_device, null_shaders};
+use crate::support::{Said, Watch, Watched, bounded, lock, null_device, null_shaders};
 
 const E1: Extent = Extent { width: 64, height: 48 };
 const E2: Extent = Extent { width: 80, height: 40 };
@@ -46,16 +46,28 @@ pub struct Run {
 
 impl Run {
     pub fn new(capabilities: Capabilities, workers: Workers, world: WorldConfig) -> Self {
+        Self::watched(capabilities, workers, world, false).0
+    }
+
+    /// A run whose swapchain is [`Watched`], answering every second acquire with no image
+    /// where `skip` is set.
+    pub fn watched(
+        capabilities: Capabilities,
+        workers: Workers,
+        world: WorldConfig,
+        skip: bool,
+    ) -> (Self, Arc<Watch>) {
         let executor = start_executor(workers).expect("an executor");
         let (device, control, said) = null_device(capabilities);
         let platform = Arc::clone(executor.platform());
         // As the binary makes it, beside the device, at the window's first size.
-        let swapchain =
-            device.create_swapchain(&SwapchainDesc { extent: E1 }).expect("a swapchain");
+        let inner = device.create_swapchain(&SwapchainDesc { extent: E1 }).expect("a swapchain");
+        let watch = Arc::new(Watch::default());
+        let swapchain = Box::new(Watched { inner, watch: Arc::clone(&watch), skip });
         let shaders = null_shaders();
         let Wired { shown, present, frames, input } =
             wire(&executor, &*platform, &device, swapchain, &shaders, world, None).expect("wired");
-        Self {
+        let run = Self {
             executor,
             control,
             said,
@@ -65,7 +77,8 @@ impl Run {
             input,
             start: Instant::now(),
             steps: 0,
-        }
+        };
+        (run, watch)
     }
 
     pub fn shown(&self) -> &Shown {
@@ -207,6 +220,33 @@ fn each_layout_steps_e1_e2_e1_through_stalled_presents_and_refuses_nothing() {
             lock(&run.said.texts)
         );
         assert!(run.stop().is_none(), "no chaos, no log");
+    }
+}
+
+/// On each layout, with every second present call making no submit, its acquire answered
+/// with no image: the extent E1, hidden, E2 and E1 again, then more frames at E1. A target
+/// whose call made no submit was released toward the present role, on two queues, with no
+/// acquire to meet it, and the frame that draws it next takes it back from `Undefined`
+/// (D160's item 7 (c), verification row 230): null refuses nothing and says nothing. Every
+/// frame but the hidden one draws; whether it is queued, held or dropped is the present
+/// thread's pace and not asserted.
+#[test]
+fn each_layout_takes_back_the_targets_of_present_calls_that_made_no_submit() {
+    for (layout, capabilities) in layouts() {
+        let (mut run, watch) = Run::watched(capabilities, workers(), WorldConfig::shown(), true);
+        let extents = [Some(E1), Some(E1), None, Some(E2), Some(E2), Some(E1), Some(E1)];
+        let mut seen: Vec<_> = extents.into_iter().map(|extent| name(&run.step(extent))).collect();
+        seen.extend((0..8).map(|_| name(&run.step(Some(E1)))));
+        assert_eq!(seen[2], "hidden", "{layout}: {seen:?}");
+        let drew = seen.iter().filter(|name| ["drawn", "held", "dropped"].contains(name)).count();
+        assert_eq!(drew, seen.len() - 1, "{layout}: {seen:?}");
+        let said = run.said.count.load(Ordering::Relaxed);
+        assert_eq!(said, 0, "{layout}: {:?}", lock(&run.said.texts));
+        assert!(run.stop().is_none(), "no chaos, no log");
+        // The stop awaited every call; a call whose acquire was skipped made no submit.
+        let skipped = watch.skipped.load(Ordering::Relaxed);
+        assert!(skipped >= 3, "{layout}: {skipped} calls made no submit");
+        assert_eq!(*lock(&watch.resizes), [E1, E2, E1], "{layout}");
     }
 }
 

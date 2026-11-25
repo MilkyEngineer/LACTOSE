@@ -12,10 +12,12 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use lactose_app_client::CookedShaders;
+use lactose_core::Result;
 use lactose_rhi_api::{
-    Capabilities, ConstantSlot, ConstantType, CookedShader, Device, DeviceRequest, HEAP_SET,
-    HEAP_SLOTS_DEFAULT, HeapArray, HeapArrayKind, HeapForm, HeapUse, Message, MessageSink,
-    SAMPLERS_DEFAULT, ShaderStage, ShaderTarget,
+    Acquired, Capabilities, ConstantSlot, ConstantType, CookedShader, Device, DeviceRequest,
+    DisplayTime, Extent, Format, HEAP_SET, HEAP_SLOTS_DEFAULT, HeapArray, HeapArrayKind, HeapForm,
+    HeapUse, ImageHandle, Message, MessageSink, PresentId, Presented, SAMPLERS_DEFAULT,
+    ShaderStage, ShaderTarget, Submit, Swapchain,
 };
 use lactose_rhi_null::{Control, NullDevice, NullSurface};
 use lactose_task::Executor;
@@ -107,6 +109,65 @@ pub fn null_shaders() -> CookedShaders {
         fragment: null_shader(ShaderStage::Fragment, 0, Vec::new(), 1, None),
         present_vertex: null_shader(ShaderStage::Vertex, 16, Vec::new(), 0, None),
         present_fragment: null_shader(ShaderStage::Fragment, 16, Vec::new(), 1, Some(heap)),
+    }
+}
+
+/// What a [`Watched`] swapchain was asked.
+#[derive(Default)]
+pub struct Watch {
+    /// Each resize, in order.
+    pub resizes: Mutex<Vec<Extent>>,
+    /// The acquires asked of it.
+    pub acquires: AtomicUsize,
+    /// Those it answered with no image itself, without asking null.
+    pub skipped: AtomicUsize,
+}
+
+/// Null's swapchain, watched: each resize written down and, with `skip`, every second
+/// acquire answered `Acquired::None`, so that every second present call makes no submit and
+/// its target's release toward the present role meets no acquire.
+pub struct Watched {
+    pub inner: Box<dyn Swapchain>,
+    pub watch: Arc<Watch>,
+    pub skip: bool,
+}
+
+impl Swapchain for Watched {
+    fn format(&self) -> Format {
+        self.inner.format()
+    }
+
+    fn extent(&self) -> Extent {
+        self.inner.extent()
+    }
+
+    fn image_count(&self) -> u32 {
+        self.inner.image_count()
+    }
+
+    fn acquire(&mut self) -> Result<Acquired> {
+        if self.watch.acquires.fetch_add(1, Ordering::Relaxed) % 2 == 1 && self.skip {
+            self.watch.skipped.fetch_add(1, Ordering::Relaxed);
+            return Ok(Acquired::None);
+        }
+        self.inner.acquire()
+    }
+
+    fn present(&mut self, image: ImageHandle, submit: Submit<'_>) -> Result<Presented> {
+        self.inner.present(image, submit)
+    }
+
+    fn resize(&mut self, extent: Extent) -> Result<()> {
+        lock(&self.watch.resizes).push(extent);
+        self.inner.resize(extent)
+    }
+
+    fn last_present(&self) -> Option<PresentId> {
+        self.inner.last_present()
+    }
+
+    fn display_times(&mut self, into: &mut Vec<DisplayTime>) -> bool {
+        self.inner.display_times(into)
     }
 }
 

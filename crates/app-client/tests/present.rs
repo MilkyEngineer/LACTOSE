@@ -3,64 +3,22 @@
 //! frame's extent and at no other call, and a heap slot rewritten for each new image, so that
 //! an image replaced in its slot is destroyed once the read of its successor is reached.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 
 use lactose_app::{Finished, PresentSide, TargetIndex};
 use lactose_app_client::{ClientPresent, TARGET_FORMAT};
-use lactose_core::Result;
 use lactose_rhi_api::{
-    Acquired, Capabilities, ColourAttachment, Device, DisplayTime, Encoder, Extent, Format,
-    ImageDesc, ImageHandle, ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage, Load,
-    PassReach, PresentId, Presented, QueueLayout, QueueRole, RenderPass, Sharing, StateOn, Store,
-    Submit, Swapchain, SwapchainDesc, Target, TimelineHandle, TimelinePoint,
+    Capabilities, ColourAttachment, Device, Encoder, Extent, ImageDesc, ImageHandle, ImageMemory,
+    ImageRange, ImageState, ImageTransition, ImageUsage, Load, PassReach, QueueLayout, QueueRole,
+    RenderPass, Sharing, StateOn, Store, Submit, SwapchainDesc, Target, TimelineHandle,
+    TimelinePoint,
 };
 
-use crate::support::{WAIT_BOUND, lock, null_device, null_shaders};
+use crate::support::{WAIT_BOUND, Watch, Watched, lock, null_device, null_shaders};
 
 const E1: Extent = Extent { width: 64, height: 48 };
 const E2: Extent = Extent { width: 80, height: 40 };
-
-/// Null's swapchain, with each resize it is asked for written down.
-struct Resizes {
-    inner: Box<dyn Swapchain>,
-    asked: Arc<Mutex<Vec<Extent>>>,
-}
-
-impl Swapchain for Resizes {
-    fn format(&self) -> Format {
-        self.inner.format()
-    }
-
-    fn extent(&self) -> Extent {
-        self.inner.extent()
-    }
-
-    fn image_count(&self) -> u32 {
-        self.inner.image_count()
-    }
-
-    fn acquire(&mut self) -> Result<Acquired> {
-        self.inner.acquire()
-    }
-
-    fn present(&mut self, image: ImageHandle, submit: Submit<'_>) -> Result<Presented> {
-        self.inner.present(image, submit)
-    }
-
-    fn resize(&mut self, extent: Extent) -> Result<()> {
-        lock(&self.asked).push(extent);
-        self.inner.resize(extent)
-    }
-
-    fn last_present(&self) -> Option<PresentId> {
-        self.inner.last_present()
-    }
-
-    fn display_times(&mut self, into: &mut Vec<DisplayTime>) -> bool {
-        self.inner.display_times(into)
-    }
-}
 
 /// A target as a frame leaves it on one queue: made at `extent`, a colour attachment on
 /// the graphics role from a submit that signals the next value of `frames`.
@@ -124,9 +82,9 @@ fn drawn(
 fn the_present_side_resizes_at_each_change_of_extent_and_lets_each_replaced_image_go() {
     let (device, _control, said) =
         null_device(Capabilities { queues: QueueLayout::ONE, ..Capabilities::LEAST });
-    let asked = Arc::new(Mutex::new(Vec::new()));
+    let watch = Arc::new(Watch::default());
     let inner = device.create_swapchain(&SwapchainDesc { extent: E1 }).expect("a swapchain");
-    let swapchain = Box::new(Resizes { inner, asked: Arc::clone(&asked) });
+    let swapchain = Box::new(Watched { inner, watch: Arc::clone(&watch), skip: false });
     let mut present =
         ClientPresent::new(Arc::clone(&device), swapchain, &null_shaders()).expect("the side");
     let frames = device.create_timeline(0).expect("a timeline");
@@ -145,7 +103,7 @@ fn the_present_side_resizes_at_each_change_of_extent_and_lets_each_replaced_imag
                 .unwrap_or_else(|error| panic!("call {call}: the image it replaced: {error}"));
         }
     }
-    assert_eq!(*lock(&asked), [E1, E2, E1]);
+    assert_eq!(*lock(&watch.resizes), [E1, E2, E1]);
     assert_eq!(said.count.load(Ordering::Relaxed), 0, "{:?}", lock(&said.texts));
     present.close();
     for image in in_slots.into_iter().flatten() {
