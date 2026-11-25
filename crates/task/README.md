@@ -351,13 +351,25 @@ flavor, and returns what `task_policy_get` then reports, with what the role gran
 scheduled priority (`thread_info`, `THREAD_EXTENDED_INFO`, `pth_priority`) of a thread it then
 starts in the frame-critical class, user-interactive QoS. `TaskRole`'s `Display` is the role's
 name in `<mach/task_policy.h>`, the two calls' results and that priority, the text a result
-file records. The role read back is the request: macOS accepts it from a process under any
-clamp, so `is_foreground` holds under `taskpolicy -b` or `-c` and in a launchd background job
-alike, and only the priority shows what was granted. A process started from a terminal is in
+file records. The role read back is the request: macOS accepts it however the process was
+started, so `is_foreground` holds under `taskpolicy -b` or `-c` and in every launchd job alike,
+and only the priority shows what was granted. The record is the priority read back, whatever
+it is; there is no one value that means unclamped. A process started from a terminal is in
 `TASK_UNSPECIFIED`, where user-interactive QoS is clamped to priority 31. On the M1 under
-macOS 27.2 the priority after the request is 47 from a terminal (31 before it), 20 under
-`taskpolicy -c utility` and 4 under `taskpolicy -b` (20 and 4 before it too). Every other
-target has no task roles: the call asks nothing and returns `TaskRole::NotApplicable`.
+macOS 27.2, before the request and then after it:
+
+| Started by | Before | After |
+|---|---|---|
+| A terminal | 31 | 47 |
+| launchd, `ProcessType` `Interactive` | 37 | 37 |
+| launchd, no `ProcessType` or `Standard` | 20 | 20 |
+| launchd, `ProcessType` `Background` or `Adaptive` | 4 | 4 |
+| `taskpolicy -c utility` | 20 | 20 |
+| `taskpolicy -b` | 4 | 4 |
+
+A child process inherits the start it was given: cargo and nextest started by a launchd job read
+as that job does. Every other target has no task roles: the call asks nothing and returns
+`TaskRole::NotApplicable`.
 
 The role cannot be given back. On the Apple M1 under macOS 27.2 a request for
 `TASK_UNSPECIFIED` returns `KERN_INVALID_ARGUMENT` (4) and the role stays as it was;
@@ -561,16 +573,19 @@ Correctness:
   aborts the process, and that an unfollowable replay log does.
 - `src/measure.rs` holds the measurement calls: on macOS the foreground role taken and read
   back with the priority it grants, 47 where the process started at 31, never below the
-  priority before it, and again with no change; the class map against the device tree's (above) and against
-  the topology's counts; a class read on every call on four threads wherever the system reports
-  the cores' types; on a Mac with two levels, as many spinning user-interactive threads as CPUs
-  reading both classes between them, since macOS cannot pin and the performance cores alone
-  cannot hold them all; and on Linux and Windows a thread pinned to each CPU the process may
-  use in turn, where every reading is the same and is that CPU's. `src/platform.rs` holds the maps
-  built from hand-made input: Apple levels, Linux capacities and PMU lists (a device-tree arm64
-machine whose clusters restart their core ids among them), and Windows core
-  records with their group masks, on any host. The tests that call the system are ignored
-  under Miri.
+  priority before it, and again with no change; the class map against the device tree's
+  (above) and against the topology's counts; a class read on every call on four threads
+  wherever the system reports the cores' types; on a Mac with two levels, as many spinning
+  user-interactive threads as CPUs reading both classes between them, since macOS cannot pin
+  and the performance cores alone cannot hold them all; and on Linux and Windows a thread
+  pinned to each CPU the process may use in turn, where every reading is the same and is that
+  CPU's. `src/platform.rs` holds the maps built from hand-made input: Apple levels, Linux
+  capacities and PMU lists (and a device-tree arm64 machine where each cluster restarts its
+  core ids at 0), and Windows core records with their group masks, on any host; and the Linux
+  sysfs reader over a temporary tree, with and without `topology/cluster_id` and with an
+  offline CPU. The tests that call the system are ignored under Miri. CI's macOS leg runs the
+  role read-back and the class-map tests again with their output shown, so its log records
+  the priority before and after the request and the levels the runner reports.
 
 What the implementation relies on in its pinned dependencies:
 

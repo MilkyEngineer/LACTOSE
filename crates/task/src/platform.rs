@@ -72,6 +72,7 @@ pub(crate) fn default_background_workers(
 #[allow(dead_code, reason = "each operating system uses its own part; the tests use all of it")]
 mod detect {
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     use super::{CoreClass, CoreTopology};
 
@@ -220,7 +221,7 @@ mod detect {
     }
 
     /// One logical CPU as Linux sysfs describes it.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) struct LinuxCpu {
         pub(super) cpu: u32,
         /// `topology/physical_package_id`.
@@ -252,6 +253,37 @@ mod detect {
             }
         }
         cpus
+    }
+
+    /// Every online logical CPU under `root`, which sysfs puts at `/sys/devices/system/cpu`:
+    /// a `cpu<n>` directory each, with `topology/physical_package_id`, `topology/core_id`,
+    /// `topology/cluster_id` where the kernel has it, and `cpu_capacity` where it exports one.
+    /// `None` where `root` cannot be read.
+    pub(super) fn linux_cpus(root: &Path) -> Option<Vec<LinuxCpu>> {
+        fn read_u32(path: &Path) -> Option<u32> {
+            std::fs::read_to_string(path).ok()?.trim().parse().ok()
+        }
+        let mut cpus = Vec::new();
+        for entry in std::fs::read_dir(root).ok()?.flatten() {
+            let name = entry.file_name();
+            let Some(cpu) = name.to_str().and_then(|name| name.strip_prefix("cpu")?.parse().ok())
+            else {
+                continue;
+            };
+            let path = entry.path();
+            // An offline CPU has no topology directory.
+            let (Some(package), Some(core)) = (
+                read_u32(&path.join("topology/physical_package_id")),
+                read_u32(&path.join("topology/core_id")),
+            ) else {
+                continue;
+            };
+            // Absent before 5.16, and -1 where the kernel knows no cluster: one cluster.
+            let cluster = read_u32(&path.join("topology/cluster_id")).unwrap_or(0);
+            let capacity = read_u32(&path.join("cpu_capacity"));
+            cpus.push(LinuxCpu { cpu, package, cluster, core, capacity });
+        }
+        Some(cpus)
     }
 
     /// The topology of a Linux machine.
@@ -496,12 +528,11 @@ mod os {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use super::detect::{LinuxCpu, linux_cpu_classes, linux_topology};
+    use super::detect::{linux_cpu_classes, linux_cpus, linux_topology};
     use super::{CoreClass, CoreTopology};
 
-    fn read_u32(path: &Path) -> Option<u32> {
-        std::fs::read_to_string(path).ok()?.trim().parse().ok()
-    }
+    /// The directory sysfs describes each logical CPU in.
+    const CPU_ROOT: &str = "/sys/devices/system/cpu";
 
     /// The CPU list of a PMU, which Intel hybrid parts register for each core type.
     fn pmu_cpus(pmu: &str) -> Option<String> {
@@ -509,12 +540,12 @@ mod os {
     }
 
     pub(super) fn topology() -> Option<CoreTopology> {
-        let cpus = cpus()?;
+        let cpus = linux_cpus(Path::new(CPU_ROOT))?;
         linux_topology(&cpus, pmu_cpus("cpu_core").as_deref(), pmu_cpus("cpu_atom").as_deref())
     }
 
     pub(super) fn cpu_classes() -> BTreeMap<u32, CoreClass> {
-        let Some(cpus) = cpus() else { return BTreeMap::new() };
+        let Some(cpus) = linux_cpus(Path::new(CPU_ROOT)) else { return BTreeMap::new() };
         linux_cpu_classes(&cpus, pmu_cpus("cpu_core").as_deref(), pmu_cpus("cpu_atom").as_deref())
     }
 
@@ -522,30 +553,6 @@ mod os {
     pub(super) fn current_cpu() -> Option<u32> {
         // SAFETY: `sched_getcpu` takes nothing and returns the CPU or -1.
         u32::try_from(unsafe { libc::sched_getcpu() }).ok()
-    }
-
-    /// Every online logical CPU as sysfs describes it.
-    fn cpus() -> Option<Vec<LinuxCpu>> {
-        let mut cpus = Vec::new();
-        for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
-            let name = entry.file_name();
-            let Some(cpu) = name.to_str().and_then(|name| name.strip_prefix("cpu")?.parse().ok())
-            else {
-                continue;
-            };
-            let path = entry.path();
-            // An offline CPU has no topology directory.
-            let (Some(package), Some(core)) = (
-                read_u32(&path.join("topology/physical_package_id")),
-                read_u32(&path.join("topology/core_id")),
-            ) else {
-                continue;
-            };
-            let cluster = read_u32(&path.join("topology/cluster_id")).unwrap_or(0);
-            let capacity = read_u32(&path.join("cpu_capacity"));
-            cpus.push(LinuxCpu { cpu, package, cluster, core, capacity });
-        }
-        Some(cpus)
     }
 }
 
@@ -939,6 +946,99 @@ mod tests {
         assert_eq!(linux_topology(&cpus, None, None), Some(topology(4, 4)));
     }
 
+    /// Writes a sysfs CPU tree under a fresh temporary directory: each CPU's files as
+    /// `(cpu, [(relative path, contents)])`, plus the entries of the real directory that are
+    /// not CPUs.
+    fn sysfs_tree(name: &str, cpus: &[(u32, Vec<(&str, &str)>)]) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("lactose-task-sysfs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cpuidle")).unwrap();
+        std::fs::create_dir_all(root.join("cpufreq")).unwrap();
+        std::fs::write(root.join("online"), "0-7\n").unwrap();
+        for (cpu, files) in cpus {
+            let dir = root.join(format!("cpu{cpu}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (path, contents) in files {
+                let path = dir.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, contents).unwrap();
+            }
+        }
+        root
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "writes a directory tree")]
+    fn linux_sysfs_is_read_with_and_without_cluster_ids() {
+        use CoreClass::{Efficiency, Performance};
+
+        let read = |root: &std::path::Path| {
+            let mut cpus = super::detect::linux_cpus(root).unwrap();
+            cpus.sort_by_key(|cpu| cpu.cpu);
+            std::fs::remove_dir_all(root).unwrap();
+            cpus
+        };
+        let cpu = |cpu, package, cluster, core, capacity| LinuxCpu {
+            cpu,
+            package,
+            cluster,
+            core,
+            capacity,
+        };
+
+        // A current device-tree arm64 kernel: one package, core ids restarting in each
+        // cluster; an offline CPU with no topology; a CPU whose cluster the kernel does not
+        // know (-1) and that exports no capacity.
+        let values: Vec<String> = (0..8).map(|cpu: u32| (cpu % 4).to_string()).collect();
+        let mut tree: Vec<(u32, Vec<(&str, &str)>)> = (0..8)
+            .map(|cpu: u32| {
+                let little = cpu < 4;
+                (
+                    cpu,
+                    vec![
+                        ("topology/physical_package_id", "0\n"),
+                        ("topology/core_id", values[cpu as usize].as_str()),
+                        ("topology/cluster_id", if little { "0\n" } else { "1\n" }),
+                        ("cpu_capacity", if little { "446\n" } else { "1024\n" }),
+                    ],
+                )
+            })
+            .collect();
+        tree.push((8, vec![("cpu_capacity", "1024\n")]));
+        tree.push((
+            9,
+            vec![
+                ("topology/physical_package_id", "1"),
+                ("topology/core_id", "0"),
+                ("topology/cluster_id", "-1"),
+            ],
+        ));
+        let cpus = read(&sysfs_tree("clusters", &tree));
+        let mut expected: Vec<LinuxCpu> = (0..4).map(|n| cpu(n, 0, 0, n, Some(446))).collect();
+        expected.extend((4..8).map(|n| cpu(n, 0, 1, n - 4, Some(1024))));
+        expected.push(cpu(9, 1, 0, 0, None));
+        assert_eq!(cpus, expected);
+        let classes = linux_cpu_classes(&cpus[..8], None, None);
+        assert_eq!(classes, spans(&[(0, 3, Efficiency), (4, 7, Performance)]));
+
+        // A kernel before 5.16: no cluster ids, every core its own id within the package.
+        let tree: Vec<(u32, Vec<(&str, &str)>)> = (0..4)
+            .map(|cpu: u32| {
+                (
+                    cpu,
+                    vec![
+                        ("topology/physical_package_id", "0"),
+                        ("topology/core_id", values[cpu as usize].as_str()),
+                    ],
+                )
+            })
+            .collect();
+        let cpus = read(&sysfs_tree("no-clusters", &tree));
+        assert_eq!(cpus, (0..4).map(|n| cpu(n, 0, 0, n, None)).collect::<Vec<_>>());
+        assert!(super::detect::linux_cpus(std::path::Path::new("/nonexistent-sysfs")).is_none());
+    }
+
     #[test]
     fn apple_cpu_classes_number_the_slowest_level_first() {
         use CoreClass::{Efficiency, Performance};
@@ -961,6 +1061,10 @@ mod tests {
     #[cfg_attr(miri, ignore = "queries the operating system")]
     fn detected_topology_is_usable() {
         let topology = StdPlatform.topology();
+        // CI's macOS leg shows this line, so its log records what the runner reports.
+        eprintln!("{topology:?}, classes {:?}", cpu_classes());
+        #[cfg(target_vendor = "apple")]
+        eprintln!("hw.nperflevels {:?}", super::os::sysctl(c"hw.nperflevels"));
         assert!(topology.performance >= 1);
         // Apple Silicon has efficiency cores, but a virtual machine (the GitHub runner) may
         // present one performance level; the assertion follows what the kernel reports.

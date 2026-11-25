@@ -47,8 +47,11 @@ pub fn current_core_class() -> Option<CoreClass> {
 /// grants.
 ///
 /// `priority` is the scheduled priority (`pth_priority` of `THREAD_EXTENDED_INFO`) of a
-/// thread started after the request in [`ThreadClass::FrameCritical`], user-interactive QoS:
-/// 47 where the foreground role holds, 31 in `TASK_UNSPECIFIED`, lower under a clamp.
+/// thread started after the request in [`ThreadClass::FrameCritical`], user-interactive QoS.
+/// It is the record of what the run was granted, whatever it reads: it depends on how the
+/// process was started, not only on the role, and the readings measured on the M1 are in
+/// `README.md`, "Measurement calls" (47 from a terminal, 37 for a launchd job of
+/// `ProcessType` `Interactive`, 20 or 4 for other launchd jobs and under `taskpolicy`).
 /// `None` where the thread could not take its class or the query failed.
 ///
 /// [`ThreadClass::FrameCritical`]: lactose_core::ThreadClass::FrameCritical
@@ -139,10 +142,10 @@ fn write_priority(formatter: &mut fmt::Formatter<'_>, priority: Option<i32>) -> 
 ///
 /// A process started from a terminal is in `TASK_UNSPECIFIED`, where user-interactive QoS is
 /// clamped to priority 31 (`docs/verification.md`, the task role). The role read back is the
-/// request, which macOS accepts from a process under any clamp; the priority is what was
-/// granted, 47 where nothing clamps the process. The role is the whole process's. It cannot
-/// be given back: macOS refuses
-/// a request for `TASK_UNSPECIFIED`, so a case that needs that role runs in a process of its
+/// request, which macOS accepts however the process was started; the priority is what was
+/// granted, which the role raises from a terminal and not from every launchd job
+/// ([`TaskRole`]). The role is the whole process's. It cannot be given back: macOS refuses a
+/// request for `TASK_UNSPECIFIED`, so a case that needs that role runs in a process of its
 /// own (`README.md`, "Measurement calls"). Every other target has no task roles and returns
 /// [`TaskRole::NotApplicable`] without asking.
 #[must_use = "the role the system reports is the record of the run"]
