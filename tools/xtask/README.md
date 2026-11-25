@@ -596,6 +596,7 @@ standard error as it comes.
   figures and the criterion, and the measurement fails after writing it where the criterion
   is not met. It presents: the screen must be unlocked and the display awake. A host the
   layer's pin names nothing for (Windows) cannot run it.
+- `frame-pace` is not a test either (section "frame-pace" below).
 - `spike-net` runs the netcode spike's ten-minute replays one `cargo nextest run` at a time;
   each prints its report as one JSON object, whose values the files carry under
   `<scene>.<clock>.` (nested keys joined by dots, an array as its JSON text), with the
@@ -643,6 +644,55 @@ standard error as it comes.
 
 It loads the machine for minutes: under other agents' load, wrap it in `heavy`, and read its
 numbers as steering only. The numbers that prove a criterion come from a quiet machine.
+
+### frame-pace
+
+`frame-pace` is the milestone 2 plan's row of that name (D162): the client binary, built in
+release, paced by its timer root with `--stamps` (`crates/app-client/README.md`, "Stamps"),
+under the environment of the measurements on a device, no validator on, once under each of
+the host's drivers, each driver's files named for it. It presents: the screen must be
+unlocked and the display awake (`caffeinate -d` on macOS).
+
+- **The display's rate.** On macOS `tools/xtask/display/rate.swift` prints the main
+  display's mode's rate (`CGDisplayModeGetRefreshRate`), the display link's nominal period as
+  a rate, and `NSScreen.maximumFramesPerSecond`, the whole number MoltenVK reports as a
+  swapchain's refresh. The mode's rate is the one used, the link's where the mode reports 0;
+  the file names its source and the others beside it. Elsewhere it is unread, and the file
+  says so. `lactose-rhi-api`'s swapchain reports no refresh, so none is recorded from it.
+- **The runs.** A real-time run, 60 s (12 s under `--short`), which is both the plan's shown
+  run of ten seconds or more and its run of a minute at real time. Where any present call
+  found a source of display times, the floor run, 60 s (20 s short), at the time scale
+  `pace::floor_scale` gives: frames a thousandth slower than half the display's rate, from
+  the mode's rate or, where that is unread, from the refresh fitted to the real-time run's
+  display times. The scale is whole thousandths (`TimeScale`), rounded down: at 60 Hz the
+  plan's 0.4995 is 0.499, about 0.2% slower than half the rate, a sweep of the refresh in
+  about 8.3 s. A floor run that swept fewer than twice is recorded as no floor, nothing is
+  read against it, and it is run again (`floor_again`) at the scale from its own fitted
+  refresh. On Windows the real-time run is made again minimised (`--minimised`).
+- **The reading** (`src/pace.rs`). The refresh is fitted freely to the display times by least
+  squares against each time's refresh index, the window doubling from 32 periods so a guess
+  off by a part in a hundred keeps each time on its own refresh (`fit.*`). The sweeps are the
+  latches' phase against that refresh, unwrapped from one latch to the next. The grid test is
+  the P99 and greatest distance of the display times from their circular mean phase of the
+  mode's period (`grid.*`), and of the fitted one (`grid_fitted.*`). Each run's figures are
+  prefixed `real.`, `floor.`, `floor_again.` or `minimised.`: the `info` stamps; the frames'
+  lateness (the first tick's start against the deadline the root slept to), also by what the
+  frame before did (`lateness.after_*`), and `Shown::frame`'s time (`frame_call`); each
+  outcome's count (`joined.*`, `deferred.*`) and `behind`; `stats`; the record (job start to
+  `draw`'s return), its greatest width (`width.max`, and `width.at_frame_worker_count`, the
+  records as wide as the frame-critical workers), the longest closure (`longest_job`); the
+  submit, and on a shared queue the hold (`draw`'s return to the submit's entry); each present
+  call's waits, acquire, driver call and whole time, with P90; `waiting`'s greatest and the
+  share of calls that reported two or more; the image counts; the latch's age at the call's
+  return and at the display, an age below half the floor's median dropped and counted. Each
+  is P50, P99 and the greatest, in microseconds. Then the flag (`flag.waiting_stayed_low`)
+  and D162's four readings (`reading.*`), the lateness read against D144's 1 ms on Windows
+  and D156's 50 µs on macOS.
+- **What it cannot read.** Whether the window was occluded and whether another client was
+  drawing are not read; the header says so. A JOIN_MARGIN wait is not told apart from a join
+  that found the task resolved: the lateness is grouped by what the frame before took back or
+  deferred. The record's width is counted by thread, each frame-critical worker being one.
+  The stamps take a lock each while a run takes them.
 
 ## Slang
 

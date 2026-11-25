@@ -29,7 +29,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::vulkan;
+use crate::{pace, vulkan};
 
 /// The variable a test reads to cut its repetitions in a short run.
 pub const SHORT_VAR: &str = "LACTOSE_MEASURE_SHORT";
@@ -88,6 +88,11 @@ pub enum Run {
     /// own beside it, once under each of [`Options::drivers`], judged by decision 5.10's rule
     /// ([`vulkan::judge`]).
     Triangle,
+    /// `frame-pace`: the client binary's paced run with its stamps, in release, no validator
+    /// on, once under each of [`Options::drivers`]: at real time, then, where the swapchain
+    /// reports display times, the floor run, made again from the fitted refresh where it
+    /// swept fewer than twice, and on Windows the run again minimised ([`pace`]).
+    FramePace,
     /// The netcode spike's ten-minute replays (`REPLAYS`), ignored tests run in release one
     /// at a time, each of which prints its figures as one JSON object.
     SpikeReplays,
@@ -110,6 +115,7 @@ impl Run {
             Self::Test { .. }
                 | Self::Device { .. }
                 | Self::GpuCost { .. }
+                | Self::FramePace
                 | Self::SpikeReplays
                 | Self::TaskBench
         )
@@ -118,7 +124,10 @@ impl Run {
     /// Whether it needs a Vulkan device.
     #[must_use]
     pub const fn on_device(self) -> bool {
-        matches!(self, Self::Device { .. } | Self::GpuCost { .. } | Self::Triangle)
+        matches!(
+            self,
+            Self::Device { .. } | Self::GpuCost { .. } | Self::Triangle | Self::FramePace
+        )
     }
 
     /// The package, file and test of an ignored test, on a device or not.
@@ -154,7 +163,7 @@ const fn device(package: &'static str, file: &'static str, test: &'static str) -
 }
 
 /// Every measurement, in the order `--all` runs them.
-pub const MEASUREMENTS: [Measurement; 17] = [
+pub const MEASUREMENTS: [Measurement; 18] = [
     Measurement {
         name: "tick-100k",
         what: "Criterion 1: the median step of the 100k scene on one frame worker and on N, S and the projected eight-core tick",
@@ -276,6 +285,12 @@ pub const MEASUREMENTS: [Measurement; 17] = [
             file: "crates/app-client/tests/gpu.rs",
             test: "cost_of_draws_and_pipelines",
         },
+    },
+    Measurement {
+        name: "frame-pace",
+        what: "The client binary shown and paced by its timer root, each frame and each present call stamped: the lateness of each frame's first tick, the record, its width and longest job, the submit and the hold, the present call's parts, `waiting`, and the latch's age at the display against the floor swept across the refresh",
+        threshold: "none: recorded; the lateness read against D144's 1 ms on Windows and D156's 50 us on macOS, and D162's four readings (milestone 2 plan, section 4, row `frame-pace`)",
+        run: Run::FramePace,
     },
 ];
 
@@ -1204,6 +1219,7 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
                 run_gpu_cost(workspace, options, &machine, m, &out, &mut devices)
             }
             Run::Triangle => run_triangle(workspace, options, &machine, m, &out, &mut devices),
+            Run::FramePace => run_frame_pace(workspace, options, &machine, m, &out, &mut devices),
             Run::SpikeReplays => run_spike_replays(workspace, options, &machine, m, &out),
             Run::TaskBench => run_task_bench(workspace, options, &machine, &out),
             Run::Headless => run_headless(workspace, options, &machine, m, &out),
@@ -2152,6 +2168,289 @@ fn run_triangle(
     }
 }
 
+/// `frame-pace`'s real-time run and floor run, in seconds: a full run's, then a short
+/// run's. The real-time run is both the plan's shown run of ten seconds or more and its run
+/// of a minute or more at real time.
+const PACE_SECONDS: [(u32, u32); 2] = [(60, 60), (12, 20)];
+/// How long past its seconds a run of `frame-pace` may take: its device, its pipelines and
+/// its shutdown.
+const PACE_GRACE: Duration = Duration::from_secs(120);
+/// The Swift script that reads the main display's refresh rate on macOS.
+pub const DISPLAY_SCRIPT: &str = "tools/xtask/display/rate.swift";
+
+/// The display's refresh rate as `frame-pace` reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayRate {
+    /// The display mode's exact rate in hertz, where it is read.
+    pub hz: Option<f64>,
+    /// Where it came from, or why it is unread, with what the screen reports beside it.
+    pub source: String,
+}
+
+/// The rate in the display script's output: the display mode's where it is not zero, and
+/// the display link's nominal period where it is (a display of variable rate reports none);
+/// the screen's greatest frames a second, which MoltenVK reports as the swapchain's refresh,
+/// named beside it.
+#[must_use]
+pub fn display_rate_of(output: &str) -> DisplayRate {
+    let value = |name: &str| {
+        output.lines().find_map(|line| line.strip_prefix(name)?.trim().parse::<f64>().ok())
+    };
+    let screen = value("screen_fps ").map_or_else(
+        || "the screen's greatest frames a second unreported".to_owned(),
+        |fps| format!("the screen's greatest frames a second {fps}"),
+    );
+    match (value("mode_hz ").filter(|hz| *hz > 0.0), value("link_hz ").filter(|hz| *hz > 0.0)) {
+        (Some(hz), link) => DisplayRate {
+            hz: Some(hz),
+            source: format!(
+                "{hz:.6} Hz, the main display's mode (`CGDisplayModeGetRefreshRate`); {}; \
+                 {screen}",
+                link.map_or_else(
+                    || "the display link's nominal period unreported".to_owned(),
+                    |link| format!("the display link's nominal period {link:.6} Hz"),
+                ),
+            ),
+        },
+        (None, Some(hz)) => DisplayRate {
+            hz: Some(hz),
+            source: format!(
+                "{hz:.6} Hz, the display link's nominal period, the mode reporting no rate; \
+                 {screen}"
+            ),
+        },
+        (None, None) => DisplayRate {
+            hz: None,
+            source: format!("unread: neither the mode nor the display link gave a rate; {screen}"),
+        },
+    }
+}
+
+fn display_rate(root: &Path) -> DisplayRate {
+    if !cfg!(target_os = "macos") {
+        return DisplayRate {
+            hz: None,
+            source: "unread: `frame-pace` reads the display mode's rate on macOS alone".to_owned(),
+        };
+    }
+    let output =
+        Command::new("swift").current_dir(root).arg(DISPLAY_SCRIPT).stdin(Stdio::null()).output();
+    match output {
+        Ok(output) if output.status.success() => {
+            display_rate_of(&String::from_utf8_lossy(&output.stdout))
+        }
+        Ok(output) => DisplayRate {
+            hz: None,
+            source: format!("unread: {DISPLAY_SCRIPT} ended with {}", output.status),
+        },
+        Err(e) => DisplayRate { hz: None, source: format!("unread: cannot run swift: {e}") },
+    }
+}
+
+/// One run of the client binary for `frame-pace`.
+struct PaceRun<'a> {
+    binary: &'a Path,
+    device: &'a OnDevice,
+    machine: &'a Machine,
+    dir: &'a Path,
+    shaders: &'a Path,
+}
+
+impl PaceRun<'_> {
+    /// Runs the binary paced for `seconds` at `scale`, minimised or not, its stamps written
+    /// to `<label>.stamps`; returns them, the command as the header shows it and the run's
+    /// output, with the load before and after.
+    fn run(
+        &self,
+        root: &Path,
+        label: &str,
+        seconds: u32,
+        scale: Option<u32>,
+        minimised: bool,
+    ) -> Result<(pace::Stamps, String, String), String> {
+        let stamps = self.dir.join(format!("{label}.stamps"));
+        let mut args = vec![
+            "--shaders".to_owned(),
+            self.shaders.to_string_lossy().into_owned(),
+            "--cache".to_owned(),
+            self.dir.join("pipeline-cache.bin").to_string_lossy().into_owned(),
+            "--seconds".to_owned(),
+            seconds.to_string(),
+        ];
+        if let Some(scale) = scale {
+            args.extend(["--time-scale".to_owned(), scale.to_string()]);
+        }
+        if minimised {
+            args.push("--minimised".to_owned());
+        }
+        args.extend(["--stamps".to_owned(), stamps.to_string_lossy().into_owned()]);
+        let mut command = Command::new(self.binary);
+        self.device.run.apply(&mut command).args(&args).current_dir(self.dir).stdin(Stdio::null());
+        pass_workers(&mut command, self.machine);
+        eprintln!("measure: frame-pace's {label} run, {seconds} s");
+        let before = uptime();
+        let ended =
+            vulkan::run_bounded(&mut command, Duration::from_secs(seconds.into()) + PACE_GRACE)
+                .map_err(|e| format!("cannot run {}: {e}", self.binary.display()))?;
+        let after = uptime();
+        let shown: Vec<String> = args.iter().map(|arg| shown_path(root, Path::new(arg))).collect();
+        let ran = shell_line(&[], &format!("target/release/{CLIENT}"), &shown);
+        let output = format!(
+            "{label}: `{ran}`, load {before} before, {after} after\n{}",
+            vulkan::output(CLIENT, &ended)
+        );
+        if !ended.succeeded {
+            return Err(format!("the {label} run ended with {}:\n{output}", ended.status));
+        }
+        let stamps = pace::Stamps::parse(&read_file(&stamps)?)?;
+        Ok((stamps, ran, output))
+    }
+}
+
+fn run_frame_pace(
+    workspace: &Workspace,
+    options: &Options,
+    machine: &Machine,
+    m: &'static Measurement,
+    out: &Path,
+    devices: &mut Devices,
+) -> Result<Vec<PathBuf>, String> {
+    let shaders = devices.shaders(workspace)?;
+    let args: Vec<String> = ["build", "--locked", "--release", "-p", CLIENT, "--bin", CLIENT]
+        .map(str::to_owned)
+        .to_vec();
+    build(workspace, &args)?;
+    let binary = workspace
+        .target_dir
+        .join("release")
+        .join(format!("{CLIENT}{}", std::env::consts::EXE_SUFFIX));
+    let rate = display_rate(&workspace.root);
+    let mode_period = rate.hz.map(|hz| 1e9 / hz);
+    let (real_seconds, floor_seconds) = PACE_SECONDS[usize::from(options.short)];
+    let lateness = if cfg!(windows) {
+        Some(1_000_000)
+    } else if cfg!(target_os = "macos") {
+        Some(50_000)
+    } else {
+        None
+    };
+    let mut written = Vec::new();
+    for driver in options.drivers() {
+        let device = devices.get(workspace, options, driver)?;
+        let dir = workspace.target_dir.join("measure").join("frame-pace").join(driver.name());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let runner = PaceRun { binary: &binary, device, machine, dir: &dir, shaders: &shaders };
+        let mut output = String::new();
+        let mut found = vec![("display.rate".to_owned(), rate.source.clone())];
+        let sampler = Sampler::start();
+        let (real, ran, said) = runner.run(&workspace.root, "real", real_seconds, None, false)?;
+        output.push_str(&said);
+        // The floor, where the swapchain reports display times: from the display mode's
+        // rate, or the refresh fitted to the real-time run's display times where it is
+        // unread; once more from the floor's own fit where it swept fewer than twice.
+        let (mut floor, mut refresh) = (None, mode_period);
+        if real.reports_display_times() {
+            let times = real.display_times();
+            let real_fit = pace::period_guess(&times).and_then(|guess| pace::fit(&times, guess));
+            if let Some(fitted) = real_fit {
+                found.push(("real.fit.hz".to_owned(), format!("{:.4}", 1e9 / fitted.period)));
+            }
+            let period = mode_period.or(real_fit.map(|fitted| fitted.period));
+            let tick = real.tick_period().ok_or("the stamps name no tick period")?;
+            if let Some(period) = period {
+                let scale = pace::floor_scale(1e9 / period, tick);
+                found.push(("floor.scale_thousandths".to_owned(), scale.to_string()));
+                let (stamps, _, said) =
+                    runner.run(&workspace.root, "floor", floor_seconds, Some(scale), false)?;
+                output.push_str(&said);
+                let first = pace::floor_figures("floor", &stamps, period, mode_period);
+                found.extend(first.figures);
+                floor = first.ages;
+                refresh = refresh.or(first.fit.map(|fitted| fitted.period));
+                if first.ages.is_none()
+                    && let Some(fitted) = first.fit
+                {
+                    // A scale equal to the first run's is run again all the same: the
+                    // thousandths are the finest step the flag takes.
+                    let again = pace::floor_scale(1e9 / fitted.period, tick);
+                    found.push(("floor_again.scale_thousandths".to_owned(), again.to_string()));
+                    let (stamps, _, said) = runner.run(
+                        &workspace.root,
+                        "floor_again",
+                        floor_seconds,
+                        Some(again),
+                        false,
+                    )?;
+                    output.push_str(&said);
+                    let again =
+                        pace::floor_figures("floor_again", &stamps, fitted.period, mode_period);
+                    found.extend(again.figures);
+                    floor = again.ages;
+                }
+            } else {
+                found.push((
+                    "floor".to_owned(),
+                    "not run: no rate is read and no refresh could be fitted".to_owned(),
+                ));
+            }
+        } else {
+            found.push((
+                "floor".to_owned(),
+                "not run: the swapchain reports no display times".to_owned(),
+            ));
+        }
+        let against = pace::Against { lateness, floor, refresh };
+        found.extend(pace::figures("real", &real, against));
+        if cfg!(windows) {
+            let (minimised, _, said) =
+                runner.run(&workspace.root, "minimised", real_seconds, None, true)?;
+            output.push_str(&said);
+            found.extend(pace::figures(
+                "minimised",
+                &minimised,
+                pace::Against { floor: None, ..against },
+            ));
+        }
+        let load = sampler.stop();
+        let mut header =
+            header(options, machine, m, "release", default_workers(machine), ran, load);
+        header.variant = Some(driver.name());
+        let adapter = output.lines().find_map(|line| {
+            let at = line.find("adapter: \"")? + "adapter: \"".len();
+            line[at..].split('"').next().map(str::to_owned)
+        });
+        header.notes.extend(device_notes(&device.setting, adapter.as_deref()));
+        for (name, value) in &mut header.notes {
+            if name == "Presentation" {
+                *value = format!(
+                    "a window, the present thread drawing each frame's offscreen target to the \
+                     swapchain's image, no validator on; the display's rate {}; whether the \
+                     window was occluded and whether another client was drawing are not read; \
+                     the display held awake by the caller",
+                    rate.source
+                );
+            }
+        }
+        header.notes.push((
+            "Runs".to_owned(),
+            format!(
+                "the real-time run of {real_seconds} s{}{}, each run's command and load in the \
+                 output below; every figure is the binary's own stamps, taken while a run asks \
+                 for them, each stamp one lock",
+                if floor.is_some() || found.iter().any(|(n, _)| n == "floor.floor") {
+                    format!(", the floor run of {floor_seconds} s")
+                } else {
+                    String::new()
+                },
+                if cfg!(windows) { ", and the minimised run" } else { "" },
+            ),
+        ));
+        written.extend(write(out, &header, &found, &output)?);
+    }
+    Ok(written)
+}
+
 /// A file's text.
 fn read_file(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
@@ -3079,13 +3378,25 @@ mod tests {
     /// The measure workflow's runners have no device: `--no-device` leaves those that need
     /// one out of `--all`, and refuses one named.
     #[test]
+    fn the_display_s_rate_is_the_mode_s_then_the_link_s() {
+        let both = display_rate_of("mode_hz 60.000000\nlink_hz 59.999832\nscreen_fps 60\n");
+        assert_eq!(both.hz, Some(60.0));
+        assert!(both.source.contains("mode") && both.source.contains("second 60"), "{both:?}");
+        let variable = display_rate_of("mode_hz 0.000000\nlink_hz 120.000000\n");
+        assert_eq!(variable.hz, Some(120.0));
+        assert!(variable.source.contains("display link") && variable.source.contains("unreported"));
+        assert_eq!(display_rate_of("screen_fps 60\n").hz, None);
+    }
+
+    #[test]
     fn the_arguments_select_the_device_and_leave_it_out() {
         let all = parse(&["--all", "--short", "--no-device"]).unwrap();
         let names: Vec<&str> = all.selected.iter().map(|m| m.name).collect();
         assert!(names.contains(&"record-stall") && names.contains(&"tick-100k"), "{names:?}");
         assert!(!names.contains(&"extract-50k") && !names.contains(&"remote-upload-5k"));
         assert!(!names.contains(&"gpu-cost") && !names.contains(&"triangle"), "{names:?}");
-        assert_eq!(all.selected.len() + 4, MEASUREMENTS.len());
+        assert!(!names.contains(&"frame-pace"), "{names:?}");
+        assert_eq!(all.selected.len() + 5, MEASUREMENTS.len());
         let error = parse(&["extract-50k", "--no-device"]).unwrap_err();
         assert!(error.contains("`extract-50k`"), "{error}");
         let named = parse(&["extract-50k", "--driver", "kosmickrisp", "--adapter", "Apple M1"]);
