@@ -431,7 +431,9 @@ and changes nothing the crate ships.
   `InterpolationReader::retried_reads` counts the reads so retried, each once however long
   it spun, by every reader since the split, for `remote-upload-5k`'s rate: added to only by
   a retried read, with no ordering; and `InterpolationReader::bytes` is the slots'
-  footprint, for the same file.
+  footprint, for the same file. Both retry paths, an odd first load and a reload that
+  moved, are counted by unit tests; the stress test holds the count to at most one a read,
+  and a writer racing one reader over 2,000,000 pushes to more than none.
 - `allocate` takes the most recently released slot, else the next never-used, at a new
   generation (never zero, wrapping past `u32::MAX` to one), empty; `ResourceExhausted` when
   every slot is allocated. `push(slot, state)` keeps the eight newest states by tick: a

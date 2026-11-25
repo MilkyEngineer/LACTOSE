@@ -258,6 +258,8 @@ fn every_sample_is_a_pushed_state(pushes: u64, reallocate_every: u64) {
         Arc::new((0..SLOTS).map(|_| AtomicU64::new(u64::MAX)).collect());
     let done = Arc::new(AtomicBool::new(false));
     let checked_samples = Arc::new(AtomicU64::new(0));
+    // Every slot read, whatever its sample: a read is counted retried once at most.
+    let reads = Arc::new(AtomicU64::new(0));
     // The writer starts once every reader runs, so a short run overlaps them too.
     let started = Arc::new(Barrier::new(READERS + 1));
     let readers: Vec<_> = (0..READERS)
@@ -266,6 +268,7 @@ fn every_sample_is_a_pushed_state(pushes: u64, reallocate_every: u64) {
             let published = Arc::clone(&published);
             let done = Arc::clone(&done);
             let checked_samples = Arc::clone(&checked_samples);
+            let reads = Arc::clone(&reads);
             let started = Arc::clone(&started);
             std::thread::spawn(move || {
                 started.wait();
@@ -310,6 +313,7 @@ fn every_sample_is_a_pushed_state(pushes: u64, reallocate_every: u64) {
                     }
                 }
                 checked_samples.fetch_add(count, Ordering::Relaxed);
+                reads.fetch_add(round * u64::from(SLOTS), Ordering::Relaxed);
                 (torn, interpolated)
             })
         })
@@ -338,6 +342,8 @@ fn every_sample_is_a_pushed_state(pushes: u64, reallocate_every: u64) {
     );
     assert_eq!(torn, 0, "samples that are no pushed state");
     assert_eq!(interpolated, 0, "samples at the newest or before the oldest are held");
+    let (reads, retried) = (reads.load(Ordering::Relaxed), reader.retried_reads());
+    assert!(retried <= reads, "{retried} retried reads of {reads} reads");
     assert!(samples > 0);
 }
 
@@ -355,4 +361,40 @@ fn every_sample_under_contention_is_a_pushed_state() {
 #[test]
 fn every_sample_under_contention_is_a_pushed_state_at_a_size_miri_runs() {
     every_sample_is_a_pushed_state(150, 37);
+}
+
+/// One writer pushing into one slot while one reader samples it: a read that a write
+/// overlaps is counted (review r1 of `measure-m2`, C5, whose probe read 1,789 retried reads
+/// at this size). Whether any read overlaps a write is the scheduler's; at 2,000,000
+/// pushes none has yet been seen to miss.
+#[test]
+#[cfg_attr(miri, ignore = "the hardware size")]
+fn a_contended_read_is_counted() {
+    let (mut writer, reader) = buffer(1);
+    let slot = writer.allocate().unwrap();
+    writer.push(slot, state(1, 1.0)).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(Barrier::new(2));
+    let sampler = {
+        let (reader, done, started) = (reader.clone(), Arc::clone(&done), Arc::clone(&started));
+        std::thread::spawn(move || {
+            started.wait();
+            let mut reads = 0_u64;
+            while !done.load(Ordering::Acquire) {
+                let _ = reader.sample(slot, at(u32::MAX >> 2, 0));
+                reads += 1;
+            }
+            reads
+        })
+    };
+    started.wait();
+    for tick in 2..2_000_002 {
+        writer.push(slot, state(tick, 1.0)).unwrap();
+    }
+    done.store(true, Ordering::Release);
+    let reads = sampler.join().unwrap();
+    let retried = reader.retried_reads();
+    println!("{retried} retried reads of {reads} reads");
+    assert!(retried > 0, "no retried read was counted in {reads} reads");
+    assert!(retried <= reads, "{retried} retried reads of {reads} reads");
 }

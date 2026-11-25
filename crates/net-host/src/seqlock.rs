@@ -334,10 +334,17 @@ mod tests {
     std::thread_local! {
         /// How many of this thread's next `Acquire` loads read an odd sequence.
         static ODD: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+        /// How many of this thread's next reads see a whole write begin and end between
+        /// their first load of the sequence and its reload.
+        static MOVED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+        /// The `Relaxed` 32-bit loads since this thread's last `Acquire` one.
+        static SINCE: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
     }
 
     /// The standard atomics, with a reader's first load seeing a write in progress as many
-    /// times as [`ODD`] says.
+    /// times as [`ODD`] says, and its reload seeing a write that began and ended since the
+    /// first load as many times as [`MOVED`] says. The reload is the third `Relaxed` 32-bit
+    /// load after the first, which is `Acquire`: the generation, the count, the sequence.
     struct Overlapped;
 
     impl Memory for Overlapped {
@@ -354,10 +361,21 @@ mod tests {
 
         fn load_u32(atomic: &AtomicU32, order: Ordering) -> u32 {
             let value = Native::load_u32(atomic, order);
-            let odd = ODD.get();
-            if order == Acquire && odd > 0 {
-                ODD.set(odd - 1);
-                return value | 1;
+            if order == Acquire {
+                SINCE.set(0);
+                let odd = ODD.get();
+                if odd > 0 {
+                    ODD.set(odd - 1);
+                    return value | 1;
+                }
+                return value;
+            }
+            let since = SINCE.get() + 1;
+            SINCE.set(since);
+            let moved = MOVED.get();
+            if since == 3 && moved > 0 {
+                MOVED.set(moved - 1);
+                return value.wrapping_add(2);
             }
             value
         }
@@ -393,5 +411,20 @@ mod tests {
         ODD.set(3);
         let (read, retries) = slot.read_counted();
         assert_eq!((read, retries), (clean, 3));
+    }
+
+    /// The other retry: a read whose reload of the sequence finds that a write began and
+    /// ended since its first load (review r1 of `measure-m2`, C5).
+    #[test]
+    fn a_read_counts_its_retries_by_the_reload() {
+        let slot = Slot::<Overlapped, 2, 2>::new();
+        slot.reset(1);
+        slot.push([2 << 32, 7]);
+        let (clean, retries) = slot.read_counted();
+        assert_eq!((clean.count, retries), (1, 0));
+        MOVED.set(2);
+        let (read, retries) = slot.read_counted();
+        assert_eq!((read, retries), (clean, 2));
+        assert_eq!(MOVED.get(), 0, "both reloads were taken");
     }
 }
