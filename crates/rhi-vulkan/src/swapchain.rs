@@ -147,7 +147,9 @@ impl Drop for Spent {
             // drop) or lost: every batch that waited for one of these has completed. Each
             // present that waited for a present semaphore is done, by its fence, which the
             // swapchain's drop waited for before it handed these over; nothing signals one
-            // again.
+            // again. Except after a loss, each acquire's signal of one was waited for by one
+            // of those batches: the drop hands these over only with no acquire semaphore left
+            // signalled.
             unsafe { self.raw.device.destroy_semaphore(semaphore, None) };
         }
     }
@@ -158,13 +160,12 @@ impl Drop for Spent {
 enum Use {
     /// Unsignalled, with no operation pending: an acquire may take it.
     Free,
-    /// An acquire signalled it, and no batch has waited for it yet.
+    /// An acquire signalled it, and no batch has waited for it yet: none was made, or the
+    /// batch that was to wait for it and the empty batch after it both failed. `spend` waits
+    /// for it before its driver swapchain is given up, and it is never destroyed unwaited.
     Signalled,
     /// The present queue's submit of this stamp waited for it.
     Waited(u64),
-    /// The batch that was to wait for it and the empty batch after it both failed: it is
-    /// never taken again, and is destroyed with the swapchain.
-    Abandoned,
 }
 
 /// The image an acquire returned, until its present is taken.
@@ -775,29 +776,45 @@ impl VulkanSwapchain {
         let info = vk::SubmitInfo2::default()
             .wait_semaphore_infos(&waits)
             .signal_semaphore_infos(&signals);
-        // SAFETY: the queue's lock is held (the caller's); the semaphore is signalled with no
-        // wait pending; the queue's own timeline grows by one.
-        let submitted =
-            unsafe { self.device().queue_submit2(target.queue, &[info], vk::Fence::null()) };
+        let submitted = if submit::injected() {
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        } else {
+            // SAFETY: the queue's lock is held (the caller's); the semaphore is signalled with
+            // no wait pending; the queue's own timeline grows by one.
+            unsafe { self.device().queue_submit2(target.queue, &[info], vk::Fence::null()) }
+        };
         self.shared.records().received(queue, seq, submitted.is_err());
         submitted.map(|()| seq).map_err(|e| self.failed(e, "vkQueueSubmit2"))
     }
 
-    /// Ends a held image's acquire: where no batch has waited for its semaphore, an empty
-    /// batch on the present queue waits for it, so that the semaphore is used again only
-    /// after that batch completes, and never where the batch failed. The image is forgotten,
-    /// acquired by a swapchain that is to be replaced or destroyed. The batch's stamp, where
-    /// one was made.
+    /// Ends a held image's acquire, and waits for every acquire semaphore no batch has waited
+    /// for, the held image's and any whose batches failed, each with an empty batch on the
+    /// present queue, so that a semaphore is used again or destroyed only after its batch
+    /// completes. The image is forgotten, acquired by a swapchain that is to be replaced or
+    /// destroyed. The last batch's stamp, where one was made; the first failure, where a
+    /// batch failed and left its semaphore signalled.
     fn spend(&mut self) -> Result<Option<u64>> {
-        let Some(held) = self.held.take() else { return Ok(None) };
-        let Some(at) = held.semaphore else { return Ok(None) };
+        self.held = None;
+        if self.pool.iter().all(|entry| entry.1 != Use::Signalled) {
+            return Ok(None);
+        }
         let _queue = lock(&self.shared.queues[self.queue]);
-        let spent = self.empty_batch(self.pool[at].0);
-        self.pool[at].1 = match spent {
-            Ok(seq) => Use::Waited(seq),
-            Err(_) => Use::Abandoned,
-        };
-        spent.map(Some)
+        let (mut last, mut failure) = (None, None);
+        for at in 0..self.pool.len() {
+            if self.pool[at].1 != Use::Signalled {
+                continue;
+            }
+            match self.empty_batch(self.pool[at].0) {
+                Ok(seq) => {
+                    self.pool[at].1 = Use::Waited(seq);
+                    last = Some(seq);
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(last), Err)
     }
 
     /// Waits, with no lock held, until `deadline` for a point a present's walk left
@@ -1076,13 +1093,13 @@ impl Swapchain for VulkanSwapchain {
             signal: Some(self.chain.present_semaphores[index]),
         };
         let (sent, spent) = submit::send(&shared, staged, &submit, binary);
-        if let Some(at) = held.semaphore {
-            self.pool[at].1 = if spent { Use::Waited(seq) } else { Use::Abandoned };
+        if spent && let Some(at) = held.semaphore {
+            self.pool[at].1 = Use::Waited(seq);
         }
         // The acquire's semaphore is spent, by the submit or the empty batch after its
-        // failure, or abandoned: the image stays acquired, and its next present waits for
-        // nothing.
-        self.held = Some(Held { semaphore: None, ..held });
+        // failure: the image stays acquired, and its next present waits for nothing. Where
+        // both failed, the semaphore stays signalled, and its next present waits for it.
+        self.held = Some(Held { semaphore: held.semaphore.filter(|_| !spent), ..held });
         if let Err(error) = sent {
             self.spare.push(fence);
             return Err(error);
@@ -1176,9 +1193,10 @@ impl Swapchain for VulkanSwapchain {
                  past the bound",
             ));
         }
-        // The batch that waits for a given-up acquire's semaphore holds the driver swapchain,
-        // which is retired below, as the drop's batches hold it; the semaphore stays the
-        // pool's.
+        // The batches that wait for the acquire semaphores no batch had waited for hold the
+        // driver swapchain, which is retired below, as the drop's batches hold it; the
+        // semaphores stay the pool's. Where one fails, the resize is refused here, before
+        // the driver swapchain whose acquire signalled that semaphore is given up.
         if let Some(seq) = self.spend()? {
             let spent = Spent {
                 raw: Arc::clone(&self.shared.raw),
@@ -1211,8 +1229,9 @@ impl Swapchain for VulkanSwapchain {
 
 impl VulkanSwapchain {
     /// The drop's wait, three bounds, for the presents' fences, which the presentation
-    /// engine signals; then a held image's acquire semaphore is spent by an empty batch,
-    /// which is not waited for. Whether the presents ended, or the device is lost.
+    /// engine signals; then every acquire semaphore no batch has waited for is spent by an
+    /// empty batch, which is not waited for. Whether the presents ended and each of those
+    /// batches was made, or the device is lost.
     fn finish(&mut self) -> bool {
         // A present is pending until its fence signals, which the presentation engine
         // gives within a few refreshes. No batch of the present queue is waited for: where
@@ -1221,8 +1240,8 @@ impl VulkanSwapchain {
         let deadline = Instant::now() + BOUND * 3;
         let pending = self.pending.clone();
         let shown = self.wait_fences(&pending, deadline).unwrap_or(false);
-        let _ = self.spend();
-        shown || self.shared.records().lost
+        let spent = self.spend().is_ok();
+        (shown && spent) || self.shared.records().lost
     }
 
     /// The drop's check while its thread unwinds a panic, which waits for nothing: whether
@@ -1242,7 +1261,7 @@ impl VulkanSwapchain {
     fn last_batch(&self) -> u64 {
         let waited = self.pool.iter().filter_map(|entry| match entry.1 {
             Use::Waited(seq) => Some(seq),
-            Use::Free | Use::Signalled | Use::Abandoned => None,
+            Use::Free | Use::Signalled => None,
         });
         waited.max().unwrap_or(0).max(self.chain.unsignalled)
     }
@@ -1259,7 +1278,8 @@ impl Drop for VulkanSwapchain {
         self.forget(&chain);
         if !done {
             // Something of the swapchain may still be in the presentation engine's or a
-            // queue's use: the device leaks with it, nothing of either destroyed under that
+            // queue's use, or an acquire's signal of a semaphore no batch has waited for may
+            // be pending: the device leaks with it, nothing of either destroyed under that
             // use, and the records keep the swapchain's mark, so that a later
             // `create_swapchain` is refused and never reaches the driver with the surface
             // in use.
@@ -1323,17 +1343,19 @@ mod tests {
     use ash::vk;
     use lactose_core::ErrorKind;
     use lactose_rhi_api::{
-        Acquired, BufferCopy, BufferDesc, BufferState, BufferTransition, BufferUsage, Device,
-        DeviceRequest, DisplayTime, Encoder, Extent, HEAP_SLOTS_DEFAULT, ImageHandle, ImageRange,
-        ImageState, ImageTransition, ImageUsage, MemoryClass, Message, MessageSink, PresentId,
-        Presented, QueueRole, Rule, SAMPLERS_DEFAULT, Sharing, StateOn, Submit, Swapchain,
-        TimelineHandle, TimelinePoint,
+        Acquired, BufferCopy, BufferDesc, BufferState, BufferTransition, BufferUsage,
+        ColourAttachment, Device, DeviceRequest, DisplayTime, Encoder, Extent, HEAP_SLOTS_DEFAULT,
+        ImageHandle, ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryClass,
+        Message, MessageSink, PassReach, PresentId, Presented, QueueRole, RenderPass, Rule,
+        SAMPLERS_DEFAULT, Sharing, StateOn, Store, Submit, Swapchain, Target, TimelineHandle,
+        TimelinePoint,
     };
 
     use super::{
         BOUND, DRAIN_MOST, Fail, HANDED, HISTORY, Timing, UNDECIDED, Use, VulkanSwapchain, empty,
         read_history, usage, widen,
     };
+    use crate::submit::FAILING;
     use crate::{VulkanDevice, lock};
 
     fn caps(current: (u32, u32), most: (u32, u32)) -> vk::SurfaceCapabilitiesKHR {
@@ -1621,6 +1643,39 @@ mod tests {
         kept.heard().into_iter().filter(|text| breach.iter().any(|b| text.contains(b))).collect()
     }
 
+    /// Waits on the host for an empty batch on the present queue that waits for the acquired
+    /// image's semaphore, so that a write of the image submitted after it, on any queue, is
+    /// ordered after the acquire. The image stays acquired, with no semaphore to wait for.
+    fn wait_for_acquire(swapchain: &mut VulkanSwapchain) {
+        let mut held = swapchain.held.expect("an acquired image");
+        let at = held.semaphore.take().expect("its acquire's semaphore");
+        let seq = {
+            let _queue = lock(&swapchain.shared.queues[swapchain.queue]);
+            swapchain.empty_batch(swapchain.pool[at].0).expect("the empty batch")
+        };
+        swapchain.pool[at].1 = Use::Waited(seq);
+        swapchain.held = Some(held);
+        let deadline = Instant::now() + BOUND * 5;
+        assert!(swapchain.wait_queue(seq, deadline).expect("the wait"), "the acquire's batch");
+    }
+
+    /// Clears `image`, in `ColourAttachment`, in a pass of its own.
+    fn clear(encoder: &mut dyn Encoder, image: ImageHandle) {
+        let colour = [ColourAttachment {
+            target: Target { image, mip: 0, layer: 0 },
+            load: Load::Clear([1.0, 0.5, 0.0, 1.0]),
+            store: Store::Store,
+            local_read: false,
+        }];
+        encoder.begin_render_pass(&RenderPass {
+            label: "clear",
+            colour: &colour,
+            depth: None,
+            reach: PassReach::NOTHING,
+        });
+        encoder.end_pass();
+    }
+
     /// An acquire that reuses the last acquire's semaphore while the batch that waits for it
     /// is held on the present queue, by a host point not yet signalled, is reported by the
     /// layer; the swapchain's own pool never does so, and the device tests' runs are silent.
@@ -1816,6 +1871,85 @@ mod tests {
         drop(next);
         drop(encoders);
         drop(busy);
+        drop(shared);
+        drop(device);
+        assert_eq!(breaches(&kept), Vec::<String>::new());
+    }
+
+    /// An acquire semaphore whose batches failed (out of host memory, injected) is left to a
+    /// later batch, never given up unwaited: after a present whose submit and the empty batch
+    /// after it both failed, the image stays acquired with its semaphore signalled, and the
+    /// image's next present waits for it; after a `resize` whose empty batch for an acquired
+    /// image failed, refused before it gives up the driver swapchain, the next `resize` waits
+    /// for it. The layer says nothing.
+    #[test]
+    #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+    fn an_acquire_semaphore_whose_batch_failed_is_waited_for_by_a_later_one() {
+        let test = "an_acquire_semaphore_whose_batch_failed_is_waited_for_by_a_later_one";
+        let kept = Arc::new(Kept::default());
+        let Some(device) = device(&kept, test) else { return };
+        let mut swapchain = VulkanSwapchain::new(device.shared(), SMALL).expect("a swapchain");
+        let first = image(&mut swapchain);
+        let at = swapchain.held.and_then(|held| held.semaphore).expect("the acquire's semaphore");
+        let mut failed = [presentable(&device, first)];
+        FAILING.set(2);
+        let submit = Submit { encoders: &mut failed, waits: &[], signals: &[] };
+        let error = swapchain.present(first, submit).expect_err("the injected failures");
+        assert_eq!(FAILING.get(), 0, "the present made fewer than two driver submits");
+        assert_eq!(error.kind(), ErrorKind::ResourceExhausted, "{error}");
+        assert_eq!(swapchain.pool[at].1, Use::Signalled, "after the present's failures");
+        let left = swapchain.held.and_then(|held| held.semaphore);
+        assert_eq!(left, Some(at), "the semaphore is not left to the next present");
+        let mut encoders = [presentable(&device, first)];
+        let submit = Submit { encoders: &mut encoders, waits: &[], signals: &[] };
+        assert_eq!(swapchain.present(first, submit).expect("the present"), Presented::Shown);
+        assert!(matches!(swapchain.pool[at].1, Use::Waited(_)), "{:?}", swapchain.pool[at].1);
+        // A later batch of the queue has signalled past the failed submit's stamp, which the
+        // failed encoder's drop waits for.
+        drop(failed);
+        let _second = image(&mut swapchain);
+        let at = swapchain.held.and_then(|held| held.semaphore).expect("the acquire's semaphore");
+        let before = swapchain.extent();
+        let wider = Extent { width: 96, height: 48 };
+        FAILING.set(1);
+        let error = swapchain.resize(wider).expect_err("the injected failure");
+        assert_eq!(FAILING.get(), 0, "the resize made no driver submit");
+        assert_eq!(error.kind(), ErrorKind::ResourceExhausted, "{error}");
+        assert_eq!(swapchain.pool[at].1, Use::Signalled, "after the resize's failure");
+        assert_eq!(swapchain.extent(), before, "the refused resize gave its driver swapchain up");
+        swapchain.resize(wider).expect("the later resize");
+        assert!(matches!(swapchain.pool[at].1, Use::Waited(_)), "{:?}", swapchain.pool[at].1);
+        assert_eq!(swapchain.extent(), wider);
+        let next = image(&mut swapchain);
+        let mut more = [presentable(&device, next)];
+        let submit = Submit { encoders: &mut more, waits: &[], signals: &[] };
+        assert_eq!(swapchain.present(next, submit).expect("a present"), Presented::Shown);
+        drop(swapchain);
+        drop(encoders);
+        drop(more);
+        drop(device);
+        assert_eq!(breaches(&kept), Vec::<String>::new());
+    }
+
+    /// A drop whose empty batch for the acquired image's semaphore fails (out of host memory,
+    /// injected) is left an acquire's signal no batch has waited for: it leaks the device, and
+    /// destroys nothing of the swapchain, rather than destroy that semaphore unwaited, and a
+    /// second swapchain is refused. The layer says nothing.
+    #[test]
+    #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+    fn a_drop_whose_batch_for_an_acquire_failed_leaks_the_device() {
+        let test = "a_drop_whose_batch_for_an_acquire_failed_leaks_the_device";
+        let kept = Arc::new(Kept::default());
+        let Some(device) = device(&kept, test) else { return };
+        let shared = Arc::clone(device.shared());
+        let mut swapchain = VulkanSwapchain::new(&shared, SMALL).expect("a swapchain");
+        let _held = image(&mut swapchain);
+        FAILING.set(1);
+        drop(swapchain);
+        assert_eq!(FAILING.get(), 0, "the drop made no driver submit");
+        assert!(shared.raw.leaking(), "the drop did not leak the device");
+        let again = VulkanSwapchain::new(&shared, SMALL).err().expect("a second swapchain");
+        assert_eq!(Rule::of(&again), Some(Rule::Swapchain), "{again}");
         drop(shared);
         drop(device);
         assert_eq!(breaches(&kept), Vec::<String>::new());
@@ -2080,5 +2214,68 @@ mod tests {
         drop(swapchain);
         drop(device);
         assert_eq!(breaches(&kept), Vec::<String>::new());
+    }
+
+    /// A graphics submit that writes the acquired image, held by a host point, is pending
+    /// while the swapchain is resized, or dropped and made again: the device keeps the
+    /// image's object, and with it the driver swapchain, until the point is signalled and the
+    /// submit is known complete, then lets both go, and the layer says nothing. The write is
+    /// submitted once the host has seen a batch that waits for the image's acquire complete,
+    /// which orders it after the acquire: nothing on the graphics queue waits for an acquire.
+    /// The Vulkan backend takes a swapchain image on a graphics encoder, which null alone
+    /// refuses (`present-queue`).
+    #[test]
+    #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+    fn a_frame_submit_pending_on_a_swapchain_image_keeps_it_past_a_resize_or_the_drop() {
+        let test = "a_frame_submit_pending_on_a_swapchain_image_keeps_it_past_a_resize_or_the_drop";
+        for by_drop in [false, true] {
+            let kept = Arc::new(Kept::default());
+            let Some(device) = device(&kept, test) else { return };
+            let shared = Arc::clone(device.shared());
+            let mut swapchain = VulkanSwapchain::new(&shared, SMALL).expect("a swapchain");
+            let held = image(&mut swapchain);
+            let owner = Arc::downgrade(swapchain.chain.owner.as_ref().expect("a driver swapchain"));
+            wait_for_acquire(&mut swapchain);
+            let gate = device.create_timeline(0).expect("a timeline");
+            let done = device.create_timeline(0).expect("a timeline");
+            let mut draw = device.create_encoder(G, "frame").expect("an encoder");
+            draw.transition_images(&[ImageTransition {
+                image: held,
+                range: ImageRange::FIRST,
+                from: StateOn { state: ImageState::Undefined, queue: G },
+                to: StateOn { state: ImageState::ColourAttachment, queue: G },
+            }]);
+            clear(&mut *draw, held);
+            let mut draws = [draw];
+            let (waits, signals) = ([at(gate, 1)], [at(done, 1)]);
+            let submit = Submit { encoders: &mut draws, waits: &waits, signals: &signals };
+            device.submit(G, submit).expect("the frame's submit");
+            let mut swapchain = if by_drop {
+                drop(swapchain);
+                VulkanSwapchain::new(&shared, SMALL).expect("a swapchain again")
+            } else {
+                swapchain.resize(Extent { width: 96, height: 48 }).expect("the resize");
+                swapchain
+            };
+            swapchain.reap_left();
+            let kept_images = lock(&shared.left).images.len();
+            assert_eq!(kept_images, 1, "by_drop {by_drop}: the image's object was not kept");
+            assert!(owner.upgrade().is_some(), "by_drop {by_drop}: the driver swapchain went");
+            device.signal_timeline(waits[0]).expect("the gate");
+            assert!(device.wait_timeline(signals[0], BOUND * 20).expect("the wait"), "the submit");
+            drop(draws);
+            swapchain.reap_left();
+            assert!(lock(&shared.left).images.is_empty(), "by_drop {by_drop}: still kept");
+            assert!(owner.upgrade().is_none(), "by_drop {by_drop}: the driver swapchain stayed");
+            let next = image(&mut swapchain);
+            let mut encoders = [presentable(&device, next)];
+            let submit = Submit { encoders: &mut encoders, waits: &[], signals: &[] };
+            assert_eq!(swapchain.present(next, submit).expect("a present"), Presented::Shown);
+            drop(swapchain);
+            drop(encoders);
+            drop(shared);
+            drop(device);
+            assert_eq!(kept.heard(), Vec::<String>::new(), "by_drop {by_drop}");
+        }
     }
 }

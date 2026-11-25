@@ -165,6 +165,24 @@ pub(crate) struct Binary {
     pub(crate) signal: Option<vk::Semaphore>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The driver submits this thread makes next that a unit test fails, out of host memory
+    /// with nothing submitted: a present's submit and the empty batch after it, and the
+    /// swapchain's empty batches (`injected`).
+    pub(crate) static FAILING: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Whether a unit test fails this driver submit (`FAILING`): never outside the unit tests.
+pub(crate) fn injected() -> bool {
+    #[cfg(test)]
+    if FAILING.get() > 0 {
+        FAILING.set(FAILING.get() - 1);
+        return true;
+    }
+    false
+}
+
 /// The checks of a submit to `queue` for `role`, under that queue's lock, which the caller
 /// holds, and its stamp; for a present (`walk`), its release walk first, and nothing is
 /// stamped where the walk leaves a point undecided.
@@ -251,6 +269,9 @@ pub(crate) fn send(
             .wait_semaphore_infos(&wait_infos)
             .command_buffer_infos(&buffers)
             .signal_semaphore_infos(&signal_infos);
+        if injected() {
+            return Err(driver(vk::Result::ERROR_OUT_OF_HOST_MEMORY, "vkQueueSubmit2"));
+        }
         // SAFETY: the queue's lock is held, which every submit to it takes; each command
         // buffer is executable and in no other pending submit (`Encoding`); every resource
         // and pipeline it names is held by its encoder and was live at the checks; every
@@ -272,9 +293,12 @@ pub(crate) fn send(
             let info = vk::SubmitInfo2::default()
                 .wait_semaphore_infos(&acquired)
                 .signal_semaphore_infos(&own);
-            // SAFETY: as above, with no command buffer and no caller's point.
-            let retried =
-                unsafe { raw.device.queue_submit2(target.queue, &[info], vk::Fence::null()) };
+            let retried = if injected() {
+                Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+            } else {
+                // SAFETY: as above, with no command buffer and no caller's point.
+                unsafe { raw.device.queue_submit2(target.queue, &[info], vk::Fence::null()) }
+            };
             if let Err(error) = retried {
                 spent = false;
                 shared.lost_on(error);
