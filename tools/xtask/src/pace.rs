@@ -1346,27 +1346,45 @@ mod tests {
         assert!(!reading.contains("-694"), "{reading}");
     }
 
-    /// The diff review's probe of the selection: on two queues, every submit begins 1.2 ms
-    /// before the driver call, its own cost 150 to 250 us, and 5 of 1,000 take 2 ms of their
-    /// own and so run on into the call. None began during it, so none is read as having
-    /// waited: a submit that ran into a call is chosen by its own length.
+    /// The diff reviews' probes of the selection, on both queue layouts. Every submit begins
+    /// 1.2 ms before the driver call, its own cost 150 to 250 us, and 5 of 1,000 take 2 ms of
+    /// their own and so run on into the call. None began during it, so none is read as having
+    /// waited: a submit that ran into a call is chosen by its own length. A call's span is
+    /// `[start, end)`: a submit entered exactly at its start is counted, one entered exactly
+    /// at its end, the queue's lock released, is not.
     #[test]
     fn a_submit_that_ran_into_a_driver_call_by_its_length_is_its_own_cost() {
-        let mut text = head(false, true);
-        for n in 0..1000u64 {
-            let at = n * 16_666_666;
-            let mut frame = apart(at);
-            let own = if n % 200 == 3 { 2_000_000 } else { 150_000 + (n % 101) * 1_000 };
-            frame.submit = (MS, MS + own);
-            frame.driver = (2 * MS + 200_000, 2 * MS + 788_000);
-            shot(&mut text, n, at, &frame);
+        const START: u64 = 2 * MS + 200_000;
+        const END: u64 = 2 * MS + 788_000;
+        let run = |shared: bool, submit: &dyn Fn(u64) -> (u64, u64)| {
+            let mut text = head(shared, true);
+            for n in 0..1000u64 {
+                let at = n * 16_666_666;
+                let mut frame = apart(at);
+                frame.submit = submit(n);
+                frame.driver = (START, END);
+                shot(&mut text, n, at, &frame);
+            }
+            figures("real", &Stamps::parse(&text).expect("the stamps"), Against::default())
+        };
+        let entered_at = |enter: u64| {
+            move |n: u64| if n % 200 == 7 { (enter, enter + 900_000) } else { (MS, MS + 200_000) }
+        };
+        for shared in [false, true] {
+            let figures = run(shared, &|n| {
+                let own = if n % 200 == 3 { 2_000_000 } else { 150_000 + (n % 101) * 1_000 };
+                (MS, MS + own)
+            });
+            assert_eq!(get(&figures, "real.submit.began_during_driver"), "0 of 1000");
+            assert_eq!(get(&figures, "real.submit.max_us"), "2000.0");
+            let reading = get(&figures, "real.reading.submit_against_driver");
+            assert!(reading.starts_with("recorded: no submit began during"), "{reading}");
+
+            let figures = run(shared, &entered_at(START));
+            assert_eq!(get(&figures, "real.submit.began_during_driver"), "5 of 1000", "{shared}");
+            let figures = run(shared, &entered_at(END));
+            assert_eq!(get(&figures, "real.submit.began_during_driver"), "0 of 1000", "{shared}");
         }
-        let figures =
-            figures("real", &Stamps::parse(&text).expect("the stamps"), Against::default());
-        assert_eq!(get(&figures, "real.submit.began_during_driver"), "0 of 1000");
-        assert_eq!(get(&figures, "real.submit.max_us"), "2000.0");
-        let reading = get(&figures, "real.reading.submit_against_driver");
-        assert!(reading.starts_with("recorded: no submit began during"), "{reading}");
     }
 
     /// The reviewers' probe of the lateness: one frame of 600 at 51 us is counted, and the
