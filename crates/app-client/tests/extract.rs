@@ -6,9 +6,10 @@
 //!
 //! The world is a server's: 100,000 rows with a `Transform` and a `MeshInstance` in four
 //! archetypes and sixteen regions, as milestone 1's cost scene is laid out: half carry a
-//! walker that a kernel moves one unit along x every tick, and one row in ten of each half
-//! carries `Shown`, an `extracted` component, so 10,000 presented rows go to the snapshot
-//! beside the ring (D157). Each frame is one tick, then `Simulation::run_passes` with
+//! walker that a kernel moves one unit along x every tick, and one row in twenty of each
+//! half carries `Shown`, an `extracted` component, so 5,000 presented rows go to the snapshot
+//! beside the ring (D157). Their keys alternate between the two presented archetypes, so no
+//! chunk order is key order, and every chunk holds rows of every region (D164). Each frame is one tick, then `Simulation::run_passes` with
 //! extract alone in the pass stage, timed, then the publication, `Renderer::prepare` and an
 //! empty submit that signals the frame's timeline value, so the ring's regions come free; a
 //! wait for a free region, before the pass, is outside the time and reported.
@@ -24,9 +25,12 @@
 //! in a short run) after a full pass. The pass is timed inside the bounded future, from its
 //! first poll to its end.
 //!
-//! The presented count, 10,000, is the measuring lane's choice: the plan asks for a stated
-//! count and names none. It stays until the milestone's planner names one, and the file
-//! says so beside the figure.
+//! The presented count, 5,000, is D164's: criterion 5's count. On null two arms are printed
+//! beside, on N workers, neither judged: the snapshot's part at 10,000 presented rows, laid
+//! out the same way, and its part of a pass that sorts, in which one presented row that does
+//! not walk is despawned and another spawned in its region before every tick, so the fill's
+//! kept places no longer hold (D164). Each part is the pass with the snapshot less the ring
+//! alone over the same world.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,7 +56,9 @@ use crate::timing::{Ender, Waits, figure, measured_workers, median, micros, shor
 
 const ROWS: u64 = 100_000;
 const MOVED: u64 = 50_000;
-const PRESENTED: u64 = 10_000;
+const PRESENTED: u64 = 5_000;
+/// The presented rows of the null arm printed beside the figure.
+const PRESENTED_BESIDE: u64 = 10_000;
 const REGIONS: u64 = 16;
 /// The ring's regions: the frame being written, and two submitted behind it.
 const RING_REGIONS: u32 = 3;
@@ -75,9 +81,15 @@ fn key(n: u64) -> StableKey {
     StableKey::Net(NetId::cooked(n))
 }
 
-/// The world, populated: rows `1..=ROWS`, the even ones walking, those at 1 and 2 modulo 20
-/// presented (half of them walking), in the regions by `n` modulo sixteen.
-fn world() -> Simulation {
+/// The period of the presented rows among `1..=ROWS`, for `presented` of them.
+const fn period(presented: u64) -> u64 {
+    2 * ROWS / presented
+}
+
+/// The world, populated: rows `1..=ROWS`, the even ones walking, `presented` of them carrying
+/// `Shown`, those at 1 and 2 modulo [`period`] (half of them walking), in the regions by `n`
+/// modulo sixteen.
+fn world(presented: u64) -> Simulation {
     let mut types = TypeTable::new();
     lactose_physics_api::register_types(&mut types).unwrap();
     lactose_present_api::register_types(&mut types).unwrap();
@@ -100,7 +112,7 @@ fn world() -> Simulation {
         let region = RegionId(1 + n % REGIONS);
         let mesh = MeshInstance::new(AssetRef::new(AssetId::from_bits(n)));
         let at = Transform::IDENTITY;
-        let shown = matches!(n % 20, 1 | 2);
+        let shown = matches!(n % period(presented), 1 | 2);
         let result = match (n % 2 == 0, shown) {
             (true, false) => world.spawn(key(n), region, (at, mesh, Walker(Scalar::ONE))),
             (true, true) => world.spawn(key(n), region, (at, mesh, Walker(Scalar::ONE), Shown(1))),
@@ -137,6 +149,9 @@ enum Into {
     Ring,
     /// The snapshot, beside a counting sink.
     Snapshot,
+    /// The ring and the snapshot, one presented row despawned and another spawned before
+    /// every timed tick: a pass that sorts.
+    Sorting,
 }
 
 /// A world and the renderer its passes write, frame by frame.
@@ -148,10 +163,15 @@ struct Rig {
     counted: Counting,
     reader: Option<SnapshotReader>,
     into: Into,
+    presented: u64,
+    /// The sorting arm's next row to despawn, a presented row that does not walk, and how
+    /// many rows it has spawned.
+    gone: u64,
+    spawned: u64,
 }
 
 impl Rig {
-    fn new(device: &Arc<dyn Device>) -> Self {
+    fn new(device: &Arc<dyn Device>, presented: u64) -> Self {
         // The first pass after a sink is installed is full: every row, and the notes.
         let desc = RendererDesc {
             instances: ROWS as u32,
@@ -162,13 +182,16 @@ impl Rig {
         let renderer = Renderer::new(Arc::clone(device), &desc).expect("a renderer");
         let ender = Ender::new(&**device);
         Self {
-            simulation: Some(world()),
+            simulation: Some(world(presented)),
             renderer,
             ender,
             waits: Waits::default(),
             counted: Counting::default(),
             reader: None,
             into: Into::Both,
+            presented,
+            gone: 1,
+            spawned: 0,
         }
     }
 
@@ -177,12 +200,12 @@ impl Rig {
         let simulation = self.simulation.as_mut().expect("between frames");
         let state = extract_state(simulation).expect("setup ran");
         let sink: Box<dyn InstanceSink> = match into {
-            Into::Both | Into::Ring => Box::new(self.renderer.sink()),
+            Into::Both | Into::Ring | Into::Sorting => Box::new(self.renderer.sink()),
             Into::Snapshot => Box::new(self.counted.clone()),
         };
         drop(state.set_sink(Some(sink)));
         self.reader = match into {
-            Into::Both | Into::Snapshot => {
+            Into::Both | Into::Snapshot | Into::Sorting => {
                 let (writer, reader) = snapshot_channel();
                 drop(state.set_snapshot(Some(writer)));
                 Some(reader)
@@ -231,7 +254,7 @@ impl Rig {
         };
         if let Some(reader) = &mut self.reader {
             let frame = reader.acquire().expect("a published snapshot");
-            assert_eq!(frame.newer().rows::<Shown>().len(), PRESENTED as usize);
+            assert_eq!(frame.newer().rows::<Shown>().len(), self.presented as usize);
         }
         (time, rows)
     }
@@ -243,18 +266,37 @@ impl Rig {
         assert!(full >= ROWS as usize, "the first pass after a sink is full: {full} rows");
         let times: Vec<Duration> = (0..passes)
             .map(|_| {
+                // The sorting arm's pass also writes the row it spawned, and once more, at
+                // the settling write, the one it spawned the frame before.
+                let spawned = if into == Into::Sorting { self.churn() } else { 0 };
                 let (time, rows) = self.frame(executor);
-                assert_eq!(rows, MOVED as usize, "a pass writes the rows that moved");
+                let moved = MOVED as usize + spawned;
+                assert_eq!(rows, moved, "a pass writes the rows that moved and were spawned");
                 time
             })
             .collect();
         median(times)
     }
+
+    /// Despawns a presented row that does not walk and spawns another in its region, before
+    /// a tick. Returns how many spawned rows the next pass writes.
+    fn churn(&mut self) -> usize {
+        let world = self.simulation.as_mut().expect("between frames").world_mut();
+        let gone = key(self.gone);
+        let region = world.region_of(gone).expect("a live presented row");
+        world.despawn(gone).unwrap();
+        self.spawned += 1;
+        let fresh = key(ROWS + self.spawned);
+        let mesh = MeshInstance::new(AssetRef::new(AssetId::from_bits(ROWS + self.spawned)));
+        world.spawn(fresh, region, (Transform::IDENTITY, mesh, Shown(1))).unwrap();
+        self.gone += period(self.presented);
+        1 + usize::from(self.spawned > 1)
+    }
 }
 
 /// Every figure of one ring, under `prefix`.
 fn measure(prefix: &str, device: &Arc<dyn Device>, n: u32, passes: usize) {
-    let mut rig = Rig::new(device);
+    let mut rig = Rig::new(device, PRESENTED);
     let executor = |workers| {
         start_executor(Workers { frame_workers: Some(workers), ..Workers::default() })
             .expect("an executor")
@@ -284,6 +326,31 @@ fn measure(prefix: &str, device: &Arc<dyn Device>, n: u32, passes: usize) {
     rig.waits.report(prefix);
 }
 
+/// The two arms printed beside the figure on N workers, neither judged (D164): the
+/// snapshot's part at [`PRESENTED_BESIDE`] presented rows, and at [`PRESENTED`] its part of a
+/// pass that sorts. Each part is the pass less the ring alone over the same world.
+fn beside(prefix: &str, device: &Arc<dyn Device>, n: u32, passes: usize) {
+    let executor = start_executor(Workers { frame_workers: Some(n), ..Workers::default() })
+        .expect("an executor");
+    let part = |with: Duration, ring: Duration| {
+        format!("{:.1}", (with.as_secs_f64() - ring.as_secs_f64()) * 1e6)
+    };
+    let mut wider = Rig::new(device, PRESENTED_BESIDE);
+    let both = wider.median(&executor, Into::Both, passes);
+    let ring = wider.median(&executor, Into::Ring, passes);
+    drop(wider);
+    figure(&format!("{prefix}.p{PRESENTED_BESIDE}.pass_us"), micros(both));
+    figure(&format!("{prefix}.p{PRESENTED_BESIDE}.ring_alone_us"), micros(ring));
+    figure(&format!("{prefix}.p{PRESENTED_BESIDE}.snapshot_part_us"), part(both, ring));
+    let mut churned = Rig::new(device, PRESENTED);
+    let ring = churned.median(&executor, Into::Ring, passes);
+    let sorting = churned.median(&executor, Into::Sorting, passes);
+    executor.shutdown();
+    figure(&format!("{prefix}.sorting.pass_us"), micros(sorting));
+    figure(&format!("{prefix}.sorting.ring_alone_us"), micros(ring));
+    figure(&format!("{prefix}.sorting.snapshot_part_us"), part(sorting, ring));
+}
+
 /// `cargo xtask measure extract-50k` runs it.
 #[test]
 #[ignore = "a measurement on a Vulkan device, run by `cargo xtask measure`: times are reported"]
@@ -296,12 +363,15 @@ fn cost_of_extract_at_50k_dirty_rows() {
     messages.assert_none();
     let (null, _, said) = null_device(Capabilities::LEAST);
     measure("null", &null, n, passes);
+    beside("null", &null, n, passes);
     assert_eq!(said.count.load(Ordering::Relaxed), 0, "null refused nothing");
     figure("workers", format!("1 and {n}"));
     figure("rows", ROWS);
     figure("moved", MOVED);
     figure("presented", PRESENTED);
-    figure("presented.chosen_by", "the measuring lane, pending the milestone's planner");
+    figure("presented.chosen_by", "D164");
+    figure("presented.beside", PRESENTED_BESIDE);
+    figure("beside.judged", "no: the null arms p10000 and sorting are printed, not judged");
     figure("archetypes", 4);
     figure("regions", REGIONS);
     figure("passes", passes);
