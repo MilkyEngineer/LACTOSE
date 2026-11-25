@@ -9,6 +9,10 @@ license.workspace = true
 autotests = false
 
 [dependencies]
+# Not used here: `parry3d-f64`'s `bitflags` with `std` named, as the window stack names it in a
+# binary that links a window, so that every feature root's boundary tree is alike (the root
+# Cargo.toml).
+bitflags.workspace = true
 # The plain-data byte images of the rows the bookkeeping keeps, in the snapshot.
 bytemuck.workspace = true
 lactose-core.workspace = true

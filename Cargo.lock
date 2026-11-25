@@ -995,6 +995,7 @@ dependencies = [
 name = "lactose-physics-rapier"
 version = "0.0.0"
 dependencies = [
+ "bitflags 2.13.2",
  "bytemuck",
  "lactose-asset-api",
  "lactose-bundle",

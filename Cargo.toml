@@ -49,6 +49,11 @@ lactose-rhi-vulkan = { path = "crates/rhi-vulkan" }
 # Third-party crates. Cargo.lock pins the exact versions; docs/verification.md lists the
 # claims that are re-checked against those versions.
 ash = { version = "=0.38.0", default-features = false, features = ["loaded", "debug", "std"] }
+# Pinned exactly, with `std` named: `lactose-physics-rapier` asks for it so that its boundary
+# tree is the same in every feature root. `parry3d-f64` builds it without `std`, and the window
+# stack (`objc2-app-kit` and `objc2-quartz-core` on macOS, `rustix` on Linux) turns `std` on in
+# any binary that links a window (`cargo xtask features`).
+bitflags = { version = "=2.13.2", default-features = false, features = ["std"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 crossbeam-deque = "0.8"
 # Pinned exactly: the main thread's queue, on which `lactose-rhi-vulkan` takes the layer it made
