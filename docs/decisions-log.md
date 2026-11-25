@@ -10766,3 +10766,74 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   runs in a recorded test; and section 22 records the exit and two readings of its criteria. Its two
   reviews (not checked in) found nothing blocking, 2 serious and 12 minor findings, all answered in
   the text applied.
+
+**D164. Criteria 4 and 5 of milestone 2 on the M1: the snapshot's fill sorts once and keeps its
+order, the cost scene presents 5,000 rows, and the remote upload is read on performance cores**
+(§2, §5.1, §5.3, §21, §22, `lactose-present-api`, `lactose-task`, `docs/plans/milestone-2.md`)
+- Why: lane `measure-m2`'s first runs on the M1 put both criteria over 1 ms, and their reviews
+  found one cause in the engine and one in the operating system. Extract's pass took a median of
+  1.72 ms on four workers, on the device and on null: 1.08 ms of it the snapshot's fill at 10,000
+  presented rows and 0.65 ms the ring at 50,000 dirty rows, 27 ns a row on one worker, inside
+  D21's 20 to 40. The remote upload's median was 0.39 ms in one run and 1.83 ms in the next with
+  the code unchanged.
+  - *A copy of the presented rows at every pass after a tick is D157's; the sorts are not.* D157
+    chose a whole state in three buffers and ruled out a snapshot of differences, so a pass that
+    follows a tick leaves its buffer whole. `present-impl`'s fill also builds a list of rows for
+    each column and sorts it, and sorts the keys again: 70 to 77% of its time at 10,000 rows in
+    the proposal's review, and little where the rows lie in key order, as in the scene of
+    verification row 192. The fill sorts the presented rows' places once, by key, and keeps the
+    sorted places for the next pass. A pass checks each place against its chunk's key as it copies
+    and sorts again only when a place no longer holds its key or the count of presented rows
+    changed. No public signature changes. The lane is `snapshot-order`.
+  - *A kept place is a hint, never a key.* It says where a row is, not what it holds: the columns
+    a row is copied from are read from its chunk at every pass, since a row can keep its chunk
+    and its row while its archetype changes. No byte of the snapshot depends on a place. The
+    buffer equals the one a fill that keeps nothing writes, and the lane's test holds that under
+    every layout mode SOUR runs. Section 8.2's rule on chunk and row indices stands.
+  - *The cost scene presents 5,000 rows, half of them moved, their keys interleaved across
+    chunks.* The count follows the diagnosis and not the figure: the fill that keeps its order
+    holds the criterion at 10,000 rows too, and the file prints its part there. 5,000 is criterion
+    5's count, the only count of presented rows a criterion of section 22 names, and of another
+    kind: a client's remote rows copy no transform. No document counts milestone 3's lights or
+    its characters, and its plan restates the count if its scene presents more. The layout is
+    stated because `present-impl`'s fill cost 2.6 times less where the keys lay in chunk order.
+  - *Criterion 4 keeps its 1 ms and its snapshot.* D162's join margin counts on the passes within
+    it, and the plan's decision 5.2 rules out a criterion read without the snapshot.
+  - *Criterion 5 is a cost, read on performance cores.* It is the share of a 144 Hz frame the
+    upload takes on the cores a frame's work runs on. The test's frame holds nothing else, 0.3 ms
+    of work every 6.9 ms, and macOS started it on an efficiency core at reduced clock in more than
+    half of a slow run's frames. The job took 0.32 to 0.34 ms on a performance core at full clock,
+    0.55 to 0.65 ms on one at reduced clock and 1.4 to 1.9 ms on an efficiency core at reduced
+    clock. The criterion reads the median of the frames whose job began and ended on a performance
+    core, at whatever clock, with their share of the run. The class is read from the system, so no
+    bound is chosen after the data; the time of a calibration chain cannot stand in for it, since
+    a performance core at reduced clock and an efficiency core read alike. The quiet window's run
+    is the one run. With under a tenth of its frames on performance cores it judges nothing.
+  - *The cost tests run in the foreground task role.* From a terminal a process has
+    `TASK_UNSPECIFIED`, where user-interactive QoS is clamped to priority 31 (verification row
+    78). `lactose-task` gives measurement two safe calls, the role and the class of the calling
+    thread's core, and section 21's entry says so. The lane is `measure-role`.
+  - *Section 2 says what the engine does, not what macOS grants.* "Frame-critical workers on
+    performance cores" was false of 804 to 1,106 of 1,440 jobs in the slow runs. The workers ask
+    by class, and where a frame's job starts is measured.
+  - *Where a frame runs is measured before the engine acts.* In a stand-in of the proposal's
+    review, plain threads and not the executor, a job in the foreground role after 3 ms of work
+    on three other threads began on a performance core in every frame of six runs; alone, or in
+    the unspecified role, it did not. A phase of `lactose-task`'s benchmark repeats the four cases
+    through the executor, in five interleaved rounds or more, before milestone 3 fixes a frame
+    budget on the M1 (verification).
+  - Rules out: criterion 4 read on the ring alone; a snapshot of differences, which D157 ruled out
+    and this keeps out; a row's columns kept beside its place; a run made again for where its
+    frames ran; a band whose bound is set after its data; a spin that holds the clock, which costs
+    a core at all times and did not hold the cores in the lane's review; the time-constraint
+    policy on the frame's workers, under which a thread that spins is demoted
+    (`docs/results/spike-wake-apple-m1-2026-10-06.md`); a work interval for the frame, which the
+    SDK gives to audio alone; a parallel workgroup before the placement rounds; a criterion
+    restated for the M1.
+- Driven by: lane `measure-m2`'s runs, and the three reports of their first review, `reviewer`'s,
+  `reviewer-concurrency`'s and `reviewer-gpu`'s; `docs/proposals/extract-and-upload-on-the-m1.md`
+  and the probes of its review; the owner's ruling.
+- Replaced: the 10,000 presented rows of `present-impl`'s cost test and that scene's key order
+  (verification row 192, the crate README's proof row "Cost"); in the plan's decision 5.3, the
+  median over all frames as the figure criterion 5 reads; section 2's "Frame-critical workers on
+  performance cores".
