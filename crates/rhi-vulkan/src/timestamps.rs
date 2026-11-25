@@ -6,6 +6,7 @@
 //! read back once its submit has completed.
 
 use core::any::Any;
+use core::time::Duration;
 use std::sync::Arc;
 
 use ash::vk;
@@ -42,10 +43,11 @@ impl Drop for QueryObj {
 /// nanoseconds of the GPU's clock. The queue keeps [`valid_bits`](Self::valid_bits) of each,
 /// and none where it writes no timestamps.
 ///
-/// Both M1 drivers latch a timestamp at a boundary of a Metal pass near its write rather
-/// than where the queue's order puts it, so only one layout was seen to bracket the work
-/// between two under both: the first written in an encoder of its own, submitted before the
-/// work's, and the second in the work's encoder after its last pass (the device test). And
+/// Both M1 drivers may latch a timestamp at a boundary of a Metal pass near its write rather
+/// than where the queue's order puts it. The layout the device test holds to a lagging
+/// dispatch and a lagging render pass under both is each of the two in an encoder submitted
+/// alone, the work's submit between them, each submit waiting on the one before; the pair
+/// reads the work with the queue's handoffs between the three submits. And
 /// MoltenVK makes a result available in the command buffer's completion handler, which may
 /// run a moment after a wait sees the submit's signal, so a reader polls
 /// [`read`](Self::read) until the timestamps it wrote are `Some`.
@@ -162,9 +164,13 @@ impl Timestamps {
     /// completed left it; `None` for one unwritten, one the GPU has reset for a write it has
     /// not yet completed or not yet made available, and every one on a queue with no valid
     /// bits. Once it reads `Some` after the submit that wrote it is seen complete, a
-    /// timestamp is that write's. Waits for nothing. A
-    /// difference of two is the GPU time between them while the clock does not wrap past the
-    /// valid bits between their writes.
+    /// timestamp is that write's. Waits for nothing.
+    ///
+    /// A timestamp written again reads its previous write's value, as available, until the
+    /// GPU runs the reset the new write recorded, which is a command of its submit: a `Some`
+    /// read before that submit is seen complete may be the last round's. Read a reused pool
+    /// only after its submit's signal is seen. [`elapsed`](Self::elapsed) gives the GPU time
+    /// between two.
     ///
     /// # Errors
     ///
@@ -189,12 +195,7 @@ impl Timestamps {
             }
         }
         let mask = if self.bits >= 64 { u64::MAX } else { (1_u64 << self.bits) - 1 };
-        // The period in 32.32 fixed point, so that a tick count of any size scales with no
-        // loss of its low bits, as an `f64` product would past 2^53, and a period of one
-        // gives the ticks themselves.
-        let period = f64::from(self.shared.raw.properties.limits.timestamp_period);
-        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let scale = (period * 4_294_967_296.0).round() as u128;
+        let scale = self.scale();
         Ok(data
             .iter()
             .map(|&[ticks, available]| {
@@ -202,5 +203,59 @@ impl Timestamps {
                 (available != 0).then(|| u64::try_from(nanos).unwrap_or(u64::MAX))
             })
             .collect())
+    }
+
+    /// The GPU time from `earlier` to `later`, two values [`read`](Self::read) gave: their
+    /// difference modulo the clock's range, the valid bits' scaled to nanoseconds, so a pair
+    /// the clock wrapped between reads its span and not zero. To a nanosecond of the ticks'
+    /// span, while less than one whole range of the clock lies between the two writes.
+    #[must_use]
+    pub fn elapsed(&self, earlier: u64, later: u64) -> Duration {
+        Duration::from_nanos(elapsed_nanos(earlier, later, self.bits, self.scale()))
+    }
+
+    /// The device's `timestampPeriod` in 32.32 fixed point, so that a tick count of any size
+    /// scales with no loss of its low bits, as an `f64` product would past 2^53, and a
+    /// period of one gives the ticks themselves.
+    fn scale(&self) -> u128 {
+        let period = f64::from(self.shared.raw.properties.limits.timestamp_period);
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let scale = (period * 4_294_967_296.0).round() as u128;
+        scale
+    }
+}
+
+/// `later` less `earlier`, nanoseconds of a clock of `bits` valid bits whose ticks scale by
+/// `scale` (32.32), modulo the clock's whole range so scaled; a range of 64 bits where the
+/// queue keeps none or all, so that no range is zero.
+fn elapsed_nanos(earlier: u64, later: u64, bits: u32, scale: u128) -> u64 {
+    let range = if bits == 0 || bits >= 64 { 1_u128 << 64 } else { 1_u128 << bits };
+    let span = ((range * scale) >> 32).max(1);
+    let (earlier, later) = (u128::from(earlier) % span, u128::from(later) % span);
+    let nanos = if later >= earlier { later - earlier } else { later + span - earlier };
+    u64::try_from(nanos).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::elapsed_nanos;
+
+    /// A period of one, and of 41.666…, in 32.32.
+    const ONE: u128 = 1 << 32;
+    const SLOW: u128 = 178_956_970_667;
+
+    #[test]
+    fn a_pair_the_clock_wrapped_between_reads_its_span() {
+        // Eight bits of ticks of a nanosecond: from 250 to 4 is ten ticks past the wrap.
+        assert_eq!(elapsed_nanos(250, 4, 8, ONE), 10);
+        assert_eq!(elapsed_nanos(4, 250, 8, ONE), 246);
+        assert_eq!(elapsed_nanos(7, 7, 8, ONE), 0);
+        // All 64 bits: a wrap of the whole `u64`.
+        assert_eq!(elapsed_nanos(u64::MAX - 1, 3, 64, ONE), 5);
+        // Ticks of 41.666… ns: tick 254 reads 10,583 ns and tick 2 reads 83 ns, and the
+        // range is 10,666 ns: four ticks, to a nanosecond of their 166.
+        let tick = |ticks: u128| u64::try_from((ticks * SLOW) >> 32).unwrap();
+        let span = elapsed_nanos(tick(254), tick(2), 8, SLOW);
+        assert!((166..=167).contains(&span), "{span}");
     }
 }

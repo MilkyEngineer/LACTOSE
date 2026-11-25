@@ -3,9 +3,10 @@
 //! engine's shader, a workgroup or an entry point the module does not declare, a heap past
 //! the driver's support and a resource past the device's size, the pipeline cache's start
 //! from bytes that fail each check and a cache directory that cannot be written, the drops
-//! while a thread unwinds, timestamps around a lagging dispatch, and each validator's canary but thread safety's, which is a unit
-//! test (`src/canary.rs`). `cargo xtask gpu` runs every canary in a process of its own and
-//! checks that it said its known message and nothing else.
+//! while a thread unwinds, timestamps around a lagging dispatch and a lagging render pass, and
+//! each validator's canary but thread safety's, which is a unit test (`src/canary.rs`).
+//! `cargo xtask gpu` runs every canary in a process of its own and checks that it said its
+//! known message and nothing else.
 
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -17,10 +18,11 @@ use lactose_rhi_api::{
     AddressMode, BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferReach, BufferState,
     BufferTransition, BufferUsage, CacheStart, ColourAttachment, ColourTargetDesc, ComputePass,
     ComputePipelineDesc, ComputePipelineHandle, Constant, ConstantValue, CookedShader, Cull,
-    Device, DeviceRequest, Encoder, Extent, Filter, Format, GraphicsPipelineDesc, ImageDesc,
-    ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryBlockDesc,
-    MemoryClass, PassReach, QueuePath, QueueRole, Rect, RenderPass, Rule, SamplerDesc, Sharing,
-    StageDesc, StateOn, Store, Submit, Target, TimelinePoint, WriteMask,
+    Device, DeviceRequest, Encoder, Extent, Filter, Format, GraphicsPipelineDesc,
+    GraphicsPipelineHandle, ImageDesc, ImageHandle, ImageMemory, ImageRange, ImageState,
+    ImageTransition, ImageUsage, Load, MemoryBlockDesc, MemoryClass, PassReach, QueuePath,
+    QueueRole, Rect, RenderPass, Rule, SamplerDesc, Sharing, StageDesc, StateOn, Store, Submit,
+    Target, TimelinePoint, WriteMask,
 };
 use lactose_rhi_vulkan::{Timestamps, VulkanDevice};
 
@@ -1003,16 +1005,58 @@ fn written(stamps: &Timestamps, n: usize) -> Vec<Option<u64>> {
     }
 }
 
-/// Timestamps around a lagging dispatch, the first written in an encoder of its own submitted
-/// before the dispatch's and the second in the dispatch's encoder after its pass: unwritten
-/// ones read `None`, the two read the lag between them, within the host's wait for the
-/// submit, and the first encoder, reset and written again, reads the later write. Each misuse
-/// is refused, the encoder left recording.
-///
-/// The layout is the one that brackets the work under both M1 drivers. Each of the others was
-/// seen to read a second's dispatch as a millisecond or less: both timestamps in encoders of
-/// their own (MoltenVK), both in the dispatch's encoder (KosmicKrisp), and the first in the
-/// dispatch's encoder with the second in one of its own after it (both).
+/// Submits each group of encoders to the graphics queue in turn, each waiting on the one
+/// before through a timeline of its own, and waits for the last; returns the groups,
+/// completed, and the host's time from the first submit to the wait's end.
+fn chained(
+    device: &VulkanDevice,
+    groups: Vec<Vec<Box<dyn Encoder>>>,
+) -> (Vec<Vec<Box<dyn Encoder>>>, Duration) {
+    let timeline = device.create_timeline(0).expect("a timeline");
+    let started = std::time::Instant::now();
+    let mut before = None;
+    let mut done = Vec::new();
+    for (value, mut group) in (1..).zip(groups) {
+        let point = TimelinePoint { timeline, value };
+        let waits: Vec<TimelinePoint> = before.into_iter().collect();
+        device
+            .submit(
+                QueueRole::Graphics,
+                Submit { encoders: &mut group, waits: &waits, signals: &[point] },
+            )
+            .expect("the submit");
+        before = Some(point);
+        done.push(group);
+    }
+    let last = before.expect("a group to submit");
+    assert!(device.wait_timeline(last, PATIENCE).expect("the wait"), "the work never ended");
+    let host = started.elapsed();
+    device.destroy_timeline(timeline).expect("the timeline's destruction");
+    (done, host)
+}
+
+/// Holds each round's GPU time between two timestamps, paired with the host's time for the
+/// round's submits and wait, to the work between them: no more than the round's host time,
+/// and no less than 0.9 of the least host time of the rounds less 2 ms. The least, since a
+/// loaded host stretches a round's own with time the GPU did not spend on the work; the 2 ms
+/// and the tenth for the host's submits and its wake from the wait. A timestamp latched a
+/// quarter of the work early or late (0.75 or 0.25 of the host's time, as MoltenVK did in
+/// other layouts) falls below the band once the work lasts more than 13.3 ms.
+fn within_the_lag(rounds: &[(Duration, Duration)]) {
+    let least = rounds.iter().map(|&(_, host)| host).min().expect("a round");
+    let floor = least.mul_f64(0.9).saturating_sub(Duration::from_millis(2));
+    for (round, &(gpu, host)) in rounds.iter().enumerate() {
+        eprintln!("round {round}: {gpu:?} on the GPU and {host:?} on the host");
+        assert!(gpu <= host, "round {round}: {gpu:?} on the GPU, past the host's {host:?}");
+        assert!(gpu >= floor, "round {round}: {gpu:?} on the GPU, under the band's {floor:?}");
+    }
+}
+
+/// Timestamps around a lagging dispatch, each written in an encoder submitted alone, the
+/// dispatch's submit between them and each submit waiting on the one before: unwritten ones
+/// read `None`, the two read the lag within [`within_the_lag`]'s band, and the first encoder,
+/// reset and written again, reads the later write. Each misuse is refused, the encoder left
+/// recording. The layout is the render pass test's, the one that held under both M1 drivers.
 #[test]
 #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
 fn timestamps_around_a_lagging_dispatch_read_its_lag() {
@@ -1036,24 +1080,15 @@ fn timestamps_around_a_lagging_dispatch_read_its_lag() {
 
     let mut earlier = None;
     let mut kept = Some(first);
+    let mut rounds = Vec::new();
     for round in 0..2 {
         let mut first = kept.take().expect("the first encoder, reset");
         stamps.write(&mut *first, 0).expect("the first write");
-        let mut lag = lagging(&device, QueueRole::Graphics);
-        stamps.write(&mut *lag, 1).expect("the write after the lag");
-        let mut submitted = [first, lag];
-        let timeline = device.create_timeline(0).expect("a timeline");
-        let done = TimelinePoint { timeline, value: 1 };
-        let started = std::time::Instant::now();
-        device
-            .submit(
-                QueueRole::Graphics,
-                Submit { encoders: &mut submitted, waits: &[], signals: &[done] },
-            )
-            .expect("the submit");
-        assert!(device.wait_timeline(done, PATIENCE).expect("the wait"), "the lag never ended");
-        let host = started.elapsed();
-        let again = stamps.write(&mut *submitted[0], 0);
+        let lag = lagging(&device, QueueRole::Graphics);
+        let mut last = device.create_encoder(QueueRole::Graphics, "last").expect("an encoder");
+        stamps.write(&mut *last, 1).expect("the write after the lag");
+        let (mut done, host) = chained(&device, vec![vec![first], vec![lag], vec![last]]);
+        let again = stamps.write(&mut *done[0][0], 0);
         assert_eq!(refused_by(again), encoding, "a write into a submitted encoder");
         let read = written(&stamps, 2);
         if bits == 0 {
@@ -1064,22 +1099,140 @@ fn timestamps_around_a_lagging_dispatch_read_its_lag() {
         let (Some(start), Some(end), None) = (read[0], read[1], read[2]) else {
             panic!("round {round}: the written timestamps did not both read: {read:?}");
         };
-        let gpu = Duration::from_nanos(end.saturating_sub(start));
-        eprintln!("round {round}: the lag took {gpu:?} on the GPU and {host:?} on the host");
-        assert!(start <= end, "round {round}: the second timestamp is before the first");
-        assert!(gpu <= host, "round {round}: {gpu:?} on the GPU, past the host's {host:?}");
-        assert!(gpu >= host / 4, "round {round}: {gpu:?} on the GPU, the lag not in it");
+        rounds.push((stamps.elapsed(start, end), host));
         if let Some(earlier) = earlier {
             assert!(start > earlier, "the encoder reset and written again read its first write");
         }
         earlier = Some(end);
-        let [mut first, _] = submitted;
+        let mut first = done.swap_remove(0).pop().expect("the first encoder");
         first.reset().expect("the reset of the completed encoder");
         kept = Some(first);
+    }
+    if !rounds.is_empty() {
+        within_the_lag(&rounds);
     }
     drop(kept);
     drop(stamps);
     drop(compute);
+    drop(device);
+    assert_eq!(sink.count(), 0, "{:?}", sink.texts());
+}
+
+/// The passes of a render pass test whose one draw lags: a full-screen triangle of
+/// `lag.slang` into a 256 x 256 target, whose fragment stage runs a given number of rounds.
+struct LagPass {
+    image: ImageHandle,
+    pipeline: GraphicsPipelineHandle,
+}
+
+impl LagPass {
+    const SIDE: u32 = 256;
+
+    /// The pipeline and its target, the target made a colour attachment.
+    fn new(device: &VulkanDevice) -> Self {
+        let vertex = suite_shader("lag.vs_main").expect("the suite's cooked shaders");
+        let fragment = suite_shader("lag.fs_main").expect("the suite's cooked shaders");
+        let target = ColourTargetDesc { format: Format::Rgba8Unorm, write_mask: WriteMask::ALL };
+        let pipeline = device
+            .create_graphics_pipeline(&GraphicsPipelineDesc {
+                label: "lag",
+                vertex: StageDesc { shader: &vertex, constants: &[] },
+                fragment: Some(StageDesc { shader: &fragment, constants: &[] }),
+                colour: &[target],
+                depth: None,
+                cull: Cull::None,
+            })
+            .expect("the lag's pipeline");
+        let image = device
+            .create_image(&ImageDesc {
+                label: "lag",
+                format: Format::Rgba8Unorm,
+                extent: Extent { width: Self::SIDE, height: Self::SIDE },
+                mips: 1,
+                layers: 1,
+                usage: ImageUsage::COLOUR,
+                memory: ImageMemory::Own,
+                sharing: Sharing::Exclusive,
+            })
+            .expect("the lag's target");
+        let mut encoder = device.create_encoder(QueueRole::Graphics, "lag").expect("an encoder");
+        let on = |state| StateOn { state, queue: QueueRole::Graphics };
+        encoder.transition_images(&[ImageTransition {
+            image,
+            range: ImageRange::FIRST,
+            from: on(ImageState::Undefined),
+            to: on(ImageState::ColourAttachment),
+        }]);
+        run(device, encoder);
+        Self { image, pipeline }
+    }
+
+    /// An encoder of the one render pass, each pixel `lag` rounds.
+    fn encoder(&self, device: &VulkanDevice, lag: u32) -> Box<dyn Encoder> {
+        let mut encoder = device.create_encoder(QueueRole::Graphics, "lag").expect("an encoder");
+        let colour = [ColourAttachment {
+            target: Target { image: self.image, mip: 0, layer: 0 },
+            load: Load::Clear([0.0; 4]),
+            store: Store::Store,
+            local_read: false,
+        }];
+        encoder.begin_render_pass(&RenderPass {
+            label: "lag",
+            colour: &colour,
+            depth: None,
+            reach: PassReach::NOTHING,
+        });
+        encoder.bind_graphics_pipeline(self.pipeline);
+        // `lag.slang`'s block: the rounds, and a word it does not read.
+        let mut push = [0_u8; 8];
+        push[..4].copy_from_slice(&lag.to_le_bytes());
+        encoder.push_bytes(0, &push);
+        encoder.draw(0..3, 0..1);
+        encoder.end_pass();
+        encoder
+    }
+}
+
+/// Timestamps in submits of their own on either side of a lagging render pass's submit, each
+/// submit waiting on the one before, read the pass in each of 16 rounds of about 21 ms on the
+/// M1, within [`within_the_lag`]'s band: the layout `gpu-cost` writes its pair in.
+///
+/// It is the one layout that held under both M1 drivers. MoltenVK writes a timestamp as a
+/// Metal pass of its own, and with the second written in the render pass's encoder after the
+/// pass it latched at a quarter point of the pass in some rounds (0.24 or 0.75 of the host's
+/// time), the first in an encoder of its own and in the same submit or one of its own alike;
+/// KosmicKrisp read the pass in every layout tried. The pair reads the pass and the queue's
+/// handoffs between the three submits: about 0.4 ms under MoltenVK and 0.7 ms under
+/// KosmicKrisp around a pass of no rounds, on the M1.
+#[test]
+#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+fn timestamps_in_submits_around_a_lagging_render_pass_read_its_lag() {
+    let sink = Arc::new(Counting::default());
+    let device = device(&sink);
+    let work = LagPass::new(&device);
+    let stamps = device.create_timestamps(QueueRole::Graphics, 2).expect("a timestamp pool");
+    let mut rounds = Vec::new();
+    for round in 0..16 {
+        let mut first = device.create_encoder(QueueRole::Graphics, "first").expect("an encoder");
+        stamps.write(&mut *first, 0).expect("the first write");
+        let mut last = device.create_encoder(QueueRole::Graphics, "last").expect("an encoder");
+        stamps.write(&mut *last, 1).expect("the second write");
+        let body = work.encoder(&device, 1 << 16);
+        let (_, host) = chained(&device, vec![vec![first], vec![body], vec![last]]);
+        let read = written(&stamps, 2);
+        if stamps.valid_bits() == 0 {
+            eprintln!("no valid bits: host time alone, {host:?}");
+            break;
+        }
+        let (Some(start), Some(end)) = (read[0], read[1]) else {
+            panic!("round {round}: the written timestamps did not both read: {read:?}");
+        };
+        rounds.push((stamps.elapsed(start, end), host));
+    }
+    if !rounds.is_empty() {
+        within_the_lag(&rounds);
+    }
+    drop(stamps);
     drop(device);
     assert_eq!(sink.count(), 0, "{:?}", sink.texts());
 }

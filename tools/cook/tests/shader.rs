@@ -730,8 +730,9 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
     let targets: &[&str] =
         if cfg!(target_os = "macos") { &["metallib", "msl", "spirv"] } else { &["msl", "spirv"] };
     // `shaders/client/`'s entries, which `lactose-app-client` runs, `shaders/conformance/`'s,
-    // which the RHI suites run, and `shaders/renderer/`'s, which `lactose-renderer` runs, cook
-    // into the pack beside the surface's, in name order.
+    // which the RHI suites run, `shaders/measure/`'s, which `cargo xtask measure` runs, and
+    // `shaders/renderer/`'s, which `lactose-renderer` runs, cook into the pack beside the
+    // surface's, in name order.
     let entries = [
         "client/present.fs_main",
         "client/present.vs_main",
@@ -748,6 +749,8 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
         "conformance/groups.cs_main",
         "conformance/ids.fs_main",
         "conformance/ids.vs_main",
+        "conformance/lag.fs_main",
+        "conformance/lag.vs_main",
         "conformance/sample.fs_main",
         "conformance/sample.vs_main",
         "conformance/specialised.cs_main",
@@ -755,6 +758,8 @@ fn the_engine_shader_cooks_to_what_its_code_declares_and_loads_from_the_pack() {
         "conformance/triangles.fs_main",
         "conformance/triangles.vs_main",
         "conformance/workgroup.cs_main",
+        "measure/cost.fs_main",
+        "measure/cost.vs_main",
         "renderer/scatter.cs_main",
         "renderer/triangle.fs_main",
         "renderer/triangle.vs_main",

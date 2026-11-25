@@ -212,8 +212,12 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   device with its command pool (`Shared::orphan`, below). So the pool is destroyed only when
   no command buffer that names it can still run, or is leaked with the device. A read of the
   results asks for 64-bit values with availability into a buffer of two words a query, the
-  stride the call is given, and is the host's alone: a query a pending submit has not yet
-  written reads as unavailable, never as torn.
+  stride the call is given, and is the host's alone: a query reads whole or unavailable,
+  never torn. Whole is not current: the reset a write records is a queue command, so a query
+  written again by a submit the GPU has not yet reached reads its previous value as
+  available until that reset runs (MoltenVK resets at encode time and hides this; the
+  specification does not). `Timestamps::read` says so, and a caller reads a reused query
+  only once its submit is seen complete. The value is stale, not unsound.
 
 ### Mapped memory (`device.rs`, `Mapping`)
 

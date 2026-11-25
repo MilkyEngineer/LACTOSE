@@ -298,14 +298,18 @@ resets it on the host (`hostQueryReset`, which the device turns on where it is o
 every timestamp may be read from its making. `write` takes the role's encoder as a `dyn Encoder`
 and records, outside any pass, a reset of the one timestamp and its write at `ALL_COMMANDS`: by
 the specification, once every command before it in the queue's order has completed. Both M1
-drivers latch it instead at a boundary of a Metal pass near the write, and of four layouts of
-two writes around a dispatch of about a second, one read the second under both: the first in an
-encoder of its own submitted before the dispatch's, the second in the dispatch's encoder after
-its pass. Both in encoders of their own read it as about a millisecond under MoltenVK, both in
-the dispatch's encoder as under 0.12 ms under KosmicKrisp, and the first in the dispatch's
-encoder with the second in one of its own after as under 0.12 ms under both. The device test
-holds that layout to the lag under each driver, and `gpu-cost` writes its pair around a render
-pass the same way. The encoder holds the pool until its submit has completed or, unwinding with
+drivers may latch it instead at a boundary of a Metal pass near the write. MoltenVK writes it as
+a Metal pass of its own: with the first in an encoder of its own and the second in a render
+pass's encoder after the pass, in one submit or with the first in a submit of its own, it latched
+the second at a quarter point of a 21 ms pass in some rounds (0.24 or 0.75 of the host's time).
+KosmicKrisp read that pass in every layout tried, and around a dispatch it read under 0.12 ms
+with both writes in the dispatch's encoder. The layout the device test holds to a lagging
+dispatch and to 16 rounds of a lagging render pass under both drivers, each within 0.9 of the
+least host time less 2 ms, is each write in an encoder submitted alone, the work's submit between
+them, each submit waiting on the one before. The pair then reads the work with the queue's
+handoffs between the three submits, about 0.4 ms under MoltenVK and 0.7 ms under KosmicKrisp
+around an empty pass on the M1, and `gpu-cost` writes its pair that way and reads a pass with its
+clear alone as well. The encoder holds the pool until its submit has completed or, unwinding with
 it pending, leaks it with the device. `read` asks the driver for every timestamp with its
 availability and waits for nothing: a timestamp is `None` until its write has completed and the
 driver has made it available, which MoltenVK does in the command buffer's completion handler, up
