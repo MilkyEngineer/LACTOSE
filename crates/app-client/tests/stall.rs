@@ -12,13 +12,16 @@
 //! at least one, and records nothing: `RECORD_RESERVATION` stays as it is until the file is
 //! read.
 //!
-//! The physics phase of each tick is the span from the first entry into its three systems'
-//! nodes (`physics_api::sync`, `step` and `write_back`) to the last exit, taken from the
-//! executor's spans. A record that overlaps it is *beside* the physics phase; one that
-//! overlaps the tick and not the phase is *beside the tick*; and the same records made with
-//! no tick running are *alone*. The file gives the median, the 99th percentile and the
-//! worst of each, and the physics phase's median. 60 ticks at each reservation (6 in a
-//! short run) after 10 of warm-up.
+//! The physics phase of each tick is the span from the first entry into its three systems
+//! (`physics_api::sync`, `step` and `write_back`) to the last exit: `step` from the
+//! executor's node spans, and the two exclusive systems, which run as no node, from
+//! `lactose-ecs`'s system spans, read by name. Every tick asserts that all three were seen. A
+//! record that overlaps the phase is *beside* the physics phase; one that overlaps the tick
+//! and not the phase is *beside the tick*; and the same records made with no tick running
+//! are *alone*. The file gives the median, the 99th percentile and the worst of each, with
+//! the same of each group's start wait, from `run_job`'s call to the job's start; and the
+//! physics phase's and the tick's medians, the tick timed inside its bounded future. 60
+//! ticks at each reservation (6 in a short run) after 10 of warm-up.
 //!
 //! Not measured here: on Windows, the time from each `block_in_place`'s end to the record's
 //! next job on a worker that was parked (the `SetEvent` item of row 164's unmeasured list).
@@ -26,7 +29,6 @@
 
 #![allow(dead_code, reason = "the scene as `lactose-sim`'s cost test has it")]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -126,18 +128,58 @@ fn composed(workers: u32, reserved: u32) -> Simulation {
 
 // ---- The physics phase, from the executor's spans ----
 
-/// The physics systems' nodes, as the executor names their spans.
+/// The physics systems, as the executor names their nodes and `lactose-ecs` their system
+/// spans.
 const PHYSICS: [&str; 3] = ["physics_api::sync", "physics_api::step", "physics_api::write_back"];
 
-/// The first entry into a physics node's span and the last exit since the last take: the
-/// physics phase of one tick. A subscriber of its own: it sees the executor's node and range
-/// spans of the three systems alone.
+/// The id of a span of no physics system: every system span is seen, to read its name.
+const OTHER: u64 = 1 + PHYSICS.len() as u64;
+
+/// What the spans of one tick's physics systems showed.
 #[derive(Default)]
-struct PhysicsPhase(Mutex<Option<(Instant, Instant)>>);
+struct Phase {
+    /// The first entry and the last exit.
+    span: Option<(Instant, Instant)>,
+    /// Which of [`PHYSICS`] were entered.
+    seen: [bool; PHYSICS.len()],
+}
+
+/// The first entry into a physics system's span and the last exit since the last take: the
+/// physics phase of one tick. A subscriber of its own: it sees the executor's node and range
+/// spans of the three systems, and `lactose-ecs`'s system span of every system, whose name
+/// it reads to keep the three. `step` runs as a node of the executor's; `sync` and
+/// `write_back` are exclusive and run as no node, so only their system spans show them.
+#[derive(Default)]
+struct PhysicsPhase(Mutex<Phase>);
 
 impl PhysicsPhase {
-    fn take(&self) -> Option<(Instant, Instant)> {
-        lock(&self.0).take()
+    /// The phase since the last take, and which of the three systems it saw.
+    fn take(&self) -> Phase {
+        std::mem::take(&mut *lock(&self.0))
+    }
+}
+
+/// The id of the physics system `name`, else [`OTHER`].
+fn physics_id(name: &str) -> Id {
+    let index = PHYSICS.iter().position(|&physics| physics == name);
+    Id::from_u64(index.map_or(OTHER, |index| index as u64 + 1))
+}
+
+/// Reads a system span's `name` field.
+#[derive(Default)]
+struct SystemName(Option<String>);
+
+impl tracing::field::Visit for SystemName {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "name" {
+            self.0 = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "name" {
+            self.0 = Some(format!("{value:?}").trim_matches('"').to_owned());
+        }
     }
 }
 
@@ -147,16 +189,23 @@ impl Subscriber for &'static PhysicsPhase {
     }
 
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.is_span()
-            && metadata.target() == "whisk"
+        let node = metadata.target() == "whisk"
             && metadata
                 .module_path()
                 .is_some_and(|path| path == "lactose_task::node" || path == "lactose_task::range")
-            && PHYSICS.contains(&metadata.name())
+            && PHYSICS.contains(&metadata.name());
+        let system = metadata.target() == "casein" && metadata.name() == "system";
+        metadata.is_span() && (node || system)
     }
 
-    fn new_span(&self, _: &Attributes<'_>) -> Id {
-        Id::from_u64(1)
+    fn new_span(&self, attributes: &Attributes<'_>) -> Id {
+        let metadata = attributes.metadata();
+        if metadata.target() == "whisk" {
+            return physics_id(metadata.name());
+        }
+        let mut name = SystemName::default();
+        attributes.record(&mut name);
+        name.0.as_deref().map_or(Id::from_u64(OTHER), physics_id)
     }
 
     fn record(&self, _: &Id, _: &Record<'_>) {}
@@ -165,16 +214,24 @@ impl Subscriber for &'static PhysicsPhase {
 
     fn event(&self, _: &tracing::Event<'_>) {}
 
-    fn enter(&self, _: &Id) {
+    fn enter(&self, id: &Id) {
+        let Some(index) = (id.into_u64() as usize).checked_sub(1).filter(|&i| i < PHYSICS.len())
+        else {
+            return;
+        };
         let now = Instant::now();
         let mut phase = lock(&self.0);
-        *phase = Some(phase.map_or((now, now), |(first, last)| (first.min(now), last)));
+        phase.seen[index] = true;
+        phase.span = Some(phase.span.map_or((now, now), |(first, last)| (first.min(now), last)));
     }
 
-    fn exit(&self, _: &Id) {
+    fn exit(&self, id: &Id) {
+        if !(1..OTHER).contains(&id.into_u64()) {
+            return;
+        }
         let now = Instant::now();
         let mut phase = lock(&self.0);
-        *phase = Some(phase.map_or((now, now), |(first, last)| (first, last.max(now))));
+        phase.span = Some(phase.span.map_or((now, now), |(first, last)| (first, last.max(now))));
     }
 }
 
@@ -205,8 +262,8 @@ impl Recorder {
     }
 
     /// One frame: the job that records it, timed from its start to `draw`'s return, then
-    /// its submit. Returns when the record began and ended.
-    fn record(&mut self, executor: &Executor) -> (Instant, Instant) {
+    /// its submit. Returns when the job was asked for, and when the record began and ended.
+    fn record(&mut self, executor: &Executor) -> Timed {
         let target = TargetIndex::new((self.frames % 2) as usize).expect("a target");
         let pass = ExtractPass {
             kind: WorldKind::Server,
@@ -214,6 +271,7 @@ impl Recorder {
             full: self.frames == 0,
         };
         self.frames += 1;
+        let asked = Instant::now();
         let job = {
             let (render, rows) = (Arc::clone(&self.render), Arc::clone(&self.rows));
             executor.run_job(move |ctx| {
@@ -230,10 +288,39 @@ impl Recorder {
                 (start, Instant::now())
             })
         };
-        let span = bounded(executor, job, "a frame's record").expect("the job runs");
+        let (start, end) = bounded(executor, job, "a frame's record").expect("the job runs");
         lock(&self.render).submit().expect("the frame submits");
-        span
+        Timed { asked, start, end }
     }
+}
+
+/// One record's times: `run_job` called, the job begun, `draw` returned.
+#[derive(Clone, Copy)]
+struct Timed {
+    asked: Instant,
+    start: Instant,
+    end: Instant,
+}
+
+impl Timed {
+    fn time(&self) -> Duration {
+        self.end - self.start
+    }
+
+    /// From `run_job`'s call to the job's start: the wait for a worker to take it.
+    fn start_wait(&self) -> Duration {
+        self.start - self.asked
+    }
+}
+
+/// A group of records' figures under `prefix`: the record's spread, and its start wait's.
+fn records(prefix: &str, records: &[Timed]) {
+    figure(&format!("{prefix}.records"), records.len());
+    if records.is_empty() {
+        return;
+    }
+    spread(&format!("{prefix}.record"), records.iter().map(Timed::time).collect());
+    spread(&format!("{prefix}.start_wait"), records.iter().map(Timed::start_wait).collect());
 }
 
 /// Every figure of one reservation, under `r<reserved>`.
@@ -244,49 +331,51 @@ fn beside(executor: &Executor, recorder: &mut Recorder, workers: u32, reserved: 
     let (mut by_physics, mut by_tick) = (Vec::new(), Vec::new());
     for tick in 0..WARM_UP + ticks {
         phase.take();
-        let done = Arc::new(AtomicBool::new(false));
         let stepping = {
-            let (executor, done) = (executor.clone(), Arc::clone(&done));
+            let executor = executor.clone();
             std::thread::spawn(move || {
                 let input = frame(simulation.tick().0 + 1);
-                let start = Instant::now();
-                let stepped =
-                    bounded(&executor, simulation.step(&executor, input), "a composed tick");
-                let span = (start, Instant::now());
-                done.store(true, Ordering::Release);
+                // Timed inside the bounded future: from its first poll to the tick's end,
+                // not the bound's keeping thread, which `bounded` starts before and joins
+                // after.
+                let step = async {
+                    let start = Instant::now();
+                    let stepped = simulation.step(&executor, input).await;
+                    (stepped, (start, Instant::now()))
+                };
+                let (stepped, span) = bounded(&executor, step, "a composed tick");
                 (stepped.expect("the tick runs"), span)
             })
         };
-        let mut records = Vec::new();
-        while !done.load(Ordering::Acquire) {
-            records.push(recorder.record(executor));
+        // Until the stepping thread ends, however it ends: a tick that panics ends the
+        // loop, and the join below fails with it.
+        let mut made = Vec::new();
+        while !stepping.is_finished() {
+            made.push(recorder.record(executor));
         }
         let (stepped, (began, ended)) = stepping.join().expect("the stepping thread");
         simulation = stepped;
-        let (first, last) = phase.take().expect("the tick ran its physics systems");
+        let Phase { span, seen } = phase.take();
+        let (first, last) = span.expect("the tick ran its physics systems");
+        assert!(seen.iter().all(|&seen| seen), "the phase saw {seen:?} of {PHYSICS:?}");
         if tick < WARM_UP {
             continue;
         }
         steps.push(ended - began);
         physics.push(last - first);
-        for (start, end) in records {
-            let time = end - start;
-            if start < last && end > first {
-                by_physics.push(time);
-            } else if start < ended && end > began {
-                by_tick.push(time);
+        for record in made {
+            if record.start < last && record.end > first {
+                by_physics.push(record);
+            } else if record.start < ended && record.end > began {
+                by_tick.push(record);
             }
         }
     }
     let prefix = format!("r{reserved}");
     figure(&format!("{prefix}.physics_us"), micros(median(physics)));
     figure(&format!("{prefix}.step_us"), micros(median(steps)));
-    figure(&format!("{prefix}.beside_physics.records"), by_physics.len());
-    spread(&format!("{prefix}.beside_physics.record"), by_physics);
-    figure(&format!("{prefix}.beside_tick.records"), by_tick.len());
-    if !by_tick.is_empty() {
-        spread(&format!("{prefix}.beside_tick.record"), by_tick);
-    }
+    records(&format!("{prefix}.beside_physics"), &by_physics);
+    records(&format!("{prefix}.beside_tick"), &by_tick);
 }
 
 /// The subscriber, installed once per process (nextest runs each test in its own).
@@ -311,14 +400,8 @@ fn the_record_beside_the_physics_phase() {
     for reserved in [1, 2] {
         beside(&executor, &mut recorder, workers, reserved, ticks);
     }
-    let alone: Vec<Duration> = (0..600)
-        .map(|_| {
-            let (start, end) = recorder.record(&executor);
-            end - start
-        })
-        .collect();
-    figure("alone.records", alone.len());
-    spread("alone.record", alone);
+    let alone: Vec<Timed> = (0..600).map(|_| recorder.record(&executor)).collect();
+    records("alone", &alone);
     figure("workers", workers);
     figure("run_job_width", executor.run_job_width());
     figure("record_reservation", RECORD_RESERVATION);

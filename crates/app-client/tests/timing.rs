@@ -67,8 +67,9 @@ pub fn median(mut spans: Vec<Duration>) -> Duration {
 
 /// N of the milestone plans' section 4: the performance cores the platform reports or, on a
 /// part that reports no core types, its physical cores, at most eight; [`WORKERS_VAR`]
-/// overrides it. `lactose-app`'s and `lactose-sim`'s cost tests hold copies of this rule,
-/// and the three must match.
+/// overrides it. The one copy in this crate's tests, which `extract.rs`, `upload.rs` and
+/// `stall.rs` share; `crates/app/tests/cost.rs` and `crates/sim/tests/cost.rs` hold the
+/// other two copies of the rule (sim's also returns the topology), and the three must match.
 pub fn measured_workers() -> u32 {
     if let Some(value) = std::env::var_os(WORKERS_VAR).filter(|value| !value.is_empty()) {
         let value = value.to_string_lossy();
