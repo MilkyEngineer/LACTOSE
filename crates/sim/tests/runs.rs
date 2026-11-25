@@ -478,6 +478,41 @@ fn the_server_drains_presentation_events_and_other_kinds_keep_them() {
     }
 }
 
+#[test]
+fn a_shown_server_keeps_its_presentation_events_and_its_hash() {
+    let executor = executor();
+    let build = |keep: bool| {
+        let builder = SimulationBuilder::new(WorldKind::Server, types()).systems(|registration| {
+            registration.stage(Stage::Post).add(&FOOTSTEPS);
+        });
+        let mut simulation =
+            if keep { builder.keep_present_events() } else { builder }.build().unwrap();
+        let region = RegionId(1);
+        let world = simulation.world_mut();
+        world
+            .create_region(RegionConfig { id: region, seed: 1, mode: RegionMode::Simulated })
+            .unwrap();
+        world.spawn(net(1), region, (Health(1),)).unwrap();
+        world.spawn(net(2), region, (Health(2),)).unwrap();
+        simulation
+    };
+    let mut dropped = build(false);
+    let mut kept = build(true);
+    for round in 1..=3_usize {
+        // Taken after one step, then after two: the caller decides when.
+        for _ in 0..round {
+            dropped = step(&executor, dropped, TickInput::default());
+            kept = step(&executor, kept, TickInput::default());
+            assert_eq!(dropped.hash().unwrap(), kept.hash().unwrap(), "round {round}");
+        }
+        assert!(dropped.world_mut().take_present_events().emitted.is_empty());
+        let batch = kept.world_mut().take_present_events();
+        assert_eq!(batch.emitted.len(), 2 * round, "two rows, one event a tick each");
+        assert!(batch.cancelled.is_empty());
+        assert_eq!(dropped.hash().unwrap(), kept.hash().unwrap(), "after the take");
+    }
+}
+
 // ---- Layout mode ----
 
 #[test]

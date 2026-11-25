@@ -226,7 +226,7 @@ fn a_frames_input_reaches_the_players_entity() {
 /// "`lactose-net-api` is implemented"). A change to any covered type moves the hash; the
 /// name lists catch a change of policy, a type moving between covered and not.
 /// `lactose-net-host`'s own pin covers only the engine crates it depends on, which leaves
-/// out `lactose-anim` and `lactose-predict`.
+/// out `lactose-anim`, `lactose-present-api` and `lactose-predict`.
 #[test]
 fn the_hash_of_the_engine_registry_is_pinned() {
     let empty = Game { name: "empty", crates: &[], order: None, sessions: None };
@@ -242,6 +242,7 @@ fn the_hash_of_the_engine_registry_is_pinned() {
     };
     let covered = [
         "anim::sim_pose",
+        "present::light",
         "physics::joint",
         "physics::teleported",
         "ecs::predicted_origin",
@@ -252,12 +253,15 @@ fn the_hash_of_the_engine_registry_is_pinned() {
         "physics::velocity",
         "anim::bone_link",
         "ecs::owned_by",
+        "present::camera_rig",
         "physics::transform",
         "physics::collider",
         "anim::params",
+        "present::mesh",
         "anim::rig",
         "sim::time_scale",
         "anim::root_motion",
+        "present::decal",
     ];
     assert_eq!(named(true), covered);
     // `derived` and not replicated: never sent and never compared.
@@ -274,5 +278,6 @@ fn the_hash_of_the_engine_registry_is_pinned() {
         "sim::region_policy",
     ];
     assert_eq!(named(false), uncovered);
-    assert_eq!(ProtocolHash::of(registry), ProtocolHash(0x1458_0671_8FB1_1F86));
+    // 0x1458_0671_8FB1_1F86 before `lactose-present-api` joined the engine lists (D162).
+    assert_eq!(ProtocolHash::of(registry), ProtocolHash(0xB439_7FA7_135F_B2DE));
 }

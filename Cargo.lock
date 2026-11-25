@@ -463,6 +463,8 @@ version = "0.0.0"
 dependencies = [
  "lactose-core",
  "lactose-ecs",
+ "lactose-math",
+ "lactose-physics-api",
  "lactose-reflect",
  "lactose-sim",
 ]

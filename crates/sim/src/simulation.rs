@@ -43,8 +43,9 @@ type Run<'a, T> = Pin<Box<dyn Future<Output = core::result::Result<T, RunError>>
 /// Defaults: the production layout, tick zero, a fresh `NetId` counter, no binds,
 /// [`RegionControl::Directed`], a policy of activation radius 1, streaming radius 2 and
 /// release radius 3, a structural-log retention of
-/// [`DEFAULT_LOG_RETENTION`](Self::DEFAULT_LOG_RETENTION) ticks, no setup, registration or
-/// check function, and hooks that do nothing.
+/// [`DEFAULT_LOG_RETENTION`](Self::DEFAULT_LOG_RETENTION) ticks, a `Server` world's
+/// presentation events dropped at each step, no setup, registration or check function, and
+/// hooks that do nothing.
 pub struct SimulationBuilder {
     kind: WorldKind,
     types: TypeTable,
@@ -55,6 +56,7 @@ pub struct SimulationBuilder {
     control: RegionControl,
     policy: RegionPolicy,
     log_retention: u32,
+    keep_present_events: bool,
     setups: Vec<Setup>,
     registrations: Vec<Register>,
     checks: Vec<Check>,
@@ -81,6 +83,7 @@ impl SimulationBuilder {
             control: RegionControl::Directed,
             policy: RegionPolicy { activation_radius: 1, streaming_radius: 2, release_radius: 3 },
             log_retention: Self::DEFAULT_LOG_RETENTION,
+            keep_present_events: false,
             setups: Vec::new(),
             registrations: Vec::new(),
             checks: Vec::new(),
@@ -179,6 +182,19 @@ impl SimulationBuilder {
     #[must_use]
     pub fn log_retention(mut self, ticks: u32) -> Self {
         self.log_retention = ticks;
+        self
+    }
+
+    /// Leaves a `Server` world's presentation events in the world's queue after each step,
+    /// for a caller that takes them after each frame's passes
+    /// ([`World::take_present_events`]): the option of a `Server` world that is shown. Such
+    /// a caller bounds the ticks it runs between two takes, since nothing else does. The
+    /// default drops them at each step, so the queue does not grow whatever drives the
+    /// steps. Every other kind leaves them whether or not this is set. It changes no hashed
+    /// state: the queue and the delivered keys are outside every region.
+    #[must_use]
+    pub fn keep_present_events(mut self) -> Self {
+        self.keep_present_events = true;
         self
     }
 
@@ -378,6 +394,7 @@ impl SimulationBuilder {
                 save,
                 hashers,
                 log_retention: self.log_retention,
+                keep_present_events: self.keep_present_events,
                 log_cursors: VecDeque::from([built]),
             },
         })
@@ -427,6 +444,8 @@ struct Core {
     save: Schedule,
     hashers: Hashers,
     log_retention: u32,
+    /// Whether a `Server` world's step leaves its presentation events for the caller.
+    keep_present_events: bool,
     /// The structural log's end at build and after each step, the last `log_retention + 1`
     /// of them, oldest first: the log is trimmed to the oldest.
     log_cursors: VecDeque<LogCursor>,
@@ -561,7 +580,9 @@ impl Simulation {
             world.trim_structural_log(oldest);
         }
         if core.kind == WorldKind::Server {
-            drop(world.take_present_events());
+            if !core.keep_present_events {
+                drop(world.take_present_events());
+            }
             // A server never rolls back: the horizon passes every despawn of the tick just
             // run, so between steps it holds no bind of an entity despawned in a step (D142).
             let after = Tick(world.tick().0.wrapping_add(1));

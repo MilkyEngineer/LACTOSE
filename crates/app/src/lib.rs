@@ -13,9 +13,9 @@
 //! The README is the contract. `tests/proof/` and `tests/headless.rs` are the milestone 1
 //! proof, the latter with the headless binary's `main` and the SOUR test of the assembly;
 //! `tests/spike.rs` is a compile-only sketch of what the milestone 1 netcode spike writes
-//! against this surface. The shown frame is a facade (`src/shown.rs`), and
-//! `tests/shown.rs` is the compile-only sketch of what `lactose-app-client` and
-//! `frame-impl`'s tests write against it.
+//! against this surface. `tests/shown.rs` is the compile-only sketch of what
+//! `lactose-app-client` writes against the shown frame, with criterion 3's (a) and (b) and
+//! the frame's job, which run; `tests/frame/` is the rest of the shown frame's proof.
 
 #![forbid(unsafe_code)]
 

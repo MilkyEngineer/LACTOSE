@@ -13,4 +13,4 @@
 
 mod sketch;
 
-pub use sketch::{Counter, register_systems, register_types, sessions};
+pub use sketch::{Counter, Orbit, register_systems, register_types, sessions};

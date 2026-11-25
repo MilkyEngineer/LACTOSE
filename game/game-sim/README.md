@@ -16,9 +16,10 @@ decision 5.18). The game arrives at milestone 5 (section 22).
 
 | Item | Contents |
 |---|---|
-| `Counter` | The sketch's one component, key `sketch::counter`, persistent and replicated: a `u32` under field ID 1 |
-| `register_types` | A registration's `types`: registers `Counter` |
-| `register_systems` | A registration's `systems`: adds `game_sim::count`, which adds one to every `Counter` each tick, wrapping, in the server and prediction worlds, to `Stage::Simulation` |
+| `Counter` | The sketch's counter, key `sketch::counter`, persistent and replicated: a `u32` under field ID 1 |
+| `Orbit` | The mover of the client's local world (`crates/app/README.md`, "The mover of the local world"), key `sketch::orbit`, persistent and replicated: `centre` (`Vec3`, ID 1), `radius` (`Scalar`, ID 2), `period` (`u32` ticks, ID 3) and `phase` (`u32` ticks, ID 4) |
+| `register_types` | A registration's `types`: registers `Counter` and `Orbit` |
+| `register_systems` | A registration's `systems`: adds to `Stage::Simulation`, in the server and prediction worlds, `game_sim::count`, which adds one to every `Counter` each tick, wrapping, and `game_sim::orbit`, which writes the `Transform` of every row with an `Orbit` each tick (below) |
 | `sessions` | A `Game`'s `sessions`: the session applier, which meets `crates/sim/README.md`'s contract ("What `SessionApplier::apply` must do"). A `Join` spawns the player's row in the join's region, under a key from `World::allocate_net_id`: a `Counter` at zero, `ClaimedBy` and `StreamingAnchor`. A `Leave` removes the claim and the anchor from that row and keeps the row |
 
 ## Rules a caller should know
@@ -37,5 +38,15 @@ decision 5.18). The game arrives at milestone 5 (section 22).
   `sessions` included, through a join, a leave and a second join with a sample every tick, and
   checks after every tick that the player resolves to one claimed row that holds the sample.
   The unrecorded tests of that file and the headless binary's own run call `sessions` too.
-- Its dependencies are `lactose-core`, `lactose-ecs`, `lactose-reflect` and `lactose-sim`, all
-  admitted to a boundary crate without an allowlist entry.
+- `game_sim::orbit` is a function of the row and the tick. With `t` the tick being run
+  (`Ctx::tick`): `step = (t + phase) mod period`, the addition wrapping; `angle = TAU × step /
+  period`, both made `Scalar` before the division; `(sin, cos) = Scalar::sin_cos(angle)`;
+  the translation `centre + radius × (cos, 0, sin)` and the rotation
+  `Quat::from_rotation_y(angle)`. It writes `lactose_physics_api::Transform` and nothing else,
+  never `Teleported`, so the row is interpolated; a period of zero leaves the row where it is.
+  No state accumulates, so a rollback, a save and a load, and a full pass place the row where
+  an unbroken run does; at the tick's wrap the row jumps unless `period` divides 2^32. A row
+  with `Orbit` has no body. Its arithmetic is `lactose-math`'s alone.
+- Its dependencies are `lactose-core`, `lactose-ecs`, `lactose-math`, `lactose-physics-api`,
+  `lactose-reflect` and `lactose-sim`, all admitted to a boundary crate without an allowlist
+  entry.

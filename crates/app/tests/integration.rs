@@ -17,6 +17,7 @@
 mod protocol;
 
 mod cost;
+mod frame;
 mod headless;
 mod schema_record;
 mod shown;

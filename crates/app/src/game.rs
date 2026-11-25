@@ -72,11 +72,12 @@ impl Game {
         /// A crate's name and its `register_types`.
         type Types = (&'static str, fn(&mut TypeTable) -> Result<()>);
         /// The engine's crates, in the README's order: before every game crate.
-        const ENGINE: [Types; 5] = [
+        const ENGINE: [Types; 6] = [
             ("lactose-input", lactose_input::register_types),
             ("lactose-net-api", lactose_net_api::register_types),
             ("lactose-physics-api", lactose_physics_api::register_types),
             ("lactose-anim", lactose_anim::register_types),
+            ("lactose-present-api", lactose_present_api::register_types),
             ("lactose-predict", lactose_predict::register_types),
         ];
         let mut types = TypeTable::new();

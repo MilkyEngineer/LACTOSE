@@ -52,7 +52,8 @@ pub(crate) fn world(
         .policy(config.policy)
         .log_retention(config.log_retention)
         .setup(lactose_net_api::setup)
-        .setup(move |world| lactose_physics_api::setup(world, backend, physics));
+        .setup(move |world| lactose_physics_api::setup(world, backend, physics))
+        .setup(lactose_present_api::setup);
     for registration in game.crates {
         if let Some(setup) = registration.setup {
             let name = registration.name;
@@ -63,7 +64,8 @@ pub(crate) fn world(
         .systems(lactose_input::register_systems)
         .systems(lactose_net_api::register_systems)
         .systems(lactose_physics_api::register_systems)
-        .systems(lactose_anim::register_systems);
+        .systems(lactose_anim::register_systems)
+        .systems(lactose_present_api::register_systems);
     for registration in game.crates {
         builder = builder.systems(registration.systems);
     }

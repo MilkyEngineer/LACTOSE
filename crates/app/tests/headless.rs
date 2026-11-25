@@ -87,19 +87,19 @@ fn table_of(region: RegionId) -> VersionTable {
 
 /// One region's cooked content: an empty baseline and one asset, built in memory. What
 /// the asset store replaces at milestone 3.
-struct InMemory {
+pub(crate) struct InMemory {
     region: RegionId,
     baseline: Arc<Baseline>,
 }
 
 impl InMemory {
-    fn new(region: RegionId) -> Result<Self> {
+    pub(crate) fn new(region: RegionId) -> Result<Self> {
         let baseline = Arc::new(Baseline::from_rows(AssetSet::new(), [], [])?);
         Ok(Self { region, baseline })
     }
 
     /// The region's bundle in its cooked state, for the first frame.
-    fn fresh(&self) -> Result<RegionBundle> {
+    pub(crate) fn fresh(&self) -> Result<RegionBundle> {
         Ok(RegionBundle {
             seed: self.region.0,
             mode: RegionMode::Simulated,

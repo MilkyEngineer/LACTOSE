@@ -220,8 +220,11 @@ exclusive systems of the input sync point are listed by name in
    catch-up frame if the retention is below the cap. `build` cannot check it, since the cap is
    `app`'s.
 4. On a `Server` world, takes and drops the presentation events, so the queue does not
-   grow (architecture section 9.4) whatever drives the steps; every other kind leaves them
-   for `predict` or presentation.
+   grow (architecture section 9.4) whatever drives the steps, unless the world was built
+   with `SimulationBuilder::keep_present_events`, the option of a `Server` world that is
+   shown (D162): its caller takes them after each frame's passes
+   (`World::take_present_events`) and bounds the ticks it runs between two takes. Every
+   other kind leaves them for `predict` or presentation.
 5. On a `Server` world, `World::set_rollback_horizon` with the tick after the one just run
    (D142). A server never rolls back and an entity it despawned never returns, so the step
    ends by passing the horizon over every despawn up to and including its own tick, and the
@@ -229,7 +232,7 @@ exclusive systems of the input sync point are listed by name in
    a server holds no bind of an entity despawned in a step, and one despawned through
    `world_mut()` between steps, an unjournaled edit, keeps its bind until the next step ends
    ("Saves and loads", the binds of a save). The delivered presentation-event keys the same
-   call prunes are those of the events step 4 dropped. A `Client` world keeps step 1: it
+   call prunes are those of the events step 4 dropped, or a shown world's caller took. A `Client` world keeps step 1: it
    exports and saves nothing, so nothing there rests on when a despawned entity's bind goes.
 6. Resolves with the simulation at the new tick.
 
@@ -755,6 +758,6 @@ lifecycle as `app` and `persist` would.
 | Save and load | `persist.rs`: `save_point`, a new simulation from it through frames with every player joining again, an in-place reload and an untouched twin, `K` ticks each: equal hashes; the same with the save taken while a player who left has its row kept; an unload and reload keeps every persistent column; a journal replayed by a small driver reproduces the hashes, from tick zero and from checkpoints across the run with `restore_session_state` |
 | Orders | `runs.rs`: two crates' exclusive systems in one pass and after `sets::INPUT` fail to build unordered and run in the order `Registration::order` gives; the edges the schedules refuse, one before `sets::INPUT` included |
 | Refusals | `refusals.rs`, `runs.rs`, `sync_point.rs`: a bundle against another baseline, a second bundle for a loaded region, an unwanted bundle, a bad resource, a document schema the registry disagrees with, a table for an unloaded region, a frame's `modes` and `unloaded` under `Anchored`, a `Join` for a region outside the atlas, a non-`derived` world resource at build: each refused as stated, nothing changed, the tick runs, the failure is reported |
-| Runs | `runs.rs`: a removed resource fails the next run with the simulation inside the error, and `run_passes` prepares both passes first and `Gather` again after `Extract`, handing the simulation back; `save_point` off the server likewise; `Cancelled` hands nothing back; the log is trimmed to the retention and a lagging consumer sees `None`; the server drains presentation events |
+| Runs | `runs.rs`: a removed resource fails the next run with the simulation inside the error, and `run_passes` prepares both passes first and `Gather` again after `Extract`, handing the simulation back; `save_point` off the server likewise; `Cancelled` hands nothing back; the log is trimmed to the retention and a lagging consumer sees `None`; the server drains presentation events, and one built with `keep_present_events` leaves them for its caller with its hash unmoved |
 | The build check | `check.rs`: one call per build after every registration function, checks in the order added, with every system of the kind in registration order on a server, a prediction and a client world; a failing check's error fails the build before the schedule prepares and stops the later checks; a passing check leaves the hashes unchanged |
 | SOUR | `sour.rs`: the program of `tests/common` for 300 ticks, built from the session and recording `(tick, hash)` after every step; `cost.rs`: the milestone 1 cost scene at 2,000 rows for 30 ticks, likewise, its per-entity units forked over the session's workers |
