@@ -72,6 +72,17 @@ pub enum Run {
         /// The test's path inside the file's module.
         test: &'static str,
     },
+    /// An ignored test on a Vulkan device, run as [`Device`](Self::Device) is, once under each
+    /// of [`Options::drivers`], each run with the engine's shaders cooked and a source salted
+    /// for it ([`salted_source`]) cooked before its window opens: `gpu-cost`.
+    GpuCost {
+        /// The package.
+        package: &'static str,
+        /// Its integration test file, as [`Test`](Self::Test)'s.
+        file: &'static str,
+        /// The test's path inside the file's module.
+        test: &'static str,
+    },
     /// The netcode spike's ten-minute replays (`REPLAYS`), ignored tests run in release one
     /// at a time, each of which prints its figures as one JSON object.
     SpikeReplays,
@@ -91,22 +102,26 @@ impl Run {
     pub const fn cut_by_short(self) -> bool {
         matches!(
             self,
-            Self::Test { .. } | Self::Device { .. } | Self::SpikeReplays | Self::TaskBench
+            Self::Test { .. }
+                | Self::Device { .. }
+                | Self::GpuCost { .. }
+                | Self::SpikeReplays
+                | Self::TaskBench
         )
     }
 
     /// Whether it needs a Vulkan device.
     #[must_use]
     pub const fn on_device(self) -> bool {
-        matches!(self, Self::Device { .. })
+        matches!(self, Self::Device { .. } | Self::GpuCost { .. })
     }
 
     /// The package, file and test of an ignored test, on a device or not.
     const fn ignored_test(self) -> Option<(&'static str, &'static str, &'static str)> {
         match self {
-            Self::Test { package, file, test } | Self::Device { package, file, test } => {
-                Some((package, file, test))
-            }
+            Self::Test { package, file, test }
+            | Self::Device { package, file, test }
+            | Self::GpuCost { package, file, test } => Some((package, file, test)),
             _ => None,
         }
     }
@@ -134,7 +149,7 @@ const fn device(package: &'static str, file: &'static str, test: &'static str) -
 }
 
 /// Every measurement, in the order `--all` runs them.
-pub const MEASUREMENTS: [Measurement; 15] = [
+pub const MEASUREMENTS: [Measurement; 16] = [
     Measurement {
         name: "tick-100k",
         what: "Criterion 1: the median step of the 100k scene on one frame worker and on N, S and the projected eight-core tick",
@@ -240,6 +255,16 @@ pub const MEASUREMENTS: [Measurement; 15] = [
             "crates/app-client/tests/stall.rs",
             "the_record_beside_the_physics_phase",
         ),
+    },
+    Measurement {
+        name: "gpu-cost",
+        what: "Ten thousand indexed draws as draws, as one multi-draw and as one indirect draw over a compacted index buffer, record and submit apart with each one's thread and the render pass's GPU time by timestamps; 96 pipelines source-cold, specialisation-cold and from a reloaded cache, with the hit bits",
+        threshold: "none: recorded (milestone 2 plan, section 4; verification rows 15 and 34, and the plan's decision 5.7)",
+        run: Run::GpuCost {
+            package: "lactose-app-client",
+            file: "crates/app-client/tests/gpu.rs",
+            test: "cost_of_draws_and_pipelines",
+        },
     },
 ];
 
@@ -802,6 +827,9 @@ enum Load {
 #[derive(Clone, Debug)]
 struct Header {
     measurement: &'static Measurement,
+    /// What the files of a measurement that writes several are named for beside it: the
+    /// driver's flag of one run under each driver.
+    variant: Option<&'static str>,
     machine: String,
     date: String,
     short: bool,
@@ -837,7 +865,8 @@ fn markdown(header: &Header, figures: &[(String, String)], output: &str) -> Stri
     let m = header.measurement;
     let mut text = String::new();
     let short = if header.short { ", short run" } else { "" };
-    let _ = writeln!(text, "# {}, {}, {}{short}\n", m.name, header.machine, header.date);
+    let under = header.variant.map_or_else(String::new, |variant| format!(" under {variant}"));
+    let _ = writeln!(text, "# {}{under}, {}, {}{short}\n", m.name, header.machine, header.date);
     let _ = writeln!(text, "{}. Threshold: {}.\n", m.what, m.threshold);
     if header.short {
         let _ = writeln!(
@@ -987,6 +1016,16 @@ impl Options {
         } else {
             vulkan::Driver::System
         })
+    }
+
+    /// The drivers of a measurement on a device that runs under each of the host's:
+    /// `--driver`'s alone, or MoltenVK and KosmicKrisp on macOS and the system's elsewhere.
+    fn drivers(&self) -> Vec<vulkan::Driver> {
+        match self.driver {
+            Some(driver) => vec![driver],
+            None if cfg!(target_os = "macos") => vulkan::MACOS_GATE.to_vec(),
+            None => vec![vulkan::Driver::System],
+        }
     }
 
     /// The command as given, `--out` as resolved.
@@ -1139,17 +1178,19 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
         Err(error) => eprintln!("measure: the topology probe failed, so it is unknown: {error}"),
     }
     let (mut written, mut failed) = (Vec::new(), Vec::new());
-    // Made before the first measurement on a device; its failure fails each of them.
-    let mut device = None;
+    // Each driver's, made before the first measurement under it; its failure fails each of
+    // them.
+    let mut devices = Devices::default();
     for m in &options.selected {
         eprintln!("measure: {} ...", m.name);
         let result = match m.run {
             Run::Test { .. } => run_test(workspace, options, &machine, m, &out, None),
-            Run::Device { .. } => {
-                match device.get_or_insert_with(|| on_device(workspace, options)) {
-                    Ok(device) => run_test(workspace, options, &machine, m, &out, Some(device)),
-                    Err(error) => Err(error.clone()),
-                }
+            Run::Device { .. } => match devices.get(workspace, options, options.driver()) {
+                Ok(device) => run_test(workspace, options, &machine, m, &out, Some(device)),
+                Err(error) => Err(error),
+            },
+            Run::GpuCost { .. } => {
+                run_gpu_cost(workspace, options, &machine, m, &out, &mut devices)
             }
             Run::SpikeReplays => run_spike_replays(workspace, options, &machine, m, &out),
             Run::TaskBench => run_task_bench(workspace, options, &machine, &out),
@@ -1412,6 +1453,7 @@ fn header(
 ) -> Header {
     Header {
         measurement: m,
+        variant: None,
         machine: machine.name.clone(),
         date: machine.date.clone(),
         short: options.short && m.run.cut_by_short(),
@@ -1437,13 +1479,23 @@ fn default_workers(machine: &Machine) -> String {
     )
 }
 
+/// The stem of `header`'s files: [`file_stem`]'s, the measurement's name followed by its
+/// variant where it has one.
+fn header_stem(header: &Header) -> String {
+    let name = match header.variant {
+        Some(variant) => format!("{}-{variant}", header.measurement.name),
+        None => header.measurement.name.to_owned(),
+    };
+    file_stem(&name, &header.machine, &header.date, header.short)
+}
+
 fn write(
     out: &Path,
     header: &Header,
     figures: &[(String, String)],
     output: &str,
 ) -> Result<Vec<PathBuf>, String> {
-    let stem = file_stem(header.measurement.name, &header.machine, &header.date, header.short);
+    let stem = header_stem(header);
     let md = out.join(format!("{stem}.md"));
     let json_file = out.join(format!("{stem}.json"));
     fs::write(&md, markdown(header, figures, output))
@@ -1489,11 +1541,36 @@ struct OnDevice {
 /// How long `vulkaninfo` may run.
 const VULKANINFO_DEADLINE: Duration = Duration::from_secs(60);
 
-/// The environment of `--driver`, the pinned SDK's loader where the driver is the SDK's or the
+/// Each driver's [`OnDevice`], made once a run.
+#[derive(Default)]
+struct Devices(Vec<(vulkan::Driver, Result<OnDevice, String>)>);
+
+impl Devices {
+    fn get(
+        &mut self,
+        workspace: &Workspace,
+        options: &Options,
+        driver: vulkan::Driver,
+    ) -> Result<&OnDevice, String> {
+        let at = match self.0.iter().position(|(made, _)| *made == driver) {
+            Some(at) => at,
+            None => {
+                self.0.push((driver, on_device(workspace, options, driver)));
+                self.0.len() - 1
+            }
+        };
+        self.0[at].1.as_ref().map_err(Clone::clone)
+    }
+}
+
+/// The environment of `driver`, the pinned SDK's loader where the driver is the SDK's or the
 /// host has no loader of its own (macOS), and `vulkaninfo`'s report under it: the SDK's copy,
 /// or the one on the path with the system's loader.
-fn on_device(workspace: &Workspace, options: &Options) -> Result<OnDevice, String> {
-    let driver = options.driver();
+fn on_device(
+    workspace: &Workspace,
+    options: &Options,
+    driver: vulkan::Driver,
+) -> Result<OnDevice, String> {
     let sdk = if driver == vulkan::Driver::System && !cfg!(target_os = "macos") {
         None
     } else {
@@ -1543,9 +1620,26 @@ fn run_test(
     out: &Path,
     device: Option<&OnDevice>,
 ) -> Result<Vec<PathBuf>, String> {
+    run_test_with(workspace, options, machine, m, out, device, None, &[])
+}
+
+/// [`run_test`], its files named for `variant` where there is one, and the test given
+/// `extra`, which the header's command shows.
+#[expect(clippy::too_many_arguments, reason = "run_test's, and the two a variant adds")]
+fn run_test_with(
+    workspace: &Workspace,
+    options: &Options,
+    machine: &Machine,
+    m: &'static Measurement,
+    out: &Path,
+    device: Option<&OnDevice>,
+    variant: Option<&'static str>,
+    extra: &[(&'static str, String)],
+) -> Result<Vec<PathBuf>, String> {
     let args = nextest_args(m.run);
     build(workspace, &no_run(&args))?;
-    let env = short_env(options);
+    let mut env = short_env(options);
+    env.extend(extra.iter().cloned());
     let mut command = Command::new(&workspace.cargo);
     command.args(&args).current_dir(&workspace.root);
     // The device's environment first: it clears what it does not set.
@@ -1573,6 +1667,7 @@ fn run_test(
     }
     let ran = shell_line(&shown, "cargo", &args);
     let mut header = header(options, machine, m, "release", workers, ran, load);
+    header.variant = variant;
     if let Some(n) = machine.workers_override {
         header.notes.push((
             "Workers override".to_owned(),
@@ -1585,6 +1680,127 @@ fn run_test(
         header.notes.extend(device_notes(&device.setting, adapter));
     }
     write(out, &header, &found, &output)
+}
+
+/// The variable naming the directory of the engine's cooked shaders for a test on a device, as
+/// `cargo xtask gpu` sets it.
+const SHADERS_VAR: &str = "LACTOSE_GPU_SHADERS";
+/// The variable naming the directory of `gpu-cost`'s cooked salted source and its salt.
+const SALTED_VAR: &str = "LACTOSE_MEASURE_SALTED";
+/// The pipelines `gpu-cost` makes from each source, the salted one's entry pairs among them.
+const COST_PIPELINES: u32 = 96;
+/// The engine's shader sources, relative to the repository root.
+const SHADER_SOURCES: &str = "shaders";
+
+/// The source `gpu-cost` makes its source-cold pipelines from, `salted.slang`: `pipelines`
+/// pairs of entry points, `vs_NN` and `fs_NN`, each folding the link-time constant `SALT`
+/// with its own number into a literal, so that each entry's SPIR-V and MSL differ from every
+/// other entry's and, under another salt, from every earlier run's. The vertex stage reads
+/// `shaders/measure/cost.slang`'s push block.
+#[must_use]
+pub fn salted_source(pipelines: u32) -> String {
+    let mut text = String::from(
+        "// Written by `cargo xtask measure gpu-cost` for one run, never checked in: its \
+         source-cold\n// pipelines, each entry pair folding the salted link-time constant \
+         into its own literal.\n\nextern static const uint SALT;\n\nstruct Push\n{\n    \
+         float4* positions;\n};\n\n[[vk::push_constant]] ConstantBuffer<Push> push;\n\n\
+         struct Varyings\n{\n    float4 position : SV_Position;\n};\n\nstruct Colour\n{\n    \
+         [[vk::location(0)]] float4 colour : SV_Target0;\n};\n",
+    );
+    for at in 0..pipelines {
+        let _ = write!(
+            text,
+            "\n[shader(\"vertex\")]\nVaryings vs_{at:02}(uint vertex : SV_VulkanVertexID)\n{{\n    \
+             Varyings result;\n    result.position = push.positions[vertex];\n    \
+             result.position.z = float((SALT + {at}u) % 16777216u) / 33554432.0;\n    \
+             return result;\n}}\n\n[shader(\"fragment\")]\nColour fs_{at:02}()\n{{\n    \
+             Colour result;\n    result.colour = float4(float((SALT + {at}u) % 16777216u) / \
+             16777216.0, 0.5, 0.25, 1.0);\n    return result;\n}}\n"
+        );
+    }
+    text
+}
+
+/// `salted.slang`'s link module, which gives `SALT` its value.
+#[must_use]
+pub fn salted_link(salt: u32) -> String {
+    format!(
+        "// Written by `cargo xtask measure gpu-cost` for one run: the salt of its source-cold \
+         pipelines.\nmodule salted_link;\n\nexport static const uint SALT = {salt}u;\n"
+    )
+}
+
+/// A path for a header: relative to the repository root where it is inside it, else cut to
+/// its file name, so that no file names a path of this machine.
+fn shown_path(root: &Path, path: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(inside) => inside.to_string_lossy().replace('\\', "/"),
+        Err(_) => redacted(&path.to_string_lossy(), None),
+    }
+}
+
+/// `gpu-cost`: the engine's shaders cooked once, then under each driver a source salted for
+/// that run cooked and the test run, each driver's pair of files named for it. A salt is the
+/// clock's nanoseconds, folded to 24 bits, as the source folds it; the cook and the build
+/// are before each window opens.
+fn run_gpu_cost(
+    workspace: &Workspace,
+    options: &Options,
+    machine: &Machine,
+    m: &'static Measurement,
+    out: &Path,
+    devices: &mut Devices,
+) -> Result<Vec<PathBuf>, String> {
+    let pin = crate::slang::Pin::parse(&read_file(&workspace.root.join(crate::slang::PIN_FILE))?)?;
+    let slangc = crate::slang::install(&pin, &workspace.target_dir)?;
+    let dir = workspace.target_dir.join("measure").join("gpu-cost");
+    eprintln!("measure: cooking {SHADER_SOURCES} with Slang {}", pin.version);
+    let sources = workspace.root.join(SHADER_SOURCES);
+    let code = crate::slang::cook(&workspace.cargo, &workspace.root, &slangc, &sources, &dir)?;
+    let mut written = Vec::new();
+    for driver in options.drivers() {
+        let device = devices.get(workspace, options, driver)?;
+        let salt = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos() ^ (since.as_secs() as u32))
+            % (1 << 24);
+        let salted = dir.join(format!("salted-{}", driver.name()));
+        let source = salted.join("src");
+        let _ = fs::remove_dir_all(&salted);
+        fs::create_dir_all(&source).map_err(|e| format!("{}: {e}", source.display()))?;
+        for (name, text) in [
+            ("salted.slang", salted_source(COST_PIPELINES)),
+            ("salted.link.slang", salted_link(salt)),
+        ] {
+            let file = source.join(name);
+            fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
+        }
+        eprintln!("measure: cooking the source salted {salt} for {}", driver.name());
+        let cooked =
+            crate::slang::cook(&workspace.cargo, &workspace.root, &slangc, &source, &salted)?;
+        let file = cooked.join("salt");
+        fs::write(&file, salt.to_string()).map_err(|e| format!("{}: {e}", file.display()))?;
+        let extra = [
+            (SHADERS_VAR, shown_path(&workspace.root, &code)),
+            (SALTED_VAR, shown_path(&workspace.root, &cooked)),
+        ];
+        written.extend(run_test_with(
+            workspace,
+            options,
+            machine,
+            m,
+            out,
+            Some(device),
+            Some(driver.name()),
+            &extra,
+        )?);
+    }
+    Ok(written)
+}
+
+/// A file's text.
+fn read_file(path: &Path) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The replays a run of `spike-net` makes: every one, or a short run's.
@@ -2221,6 +2437,40 @@ mod tests {
         );
     }
 
+    /// A measurement run under each driver writes each driver's files apart, named and
+    /// headed for it.
+    #[test]
+    fn a_run_under_each_driver_names_its_files_for_the_driver() {
+        let header = Header { variant: Some("kosmickrisp"), short: false, ..sample_header() };
+        assert_eq!(header_stem(&header), "tick-100k-kosmickrisp-apple-m1-2026-11-15");
+        let text = markdown(&header, &[], "");
+        assert!(text.starts_with("# tick-100k under kosmickrisp, apple-m1, 2026-11-15\n"));
+        assert_eq!(header_stem(&sample_header()), "tick-100k-apple-m1-2026-11-15-short");
+        let both = parse(&["gpu-cost"]).unwrap().drivers();
+        let host: &[vulkan::Driver] =
+            if cfg!(target_os = "macos") { &vulkan::MACOS_GATE } else { &[vulkan::Driver::System] };
+        assert_eq!(both, host);
+        let one = parse(&["gpu-cost", "--driver", "kosmickrisp"]).unwrap().drivers();
+        assert_eq!(one, [vulkan::Driver::KosmicKrisp]);
+    }
+
+    /// `gpu-cost`'s salted source: every pipeline's pair of entries named once, each folding
+    /// the salt with its own number, and the salt given by the link module alone.
+    #[test]
+    fn the_salted_source_gives_each_pipeline_its_own_entries() {
+        let source = salted_source(COST_PIPELINES);
+        for at in 0..COST_PIPELINES {
+            for entry in [format!("Varyings vs_{at:02}("), format!("Colour fs_{at:02}(")] {
+                assert_eq!(source.matches(&entry).count(), 1, "{entry}");
+            }
+            assert_eq!(source.matches(&format!("(SALT + {at}u)")).count(), 2, "{at}");
+        }
+        assert_eq!(source.matches("[shader(").count(), 2 * COST_PIPELINES as usize);
+        assert!(source.contains("extern static const uint SALT;"));
+        assert!(salted_link(7).contains("export static const uint SALT = 7u;"));
+        assert_ne!(salted_link(7), salted_link(8));
+    }
+
     #[test]
     fn the_load_average_is_read_from_uptime_on_macos_and_linux() {
         let mac = " 5:41  up 7 days, 16:08, 2 users, load averages: 10.73 46.34 37.61";
@@ -2423,7 +2673,8 @@ mod tests {
         let names: Vec<&str> = all.selected.iter().map(|m| m.name).collect();
         assert!(names.contains(&"record-stall") && names.contains(&"tick-100k"), "{names:?}");
         assert!(!names.contains(&"extract-50k") && !names.contains(&"remote-upload-5k"));
-        assert_eq!(all.selected.len() + 2, MEASUREMENTS.len());
+        assert!(!names.contains(&"gpu-cost"), "{names:?}");
+        assert_eq!(all.selected.len() + 3, MEASUREMENTS.len());
         let error = parse(&["extract-50k", "--no-device"]).unwrap_err();
         assert!(error.contains("`extract-50k`"), "{error}");
         let named = parse(&["extract-50k", "--driver", "kosmickrisp", "--adapter", "Apple M1"]);
@@ -2555,6 +2806,7 @@ mod tests {
     fn sample_header() -> Header {
         Header {
             measurement: find("tick-100k").unwrap(),
+            variant: None,
             machine: "apple-m1".into(),
             date: "2026-11-15".into(),
             short: true,

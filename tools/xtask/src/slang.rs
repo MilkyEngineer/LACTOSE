@@ -180,6 +180,46 @@ pub fn install(pin: &Pin, target_dir: &Path) -> Result<PathBuf, String> {
     Ok(slangc)
 }
 
+/// Cooks the shader sources under `sources` with `slangc` through `ricotta`, run by `cargo`
+/// from `root`: each entry's code into `out/code`, as `--code` writes it, the cooked sources
+/// into `out/shaders`, and the pack into `out/shaders.pack`. Removes what an earlier cook
+/// left in the two directories first, so that a shader since removed is not loaded again.
+/// Ricotta's own output goes to standard error. Returns `out/code`.
+///
+/// # Errors
+/// If a directory cannot be removed, or ricotta cannot run or fails.
+pub fn cook(
+    cargo: &str,
+    root: &Path,
+    slangc: &Path,
+    sources: &Path,
+    out: &Path,
+) -> Result<PathBuf, String> {
+    let code = out.join("code");
+    let shaders = out.join("shaders");
+    for dir in [&code, &shaders] {
+        remove(dir)?;
+    }
+    let status = Command::new(cargo)
+        .args(["run", "--locked", "--quiet", "--package", "lactose-cook", "--bin", "ricotta", "--"])
+        .arg("--slangc")
+        .arg(slangc)
+        .arg("--code")
+        .arg(&code)
+        .arg("--shaders")
+        .arg(&shaders)
+        .arg(sources)
+        .arg(out.join("shaders.pack"))
+        .current_dir(root)
+        .stdout(Stdio::from(io::stderr()))
+        .status()
+        .map_err(|e| format!("cannot run ricotta: {e}"))?;
+    if !status.success() {
+        return Err(format!("ricotta ended with {status}"));
+    }
+    Ok(code)
+}
+
 /// The SHA-256 of a file's bytes, in lowercase hexadecimal.
 fn digest_of(file: &Path) -> io::Result<String> {
     let bytes = fs::read(file)?;

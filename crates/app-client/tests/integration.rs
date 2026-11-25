@@ -16,6 +16,7 @@
 mod protocol;
 
 mod extract;
+mod gpu;
 mod null;
 mod present;
 mod recorded;

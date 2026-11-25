@@ -300,7 +300,7 @@ const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
 /// while unwinding left pending). The render graph's and the renderer's are their `device`
 /// modules'. The client's are the measurements on a device that `cargo xtask measure` runs
 /// with no layer, here run short under the validators, their figures discarded.
-const DEVICE_TESTS: [(&str, Option<&str>, &str); 7] = [
+const DEVICE_TESTS: [(&str, Option<&str>, &str); 8] = [
     ("lactose-rhi-vulkan", None, "canary::"),
     ("lactose-rhi-vulkan", None, "swapchain::"),
     ("lactose-rhi-vulkan", Some("integration"), ""),
@@ -308,6 +308,7 @@ const DEVICE_TESTS: [(&str, Option<&str>, &str); 7] = [
     ("lactose-renderer", Some("integration"), "device::"),
     ("lactose-app-client", Some("integration"), "extract::"),
     ("lactose-app-client", Some("integration"), "upload::"),
+    ("lactose-app-client", Some("integration"), "gpu::"),
 ];
 
 /// What `gpu` was asked to run.
@@ -664,35 +665,8 @@ fn ignored_tests(binary: &Path) -> Result<Vec<String>, String> {
 /// directory.
 fn cook_engine_shaders(context: &Context, pin: &slang::Pin, out: &Path) -> Result<PathBuf, String> {
     let slangc = slang::install(pin, &context.target_dir)?;
-    let code = out.join("code");
-    let shaders = out.join("shaders");
-    // A shader cooked by an earlier run and since removed would otherwise be loaded again.
-    for dir in [&code, &shaders] {
-        match fs::remove_dir_all(dir) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(format!("{}: {error}", dir.display()));
-            }
-            _ => {}
-        }
-    }
     eprintln!("gpu: cooking {SHADERS} with Slang {}", pin.version);
-    let status = Command::new(&context.cargo)
-        .args(["run", "--locked", "--quiet", "--package", "lactose-cook", "--bin", "ricotta", "--"])
-        .arg("--slangc")
-        .arg(&slangc)
-        .arg("--code")
-        .arg(&code)
-        .arg("--shaders")
-        .arg(&shaders)
-        .arg(SHADERS)
-        .arg(out.join("shaders.pack"))
-        .stdout(Stdio::from(io::stderr()))
-        .status()
-        .map_err(|e| format!("cannot run ricotta: {e}"))?;
-    if !status.success() {
-        return Err(format!("ricotta ended with {status}"));
-    }
-    Ok(code)
+    slang::cook(&context.cargo, &context.root, &slangc, Path::new(SHADERS), out)
 }
 
 /// Each validator's canary in the Metal script, every phrasing seen so far of what the
@@ -1063,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn the_device_tests_are_rhi_vulkans_canary_and_swapchain_modules_and_five_test_targets() {
+    fn the_device_tests_are_rhi_vulkans_canary_and_swapchain_modules_and_six_test_targets() {
         let library: Vec<&str> = DEVICE_TESTS
             .iter()
             .filter(|(_, target, _)| target.is_none())
@@ -1083,6 +1057,7 @@ mod tests {
                 ("lactose-renderer", "integration", "device::"),
                 ("lactose-app-client", "integration", "extract::"),
                 ("lactose-app-client", "integration", "upload::"),
+                ("lactose-app-client", "integration", "gpu::"),
             ]
         );
     }

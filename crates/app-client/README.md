@@ -106,8 +106,9 @@ the tests alone.
 | `extract-50k` | `extract::cost_of_extract_at_50k_dirty_rows`: extract's pass over 100,000 rows with 50,000 moved, writing a Vulkan device's ring and a snapshot of 10,000 presented rows, each alone, on one worker, and again on null |
 | `remote-upload-5k` | `upload::cost_of_the_remote_upload_of_5k`: the remote upload of 5,000 slots of `lactose-net-host`'s interpolation buffer into a Vulkan device's ring at 144 Hz, a writer thread of class `Network` pushing every slot at 30 Hz |
 | `record-stall` | `stall::the_record_beside_the_physics_phase`: `ClientRender`'s record on null beside the composed tick's physics phase at a reservation of one frame worker and of two, and alone; the physics phase is read from the executor's spans by a subscriber of the test's own |
+| `gpu-cost` | `gpu::cost_of_draws_and_pipelines`: 10,000 indexed draws on a Vulkan device as draws, as one multi-draw and as one indirect draw over a compacted index buffer, recorded on a thread of their own and timed apart from the submit, the render pass's GPU time read from `lactose-rhi-vulkan`'s `Timestamps`; 96 pipelines source-cold (from `LACTOSE_MEASURE_SALTED`, the source `cargo xtask measure` salts and cooks; a short run without it skips them), specialisation-cold (`shaders/measure/cost.slang`), and from a second device started from the first's cache bytes, with the hit bits |
 
-The two on a device run under the driver `cargo xtask measure --driver` names with no layer,
+The three on a device run under the driver `cargo xtask measure --driver` names with no layer,
 and fail on any message the device sends; `cargo xtask gpu` runs them short under its
 validators and discards their figures. `LACTOSE_GPU_ADAPTER` names the adapter.
 

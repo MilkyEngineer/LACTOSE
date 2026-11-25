@@ -1,4 +1,4 @@
-//! What the measurements share (`extract`, `upload`, `stall`): the figure lines `cargo xtask
+//! What the measurements share (`extract`, `upload`, `stall`, `gpu`): the figure lines `cargo xtask
 //! measure` reads, the short run, N, the percentiles, a Vulkan device whose messages the
 //! run's judge counts, and a frame's end with an empty submit.
 //!
@@ -109,22 +109,33 @@ impl Messages {
 /// no surface, and its identity as figures (`device.*`), which `cargo xtask measure` joins
 /// to the driver's own report in the file's header.
 pub fn vulkan() -> (Arc<dyn Device>, Arc<Messages>) {
+    let (device, messages) = vulkan_device(Vec::new());
+    let device: Arc<dyn Device> = Arc::new(device);
+    identity(&*device);
+    (device, messages)
+}
+
+/// As [`vulkan`], its pipeline cache started from `pipeline_cache`, with no figure.
+pub fn vulkan_device(pipeline_cache: Vec<u8>) -> (VulkanDevice, Arc<Messages>) {
     let messages = Arc::new(Messages::default());
     let request = DeviceRequest {
         adapter: std::env::var("LACTOSE_GPU_ADAPTER").ok(),
         surface: None,
         heap_slots: HEAP_SLOTS_DEFAULT,
         samplers: SAMPLERS_DEFAULT,
-        pipeline_cache: Vec::new(),
+        pipeline_cache,
         messages: Arc::clone(&messages) as Arc<dyn MessageSink>,
     };
-    let device: Arc<dyn Device> = Arc::new(VulkanDevice::new(request).expect("a Vulkan device"));
+    (VulkanDevice::new(request).expect("a Vulkan device"), messages)
+}
+
+/// The device's identity as figures (`device.*`): once in a run, since a figure is named once.
+pub fn identity(device: &dyn Device) {
     let info = device.info();
     figure("device.backend", info.backend);
     figure("device.adapter", &info.adapter);
     figure("device.driver", if info.driver.is_empty() { "unreported" } else { &info.driver });
     figure("device.coherent_host_memory", device.capabilities().coherent_host_memory);
-    (device, messages)
 }
 
 /// Ends each frame with a submit that declares nothing and signals the timeline's next
