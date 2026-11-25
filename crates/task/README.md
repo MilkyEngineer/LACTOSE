@@ -553,8 +553,10 @@ Correctness:
 - `src/measure.rs` holds the measurement calls: on macOS the foreground role taken and read
   back, and again with no change; the class map against the device tree's (above) and against
   the topology's counts; a class read on every call on four threads wherever the system reports
-  the cores' types; and on Linux and Windows a thread pinned to each CPU the process may use in
-  turn, where every reading is the same and is that CPU's. `src/platform.rs` holds the maps
+  the cores' types; on a Mac with two levels, as many spinning user-interactive threads as CPUs
+  reading both classes between them, since macOS cannot pin and the performance cores alone
+  cannot hold them all; and on Linux and Windows a thread pinned to each CPU the process may
+  use in turn, where every reading is the same and is that CPU's. `src/platform.rs` holds the maps
   built from hand-made input: Apple levels, Linux capacities and PMU lists, and Windows core
   records with their group masks, on any host. The tests that call the system are ignored
   under Miri.

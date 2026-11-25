@@ -256,6 +256,47 @@ mod tests {
         assert!(!classes.is_empty(), "macOS reported no CPUs");
     }
 
+    /// macOS cannot pin a thread, so the call is held to the current CPU by filling every
+    /// core: as many spinning threads as CPUs, which the performance cores alone cannot
+    /// hold, read both classes between them. A call that read any one CPU's class would see
+    /// one. Each thread stops once both are seen, or after two seconds.
+    #[test]
+    #[cfg_attr(miri, ignore = "queries the operating system")]
+    #[cfg(target_vendor = "apple")]
+    fn every_core_busy_reads_both_classes() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::time::{Duration, Instant};
+
+        let classes = platform::cpu_classes();
+        if !classes.values().any(|&class| class == CoreClass::Efficiency) {
+            eprintln!("one performance level; nothing to tell apart");
+            return;
+        }
+        // Bit 0: a performance reading; bit 1: an efficiency reading.
+        let seen = std::sync::Arc::new(AtomicU8::new(0));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let threads: Vec<_> = (0..classes.len())
+            .map(|_| {
+                let seen = std::sync::Arc::clone(&seen);
+                std::thread::spawn(move || {
+                    lactose_core::ThreadClass::FrameCritical.enter().unwrap();
+                    while seen.load(Ordering::Relaxed) != 0b11 && Instant::now() < deadline {
+                        let bit = match current_core_class() {
+                            Some(CoreClass::Performance) => 0b01,
+                            Some(CoreClass::Efficiency) => 0b10,
+                            None => panic!("a CPU the map does not hold"),
+                        };
+                        seen.fetch_or(bit, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(seen.load(Ordering::Relaxed), 0b11, "{} CPUs busy", classes.len());
+    }
+
     /// The map agrees with the topology the executor sizes its pools by, on a machine whose
     /// logical CPUs are its physical cores.
     #[test]
