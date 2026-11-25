@@ -802,69 +802,6 @@ fn phase<R>(
     result
 }
 
-/// Puts the process in the task role of a frontmost application on macOS and returns the
-/// role it ends up in, as the system reports it, for the record.
-#[cfg(target_os = "macos")]
-#[allow(
-    deprecated,
-    reason = "libc deprecates mach_task_self in favour of a crate this benchmark does not need"
-)]
-fn foreground_task_role() -> String {
-    // <mach/task_policy.h>: `task_category_policy` is one `integer_t`, the role.
-    const TASK_CATEGORY_POLICY: u32 = 1;
-    const TASK_FOREGROUND_APPLICATION: i32 = 1;
-    unsafe extern "C" {
-        fn task_policy_set(
-            task: libc::mach_port_t,
-            flavor: u32,
-            policy: *const i32,
-            count: u32,
-        ) -> libc::kern_return_t;
-        fn task_policy_get(
-            task: libc::mach_port_t,
-            flavor: u32,
-            policy: *mut i32,
-            count: *mut u32,
-            get_default: *mut u32,
-        ) -> libc::kern_return_t;
-    }
-    let role = TASK_FOREGROUND_APPLICATION;
-    // SAFETY: the calls take the process's own task port, a pointer to one live `i32`
-    // with the count that says so, and write only through the out-pointers given.
-    unsafe {
-        let task = libc::mach_task_self();
-        let set = task_policy_set(task, TASK_CATEGORY_POLICY, &raw const role, 1);
-        let mut current = -1i32;
-        let mut count = 1u32;
-        let mut get_default = 0u32;
-        let got = task_policy_get(
-            task,
-            TASK_CATEGORY_POLICY,
-            &raw mut current,
-            &raw mut count,
-            &raw mut get_default,
-        );
-        let name = match current {
-            0 => "TASK_UNSPECIFIED",
-            1 => "TASK_FOREGROUND_APPLICATION",
-            2 => "TASK_BACKGROUND_APPLICATION",
-            3 => "TASK_CONTROL_APPLICATION",
-            4 => "TASK_GRAPHICS_SERVER",
-            5 => "TASK_THROTTLE_APPLICATION",
-            6 => "TASK_NONUI_APPLICATION",
-            7 => "TASK_DEFAULT_APPLICATION",
-            8 => "TASK_DARWINBG_APPLICATION",
-            _ => "unknown",
-        };
-        format!("{name} (set returned {set}, get returned {got})")
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn foreground_task_role() -> String {
-    "not applicable".to_owned()
-}
-
 /// A node of empty units, for timing the scheduling around them.
 struct EmptyNode {
     units: u32,
@@ -1066,7 +1003,7 @@ fn main() {
     let commit = commit();
     let topology = StdPlatform.topology();
     let load_before = load_average().unwrap_or_else(|| "unknown".to_owned());
-    let task_role = foreground_task_role();
+    let task_role = lactose_task::take_foreground_task_role();
 
     let executor = Executor::builder().build().expect("executor starts");
     let frame_workers = executor.frame_worker_count();

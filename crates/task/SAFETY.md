@@ -6,8 +6,9 @@ comments rely on. The crate's tests run under Miri, with the stand-in deque desc
 end, are modelled under loom.
 
 Architecture section 21 lists the reasons for unsafe here: deques, scope borrows, the panic
-guard, task futures, core-topology queries, the keeper's timed wait on Windows, and the
-benchmark's and tests' process-CPU and task-role calls. The deque itself is
+guard, task futures, core-topology queries, the keeper's timed wait on Windows, the
+benchmark's and tests' process-CPU and pinning calls, and the task-role and current-core
+calls the crate gives measurement as safe functions. The deque itself is
 `crossbeam-deque` and needs no unsafe of ours beyond sending entries through it. The panic
 guard (`guard.rs`) turned out to need none: it is a value whose destructor aborts and which
 is forgotten on the normal path. What remains is below.
@@ -131,9 +132,25 @@ thread, concurrently with the others. Both handles are closed once, in `Drop`.
   `detect::windows_core_ratings`, safe code that trusts only each record's eight-byte header
   and bounds every read by the buffer. No record is read through its declared type, whose
   size (that of its largest variant) is larger than a processor-core record.
+  The group masks of a core record, which give each logical processor its core's class, are
+  read from those bytes by the same walk, each bounded by the record's own size.
 - Linux reads sysfs with safe code.
+- The current CPU, for `current_core_class`: on macOS `pthread_cpu_number_np` with a pointer
+  to a live `size_t`, read only if the call returned 0; on Windows
+  `GetCurrentProcessorNumberEx` with a pointer to a live `PROCESSOR_NUMBER`, a call that
+  cannot fail; on Linux `sched_getcpu`, which takes nothing and returns the CPU or -1. Each
+  writes only through the pointer it is given.
 
-## Process-CPU and task-role calls (`benches/whisk.rs`, `tests/idle_cpu.rs`)
+## The task-role call (`measure.rs`)
+
+On macOS `take_foreground_task_role` declares `task_policy_set` and `task_policy_get` from
+`<mach/task_policy.h>` itself and calls them on the process's own task port with the category
+flavor, whose policy is one `integer_t`: a pointer to one live `i32` with a count of one, and
+for the query live out-pointers for the role, the count and the default flag. The calls write
+only through those pointers, and the role is read only if the query returned 0 with a count
+of one.
+
+## Process-CPU calls (`benches/whisk.rs`, `tests/idle_cpu.rs`)
 
 - `getrusage` is called on Unix with a pointer to a zeroed `rusage`, which is read only if
   the call succeeded: the benchmark returns nothing otherwise, and `tests/idle_cpu.rs`
@@ -141,8 +158,13 @@ thread, concurrently with the others. Both handles are closed once, in `Drop`.
 - On Windows the benchmark calls `QueryProcessCycleTime` and `QueryThreadCycleTime` with the
   pseudo handle of the current process or thread, which is always valid, and a pointer to a
   live `u64`, which it reads only if the call succeeded.
-- On macOS the benchmark declares `task_policy_set` and `task_policy_get` from
-  `<mach/task_policy.h>` itself and calls them on the process's own task port with the
-  category flavor, whose policy is one `integer_t`: a pointer to one live `i32` with a count
-  of one, and for the query live out-pointers for the count and the default flag. The calls
-  write only through those pointers.
+
+## Pinning in tests (`measure.rs`)
+
+The tests that hold the class on a pinned thread pin a thread they spawned, and nothing else.
+On Linux `sched_getaffinity` and `sched_setaffinity` take pid 0, the calling thread, and a
+live `cpu_set_t` with its size; the set starts zeroed, which is valid for its integers, and
+`CPU_ISSET` and `CPU_SET` touch one bit below `CPU_SETSIZE`. On Windows
+`GetProcessAffinityMask` and `SetThreadAffinityMask` take the pseudo handle of the current
+process or thread, which is always valid, live out-pointers, and a mask of one processor the
+process may use.
