@@ -7,6 +7,7 @@
 //! Host-only: the sampler runs on the render side and the writer on the network thread.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lactose_core::{Error, ErrorKind, Result, Tick};
 use lactose_math::{Quat, Scalar, ScalarBits, Vec3};
@@ -154,6 +155,9 @@ const fn next_generation(generation: u32) -> u32 {
 /// [`InterpolationReader`]s through an `Arc`.
 pub struct InterpolationBuffer {
     slots: Box<[Slot]>,
+    /// How many reads of a slot were retried, by every reader
+    /// ([`InterpolationReader::retried_reads`]).
+    retried: AtomicU64,
 }
 
 impl InterpolationBuffer {
@@ -162,7 +166,7 @@ impl InterpolationBuffer {
     #[must_use]
     pub fn split(capacity: u32) -> (InterpolationWriter, InterpolationReader) {
         let slots = (0..capacity).map(|_| Slot::new()).collect();
-        let buffer = Arc::new(Self { slots });
+        let buffer = Arc::new(Self { slots, retried: AtomicU64::new(0) });
         let writer = InterpolationWriter {
             buffer: buffer.clone(),
             free: Vec::new(),
@@ -287,7 +291,11 @@ impl InterpolationReader {
         let Some(held) = self.buffer.slots.get(slot.index as usize) else {
             return RemoteSample::MISSING;
         };
-        let snapshot = held.read();
+        let (snapshot, retries) = held.read_counted();
+        if retries > 0 {
+            // A count for measurement alone: it orders nothing.
+            self.buffer.retried.fetch_add(1, Ordering::Relaxed);
+        }
         if slot.generation == 0 || snapshot.generation != slot.generation || snapshot.count == 0 {
             return RemoteSample::MISSING;
         }
@@ -341,6 +349,23 @@ impl InterpolationReader {
     #[must_use]
     pub fn capacity(&self) -> u32 {
         self.buffer.capacity()
+    }
+
+    /// How many reads of a slot, by any of the buffer's readers since the buffer was split,
+    /// were retried because a write of the slot overlapped them, each counted once however
+    /// long it waited: a count for measurement (`remote-upload-5k`'s retry rate), kept with
+    /// no ordering and added to only by a retried read, so a read no write overlaps costs
+    /// nothing more.
+    #[must_use]
+    pub fn retried_reads(&self) -> u64 {
+        self.buffer.retried.load(Ordering::Relaxed)
+    }
+
+    /// The bytes the buffer's slots occupy: its footprint, for measurement
+    /// (`remote-upload-5k`).
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        core::mem::size_of_val(&*self.buffer.slots)
     }
 }
 

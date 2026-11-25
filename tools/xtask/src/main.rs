@@ -72,11 +72,14 @@ cargo xtask <command>
                              run the program once it holds one of <n> machine-wide slots
                              (default 2, the same for every caller on the machine), and
                              exit with its status
-  measure (--all | <name>…) [--short] [--out <dir>]
+  measure (--all | <name>…) [--short] [--no-device] [--driver <name>] [--adapter <name>]
+          [--out <dir>]
                              run the milestone measurements and write each one's result
                              files to docs/results (or <dir>); --short cuts repetitions
-                             and marks the files as short; the names are in
-                             docs/results/README.md
+                             and marks the files as short; --no-device leaves out those
+                             on a Vulkan device, which run with no layer under --driver
+                             (moltenvk on macOS, system elsewhere) on --adapter (the
+                             loader's first); the names are in docs/results/README.md
   slang                      install the pinned Slang release under the target directory,
                              from tools/cook/slang.toml, and print its slangc's path
   gpu [--driver <name>] [--adapter <name>] [--only <metal|vulkan>] [--gpu-assisted]
@@ -285,8 +288,6 @@ fn install_slang() -> Result<PathBuf, String> {
 
 /// The engine's Slang sources, which `gpu` cooks.
 const SHADERS: &str = "shaders";
-/// The Swift script of the Metal step.
-const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
 /// The device tests the Vulkan step runs: each package, its test target (`None` for its
 /// library's unit tests) and the prefix of the names taken, whose ignored tests are the ones
 /// that need a device. The library's are its `canary` module's, the thread-safety canary,
@@ -295,13 +296,17 @@ const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
 /// signals, a failed `resize`, a present the driver refuses) or watch what none reports (a
 /// present's walk left undecided, a driver swapchain kept for a submit an encoder dropped
 /// while unwinding left pending). The render graph's and the renderer's are their `device`
-/// modules'.
-const DEVICE_TESTS: [(&str, Option<&str>, &str); 5] = [
+/// modules'. The client's are the measurements on a device that `cargo xtask measure` runs
+/// with no layer, here run short under the validators, their figures discarded.
+const DEVICE_TESTS: [(&str, Option<&str>, &str); 8] = [
     ("lactose-rhi-vulkan", None, "canary::"),
     ("lactose-rhi-vulkan", None, "swapchain::"),
     ("lactose-rhi-vulkan", Some("integration"), ""),
     ("lactose-render-graph", Some("integration"), "device::"),
     ("lactose-renderer", Some("integration"), "device::"),
+    ("lactose-app-client", Some("integration"), "extract::"),
+    ("lactose-app-client", Some("integration"), "upload::"),
+    ("lactose-app-client", Some("integration"), "gpu::"),
 ];
 
 /// What `gpu` was asked to run.
@@ -409,7 +414,9 @@ fn run_gpu(args: &[&str]) -> Checked {
     };
     let mut failures = Vec::new();
     if args.metal {
-        failures.extend(run_metal(args.drivers[0].name(), &code, &cooked_by, &out).err());
+        failures.extend(
+            run_metal(&context.root, args.drivers[0].name(), &code, &cooked_by, &out).err(),
+        );
     }
     if args.vulkan {
         for &driver in &args.drivers {
@@ -426,15 +433,21 @@ fn run_gpu(args: &[&str]) -> Checked {
 /// The Metal step: makes a Metal pipeline state from each cooked MSL and metallib, through
 /// the Swift script run by the command line tools' `swift`, its canaries first. The driver
 /// selects nothing here; it is recorded. Its report is `<out>/<driver>-metal.txt`.
-fn run_metal(driver: &str, code: &Path, cooked_by: &str, out: &Path) -> Result<(), String> {
+fn run_metal(
+    root: &Path,
+    driver: &str,
+    code: &Path,
+    cooked_by: &str,
+    out: &Path,
+) -> Result<(), String> {
     eprintln!("gpu: the Metal step, under driver {driver}, with Metal's validation on");
     // The canaries first, each in a process of its own: a layer that did not load reports
     // nothing. API validation's aborts the process; shader validation's lets it complete.
     // What each said, as it wrote it, is recorded: the wording differs between Xcodes.
-    let mut heard = Vec::with_capacity(CANARIES.len());
-    for (canary, phrasings, aborts) in CANARIES {
-        let run = metal_step(&["--canary", canary])?;
-        match said(phrasings, &run.stderr) {
+    let mut heard = Vec::with_capacity(vulkan::METAL_CANARIES.len());
+    for (canary, phrasings, aborts) in vulkan::METAL_CANARIES {
+        let run = vulkan::metal_step(root, &["--canary", canary])?;
+        match vulkan::said(phrasings, &run.stderr) {
             Some(says) if run.status.success() != aborts => {
                 heard.push(format!("{canary} `{says}`"));
             }
@@ -449,7 +462,7 @@ fn run_metal(driver: &str, code: &Path, cooked_by: &str, out: &Path) -> Result<(
             }
         }
     }
-    let step = metal_step(&[&code.to_string_lossy()])?;
+    let step = vulkan::metal_step(root, &[&code.to_string_lossy()])?;
     eprint!("{}", step.stdout);
     // Every line on standard error counts (decision 5.10), but the layers' own two.
     let counted: Vec<&str> = step
@@ -492,21 +505,12 @@ fn run_vulkan(
 ) -> Result<(), String> {
     let pin = vulkan::Pin::parse(&read(vulkan::PIN_FILE)?)?;
     let sdk = vulkan::sdk(&pin, &context.target_dir)?;
-    let layers = out.join("layers");
-    let no_layers = out.join("no-layers");
-    for dir in [&layers, &no_layers] {
-        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    let manifest = fs::read_to_string(&sdk.manifest)
-        .map_err(|e| format!("{}: {e}", sdk.manifest.display()))?;
-    let implicit = layers.join("VkLayer_khronos_validation.json");
-    fs::write(&implicit, vulkan::implicit_manifest(&manifest, &sdk.library)?)
-        .map_err(|e| format!("{}: {e}", implicit.display()))?;
+    let [layers, no_layers] = vulkan::layer_dirs(&sdk, &context.root.join(out))?;
     let shaders = context.root.join(out).join("shaders");
     let run = vulkan::Run::environment(
         driver,
         &sdk,
-        [&context.root.join(&layers), &context.root.join(&no_layers), &shaders],
+        [&layers, &no_layers, &shaders],
         args.validators,
         args.adapter,
     )?;
@@ -525,8 +529,8 @@ fn run_vulkan(
     let mut heard = Vec::new();
     let mut answered = Vec::new();
     for (package, target, prefix) in DEVICE_TESTS {
-        let binary = test_binary(context, package, target)?;
-        let mut tests = ignored_tests(&binary)?;
+        let binary = vulkan::test_binary(&context.cargo, &context.root, package, target)?;
+        let mut tests = vulkan::ignored_tests(&binary)?;
         tests.retain(|test| test.starts_with(prefix));
         // The run's canaries first: a layer that did not load reports nothing, and every
         // verdict after would pass for clean.
@@ -539,7 +543,10 @@ fn run_vulkan(
         for test in order {
             let expected = canaries.iter().find(|(name, _)| *name == test).map(|(_, ids)| *ids);
             let mut command = Command::new(&binary);
+            // A measurement among them runs short: its figures under the validators mean
+            // nothing, and the full run's repetitions would only cost time.
             run.apply(&mut command)
+                .env(measure::SHORT_VAR, "1")
                 .args(["--exact", test, "--ignored", "--nocapture", "--test-threads", "1"])
                 .stdin(Stdio::null());
             let ended = vulkan::run_bounded(&mut command, vulkan::DEADLINE)
@@ -608,137 +615,13 @@ fn run_vulkan(
     Ok(())
 }
 
-/// Builds the test target `target` of `package`, or its library's unit tests for `None`, and
-/// returns its binary.
-fn test_binary(context: &Context, package: &str, target: Option<&str>) -> Result<PathBuf, String> {
-    let selected = target.map_or(vec!["--lib"], |target| vec!["--test", target]);
-    let target = target.map_or_else(|| package.replace('-', "_"), str::to_owned);
-    let output = Command::new(&context.cargo)
-        .args(["test", "--locked", "--no-run", "--message-format", "json-render-diagnostics"])
-        .args(["--package", package])
-        .args(selected)
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| format!("cannot run cargo: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "the build of {package}'s {target} tests ended with {}",
-            output.status
-        ));
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|message| message["target"]["name"] == target.as_str())
-        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
-        .ok_or_else(|| format!("cargo built no binary of {package}'s {target} tests"))
-}
-
-/// The ignored tests of a libtest binary, by name.
-fn ignored_tests(binary: &Path) -> Result<Vec<String>, String> {
-    let output = Command::new(binary)
-        .args(["--list", "--ignored", "--format", "terse"])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
-    if !output.status.success() {
-        return Err(format!("{} --list ended with {}", binary.display(), output.status));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
-        .collect())
-}
-
 /// Cooks the engine's shaders with the pinned Slang: the code into `<out>/code` and each
 /// whole cooked shader into `<out>/shaders`, both emptied first. Returns the code's
 /// directory.
 fn cook_engine_shaders(context: &Context, pin: &slang::Pin, out: &Path) -> Result<PathBuf, String> {
     let slangc = slang::install(pin, &context.target_dir)?;
-    let code = out.join("code");
-    let shaders = out.join("shaders");
-    // A shader cooked by an earlier run and since removed would otherwise be loaded again.
-    for dir in [&code, &shaders] {
-        match fs::remove_dir_all(dir) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(format!("{}: {error}", dir.display()));
-            }
-            _ => {}
-        }
-    }
     eprintln!("gpu: cooking {SHADERS} with Slang {}", pin.version);
-    let status = Command::new(&context.cargo)
-        .args(["run", "--locked", "--quiet", "--package", "lactose-cook", "--bin", "ricotta", "--"])
-        .arg("--slangc")
-        .arg(&slangc)
-        .arg("--code")
-        .arg(&code)
-        .arg("--shaders")
-        .arg(&shaders)
-        .arg(SHADERS)
-        .arg(out.join("shaders.pack"))
-        .stdout(Stdio::from(io::stderr()))
-        .status()
-        .map_err(|e| format!("cannot run ricotta: {e}"))?;
-    if !status.success() {
-        return Err(format!("ricotta ended with {status}"));
-    }
-    Ok(code)
-}
-
-/// Each validator's canary in the Metal script, every phrasing seen so far of what the
-/// validator says of it, and whether that aborts the process. Each phrasing names the
-/// canary's own misuse: no buffer bound at index 0, and the `canary` kernel's store at
-/// offset 4194304, the script's index `1 << 20` into a buffer of one `uint`.
-const CANARIES: [(&str, &[&str], bool); 2] = [
-    // Xcode 16.4 writes `buffer`, Xcode 26.6 and 27.2 `Buffer`: `said` ignores ASCII case.
-    ("api", &["missing Buffer binding at index 0"], true),
-    (
-        "shader",
-        &[
-            // Xcode 27.2.
-            "Invalid store in 'device' or 'constant' address space at offset 4194304, executing \
-             compute function: \"canary\"",
-            // Xcode 26.6.
-            "Invalid device store at offset 4194304, executing kernel function: \"canary\"",
-        ],
-        false,
-    ),
-];
-
-/// The text of `stderr` that is one of `phrasings`, compared without regard to ASCII case,
-/// as the validator wrote it.
-fn said<'a>(phrasings: &[&str], stderr: &'a str) -> Option<&'a str> {
-    // ASCII lowercase keeps every byte where it was, so a match's offsets hold in `stderr`.
-    let lower = stderr.to_ascii_lowercase();
-    phrasings.iter().find_map(|phrasing| {
-        let at = lower.find(&phrasing.to_ascii_lowercase())?;
-        Some(&stderr[at..at + phrasing.len()])
-    })
-}
-
-/// What one run of the Metal script printed.
-struct StepOutput {
-    status: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-/// Runs the Metal script under Metal API and shader validation
-/// ([`vulkan::METAL_VALIDATION`]).
-fn metal_step(args: &[&str]) -> Result<StepOutput, String> {
-    let output = Command::new("swift")
-        .arg(METAL_SCRIPT)
-        .args(args)
-        .envs(vulkan::METAL_VALIDATION)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run swift: {e}"))?;
-    Ok(StepOutput {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+    slang::cook(&context.cargo, &context.root, &slangc, Path::new(SHADERS), out)
 }
 
 /// The cargo arguments that select a check group's packages, for CI's check jobs.
@@ -1026,7 +909,8 @@ fn heavy(args: &[&str]) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CANARIES, DEVICE_TESTS, GpuArgs, said, vulkan};
+    use super::{DEVICE_TESTS, GpuArgs, vulkan};
+    use lactose_xtask::vulkan::{METAL_CANARIES, said};
 
     #[test]
     fn with_no_driver_the_mac_gates_on_both_and_gpu_assisted_on_kosmickrisp() {
@@ -1054,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn the_device_tests_are_rhi_vulkans_canary_and_swapchain_modules_and_three_test_targets() {
+    fn the_device_tests_are_rhi_vulkans_canary_and_swapchain_modules_and_six_test_targets() {
         let library: Vec<&str> = DEVICE_TESTS
             .iter()
             .filter(|(_, target, _)| target.is_none())
@@ -1072,13 +956,16 @@ mod tests {
                 ("lactose-rhi-vulkan", "integration", ""),
                 ("lactose-render-graph", "integration", "device::"),
                 ("lactose-renderer", "integration", "device::"),
+                ("lactose-app-client", "integration", "extract::"),
+                ("lactose-app-client", "integration", "upload::"),
+                ("lactose-app-client", "integration", "gpu::"),
             ]
         );
     }
 
     #[test]
     fn a_canary_is_heard_in_each_phrasing_seen_and_no_other_misuse_is() {
-        let [(_, api, _), (_, shader, _)] = CANARIES;
+        let [(_, api, _), (_, shader, _)] = METAL_CANARIES;
         for (phrasings, text, heard) in [
             // Xcode 27.2 on the M1; Xcode 26.6 on the hosted runner wrote the same phrase.
             (

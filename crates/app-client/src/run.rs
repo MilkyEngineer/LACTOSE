@@ -12,8 +12,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use lactose_app::{
-    Cooked, PresentSide, RenderSide, Rendered, Server, Shown, ShownError, ShownKept, Start,
-    Stopped, TICK_PERIOD, Workers, WorldConfig, build_shown, start_executor,
+    Cooked, JOIN_MARGIN, PresentSide, RenderSide, Rendered, SHED_DEPTH, Server, Shown, ShownError,
+    ShownKept, Start, Stopped, TICK_PERIOD, Workers, WorldConfig, build_shown, start_executor,
 };
 use lactose_asset::{Store, pack_set};
 use lactose_core::{Error, ErrorKind, Result, ThreadClass, Tick};
@@ -28,6 +28,7 @@ use lactose_rhi_api::{
     Swapchain, SwapchainDesc,
 };
 use lactose_rhi_vulkan::VulkanDevice;
+use lactose_sim::TimeScale;
 use lactose_task::{Executor, Lane, LaneCall, Platform, ThreadSpec, WorkerClass};
 
 use crate::game::{Frames, GAME, InMemory};
@@ -35,6 +36,7 @@ use crate::present::ClientPresent;
 use crate::reference::{self, Counts};
 use crate::render::ClientRender;
 use crate::shaders::{CookedShaders, PipelineCache};
+use crate::stamps::{self, FrameStamp, Stamp};
 
 /// The log target of the binary's run.
 pub const LOG_TARGET: &str = "lactose_app_client";
@@ -62,6 +64,16 @@ pub enum Mode {
     Paced {
         /// The run's length, or `None` to run until the window is closed.
         seconds: Option<u32>,
+        /// The world's time scale from the first frame, or `None` for real time. A frame
+        /// starts at each tick's deadline, so the scale sets the frames' rate too:
+        /// `frame-pace`'s floor run slows them below half the display's rate.
+        scale: Option<TimeScale>,
+        /// Whether the window is minimised before the first frame
+        /// (`MainThread::set_minimised`).
+        minimised: bool,
+        /// Where `frame-pace`'s stamps are written once the frames end, or `None` to take
+        /// none (`README.md`, "Stamps").
+        stamps: Option<PathBuf>,
     },
     /// Decision 5.1's fixed-frame mode: `frames` steps at [`FIXED_EXTENT`], each drawn, then
     /// the last frame dumped into `dump` and held to the CPU reference.
@@ -423,17 +435,56 @@ fn run_on(
     if let Err(error) = device.pipeline_cache().and_then(|bytes| cache.store(&bytes)) {
         tracing::warn!(target: LOG_TARGET, "the pipeline cache was not written: {error}");
     }
+    let mut written = Ok(());
     let ran = match &options.mode {
         Mode::Fixed { frames: steps, .. } => {
             fixed_frames(executor, main, &**device, shown, &input, frames, *steps, &mut outcome)
         }
-        Mode::Paced { seconds } => {
+        Mode::Paced { seconds, scale, minimised, stamps: path } => {
+            let mut shown = shown;
+            if let Some(scale) = *scale {
+                shown.server_mut().set_time_scale(scale);
+            }
+            if *minimised {
+                // The answer is the window's reports' to give: a minimised window's frames
+                // are hidden ones.
+                executor.block_on(main.run(|main: &mut MainThread| main.set_minimised(true)))?;
+            }
+            let epoch = path.as_ref().map(|_| {
+                let epoch = stamps::start();
+                let info = |name, value: String| stamps::stamp(Stamp::Info(name, value));
+                info("frame_worker_count", executor.frame_worker_count().to_string());
+                info("run_job_width", executor.run_job_width().to_string());
+                info("queues", format!("{:?}", device.capabilities().queues));
+                info("scale", scale.map_or(1000, |scale| scale.thousandths).to_string());
+                info("tick_period_ns", TICK_PERIOD.as_nanos().to_string());
+                info("join_margin_ns", JOIN_MARGIN.as_nanos().to_string());
+                info("shed_depth", SHED_DEPTH.to_string());
+                let recorders = stamps::recorders();
+                info("recorders", if recorders { "installed" } else { "absent" }.to_owned());
+                if !recorders {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "the stamps carry no recorder: `install_log` was not the process's \
+                         first subscriber, or was not asked for the recorders' layer"
+                    );
+                }
+                epoch
+            });
             let root = paced(executor.clone(), main.clone(), shown, reports, frames, *seconds);
-            executor.block_on(executor.spawn(WorkerClass::FrameCritical, root)).and_then(|result| {
-                let (ended, counted) = result?;
-                outcome = counted;
-                Ok(ended)
-            })
+            let ran = executor.block_on(executor.spawn(WorkerClass::FrameCritical, root)).and_then(
+                |result| {
+                    let (ended, counted) = result?;
+                    outcome = counted;
+                    Ok(ended)
+                },
+            );
+            // Written once the frames have ended and before the shutdown's steps, which
+            // take no stamps; an error here is the run's once those steps are done.
+            if let (Some(path), Some(epoch)) = (path, epoch) {
+                written = stamps::finish(path, epoch);
+            }
+            ran
         }
     };
     // "Shutdown": step 1, `exit`, was queued as the frames ended, and step 2 was
@@ -471,6 +522,7 @@ fn run_on(
     if let Some(error) = error {
         return Err(error);
     }
+    written?;
     compared.map(|()| outcome)
 }
 
@@ -601,7 +653,6 @@ async fn paced(
 ) -> Result<(Ended, Outcome)> {
     let mut outcome = Outcome::default();
     let until = seconds.map(|seconds| Instant::now() + Duration::from_secs(u64::from(seconds)));
-    let mut next = move |tick: Tick| Some(frames.next(tick));
     let mut deadline = Instant::now();
     loop {
         if let Err(error) = executor.sleep_until(deadline).await {
@@ -614,8 +665,29 @@ async fn paced(
             break;
         }
         let extent = extent_of(reports.size());
-        match shown.frame(&executor, Instant::now(), &mut next, extent).await {
+        let called = Instant::now();
+        // Where a run takes stamps, the first tick's start: the callback is called as each
+        // tick begins.
+        let mut first_tick = None;
+        let mut next = |tick: Tick| {
+            if first_tick.is_none() {
+                first_tick = stamps::now();
+            }
+            Some(frames.next(tick))
+        };
+        match shown.frame(&executor, called, &mut next, extent).await {
             Ok((stepped, output)) => {
+                if let Some(returned) = stamps::now() {
+                    stamps::stamp(Stamp::Frame(FrameStamp {
+                        deadline,
+                        first_tick,
+                        called,
+                        returned,
+                        joined: output.joined,
+                        deferred: output.deferred,
+                        behind: output.world.behind,
+                    }));
+                }
                 shown = stepped;
                 outcome.frames += 1;
                 deadline = output.world.next_deadline;
@@ -631,6 +703,9 @@ async fn paced(
         }
     }
     exit(&main);
+    if stamps::on() {
+        stamps::stamp(Stamp::Stats(shown.stats()));
+    }
     let Stopped { server, render } = shown.stop().await?;
     Ok((Ended { server: Some(server), render: Some(render), error: None }, outcome))
 }

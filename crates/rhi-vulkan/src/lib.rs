@@ -26,10 +26,12 @@ mod submit;
 mod surface;
 mod swapchain;
 mod table;
+mod timestamps;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub use device::VulkanDevice;
+pub use timestamps::Timestamps;
 
 /// Takes a lock, through a poisoning: a test that fails while a lock is held reports its
 /// own failure, not a panic in every call after it.

@@ -23,6 +23,7 @@ pub mod harness;
 pub mod heavy;
 pub mod measure;
 pub mod miri;
+pub mod pace;
 pub mod policy;
 pub mod repo;
 mod rust_source;
