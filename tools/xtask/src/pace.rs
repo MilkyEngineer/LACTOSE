@@ -660,7 +660,7 @@ pub fn figures(run: &str, stamps: &Stamps, against: Against) -> Vec<(String, Str
         spread(&mut f, &name("hold"), &holds, false);
     }
 
-    // Each present call, by its parts: its waits with the encoder's drop, the acquire, the
+    // Each present call, by its parts: its waits (none for its own submit), the acquire, the
     // record, the driver's call, and the rest.
     put(&mut f, "present.calls", stamps.presents.len().to_string());
     let presented: Vec<&Present> = stamps.presents.iter().filter(|c| c.id.is_some()).collect();

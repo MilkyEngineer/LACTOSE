@@ -705,8 +705,9 @@ unlocked and the display awake (`caffeinate -d` on macOS).
   `submit.began_during`) and the rest (`submit.began_outside`), and on a shared queue the
   hold
   (`draw`'s return to the submit's entry); each present call's parts with P90: its waits (for
-  its last read, the resize and the encoder's drop, which waits for the frame's GPU work and
-  the blit), the acquire, the record (the encoder's creation and the blit's recording), the
+  its last read, the resize and, where the present side holds its bound of four encoders,
+  the oldest one's read; none waits for the present's own submit), the acquire, the record
+  (the encoder's reset or creation and the blit's recording), the
   driver's call (the wait for the image's last-present fence, then the submit and the present
   under the queue's lock), the rest and the whole; `waiting`'s greatest and the share of calls
   that reported two or more, a count that includes presents displayed and not yet reported,
