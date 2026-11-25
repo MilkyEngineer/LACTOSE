@@ -38,6 +38,8 @@ pub(super) struct Hooks {
     /// The passes with a writer installed, and those of them that wrote a snapshot.
     passes: u64,
     writes: u64,
+    /// What the reference wrote last: what a pass that writes nothing leaves standing.
+    last: Option<PresentSnapshot>,
     /// What differed, at most a few.
     mismatches: Vec<String>,
     mismatched: u64,
@@ -45,11 +47,20 @@ pub(super) struct Hooks {
 
 impl Hooks {
     pub(super) const fn new() -> Self {
-        Self { keys: Vec::new(), passes: 0, writes: 0, mismatches: Vec::new(), mismatched: 0 }
+        Self {
+            keys: Vec::new(),
+            passes: 0,
+            writes: 0,
+            last: None,
+            mismatches: Vec::new(),
+            mismatched: 0,
+        }
     }
 
     /// The reference's half of a pass over the same world: whether it writes a snapshot, and
     /// if so what, against what the pass did, `written` being the buffer it wrote, if it did.
+    /// A pass that writes nothing must leave standing a snapshot that is still the world's: a
+    /// check of the rule for idle passes that does not rest on the reference sharing it.
     #[expect(clippy::too_many_arguments, reason = "the snapshot half's inputs, test only")]
     pub(super) fn observe(
         &mut self,
@@ -68,13 +79,20 @@ impl Hooks {
         });
         let write = full || follows || changed;
         let mismatch = match (write, written) {
-            (false, None) => None,
+            (false, None) => self.last.as_ref().and_then(|last| {
+                let mut now = PresentSnapshot::empty();
+                let _ = reference_fill(presented, &mut now, chunks, tick, full);
+                (!now.same_rows(last))
+                    .then(|| format!("wrote nothing, leaving {last:?} where the world is {now:?}"))
+            }),
             (true, Some(written)) => {
                 self.writes += 1;
                 let mut reference = PresentSnapshot::empty();
                 self.keys = reference_fill(presented, &mut reference, chunks, tick, full);
-                (!written.same_rows(&reference))
-                    .then(|| format!("wrote {written:?}, the reference {reference:?}"))
+                let mismatch = (!written.same_rows(&reference))
+                    .then(|| format!("wrote {written:?}, the reference {reference:?}"));
+                self.last = Some(reference);
+                mismatch
             }
             (write, written) => {
                 Some(format!("wrote {}, the reference writes {write}", written.is_some()))
@@ -150,10 +168,9 @@ fn reference_fill(
     }
     let components: Vec<_> = rows.keys().copied().collect();
     let cut = full && presented.kind != WorldKind::Prediction;
-    snapshot.fill(presented.kind, tick, cut, &components, |component, keys, bytes| {
+    snapshot.fill(presented.kind, tick, cut, &components, |component, column| {
         for &(key, value) in &rows[&component] {
-            keys.push(key);
-            bytes.extend_from_slice(value);
+            column.push(key, value);
         }
     });
     keys_of(chunks)
@@ -277,7 +294,7 @@ impl Scene {
     }
 
     fn sorts(&mut self) -> u64 {
-        self.state().presented.sorts
+        self.state().presented.sorts()
     }
 }
 

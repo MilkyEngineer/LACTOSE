@@ -425,6 +425,25 @@ struct SnapshotColumn {
     bytes: Vec<u8>,
 }
 
+/// One component's column as [`PresentSnapshot::fill`] hands it out: a row goes in with its
+/// key and its value's bytes together, so the two cannot part.
+pub(crate) struct ColumnRows<'a>(&'a mut SnapshotColumn);
+
+impl ColumnRows<'_> {
+    /// Appends a row: its key, above every key appended before it, and its value's bytes, as
+    /// many as every other row's.
+    pub(crate) fn push(&mut self, key: StableKey, bytes: &[u8]) {
+        let column = &mut *self.0;
+        debug_assert!(
+            column.keys.last().is_none_or(|&last| last < key),
+            "rows in ascending key order"
+        );
+        debug_assert_eq!(column.bytes.len(), column.keys.len() * bytes.len(), "rows of one size");
+        column.keys.push(key);
+        column.bytes.extend_from_slice(bytes);
+    }
+}
+
 impl PresentSnapshot {
     /// The kind of the world the snapshot is of.
     #[must_use]
@@ -483,7 +502,7 @@ impl PresentSnapshot {
     }
 
     /// Makes the snapshot `kind`'s at `tick`, holding for each of `components` the rows
-    /// `copy` appends to the component's keys and values' bytes, in ascending key order; the
+    /// `copy` pushes to the component's column, in ascending key order; the
     /// columns' allocations are kept for the next pass. `cut` makes it a cut; a snapshot a
     /// pass made one stays one until it is published.
     pub(crate) fn fill(
@@ -492,7 +511,7 @@ impl PresentSnapshot {
         tick: Tick,
         cut: bool,
         components: &[ComponentKey],
-        mut copy: impl FnMut(ComponentKey, &mut Vec<StableKey>, &mut Vec<u8>),
+        mut copy: impl FnMut(ComponentKey, &mut ColumnRows<'_>),
     ) {
         self.kind = kind;
         self.tick = tick;
@@ -502,9 +521,7 @@ impl PresentSnapshot {
             column.bytes.clear();
         }
         for &component in components {
-            let column = self.columns.entry(component).or_default();
-            copy(component, &mut column.keys, &mut column.bytes);
-            debug_assert!(column.keys.is_sorted_by(|a, b| a < b), "rows in ascending key order");
+            copy(component, &mut ColumnRows(self.columns.entry(component).or_default()));
         }
         self.columns.retain(|_, column| !column.keys.is_empty());
     }
