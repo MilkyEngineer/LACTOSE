@@ -61,12 +61,13 @@ seconds, so that every step draws; a step that does not draw fails the run. Afte
 `last_frame` reads the target's pixels and the instance records the frame drew from, which
 `reference::dump` writes as `last-frame.rgba` and `last-frame.txt` beside the fraction and
 the latched camera. `reference::reference` rasterises the placements extract handed the
-renderer with the camera on the CPU, as the vertex stage computes them, and `reference::compare` holds every pixel to it:
-inside one triangle by `MARGIN` its slot's colour, outside every triangle by `MARGIN` the
-clear colour, within `MARGIN` of an edge either. `MARGIN` is a quarter of a pixel; its
-reasoning is the constant's documentation. The scene is seven rows a seventh of a period
-apart on a circle of four metres, seen from 14 metres at 0.5 radians down; at any tick that
-is a multiple of 30 every triangle is at least about 13 degrees from edge-on, and 600 is.
+renderer with the camera on the CPU, as the vertex stage computes them, and
+`reference::compare` holds every pixel to it: inside one triangle by `MARGIN` its slot's
+colour, outside every triangle by `MARGIN` the clear colour, within `MARGIN` of an edge
+either. `MARGIN` is a quarter of a pixel; its reasoning is the constant's documentation. The
+scene is seven rows a seventh of a period apart on a circle of four metres, seen from 14
+metres at 0.5 radians down; at any tick that is a multiple of 30 every triangle is at least
+about 13 degrees from edge-on, and 600 is.
 
 ## Rules a caller should know
 
