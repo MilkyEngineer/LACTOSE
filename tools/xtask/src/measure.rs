@@ -4,7 +4,9 @@
 //!
 //! A measurement is an ignored release test that prints its figures, the netcode spike's
 //! ten-minute replays, the WHISK benchmark, the headless binary's 120-tick run, or the
-//! edit-to-playing loop. A test prints each figure
+//! edit-to-playing loop. A test on a Vulkan device runs under the driver `--driver` names with
+//! no layer (`vulkan::Run::measured`), and its file's header adds the device's identity as
+//! `vulkaninfo` reports it under the same environment. A test prints each figure
 //! as a line `measure: <name> <value>` on its standard output, which nextest passes through
 //! under `--no-capture`: the test needs no path from this command and stays runnable by
 //! hand, and the line is the one contract between them; for the spike's replays the contract
@@ -26,6 +28,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::vulkan;
 
 /// The variable a test reads to cut its repetitions in a short run.
 pub const SHORT_VAR: &str = "LACTOSE_MEASURE_SHORT";
@@ -58,6 +62,16 @@ pub enum Run {
         /// The test's path inside the file's module.
         test: &'static str,
     },
+    /// An ignored test on a Vulkan device, run in release as [`Test`](Self::Test) is, under
+    /// the environment of [`vulkan::Run::measured`]; `--no-device` leaves it out.
+    Device {
+        /// The package.
+        package: &'static str,
+        /// Its integration test file, as [`Test`](Self::Test)'s.
+        file: &'static str,
+        /// The test's path inside the file's module.
+        test: &'static str,
+    },
     /// The netcode spike's ten-minute replays (`REPLAYS`), ignored tests run in release one
     /// at a time, each of which prints its figures as one JSON object.
     SpikeReplays,
@@ -75,7 +89,26 @@ impl Run {
     /// a runner's short run still yields the criterion's figure.
     #[must_use]
     pub const fn cut_by_short(self) -> bool {
-        matches!(self, Self::Test { .. } | Self::SpikeReplays | Self::TaskBench)
+        matches!(
+            self,
+            Self::Test { .. } | Self::Device { .. } | Self::SpikeReplays | Self::TaskBench
+        )
+    }
+
+    /// Whether it needs a Vulkan device.
+    #[must_use]
+    pub const fn on_device(self) -> bool {
+        matches!(self, Self::Device { .. })
+    }
+
+    /// The package, file and test of an ignored test, on a device or not.
+    const fn ignored_test(self) -> Option<(&'static str, &'static str, &'static str)> {
+        match self {
+            Self::Test { package, file, test } | Self::Device { package, file, test } => {
+                Some((package, file, test))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -96,8 +129,12 @@ const fn test(package: &'static str, file: &'static str, test: &'static str) -> 
     Run::Test { package, file, test }
 }
 
+const fn device(package: &'static str, file: &'static str, test: &'static str) -> Run {
+    Run::Device { package, file, test }
+}
+
 /// Every measurement, in the order `--all` runs them.
-pub const MEASUREMENTS: [Measurement; 12] = [
+pub const MEASUREMENTS: [Measurement; 15] = [
     Measurement {
         name: "tick-100k",
         what: "Criterion 1: the median step of the 100k scene on one frame worker and on N, S and the projected eight-core tick",
@@ -173,6 +210,36 @@ pub const MEASUREMENTS: [Measurement; 12] = [
         what: "Criterion 9: from saving a one-line change to the headless binary's report line, both edits of decision 5.9",
         threshold: "architecture section 22; milestone 1 plan, section 4 and decision 5.9",
         run: Run::EditToPlaying,
+    },
+    Measurement {
+        name: "extract-50k",
+        what: "Milestone 2's criterion 4: extract's pass over 100k rows with 50,000 moved, writing the device's ring and a snapshot of 10,000 presented rows, each alone, on one worker, and again on null",
+        threshold: "1 ms for the median on the device (milestone 2 plan, section 4, criterion 4; verification row 16)",
+        run: device(
+            "lactose-app-client",
+            "crates/app-client/tests/extract.rs",
+            "cost_of_extract_at_50k_dirty_rows",
+        ),
+    },
+    Measurement {
+        name: "remote-upload-5k",
+        what: "Milestone 2's criterion 5: the remote upload of 5,000 interpolated entities into the device's ring, paced at 144 Hz, one writer pushing every slot at 30 Hz",
+        threshold: "1 ms for the median frame, a P99 over 2 ms a finding (milestone 2 plan, section 4, criterion 5; verification rows 19 and 102)",
+        run: device(
+            "lactose-app-client",
+            "crates/app-client/tests/upload.rs",
+            "cost_of_the_remote_upload_of_5k",
+        ),
+    },
+    Measurement {
+        name: "record-stall",
+        what: "A frame's record of the minimal renderer on null beside the composed tick's physics phase, at a physics reservation of one frame worker and of two, and alone",
+        threshold: "none: recorded, and `RECORD_RESERVATION` is read from it (milestone 2 plan, section 4 and decision 5.16; verification row 21; D162)",
+        run: test(
+            "lactose-app-client",
+            "crates/app-client/tests/stall.rs",
+            "the_record_beside_the_physics_phase",
+        ),
     },
 ];
 
@@ -536,6 +603,192 @@ fn median(values: &[f64]) -> f64 {
     sorted.get(sorted.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
+/// One physical device as `vulkaninfo`'s text output prints it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Gpu {
+    /// Each `key = value` line of its sections, the first of each key.
+    properties: Vec<(String, String)>,
+    /// Each memory type's property flags, in the device's order.
+    memory_types: Vec<u32>,
+}
+
+impl Gpu {
+    /// The value of `key`, its parenthesised raw form dropped (`1.4.357 (4211045)`).
+    fn get(&self, key: &str) -> Option<&str> {
+        let (_, value) = self.properties.iter().find(|(name, _)| name == key)?;
+        Some(value.split(" (").next().unwrap_or(value))
+    }
+}
+
+/// What `vulkaninfo` reports: the instance's version and every device.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct VulkanInfo {
+    instance: Option<String>,
+    gpus: Vec<Gpu>,
+}
+
+/// Reads `vulkaninfo`'s full text output: the instance version's line, and after each
+/// `GPU<n>:` line that device's properties and its memory types' `propertyFlags`.
+fn vulkaninfo(text: &str) -> VulkanInfo {
+    let mut info = VulkanInfo::default();
+    let is_gpu = |line: &str| {
+        line.strip_prefix("GPU")
+            .and_then(|rest| rest.strip_suffix(':'))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    for line in text.lines() {
+        let line = line.trim_end();
+        if let Some(version) = line.strip_prefix("Vulkan Instance Version:") {
+            info.instance = Some(version.trim().to_owned());
+        } else if is_gpu(line) {
+            info.gpus.push(Gpu::default());
+        } else if let Some(gpu) = info.gpus.last_mut()
+            && let Some((key, value)) = line.split_once(" = ")
+        {
+            let (key, value) = (key.trim(), value.trim());
+            if key == "propertyFlags" {
+                let hex = value.split(':').next().unwrap_or(value).trim_start_matches("0x");
+                gpu.memory_types.push(u32::from_str_radix(hex, 16).unwrap_or(0));
+            } else if !gpu.properties.iter().any(|(name, _)| name == key) {
+                gpu.properties.push((key.to_owned(), value.to_owned()));
+            }
+        }
+    }
+    info
+}
+
+/// `VkMemoryPropertyFlagBits` by bit, as the header names them.
+const MEMORY_FLAGS: [(u32, &str); 9] = [
+    (0x1, "DEVICE_LOCAL"),
+    (0x2, "HOST_VISIBLE"),
+    (0x4, "HOST_COHERENT"),
+    (0x8, "HOST_CACHED"),
+    (0x10, "LAZILY_ALLOCATED"),
+    (0x20, "PROTECTED"),
+    (0x40, "DEVICE_COHERENT_AMD"),
+    (0x80, "DEVICE_UNCACHED_AMD"),
+    (0x100, "RDMA_CAPABLE_NV"),
+];
+
+/// `flags` by name, then in hexadecimal.
+fn memory_flags(flags: u32) -> String {
+    let names: Vec<&str> =
+        MEMORY_FLAGS.iter().filter(|(bit, _)| flags & bit != 0).map(|(_, name)| *name).collect();
+    let names = if names.is_empty() { "none".to_owned() } else { names.join(" + ") };
+    format!("{names} (0x{flags:04x})")
+}
+
+/// The memory type `lactose-rhi-vulkan` gives `MemoryClass::Upload` among `types`, by its
+/// rule (`raw.rs`, `choose`): the first host-visible and coherent type, then the first
+/// host-visible one, never a lazily allocated one. A buffer's own memory-type bits may rule
+/// some out, which `vulkaninfo` does not show.
+fn upload_type(types: &[u32]) -> Option<usize> {
+    const VISIBLE: u32 = 0x2;
+    const COHERENT: u32 = 0x4;
+    const LAZY: u32 = 0x10;
+    [VISIBLE | COHERENT, VISIBLE]
+        .iter()
+        .find_map(|&has| types.iter().position(|&t| t & has == has && t & LAZY == 0))
+}
+
+/// `value` with a path inside `sdk` written from `<sdk>`, and any other absolute path cut to
+/// its file name, so that a result file names no directory of the machine.
+fn redacted(value: &str, sdk: Option<&Path>) -> String {
+    let path = Path::new(value);
+    if let Some(inside) = sdk.and_then(|sdk| path.strip_prefix(sdk).ok()) {
+        return format!("<sdk>/{}", inside.to_string_lossy().replace('\\', "/"));
+    }
+    match path.file_name() {
+        Some(name) if path.is_absolute() => format!(".../{}", name.to_string_lossy()),
+        _ => value.to_owned(),
+    }
+}
+
+/// How the measurements on a device run, for their headers.
+#[derive(Clone, Debug)]
+struct DeviceSetting {
+    /// `--driver`'s name.
+    driver: &'static str,
+    /// The pinned SDK's version where its loader is the one loaded, `None` for the system's.
+    sdk_version: Option<String>,
+    /// Every variable the run sets, paths redacted.
+    environment: Vec<(String, String)>,
+    /// What `vulkaninfo` reported under the same environment, or why it reported nothing.
+    info: Result<VulkanInfo, String>,
+}
+
+/// The header's rows for a test on a device that named its adapter `adapter`.
+fn device_notes(setting: &DeviceSetting, adapter: Option<&str>) -> Vec<(String, String)> {
+    let mut notes = Vec::new();
+    let mut note = |name: &str, value: String| notes.push((name.to_owned(), value));
+    let gpu = match (&setting.info, adapter) {
+        (Err(why), _) => Err(format!("unreported: {why}")),
+        (Ok(_), None) => Err("unreported: the test printed no `device.adapter`".to_owned()),
+        (Ok(info), Some(adapter)) => {
+            info.gpus.iter().find(|gpu| gpu.get("deviceName") == Some(adapter)).ok_or_else(|| {
+                format!("unreported: `vulkaninfo` lists no device named `{adapter}`")
+            })
+        }
+    };
+    let field = |gpu: &Gpu, key: &str| gpu.get(key).unwrap_or("unreported").to_owned();
+    match &gpu {
+        Ok(gpu) => {
+            let (name, vendor, id) =
+                (field(gpu, "deviceName"), field(gpu, "vendorID"), field(gpu, "deviceID"));
+            note("Device", format!("{name}, vendor {vendor}, device {id}"));
+            let (driver, info) = (field(gpu, "driverName"), field(gpu, "driverInfo"));
+            let version = field(gpu, "driverVersion");
+            let flag = setting.driver;
+            note("Driver", format!("{driver} {info}, driver version {version}, `--driver {flag}`"));
+            let instance = setting.info.as_ref().ok().and_then(|info| info.instance.as_deref());
+            note(
+                "Vulkan",
+                format!(
+                    "the device's API {}, the instance's {}",
+                    field(gpu, "apiVersion"),
+                    instance.unwrap_or("unreported")
+                ),
+            );
+        }
+        Err(why) => note("Device", format!("{why}; the test's `device.*` figures name it")),
+    }
+    let loader = setting
+        .sdk_version
+        .as_ref()
+        .map_or_else(|| "the system's".to_owned(), |version| format!("the Vulkan SDK {version}'s"));
+    note("Loader", loader);
+    note(
+        "Validation",
+        "off: no layer enabled and every implicit one disabled \
+         (`VK_LOADER_LAYERS_DISABLE=~implicit~`), and no Metal API or shader validation"
+            .to_owned(),
+    );
+    note(
+        "Presentation",
+        "none: the run makes no surface and presents nothing, so it has no present mode and \
+         reads no display's refresh rate"
+            .to_owned(),
+    );
+    if let Ok(gpu) = &gpu {
+        let ring = upload_type(&gpu.memory_types).map_or_else(
+            || "no host-visible type is listed".to_owned(),
+            |at| {
+                format!(
+                    "type {at} of {}, {}: the first `lactose-rhi-vulkan` chooses for \
+                     `MemoryClass::Upload`, the buffer's own memory-type bits unreported",
+                    gpu.memory_types.len(),
+                    memory_flags(gpu.memory_types[at])
+                )
+            },
+        );
+        note("Ring memory", ring);
+    }
+    let environment: Vec<String> =
+        setting.environment.iter().map(|(name, value)| format!("`{name}={value}`")).collect();
+    note("Environment", environment.join(", "));
+    notes
+}
+
 /// What the machine was doing around a run.
 #[derive(Clone, Debug, PartialEq)]
 enum Load {
@@ -685,6 +938,10 @@ fn shell_line(env: &[(&str, String)], program: &str, args: &[String]) -> String 
 pub struct Options {
     selected: Vec<&'static Measurement>,
     short: bool,
+    /// `--driver`: the driver of the measurements on a device, or the host's default.
+    driver: Option<vulkan::Driver>,
+    /// `--adapter`: the device's name, or the loader's first.
+    adapter: Option<String>,
     /// The directory the result files are written to, relative to the repository root once
     /// [`resolved`](Self::resolved).
     out: PathBuf,
@@ -722,6 +979,16 @@ impl Options {
         Ok(Self { out, args, ..self.clone() })
     }
 
+    /// The driver of the measurements on a device: `--driver`'s, or MoltenVK on macOS and the
+    /// system's elsewhere.
+    fn driver(&self) -> vulkan::Driver {
+        self.driver.unwrap_or(if cfg!(target_os = "macos") {
+            vulkan::Driver::MoltenVk
+        } else {
+            vulkan::Driver::System
+        })
+    }
+
     /// The command as given, `--out` as resolved.
     fn command(&self) -> String {
         let mut command = String::from("cargo xtask measure");
@@ -733,20 +1000,41 @@ impl Options {
     }
 }
 
-/// Parses the arguments after `measure`: `--all` or names, `--short`, `--out <dir>`.
+/// Parses the arguments after `measure`: `--all` or names, `--short`, `--no-device` (which
+/// leaves out of `--all` the measurements on a device, and refuses one named), `--driver
+/// <name>`, `--adapter <name>` and `--out <dir>`.
 pub fn parse(args: &[&str]) -> Result<Options, String> {
     let names = || MEASUREMENTS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ");
     let (mut selected, mut all, mut short, mut out) = (Vec::new(), false, false, None);
+    let (mut no_device, mut driver, mut adapter) = (false, None, None);
     let mut rest = args;
     while let [first, tail @ ..] = rest {
         rest = tail;
         match *first {
             "--all" => all = true,
             "--short" => short = true,
+            "--no-device" => no_device = true,
             "--out" => {
                 let [dir, tail @ ..] = rest else { return Err("`--out` takes a directory".into()) };
                 if out.replace(PathBuf::from(dir)).is_some() {
                     return Err("`--out` is given once".into());
+                }
+                rest = tail;
+            }
+            "--driver" => {
+                let [name, tail @ ..] = rest else { return Err("`--driver` takes a name".into()) };
+                let given = vulkan::Driver::of(name).ok_or_else(|| {
+                    format!("no driver is named `{name}`: lavapipe, moltenvk, kosmickrisp, system")
+                })?;
+                if driver.replace(given).is_some() {
+                    return Err("`--driver` is given once".into());
+                }
+                rest = tail;
+            }
+            "--adapter" => {
+                let [name, tail @ ..] = rest else { return Err("`--adapter` takes a name".into()) };
+                if adapter.replace((*name).to_owned()).is_some() {
+                    return Err("`--adapter` is given once".into());
                 }
                 rest = tail;
             }
@@ -764,11 +1052,20 @@ pub fn parse(args: &[&str]) -> Result<Options, String> {
         return Err(format!("give `--all` or one or more of {}", names()));
     }
     if all {
-        selected = MEASUREMENTS.iter().collect();
+        selected = MEASUREMENTS.iter().filter(|m| !(no_device && m.run.on_device())).collect();
+    } else if let Some(m) = selected.iter().find(|m| no_device && m.run.on_device()) {
+        return Err(format!("`--no-device` leaves out `{}`, which runs on a device", m.name));
+    }
+    if (driver.is_some() || adapter.is_some()) && !selected.iter().any(|m| m.run.on_device()) {
+        return Err("`--driver` and `--adapter` name the device, and no measurement on one \
+                    is selected"
+            .into());
     }
     Ok(Options {
         selected,
         short,
+        driver,
+        adapter,
         out: out.unwrap_or_else(|| PathBuf::from(RESULTS)),
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
     })
@@ -842,10 +1139,18 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
         Err(error) => eprintln!("measure: the topology probe failed, so it is unknown: {error}"),
     }
     let (mut written, mut failed) = (Vec::new(), Vec::new());
+    // Made before the first measurement on a device; its failure fails each of them.
+    let mut device = None;
     for m in &options.selected {
         eprintln!("measure: {} ...", m.name);
         let result = match m.run {
-            Run::Test { .. } => run_test(workspace, options, &machine, m, &out),
+            Run::Test { .. } => run_test(workspace, options, &machine, m, &out, None),
+            Run::Device { .. } => {
+                match device.get_or_insert_with(|| on_device(workspace, options)) {
+                    Ok(device) => run_test(workspace, options, &machine, m, &out, Some(device)),
+                    Err(error) => Err(error.clone()),
+                }
+            }
             Run::SpikeReplays => run_spike_replays(workspace, options, &machine, m, &out),
             Run::TaskBench => run_task_bench(workspace, options, &machine, &out),
             Run::Headless => run_headless(workspace, options, &machine, m, &out),
@@ -1053,7 +1358,7 @@ fn capture(command: &mut Command, mut line: impl FnMut(&str, Duration)) -> Resul
 
 /// The arguments of `cargo nextest run` for one ignored test in release.
 fn nextest_args(run: Run) -> Vec<String> {
-    let Run::Test { package, file, test } = run else { return Vec::new() };
+    let Some((package, file, test)) = run.ignored_test() else { return Vec::new() };
     let module = file.rsplit('/').next().and_then(|name| name.strip_suffix(".rs")).unwrap_or(file);
     [
         "nextest",
@@ -1175,18 +1480,78 @@ fn short_env(options: &Options) -> Vec<(&'static str, String)> {
     if options.short { vec![(SHORT_VAR, "1".to_owned())] } else { Vec::new() }
 }
 
+/// The environment of the measurements on a device and what their headers say of it.
+struct OnDevice {
+    run: vulkan::Run,
+    setting: DeviceSetting,
+}
+
+/// How long `vulkaninfo` may run.
+const VULKANINFO_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The environment of `--driver`, the pinned SDK's loader where the driver is the SDK's or the
+/// host has no loader of its own (macOS), and `vulkaninfo`'s report under it: the SDK's copy,
+/// or the one on the path with the system's loader.
+fn on_device(workspace: &Workspace, options: &Options) -> Result<OnDevice, String> {
+    let driver = options.driver();
+    let sdk = if driver == vulkan::Driver::System && !cfg!(target_os = "macos") {
+        None
+    } else {
+        let file = workspace.root.join(vulkan::PIN_FILE);
+        let pin = fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let pin = vulkan::Pin::parse(&pin)?;
+        let sdk = vulkan::sdk(&pin, &workspace.target_dir)?;
+        Some((pin.version, sdk))
+    };
+    let run = vulkan::Run::measured(
+        driver,
+        sdk.as_ref().map(|(_, sdk)| sdk),
+        options.adapter.as_deref(),
+    )?;
+    let root = sdk.as_ref().and_then(|(_, sdk)| sdk.loader.parent());
+    let program =
+        root.map_or_else(|| PathBuf::from("vulkaninfo"), |root| root.join("bin/vulkaninfo"));
+    let mut command = Command::new(&program);
+    run.apply(&mut command).stdin(Stdio::null());
+    let info = match vulkan::run_bounded(&mut command, VULKANINFO_DEADLINE) {
+        Err(e) => Err(format!("`vulkaninfo` did not run: {e}")),
+        Ok(ended) if ended.killed_at.is_some() => {
+            Err(format!("`vulkaninfo` ran past {VULKANINFO_DEADLINE:?}"))
+        }
+        Ok(ended) if !ended.succeeded => Err(format!("`vulkaninfo` ended with {}", ended.status)),
+        Ok(ended) => Ok(vulkaninfo(&ended.stdout)),
+    };
+    if let Err(why) = &info {
+        eprintln!("measure: the device's identity is {why}");
+    }
+    let environment =
+        run.set.iter().map(|(name, value)| (name.clone(), redacted(value, root))).collect();
+    let setting = DeviceSetting {
+        driver: driver.name(),
+        sdk_version: sdk.map(|(version, _)| version),
+        environment,
+        info,
+    };
+    Ok(OnDevice { run, setting })
+}
+
 fn run_test(
     workspace: &Workspace,
     options: &Options,
     machine: &Machine,
     m: &'static Measurement,
     out: &Path,
+    device: Option<&OnDevice>,
 ) -> Result<Vec<PathBuf>, String> {
     let args = nextest_args(m.run);
     build(workspace, &no_run(&args))?;
     let env = short_env(options);
     let mut command = Command::new(&workspace.cargo);
     command.args(&args).current_dir(&workspace.root);
+    // The device's environment first: it clears what it does not set.
+    if let Some(device) = device {
+        device.run.apply(&mut command);
+    }
     // A short run sets the variable; a full one makes sure the caller's does not leak in.
     command.env_remove(SHORT_VAR).envs(env.iter().map(|(name, value)| (name, value)));
     pass_workers(&mut command, machine);
@@ -1213,6 +1578,11 @@ fn run_test(
             "Workers override".to_owned(),
             format!("`{WORKERS_VAR}={n}`: N, in place of the topology's"),
         ));
+    }
+    if let Some(device) = device {
+        let adapter = found.iter().find(|(name, _)| name == "device.adapter");
+        let adapter = adapter.map(|(_, value)| value.as_str());
+        header.notes.extend(device_notes(&device.setting, adapter));
     }
     write(out, &header, &found, &output)
 }
@@ -1622,7 +1992,7 @@ mod tests {
     #[test]
     fn a_measured_test_is_never_retried() {
         for run in [PROBE, REPLAYS[0].run()].into_iter().chain(MEASUREMENTS.iter().map(|m| m.run)) {
-            if let Run::Test { test, .. } = run {
+            if let Some((_, _, test)) = run.ignored_test() {
                 let args = nextest_args(run);
                 let at = args.iter().position(|arg| arg == "--retries").unwrap();
                 assert_eq!(args[at + 1], "0", "{test}");
@@ -2011,7 +2381,7 @@ mod tests {
             run: PROBE,
         }]) {
             assert!(names.insert(m.name), "{} is named twice", m.name);
-            if let Run::Test { file, test, .. } = m.run {
+            if let Some((_, file, test)) = m.run.ignored_test() {
                 let source = repository(file);
                 let name = test.rsplit("::").next().unwrap();
                 let at = source
@@ -2043,6 +2413,121 @@ mod tests {
         assert!(parse(&["nothing"]).is_err());
         assert!(parse(&["--out"]).is_err());
         assert!(parse(&["--all", "--out", "a", "--out", "b"]).is_err());
+    }
+
+    /// The measure workflow's runners have no device: `--no-device` leaves those that need
+    /// one out of `--all`, and refuses one named.
+    #[test]
+    fn the_arguments_select_the_device_and_leave_it_out() {
+        let all = parse(&["--all", "--short", "--no-device"]).unwrap();
+        let names: Vec<&str> = all.selected.iter().map(|m| m.name).collect();
+        assert!(names.contains(&"record-stall") && names.contains(&"tick-100k"), "{names:?}");
+        assert!(!names.contains(&"extract-50k") && !names.contains(&"remote-upload-5k"));
+        assert_eq!(all.selected.len() + 2, MEASUREMENTS.len());
+        let error = parse(&["extract-50k", "--no-device"]).unwrap_err();
+        assert!(error.contains("`extract-50k`"), "{error}");
+        let named = parse(&["extract-50k", "--driver", "kosmickrisp", "--adapter", "Apple M1"]);
+        let named = named.unwrap();
+        assert_eq!(named.driver(), vulkan::Driver::KosmicKrisp);
+        assert_eq!(named.adapter.as_deref(), Some("Apple M1"));
+        let default = parse(&["remote-upload-5k"]).unwrap().driver();
+        let host = if cfg!(target_os = "macos") {
+            vulkan::Driver::MoltenVk
+        } else {
+            vulkan::Driver::System
+        };
+        assert_eq!(default, host);
+        assert!(parse(&["extract-50k", "--driver", "metal"]).is_err());
+        assert!(parse(&["extract-50k", "--driver"]).is_err());
+        assert!(parse(&["extract-50k", "--driver", "system", "--driver", "system"]).is_err());
+        assert!(parse(&["tick-100k", "--driver", "system"]).is_err());
+        assert!(parse(&["--all", "--no-device", "--adapter", "Apple M1"]).is_err());
+    }
+
+    /// `vulkaninfo`'s text output under MoltenVK on the M1, cut to what the header reads, and
+    /// a second device after it.
+    const VULKANINFO: &str = "==========\nVULKANINFO\n==========\n\n\
+        Vulkan Instance Version: 1.4.363\r\n\n\
+        Presentable Surfaces:\n=====================\nGPU id : 0 (Apple M1) [VK_EXT_metal_surface]:\n\
+        Device Properties and Extensions:\n=================================\nGPU0:\n\
+        VkPhysicalDeviceProperties:\n---------------------------\n\
+        \tapiVersion        = 1.4.357 (4211045)\n\tdriverVersion     = 0.2.2210 (10402)\n\
+        \tvendorID          = 0x106b\n\tdeviceID          = 0x1b020207\n\
+        \tdeviceType        = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU\n\
+        \tdeviceName        = Apple M1\n\
+        VkPhysicalDeviceDriverProperties:\n\
+        \tdriverID                                             = DRIVER_ID_MOLTENVK\n\
+        \tdriverName                                           = MoltenVK\n\
+        \tdriverInfo                                           = 1.4.2\n\
+        VkPhysicalDeviceLayeredApiPropertiesListKHR:\n\t\tdeviceName = Metal\n\
+        memoryTypes: count = 3\n\
+        \tmemoryTypes[0]:\n\t\theapIndex     = 0\n\t\tpropertyFlags = 0x0001: count = 1\n\
+        \t\t\tMEMORY_PROPERTY_DEVICE_LOCAL_BIT\n\
+        \tmemoryTypes[1]:\n\t\theapIndex     = 0\n\t\tpropertyFlags = 0x000f: count = 4\n\
+        \tmemoryTypes[2]:\n\t\theapIndex     = 0\n\t\tpropertyFlags = 0x0011: count = 2\n\
+        GPU1:\n\tdeviceName = Other\n\t\tpropertyFlags = 0x0012: count = 2\n\
+        \t\tpropertyFlags = 0x0002: count = 1\n";
+
+    #[test]
+    fn the_device_s_identity_is_read_from_vulkaninfo() {
+        let info = vulkaninfo(VULKANINFO);
+        assert_eq!(info.instance.as_deref(), Some("1.4.363"));
+        assert_eq!(info.gpus.len(), 2, "the surfaces' `GPU id` line is no device");
+        let m1 = &info.gpus[0];
+        assert_eq!(m1.get("deviceName"), Some("Apple M1"), "the first of a key is kept");
+        assert_eq!(m1.get("apiVersion"), Some("1.4.357"));
+        assert_eq!(m1.get("driverVersion"), Some("0.2.2210"));
+        assert_eq!(m1.get("driverInfo"), Some("1.4.2"));
+        assert_eq!(m1.memory_types, [0x1, 0xf, 0x11]);
+        assert_eq!(upload_type(&m1.memory_types), Some(1));
+        assert_eq!(
+            memory_flags(0xf),
+            "DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT + HOST_CACHED (0x000f)"
+        );
+        assert_eq!(memory_flags(0), "none (0x0000)");
+        // A lazily allocated type is never chosen, and a coherent one before any other.
+        assert_eq!(upload_type(&info.gpus[1].memory_types), Some(1));
+        assert_eq!(upload_type(&[0x2, 0x6]), Some(1));
+        assert_eq!(upload_type(&[0x1, 0x11]), None);
+        assert_eq!(vulkaninfo("no output"), VulkanInfo::default());
+    }
+
+    #[test]
+    fn a_device_s_header_names_it_and_no_directory_of_the_machine() {
+        let sdk = std::env::temp_dir().join("VulkanSDK").join("macOS");
+        let icd = sdk.join("share").join("vulkan").join("icd.d").join("MoltenVK_icd.json");
+        let icd = icd.to_str().unwrap();
+        assert_eq!(redacted(icd, Some(&sdk)), "<sdk>/share/vulkan/icd.d/MoltenVK_icd.json");
+        let elsewhere = std::env::temp_dir().join("lvp_icd.json");
+        assert_eq!(redacted(elsewhere.to_str().unwrap(), Some(&sdk)), ".../lvp_icd.json");
+        assert_eq!(redacted("~implicit~", Some(&sdk)), "~implicit~");
+        let mut setting = DeviceSetting {
+            driver: "moltenvk",
+            sdk_version: Some("1.4.363.1".into()),
+            environment: vec![("VK_DRIVER_FILES".into(), redacted(icd, Some(&sdk)))],
+            info: Ok(vulkaninfo(VULKANINFO)),
+        };
+        let notes = device_notes(&setting, Some("Apple M1"));
+        let text: String =
+            notes.iter().map(|(name, value)| format!("| {name} | {value} |\n")).collect();
+        for expected in [
+            "| Device | Apple M1, vendor 0x106b, device 0x1b020207 |",
+            "| Driver | MoltenVK 1.4.2, driver version 0.2.2210, `--driver moltenvk` |",
+            "| Vulkan | the device's API 1.4.357, the instance's 1.4.363 |",
+            "| Loader | the Vulkan SDK 1.4.363.1's |",
+            "| Ring memory | type 1 of 3, DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT + HOST_CACHED (0x000f):",
+            "| Environment | `VK_DRIVER_FILES=<sdk>/share/vulkan/icd.d/MoltenVK_icd.json` |",
+            "| Validation | off: no layer enabled",
+            "| Presentation | none:",
+        ] {
+            assert!(text.contains(expected), "{expected} in\n{text}");
+        }
+        let unnamed = device_notes(&setting, Some("Apple M2"));
+        assert!(unnamed[0].1.contains("lists no device named `Apple M2`"), "{unnamed:?}");
+        assert!(!unnamed.iter().any(|(name, _)| name == "Ring memory"));
+        setting.info = Err("`vulkaninfo` did not run: not found".into());
+        let failed = device_notes(&setting, Some("Apple M1"));
+        assert!(failed[0].1.starts_with("unreported: `vulkaninfo` did not run"), "{failed:?}");
     }
 
     /// Review r1, M7: an absolute `--out` was written into the Command row as given, a

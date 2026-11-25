@@ -48,9 +48,22 @@ as a line `measure: <name>
 command. `--short` sets `LACTOSE_MEASURE_SHORT`, under which each test cuts its repetitions; a
 short run's files end in `-short` and say that their numbers mean nothing.
 `--short` cuts nothing of `headless-120` and `edit-to-playing`, whose files it leaves
-unmarked. CI runs `--all --short` by hand only (`.github/workflows/measure.yml`) to keep the
-command working on linux-x64 and windows-x64; it keeps the edit-to-playing files, named for
-the runner, and discards the rest.
+unmarked. CI runs `--all --short --no-device` by hand only (`.github/workflows/measure.yml`) to
+keep the command working on linux-x64 and windows-x64; it keeps the edit-to-playing files,
+named for the runner, and discards the rest.
+
+A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`) runs under the driver
+`--driver` names (`moltenvk`, the default on macOS, `kosmickrisp`, `lavapipe`, or `system`, the
+default elsewhere) on the adapter `--adapter` names or the loader's first, with no layer: every
+implicit layer is disabled and no Metal validation is set. Its header adds the device's
+identity as `vulkaninfo` reports it under the same environment: the device's name and vendor
+and device ids, the driver's name, information and version, the device's and the instance's
+API versions, the loader (the pinned SDK's, or the system's), the validation (off), the
+presentation (none: the run makes no surface, so it has no present mode or refresh rate), the
+memory type the ring's `MemoryClass::Upload` gets by `lactose-rhi-vulkan`'s rule, and the
+variables set, paths written from the SDK's root or cut to a file name. A test that hears a
+message from the device fails. `--no-device` leaves these out of `--all`; `cargo xtask gpu`
+runs them short under its validators, figures discarded.
 
 | Measurement | What | Run | Threshold |
 |---|---|---|---|
@@ -66,6 +79,9 @@ the runner, and discards the rest.
 | `whisk` | Milestone 0's WHISK benchmark: `cargo bench -p lactose-task --bench whisk`, which writes its own `whisk-<machine>-<date>` pair, moved here | the benchmark | `crates/task/README.md` |
 | `headless-120` | `cargo run -p lactose-app-headless -- 120`, dev profile, and the world hash it prints | the binary | None: its hash on x86-64 equals the M1's at the same commit (the plan, section 4) |
 | `edit-to-playing` | From saving a one-line change to the report line of `cargo run -p lactose-app-headless -- 1`, dev profile, warm build, median of five edits, at each of decision 5.9's two sites: the sketch game's system in `game/game-sim/src/sketch.rs` (in the binary's own crate until lane `sketch` moved it, D152) and `start_executor` in `crates/app/src/runtime.rs`; the criterion reads the slower | `cargo` in a copy of the tree | Criterion 9: architecture section 22; the plan, section 4 and decision 5.9 |
+| `extract-50k` | Extract's pass over 100,000 rows with a `Transform` and a mesh in four archetypes and sixteen regions, 50,000 moved by a kernel every tick and 10,000 presented with an `extracted` component (D157): one tick, then `Simulation::run_passes` with extract alone, the median of 60 passes after a full one, on N workers, writing the device's ring and the snapshot (`device.pass_us`, criterion 4's figure), the ring alone and the snapshot alone (their parts by difference), and the first on one worker (`device.w1.dirty_row_ns`); the same on null (`null.*`). Each pass ends with an empty submit that signals its timeline value; a wait for a free region is outside the time and counted (`*.region_waits`) | `lactose-app-client`, target `integration`, `extract::cost_of_extract_at_50k_dirty_rows`, on a device | Criterion 4: the median on the device at most 1 ms (`docs/plans/milestone-2.md`, section 4); verification row 16 |
+| `remote-upload-5k` | 5,000 slots of `lactose-net-host`'s interpolation buffer, a writer thread of class `Network` pushing every slot at 30 Hz; each frame, paced at 144 Hz by a timer for ten seconds, one job: `sample_batch` at two send intervals behind the newest state, the conversion to render space and the write to the device's ring through `lactose-presentation`'s `upload`, each part timed (`frame`, `batch`, `convert`, `write`: P50, P99, worst); then `prepare` and an empty submit. With the reads a write overlapped, so retried (each counted once), and their share of all reads, the buffer's bytes, and the frames started a period late | `lactose-app-client`, target `integration`, `upload::cost_of_the_remote_upload_of_5k`, on a device | Criterion 5: the median frame at most 1 ms, a P99 over 2 ms a finding (`docs/plans/milestone-2.md`, section 4); verification rows 19 and 102 |
+| `record-stall` | The composed tick of `composed-tick` (100k rows, 2,000 awake bodies on Rapier) stepping on N workers beside the client binary's render side recording frame after frame on null, each record one `run_job` from its start to `draw`'s return, at a physics reservation of one frame worker and of two (the solver pool N less it): the record's P50, P99 and worst beside the physics phase (from the first entry into a physics node's span to the last exit), beside the rest of the tick, and with no tick, and the physics phase's and the tick's medians. 60 ticks at each after 10 of warm-up. The Windows `SetEvent` item (D162) is not yet measured | `lactose-app-client`, target `integration`, `stall::the_record_beside_the_physics_phase` | None: recorded; `RECORD_RESERVATION` is read from it (`docs/plans/milestone-2.md`, section 4 and decision 5.16; verification row 21) |
 
 `edit-to-playing` never touches the developer's tree: it registers a detached worktree of
 `HEAD` under `target/measure/edit-to-playing/tree`, edits and builds there with its own target

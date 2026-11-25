@@ -93,6 +93,24 @@ about 13 degrees from edge-on, and 600 is.
 - A validator's message fails the run: `Outcome::messages` counts them, each logged at
   `warn` under `LOG_TARGET`.
 
+## Measurements
+
+Milestone 2's measurements of the client's frame are ignored tests of the `integration`
+target, run in release by `cargo xtask measure` and listed in `docs/results/README.md`. Each
+prints its figures as `measure: <name> <value>` and asserts counts alone, never a time;
+`tests/timing.rs` holds what they share. Their scenes' components and systems are declared in
+the tests alone.
+
+| Measurement | Test |
+|---|---|
+| `extract-50k` | `extract::cost_of_extract_at_50k_dirty_rows`: extract's pass over 100,000 rows with 50,000 moved, writing a Vulkan device's ring and a snapshot of 10,000 presented rows, each alone, on one worker, and again on null |
+| `remote-upload-5k` | `upload::cost_of_the_remote_upload_of_5k`: the remote upload of 5,000 slots of `lactose-net-host`'s interpolation buffer into a Vulkan device's ring at 144 Hz, a writer thread of class `Network` pushing every slot at 30 Hz |
+| `record-stall` | `stall::the_record_beside_the_physics_phase`: `ClientRender`'s record on null beside the composed tick's physics phase at a reservation of one frame worker and of two, and alone; the physics phase is read from the executor's spans by a subscriber of the test's own |
+
+The two on a device run under the driver `cargo xtask measure --driver` names with no layer,
+and fail on any message the device sends; `cargo xtask gpu` runs them short under its
+validators and discards their figures. `LACTOSE_GPU_ADAPTER` names the adapter.
+
 ## What proves it
 
 | What | How |

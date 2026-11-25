@@ -72,11 +72,14 @@ cargo xtask <command>
                              run the program once it holds one of <n> machine-wide slots
                              (default 2, the same for every caller on the machine), and
                              exit with its status
-  measure (--all | <name>…) [--short] [--out <dir>]
+  measure (--all | <name>…) [--short] [--no-device] [--driver <name>] [--adapter <name>]
+          [--out <dir>]
                              run the milestone measurements and write each one's result
                              files to docs/results (or <dir>); --short cuts repetitions
-                             and marks the files as short; the names are in
-                             docs/results/README.md
+                             and marks the files as short; --no-device leaves out those
+                             on a Vulkan device, which run with no layer under --driver
+                             (moltenvk on macOS, system elsewhere) on --adapter (the
+                             loader's first); the names are in docs/results/README.md
   slang                      install the pinned Slang release under the target directory,
                              from tools/cook/slang.toml, and print its slangc's path
   gpu [--driver <name>] [--adapter <name>] [--only <metal|vulkan>] [--gpu-assisted]
@@ -295,13 +298,16 @@ const METAL_SCRIPT: &str = "tools/xtask/metal/pipelines.swift";
 /// signals, a failed `resize`, a present the driver refuses) or watch what none reports (a
 /// present's walk left undecided, a driver swapchain kept for a submit an encoder dropped
 /// while unwinding left pending). The render graph's and the renderer's are their `device`
-/// modules'.
-const DEVICE_TESTS: [(&str, Option<&str>, &str); 5] = [
+/// modules'. The client's are the measurements on a device that `cargo xtask measure` runs
+/// with no layer, here run short under the validators, their figures discarded.
+const DEVICE_TESTS: [(&str, Option<&str>, &str); 7] = [
     ("lactose-rhi-vulkan", None, "canary::"),
     ("lactose-rhi-vulkan", None, "swapchain::"),
     ("lactose-rhi-vulkan", Some("integration"), ""),
     ("lactose-render-graph", Some("integration"), "device::"),
     ("lactose-renderer", Some("integration"), "device::"),
+    ("lactose-app-client", Some("integration"), "extract::"),
+    ("lactose-app-client", Some("integration"), "upload::"),
 ];
 
 /// What `gpu` was asked to run.
@@ -539,7 +545,10 @@ fn run_vulkan(
         for test in order {
             let expected = canaries.iter().find(|(name, _)| *name == test).map(|(_, ids)| *ids);
             let mut command = Command::new(&binary);
+            // A measurement among them runs short: its figures under the validators mean
+            // nothing, and the full run's repetitions would only cost time.
             run.apply(&mut command)
+                .env(measure::SHORT_VAR, "1")
                 .args(["--exact", test, "--ignored", "--nocapture", "--test-threads", "1"])
                 .stdin(Stdio::null());
             let ended = vulkan::run_bounded(&mut command, vulkan::DEADLINE)
@@ -1054,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn the_device_tests_are_rhi_vulkans_canary_and_swapchain_modules_and_three_test_targets() {
+    fn the_device_tests_are_rhi_vulkans_canary_and_swapchain_modules_and_five_test_targets() {
         let library: Vec<&str> = DEVICE_TESTS
             .iter()
             .filter(|(_, target, _)| target.is_none())
@@ -1072,6 +1081,8 @@ mod tests {
                 ("lactose-rhi-vulkan", "integration", ""),
                 ("lactose-render-graph", "integration", "device::"),
                 ("lactose-renderer", "integration", "device::"),
+                ("lactose-app-client", "integration", "extract::"),
+                ("lactose-app-client", "integration", "upload::"),
             ]
         );
     }

@@ -547,7 +547,8 @@ whose build is done. CI never uses `heavy`: its runners are single-tenant.
 
 ## Measurements
 
-`cargo xtask measure (--all | <name>…) [--short] [--out <dir>]` runs the measurements the
+`cargo xtask measure (--all | <name>…) [--short] [--no-device] [--driver <name>] [--adapter
+<name>] [--out <dir>]` runs the measurements the
 milestone criteria rest on and writes each one's result files to `docs/results` (or
 `<dir>`, which must be inside the repository; an absolute one is written relative to its
 root in the files), with the header of `docs/plans/milestone-1.md`, section 4. The names, what each
@@ -564,6 +565,23 @@ standard error as it comes.
   test's whole output. A test that prints no figure, a figure line that does not read, or a
   figure named twice fails its measurement. nextest runs it with `--retries 0`, so that no
   failed attempt's output or time is read.
+- A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`) runs under the driver
+  `--driver` names, `moltenvk` by default on macOS and `system` elsewhere, on the adapter
+  `--adapter` names or the loader's first, with no layer: the inherited variables `gpu`
+  clears are cleared, every implicit layer is disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~`)
+  and no Metal validation is set. The loader is the pinned SDK's (`vulkan-layer.toml`) on
+  macOS and for a driver the SDK ships, the system's otherwise, and the driver's manifest is
+  pinned as `gpu` pins it. `vulkaninfo` (the SDK's, or the one on the path) runs once under
+  the same environment before the first of them, and each file's header adds the rows of the
+  device its test named in `device.adapter`: its name and vendor and device ids, the driver's
+  name, information and version, the device's and the instance's API versions, the loader,
+  the validation (off), the presentation (none: no surface, so no present mode or refresh
+  rate), the memory type `lactose-rhi-vulkan` chooses for `MemoryClass::Upload`, the ring's,
+  and the environment set, a path inside the SDK written from `<sdk>` and any other cut to
+  its file name. Where `vulkaninfo` fails the rows say why and the run goes on. A test that
+  hears a message from the device fails. `--no-device` leaves them out of `--all` and refuses
+  one named; the `measure` workflow passes it, since its runners have no device. `cargo xtask
+  gpu` runs them too, short, under its validators.
 - `spike-net` runs the netcode spike's ten-minute replays one `cargo nextest run` at a time;
   each prints its report as one JSON object, whose values the files carry under
   `<scene>.<clock>.` (nested keys joined by dots, an array as its JSON text), with the
@@ -696,8 +714,11 @@ writes its report.
 4. The Vulkan step runs every device test: each ignored test of the test targets
    `DEVICE_TESTS` in `src/main.rs` lists, which are `lactose-rhi-vulkan`'s library's unit
    tests, of its `canary` and `swapchain` modules alone, so that no other ignored unit test
-   runs as a device test, its `integration` binary, and the `device` modules of
-   `lactose-render-graph`'s and `lactose-renderer`'s `integration` binaries, each in a
+   runs as a device test, its `integration` binary, the `device` modules of
+   `lactose-render-graph`'s and `lactose-renderer`'s `integration` binaries, and the
+   `extract` and `upload` modules of `lactose-app-client`'s, the measurements on a device,
+   whose figures are discarded (every device test runs with `LACTOSE_MEASURE_SHORT=1`,
+   which only they read), each in a
    process of its own, built with `cargo test --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
    - the layer is the Khronos validation layer of the Vulkan SDK that
      `tools/xtask/vulkan-layer.toml` pins, refused unless its library's SHA-256 and its

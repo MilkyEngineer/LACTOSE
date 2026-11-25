@@ -441,6 +441,31 @@ pub struct Run {
     pub canaries: Vec<(&'static str, &'static [&'static str])>,
 }
 
+/// The variables that load `sdk`'s loader and, but under `system`, pin `driver`'s manifest
+/// as the SDK ships it.
+fn loader_and_driver(driver: Driver, sdk: &Sdk) -> Result<Vec<(String, String)>, String> {
+    let path = |path: &Path| path.to_string_lossy().into_owned();
+    // On macOS the fallback path: `DYLD_LIBRARY_PATH` would also redirect a driver the
+    // loader opens by its absolute path to the SDK's copy of the same name, which the
+    // loader reports as a message under `system`, where the drivers are the system's.
+    let library_path =
+        if cfg!(target_os = "macos") { "DYLD_FALLBACK_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
+    let mut set = vec![(library_path.to_owned(), path(&sdk.loader))];
+    let icd = match driver {
+        Driver::Lavapipe => Some(lavapipe_icd(&sdk.icds)?),
+        Driver::MoltenVk => Some(sdk.icds.join("MoltenVK_icd.json")),
+        Driver::KosmicKrisp => Some(sdk.icds.join("libkosmickrisp_icd.json")),
+        Driver::System => None,
+    };
+    if let Some(icd) = icd {
+        if !icd.is_file() {
+            return Err(format!("{}: no such driver manifest", icd.display()));
+        }
+        set.push(("VK_DRIVER_FILES".to_owned(), path(&icd)));
+    }
+    Ok(set)
+}
+
 /// Variables a run removes from the environment it inherits, before it sets its own: each
 /// would change which layers or drivers load, Metal's validation, or the tests' device.
 /// `METAL_DEVICE_WRAPPER_TYPE`, which Xcode sets, turns Metal's API validation on as
@@ -500,27 +525,7 @@ impl Run {
         let [layers, no_layers, shaders] = dirs;
         let path = |path: &Path| path.to_string_lossy().into_owned();
         let mut set: Vec<(String, String)> = Vec::new();
-        // On macOS the fallback path: `DYLD_LIBRARY_PATH` would also redirect a driver the
-        // loader opens by its absolute path to the SDK's copy of the same name, which the
-        // loader reports as a message under `system`, where the drivers are the system's.
-        let library_path = if cfg!(target_os = "macos") {
-            "DYLD_FALLBACK_LIBRARY_PATH"
-        } else {
-            "LD_LIBRARY_PATH"
-        };
-        set.push((library_path.to_owned(), path(&sdk.loader)));
-        let icd = match driver {
-            Driver::Lavapipe => Some(lavapipe_icd(&sdk.icds)?),
-            Driver::MoltenVk => Some(sdk.icds.join("MoltenVK_icd.json")),
-            Driver::KosmicKrisp => Some(sdk.icds.join("libkosmickrisp_icd.json")),
-            Driver::System => None,
-        };
-        if let Some(icd) = icd {
-            if !icd.is_file() {
-                return Err(format!("{}: no such driver manifest", icd.display()));
-            }
-            set.push(("VK_DRIVER_FILES".to_owned(), path(&icd)));
-        }
+        set.extend(loader_and_driver(driver, sdk)?);
         set.push(("VK_ADD_IMPLICIT_LAYER_PATH".to_owned(), path(layers)));
         set.push(("VK_LAYER_PATH".to_owned(), path(no_layers)));
         for (name, value) in validators.settings() {
@@ -544,6 +549,37 @@ impl Run {
             canaries.push((METAL_CANARY.0, &[]));
         }
         Ok(Self { set, cleared: cleared(names), metal, canaries })
+    }
+
+    /// The environment of a measurement on `driver` (`cargo xtask measure`): no layer at
+    /// all, every implicit one disabled through the loader, and no Metal validation, so the
+    /// figures are the driver's alone. The loader is `sdk`'s where one is given, and the
+    /// driver's manifest is the SDK's, as [`environment`](Self::environment) pins it;
+    /// under `system` with no SDK the system's loader finds the system's drivers (Windows,
+    /// where no layer is pinned). MoltenVK's warnings and errors still reach standard
+    /// error, where the measurement's own sink fails on any message the device sends.
+    ///
+    /// # Errors
+    /// When the driver's manifest is not where this host keeps it, or a driver other than
+    /// `system` is given no SDK.
+    pub fn measured(
+        driver: Driver,
+        sdk: Option<&Sdk>,
+        adapter: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut set = match sdk {
+            Some(sdk) => loader_and_driver(driver, sdk)?,
+            None if driver == Driver::System => Vec::new(),
+            None => return Err(format!("the driver {} is the pinned SDK's", driver.name())),
+        };
+        set.push(("VK_LOADER_LAYERS_DISABLE".to_owned(), "~implicit~".to_owned()));
+        set.push(("MVK_CONFIG_LOG_LEVEL".to_owned(), "2".to_owned()));
+        set.push(("MESA_VK_IGNORE_CONFORMANCE_WARNING".to_owned(), "1".to_owned()));
+        if let Some(adapter) = adapter {
+            set.push(("LACTOSE_GPU_ADAPTER".to_owned(), adapter.to_owned()));
+        }
+        let names = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok());
+        Ok(Self { set, cleared: cleared(names), metal: false, canaries: Vec::new() })
     }
 
     /// Applies the run's environment to `command`: the inherited variables it clears
@@ -884,6 +920,49 @@ mod tests {
     use super::*;
 
     const PIN: &str = include_str!("../vulkan-layer.toml");
+
+    /// A measurement's environment loads no layer and sets no validation, and pins the
+    /// driver's manifest as `gpu` does.
+    #[test]
+    fn a_measurement_runs_with_no_layer_on_the_pinned_driver() {
+        let value = |run: &Run, name: &str| {
+            run.set.iter().find(|(set, _)| set == name).map(|(_, value)| value.clone())
+        };
+        let system = Run::measured(Driver::System, None, Some("Apple M1")).unwrap();
+        assert_eq!(value(&system, "VK_LOADER_LAYERS_DISABLE").as_deref(), Some("~implicit~"));
+        assert_eq!(value(&system, "LACTOSE_GPU_ADAPTER").as_deref(), Some("Apple M1"));
+        assert_eq!(value(&system, "VK_DRIVER_FILES"), None);
+        assert!(!system.metal && system.canaries.is_empty());
+        for (name, _) in &system.set {
+            assert!(
+                !name.starts_with("VK_KHRONOS_VALIDATION_")
+                    && !name.starts_with("MTL_")
+                    && !name.contains("LAYER_PATH"),
+                "{name}"
+            );
+        }
+        let error = Run::measured(Driver::MoltenVk, None, None).err().expect("no SDK");
+        assert!(error.contains("SDK"), "{error}");
+        let root = std::env::temp_dir().join(format!("measure-sdk-{}", std::process::id()));
+        let icds = root.join("icd.d");
+        fs::create_dir_all(&icds).unwrap();
+        let sdk = Sdk {
+            loader: root.join("lib"),
+            library: root.join("lib").join("layer"),
+            manifest: root.join("manifest.json"),
+            icds: icds.clone(),
+        };
+        let missing = Run::measured(Driver::KosmicKrisp, Some(&sdk), None);
+        let error = missing.err().expect("no manifest");
+        assert!(error.contains("no such driver manifest"), "{error}");
+        fs::write(icds.join("libkosmickrisp_icd.json"), "{}").unwrap();
+        let krisp = Run::measured(Driver::KosmicKrisp, Some(&sdk), None).unwrap();
+        let manifest = icds.join("libkosmickrisp_icd.json");
+        assert_eq!(value(&krisp, "VK_DRIVER_FILES"), Some(manifest.to_string_lossy().into()));
+        assert!(krisp.set.iter().any(|(_, value)| *value == sdk.loader.to_string_lossy()));
+        assert_eq!(value(&krisp, "LACTOSE_GPU_ADAPTER"), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn the_tracked_pin_reads() {
