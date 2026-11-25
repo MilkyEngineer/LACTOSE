@@ -996,8 +996,8 @@ The merge's run under lavapipe failed both held-frame tests in their `Lag` form:
 lag gives it a shape of its own, so frame 2's compile made a plan's depth image while frame 1
 ran, and the host's work waited for frame 1 at every lag. The tests now draw two frames
 first, the renderer's first and one of frame 2's shape, and frame 2's plan comes from the
-cache, which each test asserts; no other call of the host's work takes that lock, so the
-next lavapipe run is expected to hold frame 1 behind the lag and run the form's checks.
+cache, which each test asserts; no other call of the host's work takes that lock, and the
+next lavapipe run, CI run 45384226367, held frame 1 behind the lag and ran the form's checks.
 Where a lag still does not hold, a probe asks what the device does: an image made after a
 pause with a lag's submit pending, on a device that waits for the submit, returns nearer the
 lag's end than its own start. There the test passes on its `Gate` form and prints that the

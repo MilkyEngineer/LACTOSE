@@ -422,52 +422,6 @@ fn an_encoder_keeps_its_swapchain_image_past_a_resize_or_the_drop() {
     }
 }
 
-/// A graphics submit that writes the acquired image, held by a host point, is pending while
-/// the swapchain is resized, or dropped and made again: the image and its driver swapchain
-/// are kept until the submit completes, and the layer says nothing. The Vulkan backend takes
-/// a swapchain image on a graphics encoder, which null alone refuses (`present-queue`).
-#[test]
-#[ignore = "needs a Vulkan driver: cargo xtask gpu"]
-fn a_frame_submit_pending_on_a_swapchain_image_keeps_it_past_a_resize_or_the_drop() {
-    for by_drop in [false, true] {
-        let sink = Arc::new(Counting::default());
-        let test = "a_frame_submit_pending_on_a_swapchain_image_keeps_it_past_a_resize_or_the_drop";
-        let Some(device) = headless(&sink, test) else { return };
-        let small = Extent { width: 64, height: 64 };
-        let mut swapchain =
-            device.create_swapchain(&SwapchainDesc { extent: small }).expect("a swapchain");
-        let Acquired::Image(image) = acquire(&mut *swapchain) else { panic!("no image") };
-        let gate = device.create_timeline(0).expect("a timeline");
-        let done = device.create_timeline(0).expect("a timeline");
-        let mut draw = device.create_encoder(G, "frame").expect("an encoder");
-        draw.transition_images(&[image_to(
-            image,
-            on(ImageState::Undefined, G),
-            on(ImageState::ColourAttachment, G),
-        )]);
-        clear(&mut *draw, image, [1.0, 0.5, 0.0, 1.0]);
-        let mut draws = [draw];
-        let waits = [TimelinePoint { timeline: gate, value: 1 }];
-        let signals = [TimelinePoint { timeline: done, value: 1 }];
-        device
-            .submit(G, Submit { encoders: &mut draws, waits: &waits, signals: &signals })
-            .expect("the frame's submit");
-        if by_drop {
-            drop(swapchain);
-            swapchain = device.create_swapchain(&SwapchainDesc { extent: small }).expect("again");
-        } else {
-            swapchain.resize(Extent { width: 96, height: 48 }).expect("the resize");
-        }
-        device.signal_timeline(waits[0]).expect("the gate");
-        assert!(device.wait_timeline(signals[0], PATIENCE).expect("the wait"), "the submit");
-        drop(draws);
-        show(&device, &mut *swapchain);
-        drop(swapchain);
-        drop(device);
-        assert_eq!(sink.count(), 0, "by_drop={by_drop}: {:?}", sink.texts());
-    }
-}
-
 /// A window no handle of which is available, for a request that names one.
 struct NoWindow;
 

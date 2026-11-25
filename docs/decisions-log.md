@@ -7978,6 +7978,88 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     present fences. The drop waits for no batch of the present queue: its semaphores go to
     the device behind its stamp. A drop that cannot see its presents end leaks the device,
     and the records keep its mark, so a second `create_swapchain` is refused. No contract change.
+- Addendum (lane `swapchain-late`, 2026-11-25; `reviewer-gpu`'s G3 and G4 at the swapchain's fix
+  round 4, and the lane's fix rounds 1 to 3): *no semaphore of the swapchain is destroyed with a
+  signal unwaited or pending, and no encoder of a submit the driver refused waits for it.* No public
+  signature changed; one sentence of `resize`'s contract is added (below).
+  - *Acquire semaphores (G3).* An acquire semaphore whose batches fail with the device not lost, a
+    present's submit and the empty batch after it or the swapchain's empty batch alone, stays
+    signalled, since a failed `vkQueueSubmit2` leaves its semaphores as they were. It was marked
+    abandoned and destroyed at the drop with the acquire's signal possibly pending, which no
+    valid-usage rule names (VUID-vkDestroySemaphore-semaphore-05149 is of batches) and the Vulkan
+    guide's "Swapchain Semaphore Reuse" forbids. Now the image's next present waits for it, and
+    `resize` and the drop each wait for every acquire semaphore no batch has waited for, with an
+    empty batch each. A `resize` whose batch fails is refused with the driver's error before it
+    gives up the driver swapchain that signalled the semaphore; a drop whose batch fails leaks the
+    device, as one that unwinds a panic with an acquire unwaited already did, and the records keep
+    the swapchain's mark. The review's smallest fix, an empty batch after a submit's failure, was
+    already the present's retry; the case left was that batch failing too. A unit-test hook,
+    `submit::FAILING`, fails a thread's next driver submits out of host memory, after the
+    `submit::SPARED` it lets through:
+    `an_acquire_semaphore_whose_batch_failed_is_waited_for_by_a_later_one` and
+    `a_drop_whose_batch_for_an_acquire_failed_leaks_the_device`, device tests of `cargo xtask gpu`
+    on a headless surface, hold the fix. Under MoltenVK 1.4.2 a scratch build that restores the
+    abandoned mark at the present fails the first, and one that restores it at the sweep fails both.
+  - *Present semaphores.* A present the driver did not take, out of memory, whose empty batch for
+    the image's present semaphore failed too, left the batch's stamp unrecorded, so a `resize`
+    destroyed that semaphore under the present's own pending submit, which signals it
+    (VUID-vkDestroySemaphore-semaphore-05149, the review's G1). The stamp `resize` waits for and the
+    drop hands over is now that submit's; the swapchain is stale, so the image is not presented
+    again before. `a_present_semaphore_whose_batch_failed_outlives_the_submit_that_signals_it` holds
+    the submit behind released slow work, on the present role's own queue and on the graphics queue
+    (a host point cannot hold it: a present's submit is made only once released). It asserts that
+    the chain keeps the submit's stamp, which holds whether or not the work is done by then, and
+    that the `resize`, retried while refused `pending` for up to ten bounds as `resize`'s contract
+    tells a caller to, returns only once the present queue has reached the stamp, the layer silent.
+    Under MoltenVK 1.4.2 a scratch build without the fix fails it at the chain's stamp ("the chain's
+    unsignalled 0 is short of the present's stamp 1"), with and without a two-second pause after the
+    stamp is read, by which the work is done and neither the layer nor the queue's value would tell
+    (the second review's G6); before that assertion was added it failed by the layer's 05149 on each
+    layout, the graphics queue's run alone. The work is left at its size, about 160 ms of copies on
+    the M1, so that the layer's half still sees the submit pending there.
+  - *A refused submit's encoders.* Where a submit's driver call fails out of memory, or a command
+    buffer's end fails, and the empty batch after it fails too, the submit's stamp is reached only
+    by a later batch of its queue, and its encoders' drops waited for it with no bound: on a present
+    queue of its own, until the next present (the review's G2). By the spec's "VkResult Return
+    Codes", out-of-memory errors "do not modify any currently existing Vulkan objects", so the
+    command buffers never became pending: the encoders are marked, and their drop and reset wait for
+    nothing. `the_encoder_of_a_submit_the_driver_refused_drops_at_once` drops one on a thread of its
+    own, bounded at ten seconds, with a message; under MoltenVK 1.4.2 a scratch build whose drop
+    ignores the mark fails it with that message, the drop held until the next present.
+  - *A `resize` refused with a driver's error.* It has given up any acquired image, and leaves the
+    swapchain either as it was, with its extent and images, to be acquired from again, or stale.
+    `Swapchain::resize`'s "Errors" gains one sentence, a doc amendment of D158's contract text: "A
+    driver's error (`ErrorKind::ResourceExhausted` among them) has given up any acquired image, and
+    leaves the swapchain either as it was or stale until a later `resize`." The backends are made to
+    agree (the review's G9): `rhi-null` gives the acquired image up before it makes the new images,
+    and forgets those it made where its image table fills part-way;
+    `a_resize_refused_by_a_full_image_table_gives_up_the_acquired_image` fills the table from a
+    test, and a build that keeps the image, or that leaves the images made, fails it. `rhi-vulkan`
+    gives the image up, with an empty batch for its acquire semaphore, whatever driver call fails,
+    the waits for its presents' fences and for the batch after a present the driver did not take
+    included. A unit-test hook, `Fail::Wait`, fails the wait for the presents' fences out of host
+    memory: `a_resize_whose_wait_fails_gives_up_the_acquired_image` holds that path, the give-up's
+    batch succeeding and failing, on both layouts, and a build that returns the wait's error before
+    the give-up fails it (the third review's G11). It is stale with no images where
+    `vkCreateSwapchainKHR` fails. No caller in the workspace relied on null keeping the image: each
+    returns a `resize`'s driver error.
+  - *The frame submit's test (G4).*
+    `a_frame_submit_pending_on_a_swapchain_image_keeps_it_past_a_resize_or_the_drop` wrote the
+    acquired image on a graphics encoder with nothing ordering the write after the acquire, so it
+    rested on MoltenVK's and lavapipe's acquire completing first, and its proof was the layer's
+    silence alone. No safe call orders it: rhi-api keeps a swapchain image to `Present` encoders,
+    and `Device::submit` refuses the present role. The test moves to `src/swapchain.rs`'s unit
+    tests, where the host waits for an empty batch that waits for the acquire before the write is
+    submitted, and it asserts what the layer's silence stood for: the image's object and its driver
+    swapchain kept while the submit is pending, across a `resize` and across the drop with a second
+    swapchain made, let go once the submit is known complete, and no message after. A build whose
+    image objects hold no count of their driver swapchain, the build the test was written against,
+    fails it, and with that assertion taken out the layer reports
+    `VUID-vkDestroySwapchainKHR-swapchain-01282`, as at the swapchain's first review.
+    `an_encoder_dropped_unwinding_leaves_its_pending_image_to_the_device` waits for its acquire the
+    same way; `a_drop_behind_a_held_submit_on_the_shared_queue_lets_a_swapchain_be_made_again` keeps
+    its unordered write, which leaves the drop an empty batch behind the held submit, so that it
+    still fails a drop that waits for its last batch.
 
 **D159. `lactose-platform`: one window whose `Arc` is its lifetime, the two pumps over `lactose-task`'s lanes, a close and a resize as states, and a present thread over the caller's state** (§3, §4, §5.1, §21, `lactose-platform`, `crates/app/README.md`, `crates/task/README.md`)
 - Why: section 4 gives the crate four nouns and section 5.1 two threads, and the milestone 2

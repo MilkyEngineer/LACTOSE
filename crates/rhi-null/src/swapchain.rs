@@ -81,11 +81,19 @@ impl NullSwapchain {
     }
 }
 
-/// Makes a swapchain's images: colour attachments and nothing else.
+/// Makes a swapchain's images: colour attachments and nothing else. Where the table fills
+/// part-way, the images already made are forgotten.
 fn make_images(shared: &Shared, records: &mut Records, extent: Extent) -> Result<Vec<ImageHandle>> {
     let mut images = Vec::with_capacity(IMAGES);
     for _ in 0..IMAGES {
-        let handle = records.images.insert(ImageRec::new(1, 1, Sharing::Exclusive, None, true))?;
+        let rec = ImageRec::new(1, 1, Sharing::Exclusive, None, true);
+        let handle = match records.images.insert(rec) {
+            Ok(handle) => handle,
+            Err(error) => {
+                forget_images(shared, records, &images);
+                return Err(error);
+            }
+        };
         let object = ImageObj {
             format: FORMAT,
             extent,
@@ -233,12 +241,18 @@ impl Swapchain for NullSwapchain {
             }
             records = self.shared.wait(records, Some(deadline));
         }
+        // The acquired image is given up before the images are made, so that a failure
+        // leaves it given up as a driver's does on Vulkan (`lactose-rhi-api`'s `resize`).
+        if let Some(image) = self.acquired.take()
+            && let Some(rec) = records.images.get_mut(image)
+        {
+            rec.acquired = Some(false);
+        }
         let images = make_images(&self.shared, &mut records, extent)?;
         let old = core::mem::replace(&mut self.images, images);
         forget_images(&self.shared, &mut records, &old);
         records.presents.retain(|present| present.swapchain != self.number);
         self.extent = extent;
-        self.acquired = None;
         self.next = 0;
         Ok(())
     }
