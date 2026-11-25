@@ -375,9 +375,9 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   next `resize`, after a `resize` refused for its empty batch with its driver swapchain kept, the
   layer silent; a drop whose empty batch for an acquire fails, which leaks the device and refuses a
   second swapchain, the layer silent; a present the driver did not take whose empty batch for the
-  present semaphore fails too, the present's own submit held by a host point, on the present role's
-  own queue and on the graphics queue, a `resize` refused `pending` until that submit is complete
-  rather than destroy the semaphore under it, the layer silent; the encoders of a present whose
+  present semaphore fails too, the present's own submit behind released slow work, on the present
+  role's own queue and on the graphics queue, a `resize` that returns only once that submit is
+  complete rather than destroy the semaphore under it, the layer silent; the encoders of a present whose
   submit and empty batch both failed dropped at once, with no later batch of the queue, where each
   waited until the next present; a graphics submit held by a host point that writes the acquired
   image, submitted once the host has seen a batch that waits for the image's acquire complete,

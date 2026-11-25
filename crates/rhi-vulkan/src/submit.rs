@@ -277,8 +277,8 @@ pub(crate) fn send(
     // errors do not modify any currently existing Vulkan objects" (the spec's "VkResult
     // Return Codes"; `vkQueueSubmit2` adds that the state of what the command buffers name
     // is "unaffected by the call or its failure"). Each stays executable, or invalid where
-    // its end failed, and only a submission moves one to pending; another error than these
-    // may have, and is taken as pending.
+    // its end failed, and only a submission moves one to pending. Any other error of the
+    // call may have left them pending, and is taken to have.
     let mut unsent = ended.is_err();
     let submitted = ended.and_then(|()| {
         let info = vk::SubmitInfo2::default()
