@@ -99,6 +99,9 @@ pub struct Outcome {
     pub held: u64,
     /// Frames that drew and were shed.
     pub shed: u64,
+    /// Frames that drew and were dropped, neither queued, held nor shed: behind a present
+    /// call in flight on a present queue of its own.
+    pub dropped: u64,
     /// Frames that ran their ticks alone, the frame before still on the render side.
     pub busy: u64,
     /// The fixed-frame mode's comparison of the last frame with the reference.
@@ -319,6 +322,9 @@ fn drive(
             Ok::<_, Error>((device, swapchain, reports))
         }))??;
         let (device, swapchain, reports) = made;
+        // Which driver ran, and whether the roles share a queue: what a run's record needs.
+        tracing::info!(target: LOG_TARGET, "{:?}", device.info());
+        tracing::info!(target: LOG_TARGET, "{:?}", device.capabilities().queues);
         let swapchain = match swapchain {
             Ok(swapchain) => swapchain,
             Err(error) => {
@@ -496,6 +502,7 @@ async fn paced(
                     outcome.drew += u64::from(queued);
                     outcome.held += u64::from(held);
                     outcome.shed += u64::from(shed);
+                    outcome.dropped += u64::from(!(queued || held || shed));
                 }
                 outcome.busy += u64::from(matches!(output.deferred, Some(Rendered::Busy)));
             }
