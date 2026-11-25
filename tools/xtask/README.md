@@ -669,17 +669,20 @@ unlocked and the display awake (`caffeinate -d` on macOS).
   short), at the time scale `pace::floor_scale` gives from that rate: frames a thousandth
   slower than half the display's rate. The scale is whole thousandths (`TimeScale`), rounded
   down: at 60 Hz the plan's 0.4995 is 0.499, about 0.2% slower than half the rate, a sweep of
-  the refresh in about 8.3 s. Where the rate is unread, as on Windows and Linux, the file
-  records `no floor: the display's rate is unread` and no floor run is made: the real-time
-  run's frames are paced at the ticks, and on a display faster than them each gap between
-  display times is a multiple of the refresh, so no refresh is fitted from them. A floor run
-  that swept fewer than twice is recorded as no floor, nothing is read against it, and it is
-  run again (`floor_again`) at the scale from its own fitted refresh. On Windows the
-  real-time run is made again minimised (`--minimised`).
+  the refresh in about 8.3 s. No floor run is made for either of two causes, which the file
+  names: off macOS `lactose-rhi-vulkan` has no host clock to pair display times with, so its
+  swapchain reports none and Windows and Linux record `no floor: the swapchain reports no
+  display times`; on macOS, where the script fails, the file records `no floor: the
+  display's rate is unread`, and no refresh is fitted from the real-time run instead: its
+  frames are paced at the ticks, and on a display faster than them each gap between display
+  times is a multiple of the refresh. A floor run that swept fewer than twice is recorded as
+  no floor, nothing is read against it, and it is run again (`floor_again`) at the scale from
+  its own fitted refresh. On Windows the real-time run is made again minimised
+  (`--minimised`).
 - **The reading** (`src/pace.rs`). A display report earlier than its present's return is no
   display and is dropped and counted (`display.dropped_before_return`); a present with no
-  report kept is counted (`display.missing`), the last calls' among them, whose reports no
-  later call reads. The floor run's refresh is fitted freely to its display times from the
+  report kept is counted (`display.missing`), those dropped by order and the last calls'
+  among them, whose reports no later call reads. The floor run's refresh is fitted freely to its display times from the
   reported refresh by least squares against each time's refresh index, the window doubling
   from 32 periods so a report off by a part in a hundred keeps each time on its own refresh
   (`fit.hz`, and `fit.from_reported_parts_per_10000`). The sweeps are the latches' phase
@@ -711,7 +714,13 @@ unlocked and the display awake (`caffeinate -d` on macOS).
   half the floor's median dropped and counted, and the latches' phase against the refresh
   (`latch_phase`), on which the median age at the display depends. Each is P50, P99 and the
   greatest, in microseconds. Then the flag (`flag.waiting_stayed_low`) and D162's four
-  readings (`reading.*`): reading 1 fires only on the submits that overlapped a driver call;
+  readings (`reading.*`): reading 1 fires only on the submits that overlapped a driver call,
+  on a shared queue where their P99 is as long as the driver call's, and on two queues, where
+  an overlap is no wait by itself, where their P99 exceeds the P99 of the submits that
+  overlapped none (`submit.overlapping.excess_p99_us`) by more than the latter's own spread
+  from P50 to P99, the submit's variation in the same run; a missing `info join_margin_ns` or
+  `info shed_depth` is written `unread: no join_margin_ns` or `unread: no shed_depth`, so a
+  file without it does not read as a run in which no join waited or nothing was shed;
   the lateness is read at its P99 against D144's 1 ms on Windows and D156's 50 µs on macOS,
   the frames over it counted beside it (`lateness.over_limit`, and
   `lateness.over_limit_by_the_wake`).

@@ -234,7 +234,8 @@ impl Stamps {
     }
 
     /// The figures of the display reports: those kept, those dropped by order, and the
-    /// presents made with none kept.
+    /// presents made with no report kept (`display.missing`), those whose report was dropped
+    /// by order among them.
     fn display_figures(&self, put: &mut impl FnMut(&str, String)) {
         let (kept, dropped) = self.displays();
         let shown: HashMap<u64, u64> = kept.iter().copied().collect();
@@ -494,8 +495,11 @@ fn before(frames: &[Frame], at: usize, margin: Option<u64>) -> &'static str {
 /// times from the reported period `refresh`, as a fraction of a refresh after a display;
 /// why it is unread otherwise.
 fn latch_phase(stamps: &Stamps, refresh: Option<f64>) -> String {
-    let Some(refresh) = refresh else { return "unread: the display's rate is unread".to_owned() };
     let times = stamps.display_times();
+    if times.is_empty() {
+        return "unread: no display times".to_owned();
+    }
+    let Some(refresh) = refresh else { return "unread: the display's rate is unread".to_owned() };
     let Some(fitted) = fit(&times, refresh) else {
         return "unread: no refresh could be fitted to the display times".to_owned();
     };
@@ -524,6 +528,16 @@ pub fn figures(run: &str, stamps: &Stamps, against: Against) -> Vec<(String, Str
     let recorders = stamps.info("recorders") == Some("installed");
     for (key, value) in &stamps.info {
         put(&mut f, key, value.clone());
+    }
+    // Without them the frame before is never classed `joined_at_limit` and reading 3 never
+    // compares with `SHED_DEPTH`, so their absence is written, not left to look like a run
+    // in which neither happened.
+    for (key, absent) in
+        [("join_margin_ns", margin.is_none()), ("shed_depth", shed_depth.is_none())]
+    {
+        if absent {
+            put(&mut f, key, format!("unread: no {key}"));
+        }
     }
     let shared = stamps.info("queues").is_some_and(|queues| queues.contains("present: Shared"));
 
@@ -627,6 +641,10 @@ pub fn figures(run: &str, stamps: &Stamps, against: Against) -> Vec<(String, Str
     put(&mut f, "submit.overlapping_driver", format!("{} of {}", overlapping.len(), submits.len()));
     spread(&mut f, &name("submit.overlapping"), &overlapping, false);
     spread(&mut f, &name("submit.alone"), &alone, false);
+    // On two queues an overlap is no wait by itself: the overlapping submits are read by how
+    // far their P99 exceeds that of the submits that overlapped none.
+    let excess = percentile(&overlapping, 0.99).zip(percentile(&alone, 0.99)).map(|(o, a)| o - a);
+    put(&mut f, "submit.overlapping.excess_p99_us", excess.map_or_else(|| "none".to_owned(), us));
     let holds: Vec<f64> = stamps
         .submits
         .iter()
@@ -740,20 +758,42 @@ pub fn figures(run: &str, stamps: &Stamps, against: Against) -> Vec<(String, Str
     let p99 = |values: &[f64]| percentile(values, 0.99);
     let layout = if shared { "on the queue the roles share" } else { "on two queues" };
     let count = format!("{} of {}", overlapping.len(), submits.len());
+    // The margin on two queues: the spread of the submits that overlapped none, from their
+    // P50 to their P99. It is the submit's own variation in the same run, so an excess past
+    // it is more than the submit varies by beside no driver call.
+    let own_spread = percentile(&alone, 0.5).zip(p99(&alone)).map(|(median, tail)| tail - median);
     let reading = match (p99(&overlapping), p99(&submits), p99(&driver)) {
         (_, None, _) | (_, _, None) => "unread: no submit or no driver call".to_owned(),
-        (Some(over), _, Some(call)) if over >= call => format!(
+        (Some(over), _, Some(call)) if shared && over >= call => format!(
             "a defect to report: {count} submits overlapped a present's driver call {layout}, \
              their P99 {} us as long as the driver call's {} us",
             us(over),
             us(call)
         ),
-        (Some(over), _, Some(call)) => format!(
+        (Some(over), _, Some(call)) if shared => format!(
             "recorded: {count} submits overlapped a present's driver call {layout}, their P99 \
              {} us under the driver call's {} us",
             us(over),
             us(call)
         ),
+        (Some(over), ..) => match (p99(&alone), excess.zip(own_spread)) {
+            (Some(own), Some((excess, spread))) => format!(
+                "{}: {count} submits overlapped a present's driver call {layout}{}: their P99 {} \
+                 us is {} us over the {} us of the submits that overlapped none, {} the latter's \
+                 P50-to-P99 spread of {} us",
+                if excess > spread { "a defect to report" } else { "recorded" },
+                if excess > spread { " and may have waited behind it" } else { "" },
+                us(over),
+                us(excess),
+                us(own),
+                if excess > spread { "past" } else { "within" },
+                us(spread)
+            ),
+            _ => format!(
+                "unread: every submit ({count}) overlapped a present's driver call {layout}, \
+                 and none is left beside no driver call to read them against"
+            ),
+        },
         (None, Some(all), Some(call)) => format!(
             "recorded: no submit overlapped a present's driver call ({count}) {layout}: the \
              submit's P99 {} us beside the driver call's {} us is the submit's own",
@@ -1246,6 +1286,53 @@ mod tests {
         assert_eq!(get(&figures, "real.submit.p99_us"), "300.0");
     }
 
+    /// Two queues, each submit's cost its own encoding: 1,000 frames whose submits that
+    /// overlap no driver call take `alone(n)`, and 5 that overlap one take `overlapping`.
+    fn two_queues(alone: impl Fn(u64) -> u64, overlapping: u64) -> Vec<(String, String)> {
+        let mut text = head(false, true);
+        for n in 0..1000u64 {
+            let at = n * 16_666_666;
+            let mut frame = apart(at);
+            frame.submit = (MS, MS + alone(n));
+            frame.driver = (2 * MS + 200_000, 2 * MS + 788_000);
+            if n % 200 == 7 {
+                frame.submit = (2 * MS + 250_000, 2 * MS + 250_000 + overlapping);
+            }
+            shot(&mut text, n, at, &frame);
+        }
+        figures("real", &Stamps::parse(&text).expect("the stamps"), Against::default())
+    }
+
+    /// The diff review's probe of reading 1 on two queues: every submit at 794 us of its own
+    /// encoding beside a driver call of 588 us, 5 of them overlapping one, is recorded; an
+    /// overlapping P99 over the others' by less than their own P50-to-P99 spread is recorded
+    /// too, and by more is the defect.
+    #[test]
+    fn an_overlap_on_two_queues_is_read_against_the_submits_that_overlapped_none() {
+        let figures = two_queues(|_| 794_000, 794_000);
+        assert_eq!(get(&figures, "real.submit.overlapping_driver"), "5 of 1000");
+        assert_eq!(get(&figures, "real.present.driver.p99_us"), "588.0");
+        assert_eq!(get(&figures, "real.submit.overlapping.excess_p99_us"), "0.0");
+        let reading = get(&figures, "real.reading.submit_against_driver");
+        assert!(reading.starts_with("recorded: 5 of 1000 submits overlapped"), "{reading}");
+
+        // The submits that overlapped none spread from 700 us to 794 us: P50 745, P99 794.
+        let spread = |n: u64| 700_000 + (n % 95) * 1_000;
+        let figures = two_queues(spread, 824_000);
+        assert_eq!(get(&figures, "real.submit.alone.p50_us"), "745.0");
+        assert_eq!(get(&figures, "real.submit.alone.p99_us"), "794.0");
+        assert_eq!(get(&figures, "real.submit.overlapping.excess_p99_us"), "30.0");
+        let reading = get(&figures, "real.reading.submit_against_driver");
+        assert!(reading.starts_with("recorded:"), "{reading}");
+        assert!(reading.contains("within the latter's P50-to-P99 spread of 49.0 us"), "{reading}");
+
+        let figures = two_queues(spread, 1_094_000);
+        assert_eq!(get(&figures, "real.submit.overlapping.excess_p99_us"), "300.0");
+        let reading = get(&figures, "real.reading.submit_against_driver");
+        assert!(reading.starts_with("a defect to report: 5 of 1000"), "{reading}");
+        assert!(reading.contains("may have waited behind it"), "{reading}");
+    }
+
     /// The reviewers' probe of the lateness: one frame of 600 at 51 us is counted, and the
     /// reading is by the P99, within D156's 50 us; the wake and the start are split.
     #[test]
@@ -1289,6 +1376,31 @@ mod tests {
         assert_eq!(before(&frames, 1, None), "joined");
     }
 
+    /// `figures` classes the frame before by the file's `JOIN_MARGIN`, and says where the
+    /// file has none rather than class every frame `joined`.
+    #[test]
+    fn the_join_margin_is_read_from_the_file() {
+        let frames = |head: String| {
+            let mut text = head;
+            for n in 0..600u64 {
+                let at = n * 16_666_666;
+                shot(&mut text, n, at, &apart(at));
+            }
+            let mut stamps = Stamps::parse(&text).expect("the stamps");
+            // Frame 299's call returns a millisecond before frame 300's deadline.
+            stamps.frames[299].returned = stamps.frames[300].deadline - MS;
+            figures("real", &stamps, Against::default())
+        };
+        let figures = frames(head(false, true));
+        assert_eq!(get(&figures, "real.join_margin_ns"), "2000000");
+        assert_eq!(get(&figures, "real.lateness.after_joined_at_limit.count"), "1");
+        assert_eq!(get(&figures, "real.lateness.after_joined.count"), "598");
+
+        let figures = frames(head(false, true).replace("info join_margin_ns 2000000\n", ""));
+        assert_eq!(get(&figures, "real.join_margin_ns"), "unread: no join_margin_ns");
+        assert_eq!(get(&figures, "real.lateness.after_joined_at_limit.count"), "absent");
+    }
+
     /// A present displayed before the next call begins and reported only at it is no image
     /// waiting: `waiting` counts it, the count by display times does not.
     #[test]
@@ -1298,12 +1410,18 @@ mod tests {
             let at = n * 16_666_666;
             // Shown 15.7 ms after the latch, under a millisecond before the next call.
             let shown = Some(at + 16 * MS + 700_000);
-            shot(&mut text, n, at, &Shot { shown, waiting: 2, ..apart(at) });
+            shot(&mut text, n, at, &Shot { shown, waiting: 4, ..apart(at) });
         }
         let stamps = Stamps::parse(&text).expect("the stamps");
-        let figures = figures("real", &stamps, Against::default());
-        assert_eq!(get(&figures, "real.waiting.max"), "2");
+        let against =
+            Against { refresh: Some(P60), floor: Some((15.0e6, 16.0e6)), ..Default::default() };
+        let figures = figures("real", &stamps, against);
+        assert_eq!(get(&figures, "real.waiting.max"), "4");
         assert_eq!(get(&figures, "real.undisplayed.max"), "0");
+        // A `waiting` of 4 is over SHED_DEPTH's 3; the presents not yet displayed are not.
+        let reading = get(&figures, "real.reading.latch_against_floor");
+        assert!(reading.starts_with("recorded:"), "{reading}");
+        assert!(!reading.contains("above SHED_DEPTH"), "{reading}");
     }
 
     /// Without the recorders' layer the width and the longest job are unread.
@@ -1315,6 +1433,22 @@ mod tests {
         let figures = figures("real", &stamps, Against::default());
         assert!(get(&figures, "real.width").starts_with("unread"));
         assert_eq!(get(&figures, "real.width.max"), "absent");
+    }
+
+    /// A run with no display times, as under KosmicKrisp, reads no latch phase for want of
+    /// them, though the display's rate is read.
+    #[test]
+    fn a_run_with_no_display_times_reads_no_latch_phase() {
+        let mut text = head(true, true);
+        for n in 0..100u64 {
+            let at = n * 16_666_666;
+            shot(&mut text, n, at, &Shot { shown: None, ..apart(at) });
+        }
+        let stamps = Stamps::parse(&text).expect("the stamps");
+        let figures =
+            figures("real", &stamps, Against { refresh: Some(P60), ..Default::default() });
+        assert_eq!(get(&figures, "real.latch_phase"), "unread: no display times");
+        assert_eq!(get(&figures, "real.display.missing"), "100");
     }
 
     /// Latches a little over two refreshes apart go round the refresh's phase once in each

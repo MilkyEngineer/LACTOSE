@@ -2291,7 +2291,10 @@ const READINGS: &str = "the lateness is the first tick's start against the deadl
     it; the frame before a late one is classed by what it deferred, or as `joined_at_limit` \
     where its call returned at or after this frame's deadline less `JOIN_MARGIN`, its join \
     having waited to its limit, or as `joined` where it returned sooner; reading 1 counts the \
-    submits that overlapped a present's driver call by the two spans' stamps; a present call's \
+    submits that overlapped a present's driver call by the two spans' stamps, and reads them \
+    against the driver call on a shared queue and, on two queues, by their P99's excess over \
+    the P99 of the submits that overlapped none, a defect past the latter's P50-to-P99 spread; \
+    a missing `join_margin_ns` or `shed_depth` is written as unread; a present call's \
     parts are its waits (for its last read, the resize and the encoder's drop, which waits for \
     the frame's GPU work and the blit), the acquire, the record (the encoder's creation and \
     the blit's recording), the driver's call (`Swapchain::present`: the wait for the image's \
@@ -2299,7 +2302,7 @@ const READINGS: &str = "the lateness is the first tick's start against the deadl
     `waiting` counts presents displayed and not yet reported as well, and `undisplayed` counts \
     those not yet displayed by their own display times; a display report earlier than its \
     present's return is dropped and counted, and a present with no display report kept, the \
-    last calls' among them, counted as missing; the latch's median age at the display depends \
+    last calls' among them and those whose report was dropped, counted as missing; the latch's median age at the display depends \
     on the latches' phase against the refresh, which `latch_phase` gives; the grid test is \
     D162's, the reported refresh refined by the floor run's fit to five parts in 10,000 at \
     most, beside the period the free fit lands on";

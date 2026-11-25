@@ -29,6 +29,12 @@
 //! against the fastest chain of the run, and each band's share of the frames. The same frames
 //! are then run back to back with no timer, a control whose job stays busy and whose clock
 //! stays up, and given the same way under `unpaced.`.
+//!
+//! The bands are relative to the run's fastest chain, not to a core's rated clock: a run whose
+//! cores never reach their full clock, under Low Power Mode or a thermal limit, classes its
+//! fastest frames `full` all the same. The control's clock stays up where the cores can reach
+//! it, so the file flags a run whose control has under half its frames `full`
+//! (`calibration.flag`).
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,8 +66,8 @@ const RING_REGIONS: u32 = 3;
 /// The calibration chain's steps: about 10 µs on a performance core at its full clock.
 const CHAIN: u32 = 5_000;
 /// The clock bands, by a chain's time against the fastest of the run: under the first bound
-/// the core is at its full clock or near it; at the second or over, it runs at half the
-/// fastest clock or less.
+/// the core is at the run's fastest clock or near it; at the second or over, it runs at half
+/// that clock or less.
 const BANDS: [(&str, f64); 3] = [("full", 1.25), ("reduced", 2.0), ("half", f64::INFINITY)];
 
 /// The time of [`CHAIN`] dependent multiply-adds, each through `black_box`, so that nothing
@@ -307,6 +313,16 @@ fn cost_of_the_remote_upload_of_5k() {
     );
     report("", &paced, fastest);
     report("unpaced.", &unpaced, fastest);
+    let full = unpaced.iter().filter(|p| band(p.calibration, fastest) == "full").count();
+    figure(
+        "calibration.flag",
+        if full * 2 < unpaced.len() {
+            "FLAGGED: under half the control's frames are `full`: the run's fastest chain may \
+             not be a core's full clock"
+        } else {
+            "no"
+        },
+    );
     let reads = frames as u64 * u64::from(REMOTE);
     for (prefix, retried) in [("", paced_retried), ("unpaced.", unpaced_retried)] {
         figure(&format!("{prefix}reader.reads"), reads);
