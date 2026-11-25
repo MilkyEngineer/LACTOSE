@@ -196,11 +196,16 @@ pub(crate) fn start() -> Instant {
 ///
 /// `Io` where the file cannot be written.
 pub(crate) fn finish(path: &Path, epoch: Instant) -> Result<()> {
-    ON.store(false, Ordering::Relaxed);
-    let stamps = core::mem::take(&mut *STAMPS.lock().unwrap_or_else(PoisonError::into_inner));
-    std::fs::write(path, text(&stamps, epoch)).map_err(|error| {
+    std::fs::write(path, taken(epoch)).map_err(|error| {
         Error::new(ErrorKind::Io, format!("the stamps file {}: {error}", path.display()))
     })
+}
+
+/// Stops taking stamps and returns the file's text of those taken.
+fn taken(epoch: Instant) -> String {
+    ON.store(false, Ordering::Relaxed);
+    let stamps = core::mem::take(&mut *STAMPS.lock().unwrap_or_else(PoisonError::into_inner));
+    text(&stamps, epoch)
 }
 
 /// Nanoseconds from `epoch` to `at`, zero for an instant before it.
@@ -341,7 +346,31 @@ mod tests {
 
     use lactose_app::{Rendered, ShownStats};
 
-    use super::{FrameStamp, PresentStamp, Stamp, text, word};
+    use super::{
+        FrameStamp, PresentStamp, Stamp, closure, now, on, stamp, start, taken, text, word,
+    };
+
+    /// The one test that sets the flag, so no other test of the process meets it set: unset,
+    /// a site keeps nothing; set, a stamp of another thread is kept after one taken before it
+    /// was spawned; once taken, the flag is unset and nothing more is kept.
+    #[test]
+    fn stamps_are_kept_only_while_a_run_takes_them() {
+        assert!(!on() && now().is_none());
+        stamp(Stamp::Drew(Instant::now()));
+        assert_eq!(closure("writer", || 7), 7);
+        let epoch = start();
+        assert!(on());
+        stamp(Stamp::Images(3));
+        std::thread::spawn(|| closure("writer", || ())).join().expect("the thread");
+        let written = taken(epoch);
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 2, "{written}");
+        assert_eq!(lines[0], "images 3");
+        assert!(lines[1].starts_with("closure writer "), "{written}");
+        assert!(!on());
+        stamp(Stamp::Images(4));
+        assert_eq!(taken(epoch), "");
+    }
 
     #[test]
     fn each_stamp_is_one_line_of_its_kind_and_fields() {
