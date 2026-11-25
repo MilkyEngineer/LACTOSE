@@ -50,10 +50,10 @@ use loom::thread::{self, Thread};
 
 use crate::gate::{self, Gate, Opener, Wake};
 use crate::latch::Latch;
-use crate::quiesce::{Entry, Quiesce};
+use crate::quiesce::{self, Entry, Quiesce};
 use crate::sleep::Sleep;
 
-/// The preemption bound of the three-thread models, which are too large to explore
+/// The preemption bound of the three-thread models that are too large to explore
 /// exhaustively.
 const THREE_THREAD_BOUND: usize = 5;
 
@@ -500,20 +500,44 @@ fn a_run_resolves_only_when_no_job_of_it_is_executing() {
     });
 }
 
+/// A job's reference to the run's graph. Dropping it also stores `dropped`, `Relaxed`, which
+/// the main thread's `Relaxed` load sees only if the drop happens before the resolution in
+/// memory order. The count alone cannot show that: loom's `Arc::strong_count` reads the
+/// latest count and synchronizes with every drop it counts.
+struct Reference {
+    _graph: Arc<()>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for Reference {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Relaxed);
+    }
+}
+
 /// A finished run: two jobs, each holding a reference to the run as a graph run's entries
 /// hold its graph, leave it through `Quiesce::leave`, and the last unit's job closes it. The
-/// main thread waits for the resolution as `GraphRun` does, holding the graph, and is then
-/// the graph's only holder. `leave` is the shipped function or a weakened copy.
-fn the_references_at_resolution(leave: fn(&Quiesce, Arc<()>) -> bool) {
+/// main thread waits on a flag that the job which finds the run quiet sets, as `GraphRun`
+/// waits on its completion, holding the graph; it must then be the graph's only holder, with
+/// every job's drop visible to it. `leave` is the shipped function or a weakened copy, and
+/// `weakened` lowers the order of `Quiesce::exit`.
+fn the_references_at_resolution(
+    weakened: Option<quiesce::Weakened>,
+    leave: fn(&Quiesce, Reference) -> bool,
+) {
     loom::model(move || {
         let graph = Arc::new(());
-        let jobs = Arc::new(Quiesce::new());
+        let mut quiesce = Quiesce::new();
+        quiesce.weakened = weakened;
+        let jobs = Arc::new(quiesce);
         let units = Arc::new(AtomicUsize::new(2));
         let resolved = Arc::new(AtomicBool::new(false));
+        let dropped: Vec<_> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
         let main = thread::current();
-        let workers: Vec<_> = (0..2)
-            .map(|_| {
-                let held = graph.clone();
+        let workers: Vec<_> = dropped
+            .iter()
+            .map(|dropped| {
+                let held = Reference { _graph: graph.clone(), dropped: dropped.clone() };
                 let (jobs, units, resolved) = (jobs.clone(), units.clone(), resolved.clone());
                 let main = main.clone();
                 thread::spawn(move || {
@@ -532,6 +556,14 @@ fn the_references_at_resolution(leave: fn(&Quiesce, Arc<()>) -> bool) {
         while !resolved.load(Ordering::SeqCst) {
             thread::park();
         }
+        // The marks first, since reading the count synchronizes with the drops.
+        for dropped in &dropped {
+            assert!(
+                dropped.load(Ordering::Relaxed),
+                "a job held the graph after the run resolved, by memory order: \
+                 its drop does not happen before the resolution"
+            );
+        }
         assert_eq!(Arc::strong_count(&graph), 1, "a job held the graph after the run resolved");
         for worker in workers {
             worker.join().unwrap();
@@ -539,10 +571,11 @@ fn the_references_at_resolution(leave: fn(&Quiesce, Arc<()>) -> bool) {
     });
 }
 
-/// When a run resolves, every job of it has dropped its reference to the graph.
+/// When a run resolves, every job of it has dropped its reference to the graph, and every
+/// such drop happens before the resolution.
 #[test]
 fn a_run_resolves_only_when_its_jobs_have_dropped_the_graph() {
-    the_references_at_resolution(Quiesce::leave);
+    the_references_at_resolution(None, Quiesce::leave);
 }
 
 /// `Quiesce::leave` with its two steps the other way round: a job that left first may still
@@ -550,11 +583,27 @@ fn a_run_resolves_only_when_its_jobs_have_dropped_the_graph() {
 #[test]
 #[should_panic(expected = "a job held the graph after the run resolved")]
 fn weakened_a_job_that_drops_the_graph_after_it_leaves() {
-    the_references_at_resolution(|jobs, held| {
+    the_references_at_resolution(None, |jobs, held| {
         let quiet = jobs.exit();
         drop(held);
         quiet
     });
+}
+
+/// `Quiesce::exit` that releases and does not acquire: the job that finds the run quiet need
+/// not see the other job's drop, though the drop came first.
+#[test]
+#[should_panic(expected = "its drop does not happen before the resolution")]
+fn weakened_a_run_whose_last_exit_does_not_acquire() {
+    the_references_at_resolution(Some(quiesce::Weakened::ExitRelease), Quiesce::leave);
+}
+
+/// `Quiesce::exit` that is `Relaxed`: nothing a job did before it left is ordered before the
+/// resolution.
+#[test]
+#[should_panic(expected = "its drop does not happen before the resolution")]
+fn weakened_a_run_whose_exits_are_relaxed() {
+    the_references_at_resolution(Some(quiesce::Weakened::ExitRelaxed), Quiesce::leave);
 }
 
 /// The pool as an idle worker's release sees it: `idle_one` really claims a sleeper.

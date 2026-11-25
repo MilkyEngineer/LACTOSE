@@ -27,11 +27,30 @@ pub(crate) enum Entry {
 
 pub(crate) struct Quiesce {
     state: AtomicUsize,
+    /// The one change a weakened loom model makes.
+    #[cfg(all(test, feature = "loom"))]
+    pub(crate) weakened: Option<Weakened>,
+}
+
+/// The weakened variants the references' model fails. Each lowers the order of
+/// [`Quiesce::exit`], which is what makes a job's writes, and its drop of what it held, happen
+/// before the resolution.
+#[cfg(all(test, feature = "loom"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Weakened {
+    /// [`Quiesce::exit`] releases and does not acquire.
+    ExitRelease,
+    /// [`Quiesce::exit`] neither releases nor acquires.
+    ExitRelaxed,
 }
 
 impl Quiesce {
     pub(crate) fn new() -> Self {
-        Self { state: AtomicUsize::new(0) }
+        Self {
+            state: AtomicUsize::new(0),
+            #[cfg(all(test, feature = "loom"))]
+            weakened: None,
+        }
     }
 
     /// Opens the state for a new run. Only called when the previous run is quiet and
@@ -50,7 +69,19 @@ impl Quiesce {
     /// resolves the future.
     #[must_use]
     pub(crate) fn exit(&self) -> bool {
-        self.state.fetch_sub(ONE_JOB, Ordering::SeqCst) == ONE_JOB | CLOSING
+        self.state.fetch_sub(ONE_JOB, self.exit_order()) == ONE_JOB | CLOSING
+    }
+
+    /// The order of [`Quiesce::exit`]: each exit releases what its job did, and the one that
+    /// finds the run quiet acquires what every earlier exit released.
+    fn exit_order(&self) -> Ordering {
+        #[cfg(all(test, feature = "loom"))]
+        match self.weakened {
+            Some(Weakened::ExitRelease) => return Ordering::Release,
+            Some(Weakened::ExitRelaxed) => return Ordering::Relaxed,
+            None => {}
+        }
+        Ordering::SeqCst
     }
 
     /// Unregisters a job as [`Quiesce::exit`] does, once `held`, the job's reference to what

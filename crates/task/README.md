@@ -36,11 +36,12 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - **`GraphRun`.** When it resolves, with `Ok` or with `Cancelled`, no unit, scope child or
   `finalize` of that run is executing or ever will, and everything they wrote happens before
   the resolution. With `Ok` every node has finalized and the graph is handed back, and the
-  run holds no reference to it any more: every job dropped its own before it left the run,
-  so a caller that drops the graph drops each node no one else holds, on its own thread.
-  After `Cancelled` the run is torn: some nodes finalized, some ran in part, their dependents
-  never ran, and the graph is not handed back; work that shutdown left queued may hold it
-  past the resolution, until that work is dropped. A job looks for shutdown before each unit and before
+  run holds no reference to it any more: each of its jobs dropped its own before it left the
+  run, and every such drop happens before the resolution, so dropping the graph drops each
+  node that nothing else holds, on the thread that drops it. After `Cancelled` the run is
+  torn: some nodes finalized, some ran in part, their dependents never ran, and the graph is
+  not handed back; work that shutdown left queued may hold the graph's nodes until that work
+  is dropped. A job looks for shutdown before each unit and before
   `finalize`, so once shutdown has begun none of those starts, except one that was already
   past its check; jobs already running finish, including the scopes they have open, and the
   run resolves when the last of them has returned. This holds however the
@@ -388,10 +389,14 @@ Correctness:
   feature on this crate that switches an internal `sync` shim, and run with
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
-  Twelve models are explored exhaustively. The three with three threads are bounded at five
-  preemptions, the idle-release one at four, the parking lane's at three
-  (`LOOM_MAX_PREEMPTIONS` overrides the bounds). The references' model runs beside a
-  weakened copy of `Quiesce::leave` that leaves before it drops, which fails it.
+  Twelve models are explored exhaustively: two with three threads, the latch's and the
+  references', and ten with two. Four more are bounded: the sleep protocol's wake for every
+  push and the run's quiescence, each with three threads, at five preemptions; the idle
+  release, with three, at four; and the parking lane's, with two, at three
+  (`LOOM_MAX_PREEMPTIONS` overrides the bounds). The references' model checks that every
+  job's drop of its reference happens before the resolution, by a `Relaxed` store in the
+  drop that the waiting thread reads; it fails beside a copy of `Quiesce::leave` that leaves
+  before it drops, and beside a `Quiesce::exit` lowered to `Release` and to `Relaxed`.
   Eight more hold `run_job`: the completion slot against a dropped `JobRun`, exhaustively; a
   worker taking the job against shutdown beginning, at five preemptions; the width in three
   configurations with the sleep protocol, at two: a width of one, two workers beside a main

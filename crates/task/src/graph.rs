@@ -253,8 +253,9 @@ impl RunState {
 
 /// What a run's future waits on, kept apart from the graph: a job of the run holds an entry's
 /// reference to the graph, and drops it before it leaves the run through a reference of its
-/// own to this (`run_range`). So a run that resolves holds no reference to its graph, and a
-/// caller handed the graph back drops the nodes when it drops the graph, on its own thread.
+/// own to this (`run_range`). So a run that resolves with its graph holds no reference to it,
+/// and the caller handed the graph back drops the nodes when it drops the graph, on its own
+/// thread.
 pub(crate) struct RunControl {
     ordinal: AtomicU64,
     /// Holds the future back while any job of the run is executing.
@@ -355,11 +356,13 @@ impl Graph {
 /// the executor shut down first. See [`crate::Executor::run_graph`].
 ///
 /// Either way, when it resolves no unit, scope child or finalize of the run is executing or
-/// ever will, and everything they wrote happens before the resolution. With the graph, the
-/// run holds no reference to it any more, so dropping the graph drops each node no one else
-/// holds, on the thread that drops it. After `Cancelled` the run is torn: some nodes
-/// finalized, some ran in part, their dependents never ran; the graph is not handed back, and
-/// work that shutdown left queued may hold it past the resolution.
+/// ever will, and everything they wrote happens before the resolution. When it resolves with
+/// the graph, the run holds no reference to it any more: each of its jobs drops its own before
+/// it leaves the run, and every such drop happens before the resolution, so dropping the graph
+/// drops each node that nothing else holds, on the thread that drops it. After `Cancelled` the
+/// run is torn: some nodes finalized, some ran in part, their dependents never ran; the graph
+/// is not handed back, and work that shutdown left queued may hold the graph's nodes until
+/// that work is dropped.
 ///
 /// A job of the run cannot wait for its own run: the run is not quiet while that job
 /// executes. (Jobs are synchronous and `block_on` on a worker is a debug assertion, so

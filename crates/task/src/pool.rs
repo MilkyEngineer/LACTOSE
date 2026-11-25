@@ -494,6 +494,11 @@ pub(crate) struct Shared {
     /// futures. A run's control, not its graph: the sweep's reference must not hold a graph
     /// that its run has handed back.
     live_runs: Mutex<HashMap<u64, Weak<RunControl>>>,
+    /// Called by shutdown's sweep with each run it found, before it cancels it, for the test
+    /// that holds the sweep there. Each executor has its own, so a test that sets it reaches
+    /// no other test's executor.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) sweep_pause: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Every unfinished task, so shutdown can cancel the ones no queue holds.
     tasks: Mutex<HashMap<u64, Weak<dyn RawTask>>>,
     next_task: AtomicU64,
@@ -531,6 +536,8 @@ impl Shared {
             chaos,
             runs: AtomicU64::new(0),
             live_runs: Mutex::new(HashMap::new()),
+            #[cfg(all(test, not(feature = "loom")))]
+            sweep_pause: Mutex::new(None),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(0),
             handles: Mutex::new(handles),
@@ -811,6 +818,10 @@ impl Shared {
         }
         let runs = core::mem::take(&mut *lock(&self.live_runs));
         for run in runs.into_values().filter_map(|run| run.upgrade()) {
+            #[cfg(all(test, not(feature = "loom")))]
+            if let Some(pause) = &*lock(&self.sweep_pause) {
+                pause();
+            }
             run.cancel(self);
         }
         self.timers.cancel_all();

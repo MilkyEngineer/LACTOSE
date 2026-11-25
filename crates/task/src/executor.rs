@@ -78,8 +78,8 @@ impl Executor {
     /// Runs every node of `graph` on the frame-critical workers.
     ///
     /// The returned future resolves, handing the graph back, when every node has finalized;
-    /// the run then holds no reference to the graph. A node is released when all nodes it depends on have finalized; execution order
-    /// between independent nodes is unspecified.
+    /// the run then holds no reference to the graph. A node is released when all nodes it
+    /// depends on have finalized; execution order between independent nodes is unspecified.
     ///
     /// The run owns the graph, so one graph can never have two runs in flight. Dropping the
     /// future does not cancel the run: nodes own their data, the run finishes on its own,
@@ -377,6 +377,9 @@ impl ExecutorBuilder {
 
 #[cfg(all(test, not(feature = "loom")))]
 mod job_tests;
+
+#[cfg(all(test, not(feature = "loom")))]
+mod sweep_tests;
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
