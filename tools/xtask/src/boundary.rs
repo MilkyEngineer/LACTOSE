@@ -2584,6 +2584,7 @@ mod tests {
                 refused("depends", "num-traits"),
                 refused("depends", "simba"),
                 refused("dev-depends", "glam"),
+                unnamed("bitflags"),
                 unnamed("bytemuck"),
                 unnamed("postcard"),
                 unnamed("rayon"),

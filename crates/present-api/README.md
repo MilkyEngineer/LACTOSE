@@ -477,10 +477,10 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   that one pairs with what the window's pass published. A slower reader whose acquire falls
   there gets one every second acquire as well. Motion stays forward, and every transform of
   a window pair has `no_interpolate` set, its two snapshots being of one tick: a stutter,
-  never a wrong draw. A frame that acquires after `publish` gets no window pair. When the
-  reader acquires is `frame-design`'s to settle; a fourth buffer would remove the window
-  pair, and architecture section 5.3's triple buffer stands unless `frame-design` shows the
-  stutter matters.
+  never a wrong draw. A frame that acquires after `publish` gets no window pair. The
+  client's frame acquires once in every frame that published, after its `publish`, and in
+  no other (D162), so it gets none: no fourth buffer is asked for, and architecture section
+  5.3's triple buffer stands.
 - `PresentSnapshot::cut` is set on a snapshot nothing before it leads into:
   - the snapshot of a full pass in a `Server` or `Client` world (a load, a restore, a
     world shown for the first time);
@@ -532,9 +532,10 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   world keeps publishing (a hidden window, a hitch, a debugger) costs memory, one batch per
   publication with an event, until it acquires again; nothing done under the lock grows
   with that backlog: `publish` links a batch whose list node it allocated before taking
-  the lock. The first acquire after the pause returns every event of it, folded. Whether a
-  reader that comes back after a long pause should receive them all, and whether a paused
-  reader should stop acquiring at all, is `frame-design`'s decision.
+  the lock. The first acquire after the pause returns every event of it, folded. The client's
+  frame never makes that backlog (D162): it acquires in every frame that published, a
+  hidden window's among them, and a frame that publishes nothing leaves its world's events
+  in the world's queue, for `log_retention` ticks at most. No event is dropped or capped.
 - A snapshot written by a full pass in a prediction world, of the tick of the snapshot
   published last, takes that snapshot's place instead of following it: it follows what
   that one followed ("The triple buffer"), and is published in its place if that one
@@ -552,8 +553,9 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   `World::take_present_events` returns after it, for each world it shows. For a prediction
   world that is after `reconcile` (`crates/predict/README.md`, "Presentation").
 - A `Server` world's step takes and drops its presentation events
-  (`crates/sim/README.md`, "Runs", step 4), so a shown world of that kind delivers none
-  until `lactose-sim` lets a shown server keep them: "Not in this crate yet".
+  (`crates/sim/README.md`, "Runs", step 4), unless it was built with
+  `SimulationBuilder::keep_present_events`, which `lactose-app` sets for a world it shows
+  (D162): then the frame takes them after its passes, as above.
 
 *A frame's transforms.*
 
@@ -618,13 +620,6 @@ follows is the contract the renderer's sink implements, and a test's sink checks
 
 ## Not in this crate yet
 
-- A shown `Server` world's presentation events: `Simulation::step` drops them. The
-  milestone 2 plan's decision 5.1 already makes milestone 2's local world the headless
-  binary's kind, `Server`, so that world delivers no event, and no debug shape, until this
-  is settled. `frame-design` must settle event delivery for it. What it owes: a
-  `SimulationBuilder` option in `lactose-sim` that leaves a shown server's events for
-  `app`, and the amendment of `crates/sim/README.md`, "Runs", step 4, by the lane that
-  adds it. A listen server and a single-player world need the same option.
 - Extracted *resources* in the snapshot. No type is declared so today and the ECS has no
   erased iteration of world resources; the snapshot holds components alone until a reader
   needs one.

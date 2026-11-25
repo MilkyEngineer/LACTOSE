@@ -106,6 +106,21 @@ pub fn build_server(
     start: Start,
     cooked: Arc<dyn Cooked>,
 ) -> Result<Server> {
+    build_world(executor, game, config, start, cooked, false)
+}
+
+/// [`build_server`]'s path. A world that is `shown` keeps its presentation events for the
+/// frame (`SimulationBuilder::keep_present_events`) and decides errors by
+/// `ErrorPolicy::MILESTONE_2`; nothing else differs (`README.md`, "Determinism of a shown
+/// world").
+pub(crate) fn build_world(
+    executor: &Executor,
+    game: &Game,
+    config: WorldConfig,
+    start: Start,
+    cooked: Arc<dyn Cooked>,
+    shown: bool,
+) -> Result<Server> {
     let (types, schemas) = assemble::registry(game)?;
     let migrations = game.migrations()?;
     let mut kept = BTreeMap::new();
@@ -168,6 +183,9 @@ pub fn build_server(
     if let Some((tick, next_net_id, binds)) = resumed {
         builder = builder.tick(tick).next_net_id(next_net_id).binds(binds);
     }
+    if shown {
+        builder = builder.keep_present_events();
+    }
     let simulation = builder.build()?;
     let core = Core {
         pacer: TickPacer::new(Instant::now(), TICK_PERIOD, CATCH_UP_CAP),
@@ -181,7 +199,7 @@ pub fn build_server(
         kept,
         queued,
         solver,
-        policy: ErrorPolicy::MILESTONE_1,
+        policy: if shown { ErrorPolicy::MILESTONE_2 } else { ErrorPolicy::MILESTONE_1 },
     };
     Ok(Server { simulation, core })
 }
@@ -214,7 +232,7 @@ fn pinned_table(cooked: &dyn Cooked, region: RegionId) -> Option<PinnedTable> {
 }
 
 /// The pacer's scale for `scale`.
-fn pacer_scale(scale: TimeScale) -> f64 {
+pub(crate) fn pacer_scale(scale: TimeScale) -> f64 {
     f64::from(scale.thousandths) / 1000.0
 }
 
@@ -582,13 +600,27 @@ impl Server {
         Ok((Self { simulation, core }, StepOutput { requests, failures }, carried))
     }
 
-    /// [`frame`](Self::frame), with the tick of a failure.
+    /// [`frame`](Self::frame), with the tick of a failure: [`run_ticks`](Self::run_ticks),
+    /// then [`run_gather`](Self::run_gather), back to back.
     pub(crate) async fn run_frame(
         self,
         executor: &Executor,
         now: Instant,
         frames: &mut (dyn FnMut(Tick) -> Option<TickInput> + Send),
     ) -> core::result::Result<(Self, FrameOutput), Box<Failed>> {
+        let (server, ticks) = self.run_ticks(executor, now, frames).await?;
+        let (server, gathered) = server.run_gather(executor).await?;
+        Ok((server, ticks.output(gathered)))
+    }
+
+    /// The first half of [`frame`](Self::frame): the poll, with its resync while paused,
+    /// the budget, and one step per due tick.
+    pub(crate) async fn run_ticks(
+        self,
+        executor: &Executor,
+        now: Instant,
+        frames: &mut (dyn FnMut(Tick) -> Option<TickInput> + Send),
+    ) -> core::result::Result<(Self, Ticks), Box<Failed>> {
         let mut server = self;
         if server.core.time_scale.is_paused() {
             // The pacer stopped with what it owed when the pause was carried, and a paused
@@ -615,7 +647,26 @@ impl Server {
                 break;
             }
         }
-        let Self { simulation, core } = server;
+        if budget.behind {
+            debug!(target: LOG_TARGET, tick = server.tick().0, ticks, "the frame is behind");
+        }
+        let ticks = Ticks {
+            ticks,
+            behind: budget.behind,
+            next_deadline: budget.next_deadline,
+            requests,
+            failures,
+        };
+        Ok((server, ticks))
+    }
+
+    /// The second half of [`frame`](Self::frame): `Simulation::run_passes`, then
+    /// `GatherState::take`.
+    pub(crate) async fn run_gather(
+        self,
+        executor: &Executor,
+    ) -> core::result::Result<(Self, StagingFrame), Box<Failed>> {
+        let Self { simulation, core } = self;
         let tick = simulation.tick();
         let mut simulation = match simulation.run_passes(executor).await {
             Ok(simulation) => simulation,
@@ -630,18 +681,7 @@ impl Server {
             .world_mut()
             .service_mut::<GatherState>()
             .map_or_else(|| StagingFrame::new(tick), GatherState::take);
-        if budget.behind {
-            debug!(target: LOG_TARGET, tick = tick.0, ticks, "the frame is behind");
-        }
-        let output = FrameOutput {
-            ticks,
-            behind: budget.behind,
-            next_deadline: budget.next_deadline,
-            gathered,
-            requests,
-            failures,
-        };
-        Ok((Self { simulation, core }, output))
+        Ok((Self { simulation, core }, gathered))
     }
 
     /// [`save_point`](Self::save_point), with the tick of a failure.
@@ -885,6 +925,23 @@ pub struct StepOutput {
     pub requests: Vec<RegionRequest>,
     /// The lifecycle's refusals this step.
     pub failures: LifecycleFailures,
+}
+
+/// The ticks half of a frame: [`FrameOutput`] but for the gather.
+pub(crate) struct Ticks {
+    pub(crate) ticks: u32,
+    pub(crate) behind: bool,
+    pub(crate) next_deadline: Instant,
+    pub(crate) requests: Vec<RegionRequest>,
+    pub(crate) failures: LifecycleFailures,
+}
+
+impl Ticks {
+    /// The frame's output, with `gathered`.
+    pub(crate) fn output(self, gathered: StagingFrame) -> FrameOutput {
+        let Self { ticks, behind, next_deadline, requests, failures } = self;
+        FrameOutput { ticks, behind, next_deadline, gathered, requests, failures }
+    }
 }
 
 /// What one frame of the timer root produced, for what runs between frames.

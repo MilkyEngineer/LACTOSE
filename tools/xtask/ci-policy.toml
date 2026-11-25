@@ -27,7 +27,7 @@ crates = ["lactose-reflect-macros", "lactose-ecs-macros", "lactose-present-api"]
 # identical to each other and to those of the [harness] packages. Every workspace package
 # named `lactose-app-*` must be listed here.
 [feature_roots]
-packages = ["lactose-app-headless"]
+packages = ["lactose-app-headless", "lactose-app-client"]
 
 # Architecture section 8.3: the packages whose tests run under SOUR, the determinism harness.
 # Their feature trees are compared with dev-dependencies included, since a test build
@@ -46,7 +46,7 @@ packages = ["lactose-app-headless"]
 packages = [
   "lactose-sim", "lactose-ecs", "lactose-physics-api", "lactose-input", "lactose-physics-rapier",
   "lactose-net-api", "lactose-predict", "lactose-net-host", "lactose-anim", "lactose-persist",
-  "lactose-app", "lactose-present-api",
+  "lactose-app", "lactose-present-api", "lactose-app-client",
 ]
 tests = [
   "lactose_anim::sour::a_prediction_crowd_with_a_rollback",
@@ -65,6 +65,8 @@ tests = [
   "lactose_app::spike::a_kinematic_character_is_recorded::physics",
   "lactose_app::spike::fifty_thrown_bodies_are_recorded",
   "lactose_app::spike::fifty_thrown_bodies_are_recorded::physics",
+  "lactose_app_client::recorded::a_shown_world_on_null_hashes_as_the_world_unshown",
+  "lactose_app_client::recorded::a_shown_world_on_null_hashes_as_the_world_unshown::physics",
   "lactose_input::sour::the_prediction_program_with_a_rollback",
   "lactose_input::sour::the_server_program",
   "lactose_net_api::sour::a_scene_replicated_to_a_client",
@@ -178,11 +180,11 @@ base = [
   "lactose-core", "lactose-math", "lactose-task", "lactose-reflect", "lactose-reflect-macros",
   "lactose-ecs-macros", "lactose-ecs", "lactose-bundle", "lactose-asset-api", "lactose-io",
   "lactose-asset", "lactose-input", "lactose-input-host", "lactose-sim", "lactose-net-api",
-  "lactose-net-host", "lactose-persist", "lactose-xtask", "game-sim", "lactose-rhi-api",
+  "lactose-net-host", "lactose-persist", "lactose-xtask", "lactose-rhi-api",
   "lactose-platform", "lactose-render-graph", "lactose-rhi-null", "lactose-rhi-vulkan",
 ]
 physics = [
   "lactose-physics-api", "lactose-physics-rapier", "lactose-anim", "lactose-predict",
   "lactose-app", "lactose-app-headless", "lactose-cook", "lactose-present-api",
-  "lactose-renderer", "lactose-presentation",
+  "lactose-renderer", "lactose-presentation", "game-sim", "lactose-app-client",
 ]

@@ -5,33 +5,32 @@
 //! traits name `lactose-rhi-api`, `lactose-present-api`, `lactose-ecs` and `lactose-task`
 //! alone, which is what keeps the server's denylist satisfiable.
 //!
-//! **Status: facade.** Every signature is final and every body that decides anything is
-//! `todo!()`; `frame-impl` writes them. `README.md`, "The shown frame", is the contract.
-
-#![allow(
-    dead_code,
-    unused_variables,
-    reason = "facade: `frame-impl` writes every body and removes this with the last `todo!()`"
-)]
+//! `README.md`, "The shown frame", is the contract, and the steps named below are its.
 
 use core::any::Any;
 use core::fmt;
+use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lactose_core::{Error, Result, Tick};
+use lactose_core::{Error, ErrorKind, Result, Tick};
 use lactose_ecs::{Executor, WorldKind};
-use lactose_present_api::{InstanceSink, PresentFrame, SnapshotReader};
+use lactose_net_api::StagingFrame;
+use lactose_present_api::{
+    ExtractState, InstanceSink, PresentFrame, SnapshotReader, extract_state, snapshot_channel,
+};
 use lactose_rhi_api::{Extent, ImageHandle, OFFSCREEN_TARGET_IMAGES_MIN, QueuePath, TimelinePoint};
 use lactose_sim::TickInput;
-use lactose_task::{JobContext, Lane, LaneCall, Task};
+use lactose_task::{JobContext, Lane, LaneCall, Sleep, Task, WorkerClass};
+use tracing::warn;
 
 use crate::game::Game;
-use crate::policy::ErrorPolicy;
+use crate::policy::{ErrorPolicy, LOG_TARGET, Response, Source};
+use crate::runtime::{CATCH_UP_CAP, TICK_PERIOD};
 use crate::save::Cooked;
-use crate::server::{FrameOutput, Server, StepOutput};
+use crate::server::{Failed, FrameOutput, Server, StepOutput, build_world, pacer_scale};
 use crate::world::{Start, WorldConfig};
 
 /// How many offscreen targets a shown frame draws into: `OFFSCREEN_TARGET_IMAGES_MIN`, and
@@ -490,6 +489,12 @@ pub struct ShownOutput {
 pub struct Shown {
     server: Server,
     flight: Flight,
+    driver: Driver,
+}
+
+/// What the task that drives the frame keeps beside the world and the flight: what it
+/// reads and counts while a render task owns `Side`.
+struct Driver {
     policy: ErrorPolicy,
     stats: ShownStats,
     /// Whether a frame was busy behind the render task in `flight`
@@ -499,19 +504,30 @@ pub struct Shown {
     /// cleared: the task made its decision at its end, which had not come at the busy
     /// frame's limit, so the report of a call it queued is the first passed over.
     busy_gap: bool,
+    /// Ticks the world has run since its last passes. It is here and not in `Side`, since
+    /// a busy frame runs its ticks while the render task owns `Side`.
+    unpassed: u32,
+    /// `WorldConfig::log_retention` less [`CATCH_UP_CAP`]: a frame defers its passes only
+    /// while `unpassed` is at most this (`README.md`, "The frame's three states").
+    bound: u32,
 }
 
-/// The render side between frames, or the frame in flight that owns it. A render task
-/// decides its own errors with a copy of the policy: `Err` is an error the policy stops
-/// the run for, and one it logged is `Ok(Rendered::Torn)`, or a present that was skipped.
+/// The render side between frames, or the frame in flight that owns it.
 enum Flight {
     Idle(Box<Side>),
-    Running(Task<(Box<Side>, Result<Rendered>)>),
+    Running(Task<Joined>),
 }
 
+/// What a render task resolves to. It decides its own errors with a copy of the policy:
+/// the inner `Err` is an error the policy stops the run for, and one it logged is
+/// `Ok(Rendered::Torn)`, or a present that was skipped. The outer `Err` is `Cancelled`:
+/// the executor shut down before the frame's job started, and the job's closure, which
+/// held `Side`, was dropped unrun.
+type Joined = Result<(Box<Side>, Result<Rendered>)>;
+
 /// Everything a frame's render task owns: moved into the task, by the task into each job
-/// it runs (`Executor::run_job`, which `lactose-task` is asked for) and handed back when
-/// each resolves, so nothing here is shared and nothing is locked.
+/// it runs (`Executor::run_job`) and handed back when each resolves, so nothing here is
+/// shared and nothing is locked.
 struct Side {
     /// The render side.
     render: Box<dyn RenderSide>,
@@ -526,8 +542,13 @@ struct Side {
     present: PresentLane,
     /// The one present call in flight, and the target it names.
     call: Option<(TargetIndex, LaneCall<Result<PresentReport>>)>,
+    /// The target the last queued call named, `None` before the first: a frame draws into
+    /// the other.
+    named: Option<TargetIndex>,
     /// For each target, the point of the present thread's last read of it.
     read: [Option<TimelinePoint>; TARGETS],
+    /// Reports taken that said `shown`, not yet added to `ShownStats::shown`.
+    shown: u64,
     /// Whether the last report taken read below [`SHED_DEPTH`]
     /// ([`PresentReport::waiting`]): `false` before the first report, and after a call
     /// that returned an error or was cancelled, which brings no report. A report whose
@@ -548,7 +569,7 @@ struct Side {
     /// queues none with no call's return still to be taken; where the return of a call
     /// that was still out at such a frame is taken, after its report is read (`gap`); and
     /// where a render task is taken back that a frame was busy behind
-    /// (`Shown::busy_gap`). It is counted down by each report taken that carries a count,
+    /// (`Driver::busy_gap`). It is counted down by each report taken that carries a count,
     /// which then changes neither `below` nor `rose`. A frame that queued no present left
     /// the reports of the calls queued after it one present fewer to count, and they
     /// would read as the count falling and then rising again. A report whose `waiting` is
@@ -571,13 +592,16 @@ struct Side {
     /// Whether the world is owed a new sink before its next pass that writes one: a
     /// frame's counts were stale for it, or a frame was torn.
     owed: bool,
+    /// Whether a sink was installed that no pass has written: the next pass that writes
+    /// one is full.
+    fresh: bool,
     /// Whether the last pass that wrote the sink was a full one: its frame's dropped and
-    /// unplaced counts then owe no second sink.
+    /// unplaced counts then owe no second sink. A pass that extract made full for a
+    /// reason of its own (a restore, a trimmed log) is not known here and reads as not
+    /// full, which costs at most one reset more.
     full: bool,
     /// Whether the last frame that ran its passes hid for want of a region.
     starved: bool,
-    /// Ticks the world has run since its last passes.
-    unpassed: u32,
 }
 
 /// Builds a shown world: [`build_server`](crate::build_server)'s path with `config`,
@@ -605,7 +629,42 @@ pub fn build_shown(
     render: Box<dyn RenderSide>,
     present: PresentLane,
 ) -> Result<Shown> {
-    todo!("frame-impl: `README.md`, \"The shown frame\"")
+    let bound = config.log_retention.saturating_sub(CATCH_UP_CAP);
+    let mut server = build_world(executor, game, config, start, cooked, true)?;
+    let mut render = render;
+    let queue = render.present_queue();
+    let (writer, reader) = snapshot_channel();
+    let extract = extract_of(&mut server);
+    extract.set_snapshot(Some(writer));
+    extract.set_sink(Some(render.sink()));
+    let side = Side {
+        render,
+        reader,
+        queue,
+        present,
+        call: None,
+        named: None,
+        read: [None; TARGETS],
+        shown: 0,
+        below: false,
+        rose: false,
+        pass_over: 0,
+        gap: false,
+        region: None,
+        detached: false,
+        owed: false,
+        fresh: true,
+        full: false,
+        starved: false,
+    };
+    let driver = Driver {
+        policy: ErrorPolicy::MILESTONE_2,
+        stats: ShownStats::default(),
+        busy_gap: false,
+        unpassed: 0,
+        bound,
+    };
+    Ok(Shown { server, flight: Flight::Idle(Box::new(side)), driver })
 }
 
 impl Shown {
@@ -625,7 +684,7 @@ impl Shown {
     /// The counters.
     #[must_use]
     pub fn stats(&self) -> ShownStats {
-        self.stats
+        self.driver.stats
     }
 
     /// One tick and its frame, joined: the step-driven form, for the fixed-frame mode of
@@ -646,7 +705,7 @@ impl Shown {
         time: FrameTime,
         window: Option<Extent>,
     ) -> ShownStep<'_> {
-        todo!("frame-impl: `README.md`, \"The shown frame\"")
+        ShownStep { run: Box::pin(self.run_step(executor, frame, time, window)) }
     }
 
     /// One paced frame, by value: [`Server::frame`]'s ticks at `now` with `frames`; then
@@ -683,13 +742,13 @@ impl Shown {
         frames: &'a mut (dyn FnMut(Tick) -> Option<TickInput> + Send),
         window: Option<Extent>,
     ) -> ShownFrame<'a> {
-        todo!("frame-impl: `README.md`, \"The shown frame\"")
+        ShownFrame { run: Box::pin(self.run_frame(executor, now, frames, window)) }
     }
 
     /// Joins the frame in flight, if any: it awaits, and resolves when the frame's render
     /// task has, with what it did. A present call it queued may still be in flight.
     pub fn flush(self) -> ShownFlush {
-        todo!("frame-impl: `README.md`, \"The shown frame\"")
+        ShownFlush { run: Box::pin(self.run_flush()) }
     }
 
     /// Ends the render side: [`flush`](Self::flush); then the present call in flight
@@ -699,8 +758,639 @@ impl Shown {
     /// binary drops off the frame-critical workers after the present thread has stopped
     /// (`README.md`, "Shutdown").
     pub fn stop(self) -> ShownStop {
-        todo!("frame-impl: `README.md`, \"The shown frame\"")
+        ShownStop {
+            run: Box::pin(async move {
+                let Self { server, flight, .. } = self;
+                // With a frame in flight after a shutdown, the server is dropped here.
+                let render = end(flight).await?;
+                Ok(Stopped { server, render })
+            }),
+        }
     }
+}
+
+/// How a shown run resolves.
+type Outcome<T> = core::result::Result<T, ShownError>;
+
+/// How long a wait of the frame may last.
+enum Limit<'s> {
+    /// No limit: `Shown::step`, and a frame past the bound on deferring.
+    None,
+    /// One poll: step 2 on an executor of one frame-critical worker, and a render task's
+    /// look at the call in flight on a queue of its own.
+    Look,
+    /// The frame's limit, kept by the frame's one `Sleep`.
+    Until(&'s mut Sleep),
+}
+
+/// `wait` up to `limit`, polled first at each wake: `Some` with what it resolved to, or
+/// `None` where the limit came first. `Err` is the `Sleep`'s `Cancelled`.
+async fn wait_for<W: Future + Unpin>(wait: &mut W, limit: Limit<'_>) -> Result<Option<W::Output>> {
+    let mut limit = limit;
+    poll_fn(move |cx| {
+        if let Poll::Ready(value) = Pin::new(&mut *wait).poll(cx) {
+            return Poll::Ready(Ok(Some(value)));
+        }
+        match &mut limit {
+            Limit::None => Poll::Pending,
+            Limit::Look => Poll::Ready(Ok(None)),
+            Limit::Until(sleep) => Pin::new(&mut **sleep).poll(cx).map_ok(|()| None),
+        }
+    })
+    .await
+}
+
+/// The world's extract state, which `lactose_present_api::setup` installs in every world.
+fn extract_of(server: &mut Server) -> &mut ExtractState {
+    extract_state(server.simulation_mut())
+        .expect("`lactose_present_api::setup` is in every world kind's engine list")
+}
+
+/// The fraction of a paced frame (`README.md`, "The shown frame", the frame's time).
+fn fraction(server: &Server, next_deadline: Instant, now: Instant) -> f32 {
+    let scale = server.time_scale();
+    if scale.is_paused() {
+        return 1.0;
+    }
+    let period = TICK_PERIOD.as_secs_f64() / pacer_scale(scale);
+    let left = next_deadline.saturating_duration_since(now).as_secs_f64();
+    (1.0 - left / period).clamp(0.0, 1.0) as f32
+}
+
+/// What a render task taken back left.
+enum Back {
+    /// The render side, and what the frame did.
+    Side(Box<Side>, Rendered),
+    /// The render side, and an error the policy stopped the run for.
+    Stopped(Box<Side>, Error),
+    /// `Cancelled`: the render side is gone.
+    Lost(Error),
+}
+
+impl Driver {
+    /// Takes a render task's output back: its counts, and the pass-over a frame busy
+    /// behind it owes.
+    fn take_back(&mut self, joined: Result<Joined>) -> Back {
+        let (mut side, rendered) = match joined.and_then(|joined| joined) {
+            Ok(joined) => joined,
+            Err(error) => return Back::Lost(error),
+        };
+        self.stats.shown += core::mem::take(&mut side.shown);
+        if core::mem::take(&mut self.busy_gap) && !side.gap {
+            side.pass_over = SHED_DEPTH;
+            side.rose = false;
+        }
+        match rendered {
+            Ok(rendered) => {
+                let stats = &mut self.stats;
+                match rendered {
+                    Rendered::Drew { queued, held, shed, .. } => {
+                        stats.drawn += 1;
+                        stats.queued += u64::from(queued);
+                        stats.held += u64::from(held);
+                        stats.shed += u64::from(shed);
+                    }
+                    Rendered::Hidden => stats.hidden += 1,
+                    Rendered::Torn => stats.torn += 1,
+                    Rendered::Waited(_) | Rendered::Busy => {}
+                }
+                Back::Side(side, rendered)
+            }
+            Err(error) => Back::Stopped(side, error),
+        }
+    }
+}
+
+impl Shown {
+    /// The failure of a run that kept the world and the render side.
+    fn failed(self, error: Error) -> ShownError {
+        ShownError { error, kept: ShownKept::Shown(Box::new(self)) }
+    }
+
+    /// [`flush`](Self::flush).
+    async fn run_flush(self) -> Outcome<(Self, Option<Rendered>)> {
+        let Self { server, flight, mut driver } = self;
+        let task = match flight {
+            Flight::Idle(side) => {
+                return Ok((Self { server, flight: Flight::Idle(side), driver }, None));
+            }
+            Flight::Running(task) => task,
+        };
+        match driver.take_back(task.await) {
+            Back::Side(side, rendered) => {
+                Ok((Self { server, flight: Flight::Idle(side), driver }, Some(rendered)))
+            }
+            Back::Stopped(side, error) => {
+                Err(Self { server, flight: Flight::Idle(side), driver }.failed(error))
+            }
+            Back::Lost(error) => Err(ShownError { error, kept: ShownKept::Nothing }),
+        }
+    }
+
+    /// [`step`](Self::step).
+    async fn run_step(
+        self,
+        executor: &Executor,
+        frame: TickInput,
+        time: FrameTime,
+        window: Option<Extent>,
+    ) -> Outcome<(Self, StepOutput, Rendered)> {
+        let (shown, _) = self.run_flush().await?;
+        let Self { server, flight, mut driver } = shown;
+        let (server, output, _) = match server.run_step(executor, frame).await {
+            Ok(stepped) => stepped,
+            Err(failed) => return Err(world_failed(failed, flight, driver).await),
+        };
+        driver.unpassed = driver.unpassed.saturating_add(1);
+        let Flight::Idle(side) = flight else { unreachable!("the flush took the task back") };
+        let drawn = draw_frame(executor, server, side, driver, Limit::None, time, window).await?;
+        let Drawn { shown, deferred, gathered } = drawn;
+        // Taken and dropped, as the headless binary drops it.
+        drop(gathered);
+        if let Some(deferred) = deferred {
+            return Ok((shown, output, deferred));
+        }
+        let (shown, rendered) = shown.run_flush().await?;
+        Ok((shown, output, rendered.expect("a frame that did not defer started a render task")))
+    }
+
+    /// [`frame`](Self::frame).
+    async fn run_frame(
+        self,
+        executor: &Executor,
+        now: Instant,
+        frames: &mut (dyn FnMut(Tick) -> Option<TickInput> + Send),
+        window: Option<Extent>,
+    ) -> Outcome<(Self, ShownOutput)> {
+        let Self { server, flight, mut driver } = self;
+        // Step 1: the ticks, beside the render task in flight.
+        let (server, ticks) = match server.run_ticks(executor, now, frames).await {
+            Ok(ticked) => ticked,
+            Err(failed) => return Err(world_failed(failed, flight, driver).await),
+        };
+        driver.unpassed = driver.unpassed.saturating_add(ticks.ticks);
+        let deferring = driver.unpassed <= driver.bound;
+        let limit = ticks.next_deadline.checked_sub(JOIN_MARGIN).unwrap_or(now);
+        // One `Sleep` serves both waits. It registers no timer before its first poll, and
+        // answers a passed limit at that poll without registering one.
+        let mut sleep = executor.sleep_until(limit);
+        let time = FrameTime { now, fraction: fraction(&server, ticks.next_deadline, now) };
+
+        // Step 2: the wait for the frame before.
+        let (side, joined) = match flight {
+            Flight::Idle(side) => (side, None),
+            Flight::Running(mut task) => {
+                let wait = if !deferring {
+                    Limit::None
+                } else if executor.frame_worker_count() == 1 {
+                    Limit::Look
+                } else {
+                    Limit::Until(&mut sleep)
+                };
+                let joined = match wait_for(&mut task, wait).await {
+                    Ok(Some(joined)) => joined,
+                    Ok(None) => {
+                        driver.stats.busy += 1;
+                        driver.busy_gap = true;
+                        let world = ticks.output(StagingFrame::new(server.tick()));
+                        let output =
+                            ShownOutput { world, joined: None, deferred: Some(Rendered::Busy) };
+                        return Ok((
+                            Self { server, flight: Flight::Running(task), driver },
+                            output,
+                        ));
+                    }
+                    Err(error) => return Err(ShownError { error, kept: ShownKept::Nothing }),
+                };
+                match driver.take_back(joined) {
+                    Back::Side(side, rendered) => (side, Some(rendered)),
+                    Back::Stopped(side, error) => {
+                        return Err(
+                            Self { server, flight: Flight::Idle(side), driver }.failed(error)
+                        );
+                    }
+                    Back::Lost(error) => {
+                        return Err(ShownError { error, kept: ShownKept::Nothing });
+                    }
+                }
+            }
+        };
+
+        // Steps 3 to 5.
+        let wait = if deferring { Limit::Until(&mut sleep) } else { Limit::None };
+        let Drawn { shown, deferred, gathered } =
+            draw_frame(executor, server, side, driver, wait, time, window).await?;
+        let tick = shown.server.tick();
+        let world = ticks.output(gathered.unwrap_or_else(|| StagingFrame::new(tick)));
+        Ok((shown, ShownOutput { world, joined, deferred }))
+    }
+}
+
+/// What steps 3 to 5 left: the world with the render task started, or with the render
+/// side idle where the frame deferred.
+struct Drawn {
+    shown: Shown,
+    /// `Some` where the frame deferred its passes and started no render task.
+    deferred: Option<Rendered>,
+    /// The gather of the passes, where they ran.
+    gathered: Option<StagingFrame>,
+}
+
+/// What step 3 decided.
+enum State {
+    /// Draw at this extent.
+    Draw(Extent),
+    /// Run the passes and the job with no draw: no window, or `starved`.
+    Hidden { starved: bool },
+    /// Run nothing more.
+    Defer(Rendered),
+}
+
+/// Steps 3 to 5 of a frame (`README.md`, "The shown frame"), with the render side taken
+/// back: the state, the passes and the publication, and the render task, spawned and left
+/// in flight. `wait` is how long step 3 awaits a present call on a shared queue.
+async fn draw_frame(
+    executor: &Executor,
+    server: Server,
+    mut side: Box<Side>,
+    mut driver: Driver,
+    wait: Limit<'_>,
+    time: FrameTime,
+    window: Option<Extent>,
+) -> Outcome<Drawn> {
+    let deferring = driver.unpassed <= driver.bound;
+    let mut server = server;
+    let window = window.filter(|extent| extent.width != 0 && extent.height != 0);
+
+    // Step 3: the state.
+    let state = match window {
+        // A frame with no window asks nothing, so it leaves a starvation as it found it.
+        None => State::Hidden { starved: side.starved },
+        Some(extent) if side.region == Some(Region::Ready) => State::Draw(extent),
+        Some(extent) => {
+            if side.queue == QueuePath::Shared
+                && let Some((target, mut call)) = side.call.take()
+            {
+                match wait_for(&mut call, wait).await {
+                    Ok(Some(outcome)) => {
+                        if let Err(error) = side.take_report(driver.policy, target, outcome) {
+                            let shown = Shown { server, flight: Flight::Idle(side), driver };
+                            return Err(shown.failed(error));
+                        }
+                    }
+                    Ok(None) => {
+                        // Busy behind the call: this frame queues none with its return
+                        // still to be taken.
+                        side.call = Some((target, call));
+                        side.queued_none();
+                        driver.stats.busy += 1;
+                        let shown = Shown { server, flight: Flight::Idle(side), driver };
+                        let deferred = Some(Rendered::Busy);
+                        return Ok(Drawn { shown, deferred, gathered: None });
+                    }
+                    Err(error) => return Err(ShownError { error, kept: ShownKept::Nothing }),
+                }
+            }
+            let asked = executor.run_job(move |ctx| {
+                let opened = side.render.open(ctx);
+                (side, opened)
+            });
+            let (asked, opened) = match asked.await {
+                Ok(asked) => asked,
+                Err(error) => return Err(ShownError { error, kept: ShownKept::Nothing }),
+            };
+            side = asked;
+            let starved = !deferring || side.starved;
+            match opened {
+                Ok(Region::Ready) => {
+                    side.region = Some(Region::Ready);
+                    State::Draw(extent)
+                }
+                Ok(Region::Wait(point)) => {
+                    side.region = Some(Region::Wait(point));
+                    if starved {
+                        State::Hidden { starved }
+                    } else {
+                        driver.stats.waited += 1;
+                        State::Defer(Rendered::Waited(point))
+                    }
+                }
+                Err(error) => match side.torn(driver.policy, error) {
+                    Ok(_) => {
+                        driver.stats.torn += 1;
+                        if starved {
+                            State::Hidden { starved }
+                        } else {
+                            State::Defer(Rendered::Torn)
+                        }
+                    }
+                    Err(error) => {
+                        let shown = Shown { server, flight: Flight::Idle(side), driver };
+                        return Err(shown.failed(error));
+                    }
+                },
+            }
+        }
+    };
+    driver.stats.shown += core::mem::take(&mut side.shown);
+    let extent = match state {
+        State::Defer(deferred) => {
+            side.queued_none();
+            let shown = Shown { server, flight: Flight::Idle(side), driver };
+            return Ok(Drawn { shown, deferred: Some(deferred), gathered: None });
+        }
+        State::Hidden { starved } => {
+            if !side.detached {
+                extract_of(&mut server).set_sink(None);
+                side.detached = true;
+            }
+            side.starved = starved;
+            None
+        }
+        State::Draw(extent) => {
+            // The four cases of a new sink (`README.md`, "Counts, torn frames and resets").
+            if side.detached || side.owed {
+                extract_of(&mut server).set_sink(Some(side.render.sink()));
+                driver.stats.resets += 1;
+                side.detached = false;
+                side.owed = false;
+                side.fresh = true;
+            }
+            side.full = core::mem::take(&mut side.fresh);
+            side.starved = false;
+            Some(extent)
+        }
+    };
+
+    // Step 4: the passes and the publication.
+    let (mut server, gathered) = match server.run_gather(executor).await {
+        Ok(gathered) => gathered,
+        Err(failed) => return Err(world_failed(failed, Flight::Idle(side), driver).await),
+    };
+    let events = server.simulation_mut().world_mut().take_present_events();
+    extract_of(&mut server).publish(events);
+    driver.unpassed = 0;
+
+    // Step 5: the render task.
+    let task = executor.spawn(
+        WorkerClass::FrameCritical,
+        render(executor.clone(), side, driver.policy, time, extent),
+    );
+    let shown = Shown { server, flight: Flight::Running(task), driver };
+    Ok(Drawn { shown, deferred: None, gathered: Some(gathered) })
+}
+
+/// A frame's render task: the frame's job, then where it drew the hold, the submit and the
+/// decision (`README.md`, "The shown frame", step 5).
+async fn render(
+    executor: Executor,
+    side: Box<Side>,
+    policy: ErrorPolicy,
+    time: FrameTime,
+    extent: Option<Extent>,
+) -> Joined {
+    let mut side = side;
+    let draw = extent.map(|extent| {
+        let target = side.named.map_or(TargetIndex(0), other);
+        Draw { target, extent, ready: side.read[target.index()] }
+    });
+    let job = executor.run_job(move |ctx| {
+        let job = frame_job(&mut side, ctx, time, draw);
+        (side, job)
+    });
+    drop(executor);
+    let (mut side, job) = job.await?;
+    let rendered = match (job, draw) {
+        (Err(error), _) => side.torn(policy, error),
+        (Ok(Some(counts)), Some(draw)) => side.finish(policy, draw, counts).await,
+        (Ok(_), _) => {
+            side.queued_none();
+            Ok(Rendered::Hidden)
+        }
+    };
+    Ok((side, rendered))
+}
+
+/// The frame's job: one acquire, `present`, and `draw` where the frame draws.
+fn frame_job(
+    side: &mut Side,
+    ctx: &mut JobContext<'_>,
+    time: FrameTime,
+    draw: Option<Draw>,
+) -> Result<Option<FrameCounts>> {
+    let frame = side.reader.acquire().expect("the frame published before its job");
+    side.render.present(ctx, &frame, time)?;
+    draw.map(|draw| side.render.draw(ctx, draw)).transpose()
+}
+
+/// The target after `target`: the one a frame draws into where the last call named
+/// `target`.
+fn other(target: TargetIndex) -> TargetIndex {
+    TargetIndex(((target.index() + 1) % TARGETS) as u8)
+}
+
+impl Side {
+    /// A frame queued no present: the gap it leaves in what the calls after it count
+    /// (`README.md`, "The targets and the present thread", the shedding rule).
+    fn queued_none(&mut self) {
+        if self.call.is_some() {
+            self.gap = true;
+        } else {
+            self.pass_over = SHED_DEPTH;
+        }
+        self.rose = false;
+    }
+
+    /// A method of the render side failed: the frame is torn, or the run stops.
+    fn torn(&mut self, policy: ErrorPolicy, error: Error) -> Result<Rendered> {
+        self.region = None;
+        self.owed = true;
+        self.queued_none();
+        match policy.decide(Source::Render, &error) {
+            Response::Stop => Err(error),
+            Response::Log | Response::Resync => Ok(Rendered::Torn),
+        }
+    }
+
+    /// Takes the return of the call that named `target`. `Err` is an error the policy
+    /// stops the run for.
+    fn take_report(
+        &mut self,
+        policy: ErrorPolicy,
+        target: TargetIndex,
+        outcome: Result<Result<PresentReport>>,
+    ) -> Result<()> {
+        let gap = core::mem::take(&mut self.gap);
+        let taken = match outcome.and_then(|report| report) {
+            Ok(report) => {
+                self.read_report(target, report, gap);
+                Ok(())
+            }
+            // A present skipped: the target's `read` is unchanged and the call brings no
+            // count, so the report after it has none to rise from.
+            Err(error) => {
+                self.below = false;
+                match policy.decide(Source::Render, &error) {
+                    Response::Stop => Err(error),
+                    Response::Log | Response::Resync => Ok(()),
+                }
+            }
+        };
+        if gap {
+            self.pass_over = SHED_DEPTH;
+        }
+        taken
+    }
+
+    /// What `Side` keeps of a report. One taken after a gap is read as the report before
+    /// the next, and never as a rise.
+    fn read_report(&mut self, target: TargetIndex, report: PresentReport, gap: bool) {
+        if let Some(read) = report.read {
+            self.read[target.index()] = Some(read);
+        }
+        self.shown += u64::from(report.shown);
+        let Some(waiting) = report.waiting else { return };
+        if self.pass_over > 0 {
+            self.pass_over -= 1;
+            return;
+        }
+        let at = waiting >= SHED_DEPTH;
+        self.rose = !gap && at && self.below;
+        self.below = !at;
+    }
+
+    /// What a frame's counts owe (`README.md`, "Counts, torn frames and resets").
+    fn note_counts(&mut self, counts: FrameCounts) {
+        let counts = counts.of(WorldKind::Server);
+        if counts.lost || (counts.stale() && !self.full) {
+            self.owed = true;
+        } else if counts.stale() {
+            warn!(
+                target: LOG_TARGET,
+                dropped = counts.dropped,
+                unplaced = counts.unplaced,
+                "a full pass left rows out: the renderer is not sized for the world"
+            );
+        }
+    }
+
+    /// After a `draw` that succeeded: the hold on a shared queue, the submit and the
+    /// decision.
+    async fn finish(
+        &mut self,
+        policy: ErrorPolicy,
+        draw: Draw,
+        counts: FrameCounts,
+    ) -> Result<Rendered> {
+        self.note_counts(counts);
+        // The hold. An error the call reports is decided here and the submit is made
+        // whatever the response.
+        let mut held = false;
+        let mut stop = None;
+        if self.queue == QueuePath::Shared
+            && let Some((target, mut call)) = self.call.take()
+        {
+            let outcome = match wait_for(&mut call, Limit::Look).await? {
+                Some(outcome) => outcome,
+                None => {
+                    held = true;
+                    // Dropped for this call: its report is taken after the gap.
+                    self.gap = true;
+                    call.await
+                }
+            };
+            stop = self.take_report(policy, target, outcome).err();
+        }
+        let submitted = match self.render.submit() {
+            Ok(submitted) => submitted,
+            Err(error) => return stop.map_or_else(|| self.torn(policy, error), Err),
+        };
+        self.region = Some(submitted.region);
+        if let Some(error) = stop {
+            return Err(error);
+        }
+        // The decision: on a queue of its own, one look at the call in flight.
+        let free = match self.call.take() {
+            None => !held,
+            Some((target, mut call)) => match wait_for(&mut call, Limit::Look).await? {
+                Some(outcome) => {
+                    self.take_report(policy, target, outcome)?;
+                    true
+                }
+                None => {
+                    self.call = Some((target, call));
+                    false
+                }
+            },
+        };
+        let shed = free && self.rose;
+        let queued = free && !shed;
+        if queued {
+            let finished = Finished {
+                target: draw.target,
+                image: submitted.image,
+                extent: draw.extent,
+                point: submitted.point,
+            };
+            let call = self
+                .present
+                .run(move |present: &mut Box<dyn PresentSide>| present.present(finished));
+            self.call = Some((draw.target, call));
+            self.named = Some(draw.target);
+            self.rose = false;
+        } else {
+            self.queued_none();
+        }
+        Ok(Rendered::Drew {
+            target: draw.target,
+            point: submitted.point,
+            counts,
+            queued,
+            held,
+            shed,
+        })
+    }
+}
+
+/// A world's run failed: what survived it (`README.md`, "Errors").
+async fn world_failed(failed: Box<Failed>, flight: Flight, driver: Driver) -> ShownError {
+    let Failed { error, server, .. } = *failed;
+    let kept = match server {
+        Some(server) => ShownKept::Shown(Box::new(Shown { server, flight, driver })),
+        None if error.kind() == ErrorKind::Cancelled => ShownKept::Nothing,
+        None => match end(flight).await {
+            Ok(render) => ShownKept::Render(render),
+            Err(_) => ShownKept::Nothing,
+        },
+    };
+    ShownError { error, kept }
+}
+
+/// Ends the render side as [`Shown::stop`] does: the frame in flight joined, the call in
+/// flight awaited, `close` queued last and awaited, the lane dropped. An error of the
+/// render side is logged and ends nothing; `Err` is `Cancelled` from the join.
+async fn end(flight: Flight) -> Result<Box<dyn RenderSide>> {
+    let mut side = match flight {
+        Flight::Idle(side) => side,
+        Flight::Running(task) => {
+            let (side, rendered) = task.await.and_then(|joined| joined)?;
+            if let Err(error) = rendered {
+                warn!(target: LOG_TARGET, %error, "the frame in flight at the stop failed");
+            }
+            side
+        }
+    };
+    if let Some((_, call)) = side.call.take()
+        && let Err(error) = call.await.and_then(|report| report)
+    {
+        warn!(target: LOG_TARGET, %error, "the present call in flight at the stop failed");
+    }
+    let Side { render, present, .. } = *side;
+    if let Err(error) = present.run(|present: &mut Box<dyn PresentSide>| present.close()).await {
+        warn!(target: LOG_TARGET, %error, "the present side's close did not run");
+    }
+    drop(present);
+    Ok(render)
 }
 
 /// What [`Shown::stop`] hands back.

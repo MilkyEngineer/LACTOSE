@@ -10117,6 +10117,196 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   stress runs at load 23 to 27 and, after review round 1, 500 more at load 17 to 26. The
   reviewer's: main's unchanged test passed 1,500 nextest runs at load 28 to 35, and only an
   instrumented copy reproduced the arena's cost, in 6 of 1,200 runs.
+- Addendum (lane `frame-impl`, 2026-11-25; round one): *the frame in `lactose-app` is
+  implemented, with no public signature changed.* Every `todo!()` of `src/shown.rs` is written,
+  and the app README's status lines say so. What D162 left to the implementation is settled so:
+  - *`held` is the call's state when the frame's job returned.* On a shared queue the hold
+    awaits the present call before `submit`; it looks once at the call, and a frame is
+    `held`, and dropped, where that look finds the call still out. The race between the
+    job's return and the call's is not observable from outside, so the test that holds a
+    frame retries with a doubling release delay until one frame is held, and asserts that
+    every try before it queued its call.
+  - *A render task whose job a shutdown dropped unrun resolves `Cancelled` itself.* The job's
+    closure held the render side, so nothing is handed back; a paced frame met by a shutdown
+    fails with `Cancelled` and `ShownKept::Nothing`, whether the task's join or the frame's
+    `Sleep` reports it.
+  - *A full pass is known by the sink's freshness, not by the pass's rows.* A new sink is owed
+    in the README's four cases and no second reset follows a full pass that left rows out.
+  - *`lactose_present_api::setup` runs after `lactose_physics_api::setup`*, beside its
+    `register_types` after `lactose_anim`'s and its `register_systems` after
+    `lactose_anim::register_systems`, for every world kind. The four components it registers
+    are in every world's registry, so `tests/schema_record/engine.txt` gains them, and the
+    engine's `ProtocolHash`, which covers them, moves from 0x1458_0671_8FB1_1F86 to
+    0xB439_7FA7_135F_B2DE (`tests/proof/registration.rs`, verification row 98). No world
+    hash that SOUR records moved.
+  - *`Shown::stop` logs a render-side error it ends with at `warn`*, and hands the render side
+    back.
+  - *The width of `run_job` is counted at a moment.* On three frame workers the frame's job
+    and its children occupy two workers at most at any moment, but which worker is the second
+    may change within one scope, so section 6 asserts the peak of children running at once
+    against `run_job_width()` and that two children that wait for each other meet on two
+    threads; it does not assert that the children ran on two distinct threads in all
+    (`crates/task/README.md`, "The width").
+  - *The mover is `game-sim`'s `Orbit`*, a function of the tick alone: no state accumulates,
+    so a rollback, a load and a full pass place a row where an unbroken run does. `game-sim`
+    gains `lactose-math` and `lactose-physics-api` and moves from the base group of
+    `tools/xtask/ci-policy.toml` to the physics group. `game-sim` spawns no row with a mesh
+    for the headless binary: the tests' session applier spawns the three rows with
+    `MeshInstance` and `Orbit`, so that the headless binary's recorded stream is unchanged.
+  What holds it is the README's "Proof for the shown frame": section 5 of `tests/shown.rs`
+  (criterion 3(a) and (b)) and section 6 (`run_job` on two frame workers and on three), and
+  `tests/frame/`, the states, the waits of a paced frame, the protocol, the shedding rule and
+  the ends of a run, over a render side and a present side with no device that log their
+  calls and answer as each test scripts. Every wait is bounded at ten seconds by a clock that
+  is no worker's.
+- Addendum (lane `frame-impl`, 2026-11-25; round two): *the binary `lactose-app-client` is
+  built, with no public signature of `lactose-app` changed.* It joins `[feature_roots]` and
+  `[harness]` in `tools/xtask/ci-policy.toml`. What D162 and decision 5.1 left to it is
+  settled so:
+  - *The swapchain is made beside the device, in the same main-lane call* ("What
+    `lactose-app-client` wires", step 2), at the window's size, and handed to `wire`, which
+    the binary and the tests on null share (steps 4 to 6). The present side resizes at its
+    first call and at each change of the frame's extent, behind its last read, and rewrites
+    a target's heap slot, behind the same wait, whenever the image is not the one the slot
+    holds, so an extent that changed and came back with the frames between dropped still
+    rewrites it.
+  - *The present side reads each target through heap slots 0 and 1* (`HEAP`), one per
+    target, with a sampler of its own, and signals a timeline of its own as each present's
+    `read`. The device is asked for `HEAP_SLOTS_DEFAULT` and `SAMPLERS_DEFAULT`, the
+    capacities the cooked shaders are compiled for.
+  - *`PresentReport::waiting` is the present side's count*: of the presents made before the call,
+    those whose read is reached and that no display-time report has named, neither they nor
+    a later one; `None` where the swapchain has no source of display times.
+  - *The fixed-frame mode waits for each step's point*, within ten seconds, so that every
+    step draws, and a step that does not draw fails the run. Its scene is `game-sim`'s,
+    `game_sim::scene`, the client's `sessions`: a join spawns seven rows a seventh of a
+    420-tick period apart on a circle of four metres, each with `MeshInstance`. The last
+    frame is held to the CPU reference at a margin of a quarter of a pixel, whose reasoning
+    is `reference::MARGIN`'s documentation; the counts are the reference's.
+  - *The binary logs the device and its queue layout at start*, and its `Outcome` counts
+    the frames queued, held, shed, dropped and busy. On the M1 MoltenVK's window device
+    gives the present role a queue of its own and KosmicKrisp's shares the graphics queue,
+    so both layouts run there without forcing.
+  - *`tools/cook/tests/shader.rs` lists the client's shader*, since a shader added under
+    `shaders/` changes the cook's fixed list.
+  What holds it is `lactose-app-client`'s README, "What proves it", and the app README's
+  table of what that package holds: criterion 3(c) on null under SOUR; the run on null on
+  each queue layout through drawn, hidden, held and dropped frames, the extent going E1,
+  E2, E1, and present calls that make no submit, refused nothing; the present side alone on
+  null; the count over scripted reports; criterion 1 on the M1 under both drivers with each
+  validator's canary and its four mutations; and both queue layouts under synchronisation
+  validation, by a probe whose presents are slowed, with no message. Two findings were left,
+  both closed in fix round 1 and fix round 2:
+  `cargo xtask features` failed, since the window's dependencies ask `bitflags`'s `std` in
+  the boundary's tree (verification row 232), and `Renderer::drop` waited on a timeline the
+  graph's drop destroyed, which logged a `warn` at every clean shutdown. Criterion 1 on the
+  laptop is owed, the owner's.
+- Addendum (lane `frame-impl`, 2026-11-25; fix round 1): *round one's two reviews are closed,
+  with one change of behaviour and no public signature changed.*
+  - *A frame with no window leaves a starvation as it found it.* It asks nothing, so it is no
+    answer from `open`; before, it ended the starvation, and the next frame with a window
+    that found no region open deferred again for up to the bound. A frame busy after a
+    starved one, before it asks, defers within the bound as any frame does, and the frame
+    after it is starved still; the app README says both.
+  - *What the reviews found untested is under test*: a frame busy at step 2 behind a task
+    whose own frame was dropped for a call still out; a limit that arrives while step 2
+    waits for a held `draw`, and while step 3 waits for a present call held on a shared
+    queue, which the executor's timer ends; criterion 3(a)'s check over the draw's return
+    as well as its start; section 6's children on threads other than the job's, at most
+    `width - 1` at once; a run of shedding frames, bounded at four frames a call. Each fails
+    under the reviewers' mutant for it, save section 6's new bound: the breach it is for frees
+    the job's place while its opener parks, and the one mutant of the width tried fails the
+    peak's assertion before it.
+  - *The held render task's gate is held where `lactose-app` can break it*: the protocol test
+    runs the physics step's `block_in_place` on every tick beside the held task. What is left
+    is `lactose-task`'s (the row after 241).
+  - *`bitflags` is pinned with `std` in `lactose-physics-rapier`*, through the workspace,
+    provisionally: the window's dependencies ask `std` in any root that links a window, so a
+    boundary crate asks it too and every root's boundary tree is alike (verification row
+    232). `crate-tiers.toml` lists it among the crate's direct dependencies.
+- Addendum (lane `frame-impl`, 2026-11-25; fix round 2): *round two's two reviews are closed;
+  no public signature of `lactose-app` changed, and `lactose-app-client`'s `Waiting` is no
+  longer public.*
+  - *Criterion 1 holds the records to what extract handed the renderer.* The render side
+    records each call extract makes into its sink and mirrors what the sink keeps
+    (`crates/present-api/README.md`, "What the sink keeps"). At the fixed-frame mode's last
+    frame the records the device's scatter wrote below the slot table's extent are held to
+    those placements, liveness slot for slot and a live record's previous and current
+    placements bit for bit; the scene's seven instances must be live; the reference is
+    rasterised from the placements, not from the records read back, and each instance must
+    be surely drawn at some pixel. A record above the extent was never written: it is neither
+    copied nor read. The scatter writing nothing or two slots swapped, a join suppressed and
+    a scene of six rows each fail it, as decision 5.1's four mutations do, under both of the
+    M1's drivers with the validators.
+  - *Null keeps what it would refuse pending.* The tests' device answers `timeline_value` on a
+    present's read timeline with what a wait last saw, so each read stays pending until a
+    wait sees it; the render side's take-back of a target, the present's wait for the frame
+    and a slot's write each then meet a pending submit, and null refuses each without its
+    wait. The present's wait is shown on `ClientPresent` alone, since the render side's own
+    call observes its frame's point right after the submit. A gate timeline signalled from
+    the host was not used: null holds a present whose wait is undecided for a second and
+    then refuses it, so a gate let go later races that bound.
+  - *The shutdown keeps the platform's order on every path that made a device.* `exit` is
+    queued as the frames end, and before step 5 on a start that failed after the device was
+    made (fix round 3); both failed waits of the fixed-frame mode stop the world; the render
+    side's drop, step 4, runs on a thread of its own within ten seconds. Past that bound what
+    the drop holds keeps the window and the pump never returns, so in either mode the run
+    logs the error and ends the process with status 1, its teardown not run (since fix round
+    3; the paced mode stayed open before it, under the pump's warning, to be killed).
+  - *The fixed-frame mode counts its frames as the paced mode does*, queued, held, shed and
+    dropped, so round two's claim that `Outcome` counts them holds in both modes; `busy` is
+    zero in the fixed-frame mode, whose steps are joined. A step waits for its own frame's
+    point and not for the present call before it, so most fixed frames find that call still
+    out, and how many varies from run to run: one run of criterion 1 on the M1 at fix round
+    3, 600 frames, queued 73 and dropped 527 under MoltenVK, and queued 300 and held 300
+    under KosmicKrisp (load 17.02 22.42 20.16 before, 13.58 21.29 19.81 after). Across this
+    lane's and the reviewers' runs MoltenVK queued 67 to 241 of 600 and KosmicKrisp 300 to
+    348, so no split is a baseline.
+  - *`Renderer::drop` waits for nothing* (`lactose-renderer`, edited by this lane under its
+    brief): the graph's drop, before it, waits for the last frame's point and destroys the
+    timeline, and the renderer's wait on that destroyed timeline logged a `warn` at every
+    clean shutdown. A test on null finds a clean shutdown logs nothing on any thread, and
+    fails with the wait restored.
+  - *The present side holds heap slots 0 and 1*, with no allocator at milestone 2;
+    `crates/renderer/README.md` says so beside "no stage uses the heap". A resize that fails
+    with a driver's error forgets the acquired image, as `Swapchain::resize` says; `close`
+    destroys its sampler and logs each refused destroy.
+  - *`bitflags`'s pin is kept*: `crate-tiers.toml` lists it among `lactose-physics-rapier`'s
+    direct dependencies, and `cargo xtask features` and `cargo xtask boundary` pass
+    (verification row 232).
+  Not shown here: a GPU that hangs, in either mode, since no device here hangs on demand (a
+  unit test shows the bounded drop, and the exit is read, not run); a frame torn after its
+  submit, on a device; and a run that mounts a pack set.
+- Addendum (lane `frame-impl`, 2026-11-25; fix rounds 3 and 4): *round three's three reviews
+  and round four's found the branch ready to merge, and their minors are closed; `Wired`
+  gains a public field of a new type, `PresentBarrier`, and no other public signature
+  changed.*
+  - *A call that fails after its acquire keeps the acquired image* for the next call, unless
+    the device is lost: a present refused by any rule, as `Swapchain::present` says ("After
+    either refusal the image is still the acquired one"), and, since fix round 4, a present
+    encoder that cannot be made. A refusal as pending is the next call's to retry and any
+    other error fails the frame. After the acquire only a lost device gives the image up;
+    before it, a resize's driver error does, as `Swapchain::resize` says.
+  - *Past step 4's bound the process ends in either mode*, since what the drop holds keeps
+    the window and a close no longer ends the pump; `exit` is queued before step 5 on a
+    start that failed after the device was made.
+  - *`Wired::barrier` is a `PresentBarrier`*, which the shutdown does not need: its one
+    method, `passed`, queues a no-op on the present lane, which runs once every earlier call
+    has been replied to, and exposes nothing else of the lane. The null tests await it,
+    after the present calls' last swapchain call, before they name a step, so no name rests
+    on the present thread's pace (reviewer-concurrency's `reply-late` probe passes).
+  - *What the tests now hold*: a present refused by `Rule::State`, and a present encoder
+    refused once, each followed by a call that presents the same image
+    (`refused-present-forgotten`, the old arm, fails the first; the code before fix round 4
+    fails the second); a heap slot written anew after a call that made no present waits for
+    the last read, not the one before it (`slot-wait-stale`); a target's make refused at a
+    change of extent tears that frame alone and every target is destroyed
+    (`r3-m3-slot-kept`); a clean shutdown logs no warning on any thread
+    (`r3-close-warns-on-its-thread`); the lag test runs on both layouts; the records are
+    held to the placements by their bits. The bounded waits of both test packages read their
+    bound before they poll the wait, so the two limit tests of `lactose-app` fail whenever
+    the limit's timer wakes nothing (`timer-never-wakes`: both fail at the bound in each of
+    10 iterations, load 21.89 19.60 18.94 before and 20.49 19.67 19.03 after).
 
 **D163. `lactose-rhi-vulkan` without a window, and the Vulkan step of `cargo xtask gpu`** (§12.1, §20, §21, `lactose-rhi-vulkan`, `lactose-rhi-api`, `tools/xtask`, `crate-tiers.toml`)
 - Why: the milestone 2 plan's lane `vulkan`, under its decisions 5.7, 5.10, 5.12 and D158.

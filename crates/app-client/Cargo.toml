@@ -1,0 +1,61 @@
+[package]
+name = "lactose-app-client"
+description = "The client binary: a local world shown through the render graph, the renderer and the presentation schedule on a Vulkan device, presented by the platform's present thread; and decision 5.1's fixed-frame mode, whose last frame is held to a CPU reference."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+# One test target, `integration`, whose modules are the files of `tests/` (D150).
+autotests = false
+
+[dependencies]
+# The assembly: the shown frame, the executor, the policy and the registration values.
+lactose-app.workspace = true
+# The asset store and its pack set, mounted at start (D136: `lactose-app` takes no
+# dependency on `lactose-asset` before milestone 3).
+lactose-asset.workspace = true
+# The in-memory cooked content's version table and handles.
+lactose-asset-api.workspace = true
+# The in-memory cooked content's baseline.
+lactose-bundle.workspace = true
+lactose-core.workspace = true
+lactose-ecs.workspace = true
+# The fixed camera's sample, and the slot the latch reads.
+lactose-input-host.workspace = true
+# The IO pool the pack set is listed on.
+lactose-io.workspace = true
+# `RenderPosition`, the fixed camera's pivot.
+lactose-math.workspace = true
+# The window, its event pump and the present thread.
+lactose-platform.workspace = true
+# The snapshot pair the presentation schedule reads.
+lactose-present-api.workspace = true
+# The presentation schedule: the camera rig and the remote batch.
+lactose-presentation.workspace = true
+# The graph the frame is declared, compiled, recorded and submitted through.
+lactose-render-graph.workspace = true
+# The scatter and triangle passes, the camera latch and the instance buffer.
+lactose-renderer.workspace = true
+lactose-rhi-api.workspace = true
+# The device on the window.
+lactose-rhi-vulkan.workspace = true
+lactose-sim.workspace = true
+lactose-task.workspace = true
+# The game: the mover and the scene's session applier.
+game-sim.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Criterion 3(c)'s second stream, `PhysicsSnapshot::hash` (D145).
+lactose-physics-api.workspace = true
+# The device criterion 3(c) and the null run step the render side on.
+lactose-rhi-null.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true

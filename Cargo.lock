@@ -461,8 +461,12 @@ dependencies = [
 name = "game-sim"
 version = "0.0.0"
 dependencies = [
+ "lactose-asset-api",
  "lactose-core",
  "lactose-ecs",
+ "lactose-math",
+ "lactose-physics-api",
+ "lactose-present-api",
  "lactose-reflect",
  "lactose-sim",
 ]
@@ -751,6 +755,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "lactose-app-client"
+version = "0.0.0"
+dependencies = [
+ "game-sim",
+ "lactose-app",
+ "lactose-asset",
+ "lactose-asset-api",
+ "lactose-bundle",
+ "lactose-core",
+ "lactose-ecs",
+ "lactose-input-host",
+ "lactose-io",
+ "lactose-math",
+ "lactose-physics-api",
+ "lactose-platform",
+ "lactose-present-api",
+ "lactose-presentation",
+ "lactose-render-graph",
+ "lactose-renderer",
+ "lactose-rhi-api",
+ "lactose-rhi-null",
+ "lactose-rhi-vulkan",
+ "lactose-sim",
+ "lactose-task",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lactose-app-headless"
 version = "0.0.0"
 dependencies = [
@@ -962,6 +995,7 @@ dependencies = [
 name = "lactose-physics-rapier"
 version = "0.0.0"
 dependencies = [
+ "bitflags 2.13.2",
  "bytemuck",
  "lactose-asset-api",
  "lactose-bundle",

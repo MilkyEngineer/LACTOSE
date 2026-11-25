@@ -94,15 +94,18 @@ impl ErrorPolicy {
     /// The response to `error` from `source`: the table is the contract.
     #[must_use]
     pub fn respond(&self, source: Source, error: &Error) -> Response {
-        // The milestone 1 table reads no error kind; milestone 4's does.
-        let _ = error;
         match source {
             Source::Executor | Source::Load | Source::Server { .. } => Response::Stop,
             Source::Prediction { kept: true } | Source::Cooked => Response::Resync,
             Source::Prediction { kept: false } => Response::Stop,
             Source::Save => Response::Log,
+            // The first row that reads an error's kind.
             Source::Render if self.shown => {
-                todo!("frame-impl: `DeviceLost` is `Stop`, every other kind `Log`")
+                if error.kind() == ErrorKind::DeviceLost {
+                    Response::Stop
+                } else {
+                    Response::Log
+                }
             }
             Source::Render => Response::Stop,
         }

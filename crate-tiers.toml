@@ -220,8 +220,11 @@ transitive = [
 "lactose-anim" = { normal = ["tracing"] }
 # D119: the solver (rapier3d-f64 is the vendored, patched copy under vendor/), its thread
 # pool, and serde with postcard for the snapshot bytes. The solver's math is on `transitive`:
-# the crate names it only through Rapier's re-exports.
+# the crate names it only through Rapier's re-exports. `bitflags` is named to fix its feature
+# set, `std` on, in every feature root, as the window stack turns it on in a binary that links a
+# window; the crate uses none of it. `std` keeps a parse error's text and implements
+# `std::error::Error` for it, and changes no flag value, bit operation or iteration order.
 "lactose-physics-rapier" = { normal = [
-  "bytemuck", "postcard", "rapier3d-f64", "rayon", "serde", "tracing",
+  "bitflags", "bytemuck", "postcard", "rapier3d-f64", "rayon", "serde", "tracing",
 ] }
 "lactose-predict" = { normal = ["tracing"] }

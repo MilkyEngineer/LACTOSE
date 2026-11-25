@@ -15,6 +15,16 @@ anim::sim_pose key=0x109a893f2ff91874 component transient version=1 digest=0xfe8
   1.2.3 z: Scalar64
   1.2.4 w: Scalar64
   2 count: u8
+present::light key=0x1509411964ac6ed0 component persistent version=1 digest=0x32eda3f4a8112e91
+  1 color: struct Vec3
+  1.1 x: Scalar64
+  1.2 y: Scalar64
+  1.3 z: Scalar64
+  2 intensity: Scalar64
+  3 range: Scalar64
+  4 inner_angle: Scalar64
+  5 outer_angle: Scalar64
+  6 kind: LightKind
 physics::joint key=0x181bc689ec078093 component persistent version=1 digest=0x07e71a8575526fe0
   1 anchor_a: struct Vec3
   1.1 x: Scalar64
@@ -93,6 +103,12 @@ anim::bone_link key=0x5c091d46d740f1c3 component persistent version=1 digest=0x1
   3 limp: bool
 ecs::owned_by key=0x73ec98d14057b57e component persistent version=1 digest=0x8c8b8a80d71a4cb3
   1 owner: EntityRef
+present::camera_rig key=0x7d9120c86269f665 component persistent version=1 digest=0x9692d2971706d396
+  1 pivot: struct Vec3
+  1.1 x: Scalar64
+  1.2 y: Scalar64
+  1.3 z: Scalar64
+  2 boom: Scalar64
 physics::transform key=0x89c9ab9a8d67e368 component persistent version=1 digest=0x273f78488b3188ce
   1 translation: struct Vec3
   1.1 x: Scalar64
@@ -134,6 +150,8 @@ anim::params key=0xac54cec1a275c35f component persistent version=1 digest=0x4a3f
   1 values: [Scalar64; 8]
   2 flags: u32
   3 triggers: u32
+present::mesh key=0xae5fbbf570af1390 component persistent version=1 digest=0x7b7d9c549fc7f783
+  1 mesh: AssetRef
 anim::rig key=0xcd1898b229647e3c component persistent version=1 digest=0x2abe130fe6ca12b5
   1 machine: AssetRef
   2 skeleton: AssetRef
@@ -143,3 +161,9 @@ anim::root_motion key=0xe71f8aed4a8f452f component transient version=1 digest=0x
   1.2 y: Scalar64
   1.3 z: Scalar64
   2 yaw: Scalar64
+present::decal key=0xfcff3e2e47502764 component persistent version=1 digest=0xcf1fab229a76d0a3
+  1 half_extents: struct Vec3
+  1.1 x: Scalar64
+  1.2 y: Scalar64
+  1.3 z: Scalar64
+  2 material: AssetRef
