@@ -89,6 +89,9 @@ pub(crate) struct VulkanEncoder {
     pub(crate) failure: Option<Error>,
     /// The queue and stamp of the submit that took it, until its reset.
     pub(crate) submitted: Option<(usize, u64)>,
+    /// Whether that submit's driver call failed with its command buffer never pending
+    /// (`submit::send`), so that neither its drop nor its reset waits for the stamp.
+    pub(crate) unsent: bool,
     scope: Scope,
     pub(crate) buffers: HashMap<BufferHandle, (Arc<BufferObj>, Touch)>,
     pub(crate) images: HashMap<ImageHandle, Arc<ImageObj>>,
@@ -139,6 +142,7 @@ impl VulkanEncoder {
             breach: None,
             failure: None,
             submitted: None,
+            unsent: false,
             scope: Scope::Outside,
             buffers: HashMap::new(),
             images: HashMap::new(),
@@ -604,8 +608,9 @@ impl VulkanEncoder {
     /// Returns the encoder's command memory and input sets to their pools.
     fn release(&mut self) -> Result<()> {
         let device = self.shared.raw.device.clone();
-        // SAFETY: no submit of the command buffer is pending: the caller checked it, or the
-        // device is lost and its work will not run.
+        // SAFETY: no submit of the command buffer is pending: the caller checked it, its
+        // submit's driver call failed and left it as it was (`unsent`), or the device is
+        // lost and its work will not run.
         unsafe { device.reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty()) }
             .map_err(|e| driver(e, "vkResetCommandPool"))?;
         for pool in &self.inputs {
@@ -628,7 +633,7 @@ impl Drop for VulkanEncoder {
     fn drop(&mut self) {
         let raw = Arc::clone(&self.shared.raw);
         let mut pending = false;
-        if let Some((queue, seq)) = self.submitted {
+        if let Some((queue, seq)) = self.submitted.filter(|_| !self.unsent) {
             let read = self.shared.read_queue(queue);
             let (lost, known) = {
                 let records = self.shared.records();
@@ -653,8 +658,9 @@ impl Drop for VulkanEncoder {
             // destroys the pools once the device is idle, or leaks them with the device.
             self.shared.orphan(self.pool, core::mem::take(&mut self.inputs));
         } else if !raw.leaking() {
-            // SAFETY: no submit of the command buffer is pending, or the device is lost;
-            // the pools are this encoder's.
+            // SAFETY: no submit of the command buffer is pending, its submit's driver call
+            // failed and left it as it was (`unsent`), or the device is lost; the pools are
+            // this encoder's.
             unsafe {
                 for pool in &self.inputs {
                     raw.device.destroy_descriptor_pool(*pool, None);
@@ -672,7 +678,7 @@ impl Encoder for VulkanEncoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        if let Some((queue, seq)) = self.submitted {
+        if let Some((queue, seq)) = self.submitted.filter(|_| !self.unsent) {
             let known = self.shared.read_queue(queue);
             let records = self.shared.records();
             if !records.lost
@@ -688,6 +694,7 @@ impl Encoder for VulkanEncoder {
         self.breach = None;
         self.failure = None;
         self.submitted = None;
+        self.unsent = false;
         self.scope = Scope::Outside;
         self.buffers.clear();
         self.images.clear();

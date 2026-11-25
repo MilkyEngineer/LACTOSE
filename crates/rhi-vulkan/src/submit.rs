@@ -135,7 +135,7 @@ pub(crate) fn submit(shared: &Shared, role: QueueRole, submit: Submit<'_>) -> Re
     let queue = shared.queue_of(role);
     let _queue = lock(&shared.queues[queue]);
     match stage(shared, queue, role, &mut submit, false)? {
-        Staging::Staged(staged) => send(shared, staged, &submit, Binary::default()).0,
+        Staging::Staged(staged) => send(shared, staged, &mut submit, Binary::default()).0,
         Staging::Undecided(point) => {
             unreachable!("a submit is staged without a walk, yet {point:?} was left undecided")
         }
@@ -171,12 +171,19 @@ thread_local! {
     /// with nothing submitted: a present's submit and the empty batch after it, and the
     /// swapchain's empty batches (`injected`).
     pub(crate) static FAILING: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    /// The driver submits this thread makes next that are let through before `FAILING`'s.
+    pub(crate) static SPARED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
-/// Whether a unit test fails this driver submit (`FAILING`): never outside the unit tests.
+/// Whether a unit test fails this driver submit (`FAILING`, after `SPARED`): never outside
+/// the unit tests.
 pub(crate) fn injected() -> bool {
     #[cfg(test)]
     if FAILING.get() > 0 {
+        if SPARED.get() > 0 {
+            SPARED.set(SPARED.get() - 1);
+            return false;
+        }
         FAILING.set(FAILING.get() - 1);
         return true;
     }
@@ -219,12 +226,13 @@ pub(crate) fn stage(
 /// with `binary`'s semaphores; then the hold that records it received. Where the call
 /// fails and the device is not lost, an empty batch takes the stamp, waiting for
 /// `binary`'s wait, so that the acquire's semaphore is spent either way, and signalling no
-/// present semaphore. With the call's result, whether a batch the driver took waits for
-/// `binary`'s wait: not where both calls failed.
+/// present semaphore. Where no command buffer became pending, the encoders are marked
+/// `unsent`. With the call's result, whether a batch the driver took waits for `binary`'s
+/// wait: not where both calls failed.
 pub(crate) fn send(
     shared: &Shared,
     staged: Staged,
-    submit: &Submit<'_>,
+    submit: &mut Submit<'_>,
     binary: Binary,
 ) -> (Result<()>, bool) {
     let Staged { queue, seq, waits, signals } = staged;
@@ -264,24 +272,37 @@ pub(crate) fn send(
         .collect();
     signal_infos.push(point(target.timeline, seq));
     let mut spent = true;
+    // Whether no command buffer of the submit became pending: an end failed, so that none
+    // was submitted, or the driver's call failed out of memory, and "VK_ERROR_OUT_OF_*_MEMORY
+    // errors do not modify any currently existing Vulkan objects" (the spec's "VkResult
+    // Return Codes"; `vkQueueSubmit2` adds that the state of what the command buffers name
+    // is "unaffected by the call or its failure"). Each stays executable, or invalid where
+    // its end failed, and only a submission moves one to pending; another error than these
+    // may have, and is taken as pending.
+    let mut unsent = ended.is_err();
     let submitted = ended.and_then(|()| {
         let info = vk::SubmitInfo2::default()
             .wait_semaphore_infos(&wait_infos)
             .command_buffer_infos(&buffers)
             .signal_semaphore_infos(&signal_infos);
-        if injected() {
-            return Err(driver(vk::Result::ERROR_OUT_OF_HOST_MEMORY, "vkQueueSubmit2"));
-        }
-        // SAFETY: the queue's lock is held, which every submit to it takes; each command
-        // buffer is executable and in no other pending submit (`Encoding`); every resource
-        // and pipeline it names is held by its encoder and was live at the checks; every
-        // signal grows past its timeline's values and pending signals (`Timeline`), and the
-        // queue's own timeline grows by one. A binary wait is an acquire's semaphore, which
-        // the acquire signalled and no batch has waited for; a binary signal is the image's
-        // present semaphore, whose last wait, by the image's last present, is done (that
-        // present's fence has signalled).
-        unsafe { raw.device.queue_submit2(target.queue, &[info], vk::Fence::null()) }
-            .map_err(|e| driver(e, "vkQueueSubmit2"))
+        let called = if injected() {
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        } else {
+            // SAFETY: the queue's lock is held, which every submit to it takes; each command
+            // buffer is executable and in no other pending submit (`Encoding`); every
+            // resource and pipeline it names is held by its encoder and was live at the
+            // checks; every signal grows past its timeline's values and pending signals
+            // (`Timeline`), and the queue's own timeline grows by one. A binary wait is an
+            // acquire's semaphore, which the acquire signalled and no batch has waited for; a
+            // binary signal is the image's present semaphore, whose last wait, by the image's
+            // last present, is done (that present's fence has signalled).
+            unsafe { raw.device.queue_submit2(target.queue, &[info], vk::Fence::null()) }
+        };
+        unsent = matches!(
+            called,
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        );
+        called.map_err(|e| driver(e, "vkQueueSubmit2"))
     });
     if let Err(error) = &submitted {
         if error.kind() == lactose_core::ErrorKind::DeviceLost {
@@ -302,6 +323,14 @@ pub(crate) fn send(
             if let Err(error) = retried {
                 spent = false;
                 shared.lost_on(error);
+            }
+        }
+    }
+    if unsent {
+        for encoder in submit.encoders.iter_mut() {
+            let any: &mut dyn Any = &mut **encoder;
+            if let Some(encoder) = any.downcast_mut::<VulkanEncoder>() {
+                encoder.unsent = true;
             }
         }
     }
