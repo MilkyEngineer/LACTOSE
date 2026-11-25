@@ -27,11 +27,34 @@ pub(crate) enum Entry {
 
 pub(crate) struct Quiesce {
     state: AtomicUsize,
+    /// The one change a weakened loom model makes.
+    #[cfg(all(test, feature = "loom"))]
+    pub(crate) weakened: Option<Weakened>,
+}
+
+/// The weakened variants the models of a run's resolution fail. Each lowers the order of
+/// [`Quiesce::exit`] or [`Quiesce::close`], which are what make a job's writes, and its drop of
+/// what it held, happen before the resolution.
+#[cfg(all(test, feature = "loom"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Weakened {
+    /// [`Quiesce::exit`] releases and does not acquire.
+    ExitRelease,
+    /// [`Quiesce::exit`] neither releases nor acquires.
+    ExitRelaxed,
+    /// [`Quiesce::close`] releases and does not acquire.
+    CloseRelease,
+    /// [`Quiesce::close`] neither releases nor acquires.
+    CloseRelaxed,
 }
 
 impl Quiesce {
     pub(crate) fn new() -> Self {
-        Self { state: AtomicUsize::new(0) }
+        Self {
+            state: AtomicUsize::new(0),
+            #[cfg(all(test, feature = "loom"))]
+            weakened: None,
+        }
     }
 
     /// Opens the state for a new run. Only called when the previous run is quiet and
@@ -50,14 +73,49 @@ impl Quiesce {
     /// resolves the future.
     #[must_use]
     pub(crate) fn exit(&self) -> bool {
-        self.state.fetch_sub(ONE_JOB, Ordering::SeqCst) == ONE_JOB | CLOSING
+        self.state.fetch_sub(ONE_JOB, self.exit_order()) == ONE_JOB | CLOSING
+    }
+
+    /// The order of [`Quiesce::exit`]: each exit releases what its job did, and the one that
+    /// finds the run quiet acquires what every earlier exit released.
+    fn exit_order(&self) -> Ordering {
+        #[cfg(all(test, feature = "loom"))]
+        match self.weakened {
+            Some(Weakened::ExitRelease) => return Ordering::Release,
+            Some(Weakened::ExitRelaxed) => return Ordering::Relaxed,
+            _ => {}
+        }
+        Ordering::SeqCst
+    }
+
+    /// Unregisters a job as [`Quiesce::exit`] does, once `held`, the job's reference to what
+    /// the run works on, has been dropped. Returns whether that left the run quiet, in which
+    /// case the caller resolves the future: no job holds such a reference by then.
+    #[must_use]
+    pub(crate) fn leave<T>(&self, held: T) -> bool {
+        // First: a job that has left may be passed by the last to leave, which resolves the
+        // future at once, and the caller then drops what it was handed back.
+        drop(held);
+        self.exit()
     }
 
     /// Declares that no further job may start. Returns whether the run is quiet already, in
     /// which case the caller resolves the future; otherwise the last job to leave does.
     #[must_use]
     pub(crate) fn close(&self) -> bool {
-        self.state.fetch_or(CLOSING, Ordering::SeqCst) == 0
+        self.state.fetch_or(CLOSING, self.close_order()) == 0
+    }
+
+    /// The order of [`Quiesce::close`]: a close that finds the run quiet resolves it, so it
+    /// acquires what every exit released.
+    fn close_order(&self) -> Ordering {
+        #[cfg(all(test, feature = "loom"))]
+        match self.weakened {
+            Some(Weakened::CloseRelease) => return Ordering::Release,
+            Some(Weakened::CloseRelaxed) => return Ordering::Relaxed,
+            _ => {}
+        }
+        Ordering::SeqCst
     }
 
     /// Whether the run is closing. A registered job reads this between units to stop early;

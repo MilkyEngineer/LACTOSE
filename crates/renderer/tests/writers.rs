@@ -85,6 +85,8 @@ fn writes_from_several_jobs_overlapped() -> bool {
     builder.add_node(Arc::clone(&writers) as Arc<dyn GraphNode>);
     executor.block_on(executor.run_graph(builder.build().expect("one node"))).expect("the run");
     let overlapped = writers.most.load(Ordering::Relaxed) > 1;
+    // The run held no reference to its graph once it resolved (lactose-task, `GraphRun`), and
+    // the graph went with the statement above, so this is the node's last.
     drop(writers);
     let mut sink = Arc::into_inner(sink).expect("the writers are done");
     sink.end();

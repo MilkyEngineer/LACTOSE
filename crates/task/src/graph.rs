@@ -175,12 +175,14 @@ impl GraphBuilder {
                 dependents,
                 roots,
                 pending_nodes: AtomicU32::new(0),
-                ordinal: AtomicU64::new(0),
-                jobs: Quiesce::new(),
-                completion: Mutex::new(Completion {
-                    finished: false,
-                    resolved: false,
-                    waker: None,
+                control: Arc::new(RunControl {
+                    ordinal: AtomicU64::new(0),
+                    jobs: Quiesce::new(),
+                    completion: Mutex::new(Completion {
+                        finished: false,
+                        resolved: false,
+                        waker: None,
+                    }),
                 }),
             }),
         })
@@ -239,18 +241,29 @@ pub(crate) struct RunState {
     roots: Box<[u32]>,
     /// Nodes that have not finalized in the current run.
     pending_nodes: AtomicU32,
+    control: Arc<RunControl>,
+}
+
+impl RunState {
+    /// Which run of its executor this is. Identifies the run in an execution log.
+    pub(crate) fn ordinal(&self) -> u64 {
+        self.control.ordinal.load(Ordering::Relaxed)
+    }
+}
+
+/// What a run's future waits on, kept apart from the graph: a job of the run holds an entry's
+/// reference to the graph, and drops it before it leaves the run through a reference of its
+/// own to this (`run_range`). So a run that resolves with its graph holds no reference to it,
+/// and the caller handed the graph back drops the nodes when it drops the graph, on its own
+/// thread.
+pub(crate) struct RunControl {
     ordinal: AtomicU64,
     /// Holds the future back while any job of the run is executing.
     jobs: Quiesce,
     completion: Mutex<Completion>,
 }
 
-impl RunState {
-    /// Which run of its executor this is. Identifies the run in an execution log.
-    pub(crate) fn ordinal(&self) -> u64 {
-        self.ordinal.load(Ordering::Relaxed)
-    }
-
+impl RunControl {
     /// Asks for the run to end early. No job of the run starts from now on; the future
     /// resolves to `Cancelled` once the jobs that are executing have returned, which is
     /// now if there are none. Called at shutdown.
@@ -264,7 +277,7 @@ impl RunState {
     /// executing, so none ever will again. Harmless to call twice.
     fn resolve(&self, shared: &Shared) {
         // Before the future can resolve and the graph be run again under a new ordinal.
-        shared.end_run(self.ordinal());
+        shared.end_run(self.ordinal.load(Ordering::Relaxed));
         let waker = {
             let mut completion = lock(&self.completion);
             completion.resolved = true;
@@ -275,32 +288,25 @@ impl RunState {
         }
     }
 
-    /// Registers a job of the run. `None` means the run is closing and the job must not
-    /// run.
-    fn enter<'run>(&'run self, shared: &'run Shared) -> Option<JobOfRun<'run>> {
+    /// Registers a job of the run. `false` means the run is closing and the job must not
+    /// run. While a job is registered the run's future cannot resolve.
+    fn enter(&self, shared: &Shared) -> bool {
         match self.jobs.enter() {
-            Entered::Entered => Some(JobOfRun { state: self, shared }),
+            Entered::Entered => true,
             Entered::Refused { quiet } => {
                 if quiet {
                     self.resolve(shared);
                 }
-                None
+                false
             }
         }
     }
-}
 
-/// A job's registration with its run. While one exists the run's future cannot resolve;
-/// dropping the last one of a closing run resolves it.
-struct JobOfRun<'run> {
-    state: &'run RunState,
-    shared: &'run Shared,
-}
-
-impl Drop for JobOfRun<'_> {
-    fn drop(&mut self) {
-        if self.state.jobs.exit() {
-            self.state.resolve(self.shared);
+    /// Unregisters a job that holds no reference to the graph of its own. The last job of a
+    /// closing run to leave resolves it.
+    fn exit(&self, shared: &Shared) {
+        if self.jobs.exit() {
+            self.resolve(shared);
         }
     }
 }
@@ -350,9 +356,13 @@ impl Graph {
 /// the executor shut down first. See [`crate::Executor::run_graph`].
 ///
 /// Either way, when it resolves no unit, scope child or finalize of the run is executing or
-/// ever will, and everything they wrote happens before the resolution. After `Cancelled`
-/// the run is torn: some nodes finalized, some ran in part, their dependents never ran; the
-/// graph is not handed back.
+/// ever will, and everything they wrote happens before the resolution. When it resolves with
+/// the graph, the run holds no reference to it any more: each of its jobs drops its own before
+/// it leaves the run, and every such drop happens before the resolution, so dropping the graph
+/// drops each node that nothing else holds, on the thread that drops it. After `Cancelled` the
+/// run is torn: some nodes finalized, some ran in part, their dependents never ran; the graph
+/// is not handed back, and work that shutdown left queued may hold the graph's nodes until
+/// that work is dropped.
 ///
 /// A job of the run cannot wait for its own run: the run is not quiet while that job
 /// executes. (Jobs are synchronous and `block_on` on a worker is a debug assertion, so
@@ -367,7 +377,7 @@ impl Future for GraphRun {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Graph>> {
         let graph = self.graph.as_ref().expect("a graph run is not polled after it resolved");
-        let mut completion = lock(&graph.state.completion);
+        let mut completion = lock(&graph.state.control.completion);
         if completion.resolved {
             let finished = completion.finished;
             drop(completion);
@@ -400,9 +410,10 @@ pub(crate) fn start(shared: &Shared, graph: Graph) -> GraphRun {
         slot.pending_dependencies.store(slot.dependencies, Ordering::Relaxed);
     }
     state.pending_nodes.store(state.nodes.len() as u32, Ordering::Relaxed);
-    state.jobs.reset();
+    let control = &state.control;
+    control.jobs.reset();
     {
-        let mut completion = lock(&state.completion);
+        let mut completion = lock(&control.completion);
         completion.finished = state.nodes.is_empty();
         completion.resolved = completion.finished;
         if completion.finished {
@@ -410,23 +421,24 @@ pub(crate) fn start(shared: &Shared, graph: Graph) -> GraphRun {
             return GraphRun { graph: Some(graph) };
         }
     }
-    state.ordinal.store(shared.begin_run(state), Ordering::Relaxed);
+    control.ordinal.store(shared.begin_run(control), Ordering::Relaxed);
     if shared.is_shut_down() {
         // Registered first, checked second: either shutdown's sweep finds the run, or this
         // sees the flag. Cancelling twice is harmless.
-        state.cancel(shared);
+        control.cancel(shared);
     }
     // Releasing the roots calls their `units()` here, on the caller's thread. That is a
     // job of the run like any other: registered, so the run cannot be declared quiet in
     // the middle of it, and under the abort guard, because a run that is half released has
     // no state to unwind to. Submitting an entry publishes the stores above to the worker
-    // that takes it.
-    if let Some(_job) = state.enter(shared) {
+    // that takes it. The job borrows the caller's graph and takes no reference of its own.
+    if control.enter(shared) {
         abort_on_unwind(|| {
             for &root in &*state.roots {
                 release(shared, state, root, false);
             }
         });
+        control.exit(shared);
     }
     GraphRun { graph: Some(graph) }
 }
@@ -440,12 +452,13 @@ fn release(shared: &Shared, state: &Arc<RunState>, node: u32, keeps_one: bool) {
     shared.submit_range(entry, keeps_one);
 }
 
-/// Runs `units` of `node` on this worker and, if that completes the node, finalizes it and
-/// releases its dependents.
+/// Runs `units` of `node` on this worker as one job of the run, holding the entry's reference
+/// to the run, `run`, and, if that completes the node, finalizes it and releases its
+/// dependents.
 pub(crate) fn run_range(
     local: &WorkerLocal,
     arenas: &mut Arenas,
-    state: &Arc<RunState>,
+    run: Arc<RunState>,
     node: u32,
     units: Range<u32>,
     root: bool,
@@ -455,7 +468,30 @@ pub(crate) fn run_range(
     let shared = &*local.shared;
     // Registered before anything of the run is touched; refused if the run was cancelled,
     // in which case this entry is simply dropped.
-    let Some(_job) = state.enter(shared) else { return };
+    if !run.control.enter(shared) {
+        return;
+    }
+    run_registered(local, arenas, &run, node, units, root, position);
+    // The job's reference to the run goes before the job leaves it: the last job to leave
+    // resolves the run, and the caller may then drop the graph and expect the nodes gone
+    // with it. A panic in the job aborts, so no unwinding path skips this.
+    let control = Arc::clone(&run.control);
+    if control.jobs.leave(run) {
+        control.resolve(shared);
+    }
+}
+
+/// The body of [`run_range`], for a job that is registered with its run.
+fn run_registered(
+    local: &WorkerLocal,
+    arenas: &mut Arenas,
+    state: &Arc<RunState>,
+    node: u32,
+    units: Range<u32>,
+    root: bool,
+    position: u64,
+) {
+    let shared = &*local.shared;
     let slot = &state.nodes[node as usize];
     let span = if root { slot.spans.node() } else { slot.spans.range() };
     let _entered = span.enter();
@@ -496,7 +532,7 @@ pub(crate) fn run_range(
                 arenas.job.reset();
             },
             || {
-                if shared.is_shut_down() || state.jobs.closing() {
+                if shared.is_shut_down() || state.control.jobs.closing() {
                     // The run is being cancelled: no further unit starts.
                     Rest::Abandon
                 } else if local.pool().over_limit() {
@@ -522,7 +558,7 @@ pub(crate) fn run_range(
         return;
     }
 
-    if shared.is_shut_down() || state.jobs.closing() {
+    if shared.is_shut_down() || state.control.jobs.closing() {
         // Cancelled, or about to be, while the last units ran: no finalize starts either.
         return;
     }
@@ -546,8 +582,8 @@ pub(crate) fn run_range(
         // Every node has finalized. The future resolves when the run is quiet, which is
         // when this job and any other still on its way out of this function have left; the
         // graph cannot be handed back, or run again, before that.
-        lock(&state.completion).finished = true;
-        let quiet = state.jobs.close();
+        lock(&state.control.completion).finished = true;
+        let quiet = state.control.jobs.close();
         debug_assert!(!quiet, "the finishing job is still registered");
     }
 }

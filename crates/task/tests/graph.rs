@@ -4,8 +4,12 @@
 
 use crate::common;
 
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use core::task::{Context, Poll, Waker};
+use std::sync::{Arc, Mutex, mpsc};
+use std::task::Wake;
+use std::thread::ThreadId;
 
 use common::{LIMIT, Node, Rendezvous, executor, graph, let_workers_sleep, must_finish, sized};
 use lactose_task::{GraphBuilder, GraphError, NodeId};
@@ -188,6 +192,66 @@ fn an_empty_graph_resolves_and_a_dropped_run_still_finishes() {
         std::thread::yield_now();
     }
     executor.shutdown();
+}
+
+/// When a run resolves with the graph, the run holds no reference to it any more, so a caller
+/// that drops the graph drops the nodes, on its own thread. The run resolves inside the
+/// waker's `wake` on the worker that leaves it last, and this waker holds that worker there
+/// until the test has dropped the graph and looked: a reference the worker dropped only after
+/// the resolution would still be held when the test looks.
+#[test]
+fn a_run_that_resolves_holds_no_reference_to_the_graph() {
+    let executor = executor(2, 1);
+    let polled = Arc::new(AtomicBool::new(false));
+    let token = Arc::new(());
+    let node = {
+        let (polled, token) = (polled.clone(), token.clone());
+        Node::new("graph::references")
+            .run(move |_, _| {
+                let _held = &token;
+                // The run cannot resolve before the test's first poll has left its waker.
+                common::wait_for(&polled);
+            })
+            .build()
+    };
+    let (woken, wait_woken) = mpsc::channel();
+    let (looked, wait_looked) = mpsc::channel();
+    let waker = Waker::from(Arc::new(HoldingWaker {
+        woken: Mutex::new(woken),
+        looked: Mutex::new(wait_looked),
+    }));
+    let mut cx = Context::from_waker(&waker);
+    let mut run = executor.run_graph(graph(vec![node], &[]));
+    assert!(Pin::new(&mut run).poll(&mut cx).is_pending());
+    polled.store(true, Ordering::Release);
+    let woke_on = wait_woken.recv_timeout(LIMIT).expect("the run resolves");
+    assert_ne!(woke_on, std::thread::current().id(), "the run resolves on its worker");
+    let Poll::Ready(graph) = Pin::new(&mut run).poll(&mut cx) else {
+        panic!("woken before the run resolved");
+    };
+    drop(graph.unwrap());
+    let held = Arc::strong_count(&token);
+    looked.send(()).unwrap();
+    assert_eq!(held, 1, "the worker that resolved the run still held the graph");
+    executor.shutdown();
+}
+
+/// A waker that reports the thread that wakes it and holds that thread until the test has
+/// looked, or has failed and dropped its end of the channel.
+struct HoldingWaker {
+    woken: Mutex<mpsc::Sender<ThreadId>>,
+    looked: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Wake for HoldingWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.woken.lock().unwrap().send(std::thread::current().id());
+        let _ = self.looked.lock().unwrap().recv_timeout(LIMIT);
+    }
 }
 
 #[test]
