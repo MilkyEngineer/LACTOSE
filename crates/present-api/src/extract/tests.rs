@@ -602,7 +602,8 @@ type Change = (&'static str, fn(&mut World), u64);
 #[test]
 fn a_steady_scene_sorts_nothing_where_the_layout_keeps_rows_in_place() {
     let mut layouts = layouts();
-    layouts.retain(|(name, _)| !name.starts_with("SOUR") || name.ends_with("seed 1"));
+    // One seed of each SOUR mode is enough for a count that is printed.
+    layouts.retain(|(name, _)| !name.ends_with("seed 2"));
     for (name, layout) in layouts {
         let mut scene = Scene::new(WorldKind::Server, layout);
         let world = scene.world_mut();
