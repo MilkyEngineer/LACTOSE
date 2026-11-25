@@ -183,8 +183,10 @@ pub enum Call {
     /// `RenderSide::present`: the newer snapshot's tick, the frame's time, and how many
     /// presentation events the frame carried.
     Present { newer: Tick, time: FrameTime, events: usize },
-    /// `RenderSide::draw`.
+    /// `RenderSide::draw` began.
     Draw(Draw),
+    /// `RenderSide::draw` returned.
+    Drawn,
     /// `RenderSide::submit`, of the frame that drew `target`, at `point`.
     Submit { target: TargetIndex, point: TimelinePoint },
     /// `PresentSide::present` began.
@@ -457,7 +459,10 @@ impl RenderSide for ScriptedRender {
         self.script.draw_started();
         self.script.pass(|plan| &mut plan.draw_gate, "a held draw");
         self.drawn = Some(draw);
-        self.script.with(|plan| plan.draws.pop_front().unwrap_or(Ok(FrameCounts::default())))
+        let counts =
+            self.script.with(|plan| plan.draws.pop_front().unwrap_or(Ok(FrameCounts::default())));
+        self.script.log(Call::Drawn);
+        counts
     }
 
     fn submit(&mut self) -> Result<Submitted> {
@@ -760,6 +765,29 @@ impl Rig {
         window: Option<Extent>,
     ) -> core::result::Result<ShownOutput, ShownError> {
         let now = self.now(when, ticks, owed);
+        self.frame_at(now, window)
+    }
+
+    /// One paced frame whose `now` is `ahead` of the clock, with `ticks` ticks due and half
+    /// a period of the next owed: its limit falls a little after `ahead`, so a wait that has
+    /// begun is ended by the executor's timer.
+    pub fn try_frame_soon(
+        &mut self,
+        ahead: Duration,
+        ticks: u32,
+        window: Option<Extent>,
+    ) -> core::result::Result<ShownOutput, ShownError> {
+        let now = Instant::now() + ahead;
+        let from = now.checked_sub(TICK_PERIOD * ticks + TICK_PERIOD / 2).expect("uptime");
+        self.shown().server_mut().resync(from);
+        self.frame_at(now, window)
+    }
+
+    fn frame_at(
+        &mut self,
+        now: Instant,
+        window: Option<Extent>,
+    ) -> core::result::Result<ShownOutput, ShownError> {
         let shown = self.shown.take().expect("the rig holds its world");
         let frames = &mut self.frames;
         let run = shown.frame(&self.executor, now, &mut **frames, window);
@@ -787,7 +815,9 @@ impl Rig {
         rendered
     }
 
-    /// Waits until every present call queued so far has returned and been replied to.
+    /// Waits until every present call queued by the frames joined so far has returned and
+    /// been replied to. The render task of a paced frame still in flight may queue one
+    /// after: flush first where that call matters.
     pub fn settle(&self) {
         let queued = self.queued;
         self.script.until("the present calls queued", |plan| plan.drained >= queued);

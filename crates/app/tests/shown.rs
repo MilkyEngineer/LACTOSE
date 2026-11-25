@@ -693,15 +693,20 @@ fn other(target: TargetIndex) -> TargetIndex {
 /// the publication after it, which the log shows by the call that follows: the next
 /// `present` reads a snapshot of the pass's tick or a later one, and a `draw` follows such
 /// a `present`. The publication itself is no call of a side, so the log cannot place it.
+/// And no pass begins between a `draw` and its return, so a draw held at its gate across a
+/// frame is seen.
 fn passes_hold_the_frame_apart(calls: &[Call]) {
     let mut open: Option<Tick> = None;
     let mut last_pass: Option<Tick> = None;
     // Whether a `present` that read the last pass's publication has been called since it.
     let mut presented = true;
+    // Whether a `draw` has begun and not yet returned.
+    let mut drawing = false;
     for call in calls {
         match call {
             Call::Begin(pass) => {
                 assert_eq!(open, None, "a pass began inside another");
+                assert!(!drawing, "a pass began while a draw was in flight");
                 open = Some(pass.tick);
             }
             Call::End { .. } => {
@@ -720,7 +725,9 @@ fn passes_hold_the_frame_apart(calls: &[Call]) {
             Call::Draw(_) => {
                 assert_eq!(open, None, "a draw inside a pass");
                 assert!(presented, "a draw before the present of the pass's publication");
+                drawing = true;
             }
+            Call::Drawn => drawing = false,
             _ => {}
         }
     }
@@ -747,9 +754,10 @@ fn criterion_3a_no_tick_or_draw_runs_inside_a_pass() {
     rig.frame(When::Ahead, 2, Some(E1));
     rig.frame(When::Ahead, 1, None);
     rig.flush();
+    let reached = rig.script.with(|plan| plan.draw_gate.reached);
     rig.script.hold_draws(true);
     rig.frame(When::Ahead, 1, Some(E1));
-    rig.script.await_draws(1);
+    rig.script.await_draws(reached + 1);
     let busy = rig.frame(When::Passed, 2, Some(E1));
     assert_eq!(busy.deferred, Some(Rendered::Busy));
     rig.script.hold_draws(false);
@@ -807,32 +815,49 @@ struct ForkingRender {
     shared: Vec<bool>,
     /// The most children of one `open`'s first two scopes that ran at once.
     peak: u32,
+    /// The most of them that ran at once on threads other than their job's.
+    helper_peak: u32,
     /// The largest slot a job's context reported.
     slot: u32,
     /// `Executor::run_job_width` of the executor the jobs run on.
     width: u32,
 }
 
-/// How many children run at once, and the most that have.
+/// How many children run at once, and the most that have: all of them, and those on a
+/// thread other than their job's.
+#[derive(Default)]
 struct Running {
     now: AtomicU32,
     peak: AtomicU32,
+    helpers: AtomicU32,
+    helper_peak: AtomicU32,
 }
 
 /// A child running, counted until it is dropped.
-struct Child<'a>(&'a AtomicU32);
+struct Child<'a> {
+    running: &'a Running,
+    helper: bool,
+}
 
 impl Running {
-    fn enter(&self) -> Child<'_> {
+    fn enter(&self, job: std::thread::ThreadId) -> Child<'_> {
         let now = self.now.fetch_add(1, Ordering::AcqRel) + 1;
         self.peak.fetch_max(now, Ordering::AcqRel);
-        Child(&self.now)
+        let helper = std::thread::current().id() != job;
+        if helper {
+            let helpers = self.helpers.fetch_add(1, Ordering::AcqRel) + 1;
+            self.helper_peak.fetch_max(helpers, Ordering::AcqRel);
+        }
+        Child { running: self, helper }
     }
 }
 
 impl Drop for Child<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.running.now.fetch_sub(1, Ordering::AcqRel);
+        if self.helper {
+            self.running.helpers.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -874,7 +899,7 @@ impl RenderSide for ForkingRender {
         self.threads.push(job);
         self.slot = self.slot.max(ctx.slot());
         let children = Mutex::new(Vec::new());
-        let running = Running { now: AtomicU32::new(0), peak: AtomicU32::new(0) };
+        let running = Running::default();
         // One scope over disjoint `&mut` chunks, a child each.
         let marks = &mut self.marks;
         ctx.scope(|scope| {
@@ -882,7 +907,7 @@ impl RenderSide for ForkingRender {
                 let children = &children;
                 let running = &running;
                 scope.fork(move |_| {
-                    let _child = running.enter();
+                    let _child = running.enter(job);
                     lock(children).push((std::thread::current().id(), job));
                     for mark in chunk {
                         *mark += 1;
@@ -895,7 +920,7 @@ impl RenderSide for ForkingRender {
         let seen: Vec<AtomicU32> = (0..UNITS).map(|_| AtomicU32::new(0)).collect();
         ctx.scope(|scope| {
             scope.fork_range(0..UNITS as u32, |units, _| {
-                let _child = running.enter();
+                let _child = running.enter(job);
                 lock(&children).push((std::thread::current().id(), job));
                 for unit in units {
                     seen[unit as usize].fetch_add(1, Ordering::Relaxed);
@@ -905,6 +930,7 @@ impl RenderSide for ForkingRender {
         assert!(seen.iter().all(|count| count.load(Ordering::Relaxed) == 1));
         self.children.extend(children.into_inner().unwrap_or_else(PoisonError::into_inner));
         self.peak = self.peak.max(running.peak.into_inner());
+        self.helper_peak = self.helper_peak.max(running.helper_peak.into_inner());
         if self.width > 1 {
             self.shared.push(Self::meet(ctx));
         }
@@ -977,6 +1003,7 @@ fn the_frame_job_on(frame_workers: u32) {
         children: Vec::new(),
         shared: Vec::new(),
         peak: 0,
+        helper_peak: 0,
         slot: 0,
         width,
     });
@@ -1022,8 +1049,15 @@ fn the_frame_job_on(frame_workers: u32) {
     // Width one: the job's own worker runs every child it forks. Width two: a second
     // worker shares them, and no more than two run at any moment. Which worker is the
     // second may change over a scope, since the width counts workers at a moment
-    // (`crates/task/README.md`, "The width").
+    // (`crates/task/README.md`, "The width"). The job's worker holds its place from the
+    // job's take to its return, running a child or parked on a scope's latch, so at most
+    // `width - 1` children run at once on the other threads.
     assert!(render.peak >= 1 && render.peak <= width, "{} at once", render.peak);
+    assert!(
+        render.helper_peak < width,
+        "{} at once beside the job's worker, at a width of {width}",
+        render.helper_peak
+    );
     if width == 1 {
         assert!(render.children.iter().all(|(child, job)| child == job));
     } else {

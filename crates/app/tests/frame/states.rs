@@ -229,6 +229,38 @@ fn a_starved_frame_whose_open_fails_is_hidden_and_torn() {
     starves(Answer::Fail(ErrorKind::ResourceExhausted));
 }
 
+/// A frame with no window between starved frames asks nothing and ends no starvation: the
+/// next frame with a window that finds no region open is hidden, not deferred again.
+#[test]
+fn a_windowless_frame_leaves_a_starvation_as_it_was() {
+    let setup = Setup { log_retention: Some(CATCH_UP_CAP + 2), ..Setup::new(2, false) };
+    let mut rig = Rig::with(setup);
+    rig.step(Some(E1));
+    rig.script.take_calls();
+    rig.script.submit_answers([Ok(Region::Wait(super::support::point(96)))]);
+    rig.step(Some(E1));
+    rig.settle();
+    rig.script.take_calls();
+    rig.script.open_answers(&[Answer::Wait; 5]);
+    for frame in 0..2 {
+        let (rendered, _) = step(&mut rig, Some(E1));
+        assert!(matches!(rendered, Rendered::Waited(_)), "frame {frame}: {rendered:?}");
+    }
+    let (rendered, _) = step(&mut rig, Some(E1));
+    assert_eq!(rendered, Rendered::Hidden, "starved past the bound");
+    let (rendered, made) = step(&mut rig, None);
+    assert_eq!(rendered, Rendered::Hidden, "no window");
+    assert_eq!(made, calls(&["present"]), "a frame with no window asks nothing");
+    let (rendered, made) = step(&mut rig, Some(E1));
+    assert_eq!(rendered, Rendered::Hidden, "starved still: no region has opened");
+    assert_eq!(made, calls(&["open", "present"]));
+    rig.script.with(|plan| plan.opens.clear());
+    let (rendered, made) = step(&mut rig, Some(E1));
+    drew(Some(rendered));
+    assert_eq!(made[..3], calls(&["open", "sink", "begin+"]));
+    rig.stop();
+}
+
 /// Each frame that runs its passes hands the render side the presentation events of every
 /// tick since the last frame that did (`lactose-sim`'s `keep_present_events`): one a tick
 /// for each row here, so `ROWS` a tick, and twice that after a frame that deferred.

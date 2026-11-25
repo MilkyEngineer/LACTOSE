@@ -1,12 +1,12 @@
 //! A paced frame's wait for the frame before (step 2), the bound on deferring for it, a
 //! frame that looks once, and the frame's time (`README.md`, "The shown frame").
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use lactose_app::{CATCH_UP_CAP, Rendered, ShownOutput, TICK_PERIOD};
+use lactose_app::{CATCH_UP_CAP, Region, Rendered, ShownOutput, TICK_PERIOD};
 use lactose_sim::TimeScale;
 
-use super::support::{Call, E1, Rig, Setup, When, drew, later};
+use super::support::{Call, E1, Rig, Setup, When, drew, later, point};
 
 /// The release of a held side, late enough that the frame is usually waiting by then. No
 /// assertion depends on it: a frame whose limit is an hour off joins whenever it comes.
@@ -93,6 +93,49 @@ fn a_render_task_in_flight_at_the_limit_leaves_the_frame_busy() {
     drew(joined.joined);
     assert_eq!(joined.deferred, None);
     assert!(ran_passes(&rig.script.take_calls()));
+    rig.flush();
+    rig.stop();
+}
+
+/// How far ahead of the clock a frame's `now` is where its limit is to arrive while it
+/// waits: the limit is `now` and half a period, less `JOIN_MARGIN`.
+const SOON: Duration = Duration::from_millis(150);
+
+#[test]
+fn a_limit_reached_while_step_2_waits_leaves_the_frame_busy() {
+    let mut rig = Rig::new(2, false);
+    rig.script.hold_draws(true);
+    rig.frame(When::Ahead, 1, Some(E1));
+    rig.script.await_draws(1);
+    let start = Instant::now();
+    let busy = rig.try_frame_soon(SOON, 1, Some(E1)).expect("the frame");
+    let took = start.elapsed();
+    assert!(is_busy(&busy), "{:?}, joined {:?}", busy.deferred, busy.joined);
+    // The wait began before the limit and ended at it, by the executor's timer.
+    assert!(took >= SOON, "the frame waited for its limit: {took:?}");
+    rig.script.hold_draws(false);
+    drew(rig.flush());
+    rig.stop();
+}
+
+#[test]
+fn a_limit_reached_while_step_3_waits_leaves_the_frame_busy() {
+    let mut rig = Rig::new(2, true);
+    rig.step(Some(E1));
+    rig.settle();
+    // A call held on the present thread, and no region after its frame: the next frame's
+    // step 3 waits for that call.
+    let reached = rig.script.with(|plan| plan.present_gate.reached);
+    rig.script.hold_presents(true);
+    rig.script.submit_answers([Ok(Region::Wait(point(84)))]);
+    assert!(drew(Some(rig.step(Some(E1)))).1, "the call is queued");
+    rig.script.await_presents(reached + 1);
+    let start = Instant::now();
+    let busy = rig.try_frame_soon(SOON, 1, Some(E1)).expect("the frame");
+    let took = start.elapsed();
+    assert!(is_busy(&busy), "{:?}, joined {:?}", busy.deferred, busy.joined);
+    assert!(took >= SOON, "the frame waited for its limit: {took:?}");
+    rig.script.hold_presents(false);
     rig.flush();
     rig.stop();
 }

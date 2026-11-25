@@ -72,13 +72,25 @@ impl Shedder {
         rendered
     }
 
-    /// Frames until a call has been queued for each of `reports`.
+    /// Frames until a call has been queued for each of `reports`, failing past four frames
+    /// a report: a rule that sheds every frame queues no call, and would loop for ever.
     fn run(&mut self, reports: &[Rep]) {
         let until = self.calls + reports.len();
+        let cap = 4 * reports.len();
         self.rig.script.report_answers(reports.iter().map(|rep| report(*rep)));
-        while self.calls < until {
+        for _ in 0..cap {
+            if self.calls >= until {
+                return;
+            }
             self.step(Some(E1));
         }
+        assert!(
+            self.calls >= until,
+            "{cap} frames queued {} of the {} calls asked for, shed by {:?}",
+            self.calls + reports.len() - until,
+            reports.len(),
+            self.shed_by,
+        );
     }
 
     /// One frame more, which takes the last report and queues a call reporting no count.
@@ -326,9 +338,10 @@ fn a_frame_busy_at_step_2_passes_over_from_the_report_of_the_late_task_s_call() 
     shedder.rig.settle();
     // The late frame takes the depth's report and queues the first of the pattern.
     shedder.rig.script.report_answers(AFTER_GAP[..1].iter().map(|rep| report(*rep)));
+    let reached = shedder.rig.script.with(|plan| plan.draw_gate.reached);
     shedder.rig.script.hold_draws(true);
     shedder.rig.frame(When::Ahead, 1, Some(E1));
-    shedder.rig.script.await_draws(1);
+    shedder.rig.script.await_draws(reached + 1);
     let busy = shedder.rig.frame(When::Passed, 1, Some(E1));
     assert_eq!(busy.deferred, Some(Rendered::Busy));
     shedder.rig.script.hold_draws(false);
@@ -338,6 +351,38 @@ fn a_frame_busy_at_step_2_passes_over_from_the_report_of_the_late_task_s_call() 
     shedder.run(&AFTER_GAP[1..]);
     shedder.tail();
     assert!(shedder.shed_by.is_empty(), "{:?}", shedder.shed_by);
+    shedder.rig.stop();
+}
+
+/// The late task's own frame was dropped for a call still out, so the rule above has the
+/// gap already: the passes over follow that call's report, and the busy frame adds none.
+/// The README's pattern, with the reports before the gap's call below the depth.
+#[test]
+fn a_frame_busy_at_step_2_behind_a_task_dropped_for_a_call_passes_over_after_that_call_s_report() {
+    let mut shedder = Shedder::new(false);
+    shedder.run(&[At(1), At(1)]);
+    shedder.rig.settle();
+    // The gap's call: it reads the depth and is held on the present thread.
+    shedder.rig.script.hold_presents(true);
+    shedder.rig.script.report_answers([report(At(SHED_DEPTH))]);
+    let queuing = shedder.step(Some(E1));
+    assert!(drew(Some(queuing)).1, "the gap's call is queued");
+    // The late task: its draw held, then its frame dropped for the gap's call.
+    let reached = shedder.rig.script.with(|plan| plan.draw_gate.reached);
+    shedder.rig.script.hold_draws(true);
+    shedder.rig.frame(When::Ahead, 1, Some(E1));
+    shedder.rig.script.await_draws(reached + 1);
+    let busy = shedder.rig.frame(When::Passed, 1, Some(E1));
+    assert_eq!(busy.deferred, Some(Rendered::Busy));
+    shedder.rig.script.hold_draws(false);
+    let late = shedder.rig.flush();
+    shedder.note(late);
+    let (_, queued, held, _) = drew(late);
+    assert!(!queued && !held, "the late task's frame is dropped for the gap's call");
+    shedder.rig.script.hold_presents(false);
+    shedder.run(&AFTER_GAP);
+    shedder.tail();
+    assert!(shedder.shed_by.is_empty(), "shed by {:?}", shedder.shed_by);
     shedder.rig.stop();
 }
 

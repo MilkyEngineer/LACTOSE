@@ -1024,7 +1024,8 @@ async fn draw_frame(
 
     // Step 3: the state.
     let state = match window {
-        None => State::Hidden { starved: false },
+        // A frame with no window asks nothing, so it leaves a starvation as it found it.
+        None => State::Hidden { starved: side.starved },
         Some(extent) if side.region == Some(Region::Ready) => State::Draw(extent),
         Some(extent) => {
             if side.queue == QueuePath::Shared
