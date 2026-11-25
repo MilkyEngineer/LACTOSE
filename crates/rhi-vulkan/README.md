@@ -442,9 +442,9 @@ MoltenVK's; both drivers name the device `Apple M1`, so `--adapter` cannot choos
 
 | Driver | Passed | Skipped | Failed |
 |---|---|---|---|
-| MoltenVK 1.4.2, under Metal API and shader validation | 182 | 37: 31 null alone, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
-| KosmicKrisp (SDK 1.4.363) | 147 | 71: 31 null alone, 9 no window, 13 no headless surface, 4 no loss, 11 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
-| KosmicKrisp under GPU-assisted validation | 142 | 71: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit; the injected acquire-semaphore reuse skips for core validation off | 0 |
+| MoltenVK 1.4.2, under Metal API and shader validation | 184 | 37: 31 null alone, 4 no loss, `indirect_count` not reported, compute on its own queue | 0 |
+| KosmicKrisp (SDK 1.4.363) | 147 | 73: 31 null alone, 9 no window, 15 no headless surface, 4 no loss, 11 compute sharing the graphics queue and 1 compute with no queue of its own, the canary across queues (no second queue), every optional draw capability reported | 0 |
+| KosmicKrisp under GPU-assisted validation | 142 | 73: as above, but for the canary across queues, which is not this form's, and the drop that leaks the device while unwinding, which GPU-assisted validation aborts on at exit; the injected acquire-semaphore reuse skips for core validation off | 0 |
 
 The counts are of the device tests: the suite's 186 cases, 158 contract and 28 output, and the
 device's own; the Metal canary runs under MoltenVK alone. Each driver passes 27 of the 28
