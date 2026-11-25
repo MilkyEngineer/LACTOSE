@@ -2926,14 +2926,16 @@ arrived, kept by a condition variable's timeout or a thread of the test's own an
 the executor's timers, since the failures the bounds are for leave no worker to fire one.
 Tests that install the tick's hook take one lock, so that two never share it.
 
-Owed, by lane `frame-impl`'s second round with `lactose-app-client`: criterion 3(c), in that
-package's `integration` target, module `recorded`; the run on `lactose-rhi-null` through
-each state on each queue layout, the extent going E1, E2, E1 with the frame at E2 dropped or
-torn among them, held frames among them on a shared queue, refused nothing, which needs the
-render side over a device that package builds; in that package, the present side's count
-over scripted display-time reports and timeline values; and, once a Vulkan backend can run
-it, a run on one queue under the Khronos layer's synchronisation validation, with held
-frames in it ("Two rules of the layers below").
+What `lactose-app-client` holds of the shown frame (its README, "What proves it"):
+
+| What | How |
+|---|---|
+| Criterion 3(c) | `lactose-app-client`'s `tests/recorded.rs`, `a_shown_world_on_null_hashes_as_the_world_unshown`, a `[harness]` test with its `::physics` stream: the binary's wiring with `game-sim`'s scene on `lactose-rhi-null` with one queue, 48 steps through drawn, hidden and held frames and the extent going E1, hidden, E2, E1, beside the same world built by `build_server` and stepped by `Server::step`; the hashes are equal at every tick and the shown world's are recorded. The shown world built without the game's sessions fails it |
+| The run on null | `tests/null.rs`, on one queue and on several: the extent E1, hidden, E2, E1, every frame drawn and queued; presents stalled over E1, E2 and E1, which holds frames on one queue and drops them on two, and sheds none; the stall let go and frames queued again; with every second present call making no submit, the targets it named taken back from `Undefined`; nothing refused and no message. A lost device ends the next step with `DeviceLost` and the run shuts down. A waited frame, a torn one and a busy one are not reached on null through this wiring, whose control offers a loss and a stall of presents alone and whose steps are joined; `tests/frame/` drives each over a render side with no device |
+| The present side | `tests/present.rs`: `ClientPresent` alone on null, the swapchain resized at the first call and at each change of extent and at no other, and each image a slot held let go once its successor's read is reached |
+| The count | `tests/count.rs`: `Waiting` over scripted display-time reports and timeline values |
+| Criterion 1 on the M1 | The binary's fixed-frame mode, 600 frames, read back and held to the CPU reference at a quarter of a pixel, under MoltenVK and KosmicKrisp with the Khronos layer, and under MoltenVK with Metal API and Metal shader validation, each validator's canary heard in a process of its own beside it; a dropped draw, a vertex moved one pixel, a skipped clear and two instances swapped each fail it. Run by hand (`docs/verification.md`); the Windows laptop's run is owed |
+| Both queue layouts under synchronisation validation | On the M1 KosmicKrisp's window device serves the present role from the graphics queue and MoltenVK's gives it a queue of its own, so each layout runs without forcing. A probe build of a scratch copy, whose present calls each sleep 40 ms, every 13th making no submit, and whose every 97th draw is torn, ran paced for 20 s under the layer's synchronisation and thread-safety validation: on one queue frames were held, and on two dropped, beside calls that made no submit and torn frames, with no message (`docs/verification.md`) |
 
 Not held by a test: that a render task suspended at its hold leaves the gate to the physics
 step's `block_in_place` at `RECORD_RESERVATION`. `tests/frame/protocol.rs` shows the ticks

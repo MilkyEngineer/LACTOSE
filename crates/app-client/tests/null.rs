@@ -178,10 +178,12 @@ fn workers() -> Workers {
 }
 
 /// On each layout: E1, hidden, E2 and E1 again, each extent's frames drawn and queued, the
-/// targets made anew at each change and the swapchain resized; then presents stalled, which
-/// on one queue holds frames behind the present call in flight and with a present queue of
-/// its own drops them, and never sheds one, since null reports no display time; then the
-/// stall let go and frames queued again. Null refuses nothing and says nothing throughout.
+/// targets made anew at each change and the swapchain resized; then presents stalled over
+/// E1, E2 and E1 again, which on one queue holds frames behind the present call in flight
+/// and with a present queue of its own drops them, so that an extent's frames may reach no
+/// present and the present side meets new targets at an extent it already has; and never
+/// sheds one, since null reports no display time; then the stall let go and frames queued
+/// again. Null refuses nothing and says nothing throughout.
 ///
 /// A stalled present's acquire finds no image and returns at null's bound, a second, so a
 /// call is in flight for a second at a time while eight steps run: what is asserted is that
@@ -201,7 +203,9 @@ fn each_layout_steps_e1_e2_e1_through_stalled_presents_and_refuses_nothing() {
             "{layout}"
         );
         assert!(run.control.stall(true), "{layout}: the device is gone");
-        let stalled: Vec<_> = (0..8).map(|_| name(&run.step(Some(E1)))).collect();
+        let stalled_extents = [E1, E1, E2, E2, E2, E2, E1, E1];
+        let stalled: Vec<_> =
+            stalled_extents.into_iter().map(|extent| name(&run.step(Some(extent)))).collect();
         let (kept_back, never) =
             if layout == "one queue" { ("held", "dropped") } else { ("dropped", "held") };
         assert!(stalled.contains(&kept_back), "{layout}: {stalled:?}");
