@@ -39,6 +39,54 @@ pub(crate) struct Gate {
     /// their own deque. Only they can be sure to run those children, so a freed permit must
     /// reach them. Uses the sleep protocol's announce, re-check, park discipline.
     openers: Sleep,
+    /// Called by [`idle_park`] on a worker that has looked round and is about to park, with
+    /// what it saw: the window between a worker's check of the gate and its sleep, where the
+    /// tests of a task woken at a closed gate land a wake or the gate's opening. Each pool
+    /// has its own, so a test that sets it reaches no other test's executor.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) before_park: Hook<BeforePark>,
+}
+
+/// The hook [`Gate::before_park`] holds: the worker's index and what its look saw.
+#[cfg(all(test, not(feature = "loom")))]
+pub(crate) type BeforePark = std::sync::Arc<dyn Fn(usize, Look) + Send + Sync>;
+
+/// A test hook a worker reaches on its hot path. Unset, reaching it is one `Relaxed` load
+/// and no lock, so a test that sets no hook runs with no synchronisation between workers
+/// that the shipped build lacks. A test sets one before the wake, queueing or timer that
+/// brings the worker to it, which orders the setting before the worker's reach.
+#[cfg(all(test, not(feature = "loom")))]
+pub(crate) struct Hook<F> {
+    set: core::sync::atomic::AtomicBool,
+    hook: std::sync::Mutex<Option<F>>,
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+impl<F: Clone> Hook<F> {
+    pub(crate) const fn new() -> Self {
+        Self { set: core::sync::atomic::AtomicBool::new(false), hook: std::sync::Mutex::new(None) }
+    }
+
+    /// Sets the hook, or with `None` clears it.
+    pub(crate) fn set(&self, hook: Option<F>) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let set = hook.is_some();
+        if !set {
+            self.set.store(false, Relaxed);
+        }
+        *crate::lock(&self.hook) = hook;
+        if set {
+            self.set.store(true, Relaxed);
+        }
+    }
+
+    /// The hook, cloned out so that it may wait while another worker reaches it too.
+    pub(crate) fn get(&self) -> Option<F> {
+        if !self.set.load(core::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        crate::lock(&self.hook).clone()
+    }
 }
 
 impl Gate {
@@ -48,7 +96,16 @@ impl Gate {
             allowed: AtomicUsize::new(OPEN),
             reservations: Mutex::new(Vec::new()),
             openers: Sleep::new(workers),
+            #[cfg(all(test, not(feature = "loom")))]
+            before_park: Hook::new(),
         }
+    }
+
+    /// The permits out and the limit, `None` while the gate is open.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn permits(&self) -> (usize, Option<usize>) {
+        let allowed = self.allowed.load(Ordering::SeqCst);
+        (self.running.load(Ordering::SeqCst), (allowed != OPEN).then_some(allowed))
     }
 
     fn closed(&self) -> bool {
@@ -210,6 +267,10 @@ pub(crate) fn idle_park(
     if stay_awake {
         sleep.cancel(worker);
     } else {
+        #[cfg(all(test, not(feature = "loom")))]
+        if let Some(hook) = gate.before_park.get() {
+            hook(worker, seen);
+        }
         sleep.park(worker, deadline);
     }
 }
