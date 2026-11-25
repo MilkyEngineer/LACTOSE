@@ -121,11 +121,13 @@ impl Extracted {
         }
     }
 
-    /// The records the scatter of the frame just prepared leaves, slot by slot over
-    /// `capacity` slots, from the slots `table` gave: a call sent since
-    /// [`before_prepare`](Self::before_prepare) breaks the placements, as does a held key
-    /// the table has no slot for or a slot the table holds for no key held here.
-    pub fn records(&mut self, table: &SlotTable, capacity: usize) -> Option<Vec<InstanceRecord>> {
+    /// The records the scatter of the frame just prepared leaves, slot by slot below the
+    /// table's extent, where every record was written (renderer, `InstanceRecord`: a
+    /// record no entry has written is undefined, and the draw covers the extent alone), from
+    /// the slots `table` gave: a call sent since [`before_prepare`](Self::before_prepare)
+    /// breaks the placements, as does a held key the table has no slot for below its
+    /// extent or a slot the table holds for no key held here.
+    pub fn records(&mut self, table: &SlotTable) -> Option<Vec<InstanceRecord>> {
         if self.calls.try_recv().is_ok() {
             self.break_for("a pass wrote beside a frame's prepare");
         }
@@ -137,7 +139,7 @@ impl Extracted {
             return None;
         }
         let free = InstanceRecord::from_bytes(&[0; InstanceRecord::BYTES as usize]);
-        let mut records = vec![free; capacity];
+        let mut records = vec![free; table.extent() as usize];
         for (&(kind, key), held) in &self.held {
             let slot = table.get(kind, key).map(|slot| slot.index() as usize);
             let Some(record) = slot.and_then(|slot| records.get_mut(slot)) else {

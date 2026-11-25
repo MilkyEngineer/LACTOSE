@@ -116,8 +116,9 @@ pub struct LastFrame {
     pub extent: Extent,
     /// The target's pixels, row by row from the top left.
     pub pixels: Vec<[u8; 4]>,
-    /// The renderer's instance records the frame drew from, slot by slot, as the device's
-    /// scatter wrote them.
+    /// The renderer's instance records the frame drew from, slot by slot below the slot
+    /// table's extent, as the device's scatter wrote them. The records above it are
+    /// undefined and not read.
     pub records: Vec<InstanceRecord>,
     /// The records the placements extract handed the renderer give, slot by slot over the
     /// same slots: what the scatter should have written, and what the reference is
@@ -283,9 +284,12 @@ impl ClientRender {
             pixels.extend(bytes.as_chunks::<4>().0.iter().copied());
         })?;
         let mut records = Vec::new();
-        read(&**device, readback.records[at], Readback::record_bytes(), |bytes| {
-            records.extend(bytes.as_chunks::<128>().0.iter().map(InstanceRecord::from_bytes));
-        })?;
+        let size = Readback::record_bytes(expected.len());
+        if size > 0 {
+            read(&**device, readback.records[at], size, |bytes| {
+                records.extend(bytes.as_chunks::<128>().0.iter().map(InstanceRecord::from_bytes));
+            })?;
+        }
         let (camera, fraction) = (copied.camera, copied.fraction);
         Ok(Some(LastFrame { extent: readback.extent, pixels, records, expected, camera, fraction }))
     }
@@ -398,15 +402,22 @@ impl ClientRender {
             };
             let pixels = decl.import_buffer(&host(readback.pixels[at], "pixels"));
             let records = decl.import_buffer(&host(readback.records[at], "records"));
+            // The records below the slot table's extent, every one written by a scatter;
+            // those above it are undefined, and none is copied where the extent is zero.
             let instances = declared.instances;
-            let record_bytes = Readback::record_bytes();
+            let record_bytes = Readback::record_bytes(renderer.slots().extent() as usize);
+            let (sources, destinations) = if record_bytes == 0 {
+                (&[][..], &[pixels][..])
+            } else {
+                (&[instances][..], &[pixels, records][..])
+            };
             decl.copy_pass(
                 &CopyPassDecl {
                     label: "read back",
                     image_sources: &[image],
                     image_destinations: &[],
-                    buffer_sources: &[instances],
-                    buffer_destinations: &[pixels, records],
+                    buffer_sources: sources,
+                    buffer_destinations: destinations,
                 },
                 move |pass| {
                     let rect = Rect { x: 0, y: 0, extent };
@@ -415,15 +426,17 @@ impl ClientRender {
                         pixels,
                         &[BufferImageCopy { buffer_offset: 0, mip: 0, layer: 0, rect }],
                     );
-                    pass.copy_buffer(
-                        instances,
-                        records,
-                        &[BufferCopy {
-                            source_offset: 0,
-                            destination_offset: 0,
-                            size: record_bytes,
-                        }],
-                    );
+                    if record_bytes > 0 {
+                        pass.copy_buffer(
+                            instances,
+                            records,
+                            &[BufferCopy {
+                                source_offset: 0,
+                                destination_offset: 0,
+                                size: record_bytes,
+                            }],
+                        );
+                    }
                 },
             );
         }
@@ -449,8 +462,8 @@ impl Readback {
             extent,
             pixels: [buffer("pixels", pixel_bytes)?, buffer("pixels", pixel_bytes)?],
             records: [
-                buffer("records", Self::record_bytes())?,
-                buffer("records", Self::record_bytes())?,
+                buffer("records", Self::record_bytes(INSTANCES as usize))?,
+                buffer("records", Self::record_bytes(INSTANCES as usize))?,
             ],
             drawn: core::array::from_fn(|_| None),
             extracted: Extracted::new(),
@@ -461,8 +474,9 @@ impl Readback {
         u64::from(self.extent.width) * u64::from(self.extent.height) * u64::from(PIXEL_BYTES)
     }
 
-    const fn record_bytes() -> u64 {
-        INSTANCES as u64 * InstanceRecord::BYTES as u64
+    /// The bytes of `records` instance records.
+    const fn record_bytes(records: usize) -> u64 {
+        records as u64 * InstanceRecord::BYTES as u64
     }
 }
 
@@ -566,7 +580,7 @@ impl RenderSide for ClientRender {
                     .break_for(format!("a frame lost, dropped or did not place rows: {stats:?}"));
             }
             extracted
-                .records(self.renderer.slots(), INSTANCES as usize)
+                .records(self.renderer.slots())
                 .ok_or_else(|| extracted.broken().unwrap_or_default().to_owned())
         });
         // Taken from `Undefined` in a submit that waits for the present thread's last read
