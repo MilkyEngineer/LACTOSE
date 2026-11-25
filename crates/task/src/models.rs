@@ -6,13 +6,14 @@
 //! functions the executor ships: `gate::wait_for_children` is the opener's wait,
 //! `Sleep::announce_entry` is what a worker does after queueing work, `Sleep::wake_worker`
 //! is how it wakes a worker, `Timers::fire_due`
-//! is how a deadline reaches its task, `Quiesce` is what holds a run's future back,
+//! is how a deadline reaches its task, `Quiesce` is what holds a run's future back and
+//! `Quiesce::leave` how a job drops its reference to the graph before it leaves the run,
 //! `ShutdownFlag::queue` is how work is queued against shutdown's sweep, `JobSlot` is where a
 //! job's value waits for its future, `Width` is what bounds the workers such jobs occupy,
 //! `ParkingPump::wait` is how a parking lane's thread waits and `parking_lane`'s wake is how a
 //! queued call ends that wait.
 //! What a model supplies is only what loom does not model: a deque is a counter, a worker is a
-//! loom thread, and a scope's children are a number.
+//! loom thread, a run's graph is an `Arc<()>`, and a scope's children are a number.
 //!
 //! Five terms are copies in the models, because loom cannot run the types they live in
 //! (`WorkerLocal`, `Shared`), and each is held by a native test instead:
@@ -49,10 +50,10 @@ use loom::thread::{self, Thread};
 
 use crate::gate::{self, Gate, Opener, Wake};
 use crate::latch::Latch;
-use crate::quiesce::{Entry, Quiesce};
+use crate::quiesce::{self, Entry, Quiesce};
 use crate::sleep::Sleep;
 
-/// The preemption bound of the three-thread models, which are too large to explore
+/// The preemption bound of the three-thread models that are too large to explore
 /// exhaustively.
 const THREE_THREAD_BOUND: usize = 5;
 
@@ -497,6 +498,193 @@ fn a_run_resolves_only_when_no_job_of_it_is_executing() {
         assert!(resolved.load(Ordering::SeqCst) >= 1, "the run never resolved");
         assert!(!jobs.close(), "closing twice must not report quiet again");
     });
+}
+
+/// A job's reference to the run's graph. Dropping it also stores `dropped`, `Relaxed`, which
+/// the main thread's `Relaxed` load sees only if the drop happens before the resolution in
+/// memory order. The count alone cannot show that: loom's `Arc::strong_count` reads the
+/// latest count and synchronizes with every drop it counts.
+struct Reference {
+    _graph: Arc<()>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for Reference {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A finished run: two jobs, each holding a reference to the run as a graph run's entries
+/// hold its graph, leave it through `Quiesce::leave`, and the last unit's job closes it. The
+/// main thread waits on a flag that the job which finds the run quiet sets, as `GraphRun`
+/// waits on its completion, holding the graph; it must then be the graph's only holder, with
+/// every job's drop visible to it. `leave` is the shipped function or a weakened copy, and
+/// `weakened` lowers the order of `Quiesce::exit`.
+fn the_references_at_resolution(
+    weakened: Option<quiesce::Weakened>,
+    leave: fn(&Quiesce, Reference) -> bool,
+) {
+    loom::model(move || {
+        let graph = Arc::new(());
+        let mut quiesce = Quiesce::new();
+        quiesce.weakened = weakened;
+        let jobs = Arc::new(quiesce);
+        let units = Arc::new(AtomicUsize::new(2));
+        let resolved = Arc::new(AtomicBool::new(false));
+        let dropped: Vec<_> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let main = thread::current();
+        let workers: Vec<_> = dropped
+            .iter()
+            .map(|dropped| {
+                let held = Reference { _graph: graph.clone(), dropped: dropped.clone() };
+                let (jobs, units, resolved) = (jobs.clone(), units.clone(), resolved.clone());
+                let main = main.clone();
+                thread::spawn(move || {
+                    assert_eq!(jobs.enter(), Entry::Entered, "the run closes after its last unit");
+                    if units.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        // The last unit and its finalize: the run closes with this job inside.
+                        assert!(!jobs.close(), "quiet with a job registered");
+                    }
+                    if leave(&jobs, held) {
+                        resolved.store(true, Ordering::SeqCst);
+                        main.unpark();
+                    }
+                })
+            })
+            .collect();
+        while !resolved.load(Ordering::SeqCst) {
+            thread::park();
+        }
+        // The marks first, since reading the count synchronizes with the drops.
+        for dropped in &dropped {
+            assert!(
+                dropped.load(Ordering::Relaxed),
+                "a job held the graph after the run resolved, by memory order: \
+                 its drop does not happen before the resolution"
+            );
+        }
+        assert_eq!(Arc::strong_count(&graph), 1, "a job held the graph after the run resolved");
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+}
+
+/// When a run resolves, every job of it has dropped its reference to the graph, and every
+/// such drop happens before the resolution.
+#[test]
+fn a_run_resolves_only_when_its_jobs_have_dropped_the_graph() {
+    the_references_at_resolution(None, Quiesce::leave);
+}
+
+/// `Quiesce::leave` with its two steps the other way round: a job that left first may still
+/// hold the graph when the last to leave resolves the run.
+#[test]
+#[should_panic(expected = "a job held the graph after the run resolved")]
+fn weakened_a_job_that_drops_the_graph_after_it_leaves() {
+    the_references_at_resolution(None, |jobs, held| {
+        let quiet = jobs.exit();
+        drop(held);
+        quiet
+    });
+}
+
+/// `Quiesce::exit` that releases and does not acquire: the job that finds the run quiet need
+/// not see the other job's drop, though the drop came first.
+#[test]
+#[should_panic(expected = "its drop does not happen before the resolution")]
+fn weakened_a_run_whose_last_exit_does_not_acquire() {
+    the_references_at_resolution(Some(quiesce::Weakened::ExitRelease), Quiesce::leave);
+}
+
+/// `Quiesce::exit` that is `Relaxed`: nothing a job did before it left is ordered before the
+/// resolution.
+#[test]
+#[should_panic(expected = "its drop does not happen before the resolution")]
+fn weakened_a_run_whose_exits_are_relaxed() {
+    the_references_at_resolution(Some(quiesce::Weakened::ExitRelaxed), Quiesce::leave);
+}
+
+/// A cancelled run: two jobs that may enter, each making a `Relaxed` write while registered,
+/// and shutdown's `close` on the main thread. Whoever finds the run quiet (the closer, the
+/// last job to exit, or a refused job) reads every job's write with nothing of its own to
+/// order the reads, and keeps the least it saw. After the joins, every job that entered must
+/// have been seen written: the jobs' writes happen before the resolution on the `Cancelled`
+/// path too, where `close` may be the resolver. `weakened` lowers the order of `close` or
+/// `exit`.
+fn the_writes_at_a_cancelled_resolution(weakened: Option<quiesce::Weakened>) {
+    bounded(THREE_THREAD_BOUND, move || {
+        let mut quiesce = Quiesce::new();
+        quiesce.weakened = weakened;
+        let jobs = Arc::new(quiesce);
+        let writes: Vec<_> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let entered: Vec<_> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        // What any resolver saw of each job's write: 0 unwritten, 1 written, 2 nobody looked.
+        let seen: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(2))).collect();
+        let resolve = |writes: &[Arc<AtomicBool>], seen: &[Arc<AtomicUsize>]| {
+            let looked: Vec<_> = writes.iter().map(|write| write.load(Ordering::Relaxed)).collect();
+            for (seen, looked) in seen.iter().zip(looked) {
+                seen.fetch_min(usize::from(looked), Ordering::SeqCst);
+            }
+        };
+        let workers: Vec<_> = (0..2)
+            .map(|job| {
+                let (jobs, writes, entered, seen) =
+                    (jobs.clone(), writes.clone(), entered.clone(), seen.clone());
+                thread::spawn(move || match jobs.enter() {
+                    Entry::Entered => {
+                        entered[job].store(true, Ordering::Relaxed);
+                        writes[job].store(true, Ordering::Relaxed);
+                        if jobs.exit() {
+                            resolve(&writes, &seen);
+                        }
+                    }
+                    Entry::Refused { quiet } => {
+                        if quiet {
+                            resolve(&writes, &seen);
+                        }
+                    }
+                })
+            })
+            .collect();
+        // Shutdown, on the calling thread.
+        if jobs.close() {
+            resolve(&writes, &seen);
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let seen: Vec<_> = seen.iter().map(|seen| seen.load(Ordering::SeqCst)).collect();
+        assert!(seen.iter().any(|&seen| seen != 2), "the cancelled run never resolved");
+        for (entered, seen) in entered.iter().zip(seen) {
+            if entered.load(Ordering::Relaxed) {
+                assert_eq!(seen, 1, "the resolution did not see a write of a job that entered");
+            }
+        }
+    });
+}
+
+/// When a cancelled run resolves, by its close or by its last job, every write its jobs
+/// made happens before the resolution.
+#[test]
+fn a_cancelled_run_resolves_after_its_jobs_writes() {
+    the_writes_at_a_cancelled_resolution(None);
+}
+
+/// `Quiesce::close` that releases and does not acquire: a close that finds the run quiet need
+/// not see what the jobs that left wrote.
+#[test]
+#[should_panic(expected = "the resolution did not see a write of a job that entered")]
+fn weakened_a_close_that_does_not_acquire() {
+    the_writes_at_a_cancelled_resolution(Some(quiesce::Weakened::CloseRelease));
+}
+
+/// `Quiesce::close` that is `Relaxed`.
+#[test]
+#[should_panic(expected = "the resolution did not see a write of a job that entered")]
+fn weakened_a_close_that_is_relaxed() {
+    the_writes_at_a_cancelled_resolution(Some(quiesce::Weakened::CloseRelaxed));
 }
 
 /// The pool as an idle worker's release sees it: `idle_one` really claims a sleeper.

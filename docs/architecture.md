@@ -241,7 +241,11 @@ with `Cancelled` only when shutdown began before the job started, its closure dr
 dropping it cancels nothing. A graph run resolves, with the graph or
 with `Cancelled`, only when no unit, scope child or finalize of that run is executing or can
 start, and their writes happen before the resolution; this holds when the last handle is
-dropped on a worker and nothing is joined. After `Cancelled` the run is torn and the graph is
+dropped on a worker and nothing is joined. When a graph run resolves with the graph, it holds
+no reference to it any more: each of its jobs drops its own before it leaves the run, and
+every such drop happens before the resolution, so dropping the graph drops each node that
+nothing else holds, on the thread that drops it. After `Cancelled` the run is torn, work that
+shutdown left queued may hold the graph's nodes until that work is dropped, and the graph is
 not returned. A cancelled task's future has been dropped. Shutting an executor down joins its
 workers unless it is called on one of them.
 

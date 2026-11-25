@@ -2104,6 +2104,51 @@ editorial pass rather than one taken from a review.
   start; it finishes before the resolution. A job cannot wait for its own run.
 - Driven by: milestone 0 task lane, first review (hang after shutdown) and second review,
   finding 2.
+- Addendum (lane `writers-flake`, 2026-11-25): *a graph run that resolves with the graph holds
+  no reference to it.* CI run 45554176534 at ae02509, a doc-only push, failed
+  `lactose-renderer`'s `writers::rows_written_from_several_jobs_are_each_read_once`: after the
+  run resolved and the test dropped the graph, `Arc::into_inner` found the sink still held by
+  the graph's node. A run's entries hold an `Arc` of the run's state, and with it every node;
+  the job that left the run last resolved it from inside `run_range`, and its entry was dropped
+  only after `run_range` returned, so a caller woken at once could take the graph back, drop it
+  and look before that worker dropped the node. A job that left earlier had the same window, up
+  to its own drop. The run's state now keeps what its future waits on, the ordinal, the
+  quiescence word and the completion slot, in an `Arc` of its own (`RunControl`): a job leaves
+  through that reference and drops its entry's reference to the state first
+  (`Quiesce::leave`), so every job's reference to the graph is gone before the last job leaves,
+  and every such drop happens before the resolution by `Quiesce::exit`'s order, as the jobs'
+  writes do. Shutdown's sweep holds a weak reference to the control, not to the graph. The job
+  that releases the roots on the caller's thread borrows the caller's graph and takes no
+  reference. A resolution waits for nothing it did not wait for before. The promise is for `Ok`
+  alone: after `Cancelled`, work that shutdown left queued may hold the graph's nodes until it
+  is dropped. Three tests hold it, each failing a mutant of its own. `tests/graph.rs`'s
+  `a_run_that_resolves_holds_no_reference_to_the_graph` polls the run with a waker that holds
+  the resolving worker inside its wake until the test has dropped the graph and looked; it
+  failed 5 of 5 at ae02509 and 20 of 20 with the entry's reference dropped after the
+  resolution (M1). The exhaustive loom model
+  `a_run_resolves_only_when_its_jobs_have_dropped_the_graph` has two jobs hold the graph
+  through a value whose drop also makes a `Relaxed` store, and the main thread, woken by the
+  job that finds the run quiet, reads every such store `Relaxed` before it reads the count:
+  loom's `Arc::strong_count` synchronizes with the drops it counts, so the count alone shows
+  the order of `leave`'s two steps and not that the drops happen before the resolution. It
+  fails a `leave` that unregisters before it drops (M2, which the native test passes, since
+  the last job still drops first) and an `exit` lowered to `Release` (M4) or `Relaxed` (M5),
+  each run beside it as a `weakened_` variant; the older quiescence model passes M4 and M5.
+  On the `Cancelled` path shutdown's `Quiesce::close` may be the resolver, and the jobs'
+  writes happen before the resolution by its order: the loom model
+  `a_cancelled_run_resolves_after_its_jobs_writes`, bounded at five preemptions, has two jobs
+  that may enter make a `Relaxed` write each while the main thread closes, and whoever finds
+  the run quiet must see every write of a job that entered; it fails a `close` lowered to
+  `Release` (M7) or `Relaxed` (M6), as `weakened_` variants and applied to `close` itself.
+  `executor::sweep_tests` holds the sweep, through a pause point compiled only into the
+  crate's own tests, after it upgrades a run whose last finalize is past its shutdown check,
+  while the run resolves with the graph and the test drops it; it failed 20 of 20 with the
+  sweep's map back at `Weak` of the run's state (M3) and passed 200 of 200. On the M1 beside
+  eight CPU-bound loops, the renderer test at ae02509 failed 3 of 6,000 nextest stress runs at
+  load averages 14 to 59, each with the CI's message, and 20 of 20 with a 2 ms sleep between
+  `run_range`'s return and the entry's drop, the node then dropped on a `whisk-frame-` worker
+  after the test looked; with the fix it passed 3,000 of 3,000 at load 44 to 53, and 50 of 50
+  with the same sleep.
 
 **D108. Scope-open routing replaces the deque watermark** (§5.1, `lactose-task`)
 - Why: a watermark cannot stop work pushed to an opener's deque after the scope opened (a
