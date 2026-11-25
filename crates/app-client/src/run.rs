@@ -28,7 +28,7 @@ use lactose_rhi_api::{
     Swapchain, SwapchainDesc,
 };
 use lactose_rhi_vulkan::VulkanDevice;
-use lactose_task::{Executor, Lane, Platform, ThreadSpec, WorkerClass};
+use lactose_task::{Executor, Lane, LaneCall, Platform, ThreadSpec, WorkerClass};
 
 use crate::game::{Frames, GAME, InMemory};
 use crate::present::ClientPresent;
@@ -260,10 +260,20 @@ pub struct Wired {
     pub frames: Frames,
     /// What the frame's latch reads, which the binary publishes.
     pub input: Arc<LatestSample>,
-    /// The present lane, which the shutdown does not need: a call queued on it runs once
-    /// every call queued before it has run and been replied to, so a test awaits one as a
-    /// barrier behind the present calls so far.
-    pub barrier: Lane<Box<dyn PresentSide>>,
+    /// A barrier behind the present calls, which the shutdown does not need.
+    pub barrier: PresentBarrier,
+}
+
+/// The present lane, held to await what has been queued on it and nothing else.
+pub struct PresentBarrier(Lane<Box<dyn PresentSide>>);
+
+impl PresentBarrier {
+    /// A no-op queued on the present lane, which runs once every call queued there before it
+    /// has run and been replied to: what a test awaits before it names a step. It resolves
+    /// `Cancelled` once the present thread has stopped.
+    pub fn passed(&self) -> LaneCall<()> {
+        self.0.run(|_| ())
+    }
 }
 
 /// Wires the game onto `device`: the render side, the present side over `swapchain` on a
@@ -287,7 +297,7 @@ pub fn wire(
     let render = ClientRender::new(device, shaders, Arc::clone(&input), readback)?;
     let present = ClientPresent::new(Arc::clone(device), swapchain, shaders)?;
     let (lane, thread) = present_thread(platform, Box::new(present) as Box<dyn PresentSide>)?;
-    let barrier = lane.clone();
+    let barrier = PresentBarrier(lane.clone());
     let cooked = Arc::new(InMemory::new()?);
     let built = Frames::new(&cooked).and_then(|frames| {
         let cooked = cooked as Arc<dyn Cooked>;

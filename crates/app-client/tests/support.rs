@@ -149,6 +149,9 @@ pub struct Watch {
     pub refusals: Mutex<Vec<String>>,
     /// Whether a [`WatchedDevice`] refuses the next image's make, without asking null.
     pub fail_make: AtomicBool,
+    /// Whether a [`WatchedDevice`] refuses the next encoder of the present role, without
+    /// asking null.
+    pub fail_encoder: AtomicBool,
     /// The images a [`WatchedDevice`] made, and those it destroyed.
     pub made: Mutex<Vec<ImageHandle>>,
     pub destroyed: Mutex<Vec<ImageHandle>>,
@@ -260,7 +263,7 @@ impl Swapchain for Watched {
 
 /// A device that passes every call to `inner`, noting each refusal of a submit or of a heap
 /// slot's write or clear and every image made and destroyed, that refuses an image's make
-/// on request, and that answers the reads of the presents' timeline as [`Watch::lag`] says.
+/// or a present encoder on request, and that answers the reads of the presents' timeline as [`Watch::lag`] says.
 pub struct WatchedDevice {
     pub inner: Arc<dyn Device>,
     pub watch: Arc<Watch>,
@@ -430,6 +433,9 @@ impl Device for WatchedDevice {
     }
 
     fn create_encoder(&self, queue: QueueRole, label: &str) -> Result<Box<dyn Encoder>> {
+        if queue == QueueRole::Present && self.watch.fail_encoder.swap(false, Ordering::AcqRel) {
+            return Err(Error::new(ErrorKind::ResourceExhausted, "an encoder refused by the test"));
+        }
         self.inner.create_encoder(queue, label)
     }
 

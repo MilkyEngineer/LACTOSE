@@ -21,14 +21,16 @@ use lactose_app::{
     PresentSide, RenderSide, Rendered, Shown, ShownError, ShownKept, Stopped, TICK_PERIOD, Workers,
     WorldConfig, start_executor,
 };
-use lactose_app_client::{ClientRender, FIXED_SAMPLE, Frames, LastFrame, Wired, wire};
+use lactose_app_client::{
+    ClientRender, FIXED_SAMPLE, Frames, LastFrame, PresentBarrier, Wired, wire,
+};
 use lactose_core::{ErrorKind, Result};
 use lactose_input_host::LatestSample;
 use lactose_platform::PresentThread;
 use lactose_renderer::InstanceRecord;
 use lactose_rhi_api::{Capabilities, Device, Extent, QueueLayout, SwapchainDesc};
 use lactose_rhi_null::Control;
-use lactose_task::{ExecutionLog, Executor, Lane};
+use lactose_task::{ExecutionLog, Executor};
 
 use crate::support::{
     Said, Watch, Watched, WatchedDevice, bounded, lock, null_device, null_shaders, warnings,
@@ -49,8 +51,8 @@ pub struct Run {
     present: Option<PresentThread<Box<dyn PresentSide>>>,
     frames: Frames,
     input: Arc<LatestSample>,
-    /// The present lane ([`Wired::barrier`]).
-    barrier: Lane<Box<dyn PresentSide>>,
+    /// A barrier behind the present calls ([`Wired::barrier`]).
+    barrier: PresentBarrier,
     start: Instant,
     steps: u32,
 }
@@ -147,7 +149,7 @@ impl Run {
     pub fn settle(&self) {
         let queued = usize::try_from(self.shown().stats().queued).expect("a count");
         self.watch.settle(queued);
-        let barrier = self.barrier.run(|_| ());
+        let barrier = self.barrier.passed();
         bounded(&self.executor, barrier, "the present lane's barrier").expect("the barrier");
     }
 
@@ -401,8 +403,9 @@ fn the_readback_reads_the_last_frame_at_its_extent_with_the_scenes_placements() 
 /// whose call made no submit was released toward the present role, on two queues, with no
 /// acquire to meet it, and the frame that draws it next takes it back from `Undefined`
 /// (D160's item 7 (c), verification row 230): null refuses nothing and says nothing. Each
-/// step is settled ([`Run::settled`]), so every frame but the hidden one is drawn and queued,
-/// and each of their calls reaches its acquire, every second one answered with no image.
+/// step is settled ([`Run::settled`]), so every frame but the hidden one is drawn and queued;
+/// at least three of their calls made no submit, and the swapchain was resized to E1, E2 and
+/// E1 alone.
 #[test]
 fn each_layout_takes_back_the_targets_of_present_calls_that_made_no_submit() {
     for (layout, capabilities) in layouts() {

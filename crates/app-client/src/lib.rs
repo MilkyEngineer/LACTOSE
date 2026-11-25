@@ -22,7 +22,7 @@ pub use game::{Frames, GAME, InMemory, REGION};
 pub use present::{ClientPresent, HEAP};
 pub use render::{BOOM, ClientRender, INSTANCES, LastFrame, PROJECTION, TARGET_FORMAT};
 pub use run::{
-    FIXED_EXTENT, FIXED_FRACTION, FIXED_SAMPLE, LOG_TARGET, Mode, Options, Outcome, Wired, run,
-    wire,
+    FIXED_EXTENT, FIXED_FRACTION, FIXED_SAMPLE, LOG_TARGET, Mode, Options, Outcome, PresentBarrier,
+    Wired, run, wire,
 };
 pub use shaders::{CookedShaders, PipelineCache};

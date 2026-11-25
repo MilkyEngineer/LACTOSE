@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lactose_app::{Finished, PresentReport, PresentSide, TARGETS};
-use lactose_core::{ErrorKind, Result};
+use lactose_core::{Error, ErrorKind, Result};
 use lactose_rhi_api::{
     Acquired, AddressMode, ColourAttachment, ColourTargetDesc, Cull, Device, DisplayTime, Encoder,
     Extent, Filter, GraphicsPipelineDesc, GraphicsPipelineHandle, HeapSlot, ImageHandle,
@@ -222,7 +222,13 @@ impl ClientPresent {
                 }
             },
         };
-        let mut encoder = device.create_encoder(QueueRole::Present, "present")?;
+        let mut encoder = match device.create_encoder(QueueRole::Present, "present") {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                self.keep_unless_lost(image, &error);
+                return Err(error);
+            }
+        };
         // The acquire half of the hand-off the frame's submit released, with equal values;
         // where one queue serves both roles it is the whole change (graph, "Imports").
         encoder.transition_images(&[ImageTransition {
@@ -251,16 +257,23 @@ impl ClientPresent {
                 })
             }
             // After a refusal nothing was submitted and the image is still the acquired one
-            // (rhi-api, `Swapchain::present`), kept for the next call: the frame's release
-            // of the target stays unmet, and the frame takes the target back from
-            // `Undefined` behind the read it already knows. A refusal as pending is the
-            // next call's to retry; any other fails the frame.
+            // (rhi-api, `Swapchain::present`): the frame's release of the target stays
+            // unmet, and the frame takes the target back from `Undefined` behind the read it
+            // already knows. A refusal as pending is the next call's to retry; any other
+            // fails the frame.
             Err(error) => {
-                if error.kind() != ErrorKind::DeviceLost {
-                    self.acquired = Some(image);
-                }
+                self.keep_unless_lost(image, &error);
                 if Rule::of(&error) == Some(Rule::Pending) { Ok(nothing) } else { Err(error) }
             }
+        }
+    }
+
+    /// Keeps `image`, the acquired one, for the next call after `error` ended this one with
+    /// nothing presented, unless the device is lost: every error between the acquire and a
+    /// present taken leaves the image acquired.
+    fn keep_unless_lost(&mut self, image: ImageHandle, error: &Error) {
+        if error.kind() != ErrorKind::DeviceLost {
+            self.acquired = Some(image);
         }
     }
 }

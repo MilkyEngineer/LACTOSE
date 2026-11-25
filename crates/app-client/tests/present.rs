@@ -308,6 +308,30 @@ fn a_present_refused_by_another_rule_is_made_by_the_next_call_with_the_same_imag
     side.close();
 }
 
+/// A present encoder that cannot be made, a driver's error after the acquire, also leaves
+/// the image acquired: the call fails, and the next call presents that image with no acquire
+/// of its own, as does every call after it. A side that forgot it would acquire again, which
+/// null refuses while an image is acquired, at every call after (`encoder-fail`).
+#[test]
+fn an_encoder_that_fails_after_the_acquire_leaves_the_image_for_the_next_call() {
+    let mut side = Side::new(QueueLayout::ONE, false);
+    let finished = side.finished(0, E1);
+    assert!(side.call(finished).expect("call 0").read.is_some());
+    side.watch.fail_encoder.store(true, Ordering::Release);
+    let finished = side.finished(1, E1);
+    let failed = side.call(finished).expect_err("call 1, its encoder refused");
+    assert_eq!(failed.kind(), ErrorKind::ResourceExhausted, "{failed}");
+    assert_eq!(side.watch.acquires.load(Ordering::Relaxed), 2);
+    for call in 2..5 {
+        let finished = side.finished(call % 2, E1);
+        let report = side.call(finished).unwrap_or_else(|error| panic!("call {call}: {error}"));
+        assert!(report.read.is_some(), "call {call}: {report:?}");
+    }
+    assert_eq!(side.watch.acquires.load(Ordering::Relaxed), 4, "call 2 acquired nothing");
+    assert_eq!(side.watch.presents(), 4);
+    side.close();
+}
+
 /// A resize that fails with a driver's error gives up the acquired image (rhi-api,
 /// `Swapchain::resize`), and the side forgets it. The call after one whose present was
 /// refused as pending holds the acquired image; its resize to E2 fails, null's image table
