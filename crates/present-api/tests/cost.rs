@@ -120,18 +120,45 @@ fn a_pass_writes_the_moved_rows_and_the_snapshot_holds_the_presented_ones() {
     assert_eq!(shown.len(), 200);
     let walking = shown.iter().filter(|&&key| rig.world().get::<Walker>(key).is_some()).count();
     assert_eq!(walking, 100, "half the presented rows walk");
-    // No chunk order is key order: the first presented chunk holds keys on both sides of the
-    // second's first key. A row's region is a column of its chunk, so the regions interleave
-    // within each chunk.
-    let chunks: Vec<Vec<StableKey>> = rig
+    assert_eq!(interleaved(&rig), (1, 1), "each presented archetype one chunk");
+}
+
+/// The timed scene's layout, at both counts of presented rows: the plan's (milestone 2, row
+/// `extract-50k`), the presented archetypes' chunks interleaved, so no chunk order is key order.
+#[test]
+fn the_timed_scene_interleaves_its_presented_archetypes() {
+    for presented in [5_000, 10_000] {
+        let (rig, _sink) = scene(100_000, presented, true, 1);
+        let (walking, still) = interleaved(&rig);
+        println!("{presented} presented rows: {walking} chunks walking, {still} not");
+        assert!(walking > 1 && still > 1, "the timed scene's archetypes span several chunks");
+    }
+}
+
+/// Asserts that no order of the presented chunks is key order: every chunk of a presented
+/// archetype that holds two rows or more holds keys on both sides of a key of the other
+/// presented archetype, which no concatenation of chunks can put in order. Within an
+/// archetype the chunks may run in key order; across the two they cannot. A row's region is a
+/// column of its chunk, so the regions interleave within each chunk. Returns how many chunks
+/// each presented archetype has, the walking one's first.
+fn interleaved(rig: &Rig) -> (usize, usize) {
+    let shown = <Shown as lactose_reflect::Reflect>::KEY;
+    let walker = <Walker as lactose_reflect::Reflect>::KEY;
+    let (walking, still): (Vec<_>, Vec<_>) = rig
         .world()
         .chunks()
-        .filter(|chunk| chunk.column(<Shown as lactose_reflect::Reflect>::KEY).is_some())
-        .map(|chunk| chunk.keys().to_vec())
-        .collect();
-    assert!(chunks.len() >= 2, "{} chunks", chunks.len());
-    let (first, second) = (&chunks[0], &chunks[1]);
-    assert!(first.iter().any(|key| key < &second[0]) && first.iter().any(|key| key > &second[0]));
+        .filter(|chunk| chunk.column(shown).is_some())
+        .partition(|chunk| chunk.column(walker).is_some());
+    for (these, others) in [(&walking, &still), (&still, &walking)] {
+        for chunk in these.iter().filter(|chunk| chunk.keys().len() > 1) {
+            let low = chunk.keys().iter().min().expect("two rows");
+            let high = chunk.keys().iter().max().expect("two rows");
+            let split =
+                others.iter().flat_map(|other| other.keys()).any(|key| low < key && key < high);
+            assert!(split, "a presented chunk whose keys no key of the other archetype splits");
+        }
+    }
+    (walking.len(), still.len())
 }
 
 /// The arm of the ignored test that runs.
