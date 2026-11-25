@@ -366,7 +366,8 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   queue, a drop behind a graphics submit held there by a host point on the acquired image, which
   neither waits for it nor leaks the device, a second swapchain made at once that presents once the
   point is signalled; a `resize` whose `vkCreateSwapchainKHR` or image fails, stale until a later
-  `resize`; a `resize` whose wait for a shown present's fence fails out of host memory, injected,
+  `resize`, the injected `vkCreateSwapchainKHR` failure retiring the old driver swapchain as the
+  call does; a `resize` whose wait for a shown present's fence fails out of host memory, injected,
   which gives the acquired image up and leaves the swapchain as it was, not stale, the image's
   acquire semaphore waited for by the give-up's empty batch or, where that batch fails too, by a
   later `resize`, on the present role's own queue and on the graphics queue, the layer silent; a

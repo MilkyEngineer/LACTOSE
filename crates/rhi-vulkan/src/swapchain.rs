@@ -216,7 +216,8 @@ struct Timing {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fail {
-    /// `vkCreateSwapchainKHR` fails, as if out of host memory.
+    /// `vkCreateSwapchainKHR` answers out of host memory, the swapchain it names retired, as
+    /// the call retires it whatever it answers: one is made from it and let go at once.
     Create,
     /// The image of this index is not taken into the chain, as if the image table were full.
     Image(usize),
@@ -438,6 +439,12 @@ impl VulkanSwapchain {
     ) -> core::result::Result<vk::SwapchainKHR, vk::Result> {
         #[cfg(test)]
         if self.fail == Some(Fail::Create) {
+            // Unless the driver sees the old swapchain retired, a later making from nothing,
+            // before a batch that holds the old one completes, finds the surface in use.
+            // SAFETY: as below; the swapchain made has no image taken, and nothing names it.
+            if let Ok(made) = unsafe { self.presents().swapchain.create_swapchain(info, None) } {
+                drop(SwapchainObj { raw: Arc::clone(&self.shared.raw), swapchain: made });
+            }
             return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
         }
         // SAFETY: the surface is live, and the swapchain it replaces, if any, is the
