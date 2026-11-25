@@ -547,7 +547,8 @@ whose build is done. CI never uses `heavy`: its runners are single-tenant.
 
 ## Measurements
 
-`cargo xtask measure (--all | <name>…) [--short] [--out <dir>]` runs the measurements the
+`cargo xtask measure (--all | <name>…) [--short] [--no-device] [--driver <name>] [--adapter
+<name>] [--out <dir>]` runs the measurements the
 milestone criteria rest on and writes each one's result files to `docs/results` (or
 `<dir>`, which must be inside the repository; an absolute one is written relative to its
 root in the files), with the header of `docs/plans/milestone-1.md`, section 4. The names, what each
@@ -564,6 +565,38 @@ standard error as it comes.
   test's whole output. A test that prints no figure, a figure line that does not read, or a
   figure named twice fails its measurement. nextest runs it with `--retries 0`, so that no
   failed attempt's output or time is read.
+- A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`, `gpu-cost`) runs under the driver
+  `--driver` names, `moltenvk` by default on macOS and `system` elsewhere, on the adapter
+  `--adapter` names or the loader's first, with no layer: the inherited variables `gpu`
+  clears are cleared, every implicit layer is disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~`)
+  and no Metal validation is set. The loader is the pinned SDK's (`vulkan-layer.toml`) on
+  macOS and for a driver the SDK ships, the system's otherwise, and the driver's manifest is
+  pinned as `gpu` pins it. `vulkaninfo` (the SDK's, or the one on the path) runs once under
+  the same environment before the first of them, and each file's header adds the rows of the
+  device its test named in `device.adapter`: its name and vendor and device ids, the driver's
+  name, information and version, the device's and the instance's API versions, the loader,
+  the validation (off), the presentation (none: no surface, so no present mode or refresh
+  rate), the memory type `lactose-rhi-vulkan` chooses for `MemoryClass::Upload`, the ring's,
+  and the environment set, a path inside the SDK written from `<sdk>` and any other cut to
+  its file name. Where `vulkaninfo` fails the rows say why and the run goes on. A test that
+  hears a message from the device fails. `--no-device` leaves them out of `--all` and refuses
+  one named; the `measure` workflow passes it, since its runners have no device. `cargo xtask
+  gpu` runs them too, short, under its validators. With no `--driver`, `gpu-cost` runs once
+  under each of the host's drivers (MoltenVK, then KosmicKrisp, on macOS), each file named
+  for its driver; before it the engine's shaders are cooked with the pinned Slang into
+  `target/measure/shaders`, once a run, and under each driver a source salted for that run
+  (`salted_source`) is cooked before the test's window opens.
+- `triangle` is criterion 1's file, not a test: under each of the host's drivers it runs
+  each canary of `gpu`'s plain validators (`Validators::Plain`), and under MoltenVK Metal
+  API validation's through the Metal script, each in a process of its own, then the client
+  binary, built in release, `--fixed 600`, under the environment `gpu` gives its tests, with
+  the pinned layer. Each is judged by `vulkan::judge`; the run also fails without an
+  `Outcome` line, without the comparison, with a slot of no pixel surely its colour, or with
+  a line logged at warn or above. The file records each canary's word, the `Outcome`'s
+  figures and the criterion, and the measurement fails after writing it where the criterion
+  is not met. It presents: the screen must be unlocked and the display awake. A host the
+  layer's pin names nothing for (Windows) cannot run it.
+- `frame-pace` is not a test either (section "frame-pace" below).
 - `spike-net` runs the netcode spike's ten-minute replays one `cargo nextest run` at a time;
   each prints its report as one JSON object, whose values the files carry under
   `<scene>.<clock>.` (nested keys joined by dots, an array as its JSON text), with the
@@ -611,6 +644,97 @@ standard error as it comes.
 
 It loads the machine for minutes: under other agents' load, wrap it in `heavy`, and read its
 numbers as steering only. The numbers that prove a criterion come from a quiet machine.
+
+### frame-pace
+
+`frame-pace` is the milestone 2 plan's row of that name (D162): the client binary, built in
+release, paced by its timer root with `--stamps` (`crates/app-client/README.md`, "Stamps"),
+under the environment of the measurements on a device, no validator on, once under each of
+the host's drivers, each driver's files named for it. It presents: the screen must be
+unlocked and the display awake (`caffeinate -d` on macOS).
+
+- **The display's rate.** On macOS `tools/xtask/display/rate.swift` prints a line for each
+  active display, the main one marked: its mode's rate (`CGDisplayModeGetRefreshRate`), its
+  display link's nominal period as a rate, and its screen's `maximumFramesPerSecond`. The
+  main display's mode's rate is the one used, its link's where the mode reports 0; the window
+  opens on the main display, and the file names the source, the others beside it, and every
+  other display's rate. MoltenVK reports a swapchain's refresh as 10^9 over the mode's rate of
+  the screen its layer is on, truncated to whole nanoseconds, falling back to
+  `maximumFramesPerSecond` only where the mode reports 0, and to 60 where that is 0 too.
+  Elsewhere the rate is unread, and the file says so. `lactose-rhi-api`'s swapchain reports
+  no refresh, so none is recorded from it.
+- **The runs.** A real-time run, 60 s (12 s under `--short`), which is both the plan's shown
+  run of ten seconds or more and its run of a minute at real time. Where any present call
+  found a source of display times and the display's rate is read, the floor run, 60 s (20 s
+  short), at the time scale `pace::floor_scale` gives from that rate: frames a thousandth
+  slower than half the display's rate. The scale is whole thousandths (`TimeScale`), rounded
+  down: at 60 Hz the plan's 0.4995 is 0.499, about 0.2% slower than half the rate, a sweep of
+  the refresh in about 8.3 s. No floor run is made for either of two causes, which the file
+  names: off macOS `lactose-rhi-vulkan` has no host clock to pair display times with, so its
+  swapchain reports none and Windows and Linux record `no floor: the swapchain reports no
+  display times`; on macOS, where the script fails, the file records `no floor: the
+  display's rate is unread`, and no refresh is fitted from the real-time run instead: its
+  frames are paced at the ticks, and on a display faster than them each gap between display
+  times is a multiple of the refresh. A floor run that swept fewer than twice is recorded as
+  no floor, nothing is read against it, and it is run again (`floor_again`) at the scale from
+  its own fitted refresh. On Windows the real-time run is made again minimised
+  (`--minimised`).
+- **The reading** (`src/pace.rs`). A display report earlier than its present's return is no
+  display and is dropped and counted (`display.dropped_before_return`); a present with no
+  report kept is counted (`display.missing`), those dropped by order and the last calls'
+  among them, whose reports no later call reads. The floor run's refresh is fitted freely to its display times from the
+  reported refresh by least squares against each time's refresh index, the window doubling
+  from 32 periods so a report off by a part in a hundred keeps each time on its own refresh
+  (`fit.hz`, and `fit.from_reported_parts_per_10000`). The sweeps are the latches' phase
+  against that refresh, unwrapped from one latch to the next. The grid test is D162's
+  (`grid.*`): the reported period refined by that fit, moved five parts in 10,000 at most, and
+  held where 99 in 100 of the display times lie within a tenth of the period of their
+  circular mean phase; refused where they do not, or where the free fit lands past the bound.
+  Each run's figures are prefixed `real.`, `floor.`, `floor_again.` or `minimised.`: the
+  `info` stamps; the frames' lateness (the first tick's start against the deadline the root
+  slept to), split into the timer's wake (`lateness.wake`, the deadline to `Shown::frame`'s
+  call) and the engine's start (`lateness.start`, the call to the first tick), also by what
+  the frame before did (`lateness.after_*`: what it deferred; `joined_at_limit` where its call
+  returned at or after this frame's deadline less `JOIN_MARGIN`, its join having waited to its
+  limit; `joined` where it returned sooner; `nothing_joined`; `first`), and `Shown::frame`'s
+  time (`frame_call`); each outcome's count (`joined.*`, `deferred.*`) and `behind`; `stats`;
+  the record (job start to `draw`'s return), its greatest width (`width.max`, and
+  `width.at_frame_worker_count`, the records as wide as the frame-critical workers) and the
+  longest closure (`longest_job`), both unread where `info recorders` reads `absent`; the
+  submit, those that began during a present's driver call (`submit.began_during_driver`,
+  `submit.began_during`) and the rest (`submit.began_outside`), and on a shared queue the
+  hold
+  (`draw`'s return to the submit's entry); each present call's parts with P90: its waits (for
+  its last read, the resize and the encoder's drop, which waits for the frame's GPU work and
+  the blit), the acquire, the record (the encoder's creation and the blit's recording), the
+  driver's call (the wait for the image's last-present fence, then the submit and the present
+  under the queue's lock), the rest and the whole; `waiting`'s greatest and the share of calls
+  that reported two or more, a count that includes presents displayed and not yet reported,
+  and `undisplayed.*`, the same of the presents not yet displayed by their own display times;
+  the image counts; the latch's age at the call's return and at the display, an age below
+  half the floor's median dropped and counted, and the latches' phase against the refresh
+  (`latch_phase`), on which the median age at the display depends. Each is P50, P99 and the
+  greatest, in microseconds. Then the flag (`flag.waiting_stayed_low`) and D162's four
+  readings (`reading.*`): reading 1 fires only on the submits that began during a driver
+  call, a submit that began before one and ran into it being chosen by its own length and so
+  its own cost: on a shared queue where their P99 is as long as the driver call's, and on two
+  queues, where beginning during one is no wait by itself, where their P99 exceeds the P99 of
+  the submits begun outside one (`submit.began_during.excess_p99_us`, negative where under)
+  by more than the latter's own spread from P50 to P99, the submit's variation in the same
+  run; a missing `info join_margin_ns` is written `unread: no join_margin_ns`, so that a file
+  without it does not read as a run in which no join waited to its limit, and a missing `info
+  shed_depth` is written `unread: no shed_depth`: it stops reading 3's comparison with
+  `SHED_DEPTH`, and nothing more;
+  the lateness is read at its P99 against D144's 1 ms on Windows and D156's 50 µs on macOS,
+  the frames over it counted beside it (`lateness.over_limit`, and
+  `lateness.over_limit_by_the_wake`).
+- **What it cannot read.** Whether the window was occluded (`lactose-platform` forwards none
+  of winit's `WindowEvent::Occluded`) and whether another client was drawing are not read;
+  the header says so. Where the swapchain reports no display times the file says why:
+  `lactose-rhi-vulkan` reads them from `VK_GOOGLE_display_timing` alone, and D162 admits
+  `VK_EXT_present_timing` and `VK_KHR_present_wait`'s completions only once a run shows they
+  follow the display. The record's width is counted by thread, each frame-critical worker
+  being one. The stamps take a lock each while a run takes them.
 
 ## Slang
 
@@ -696,8 +820,11 @@ writes its report.
 4. The Vulkan step runs every device test: each ignored test of the test targets
    `DEVICE_TESTS` in `src/main.rs` lists, which are `lactose-rhi-vulkan`'s library's unit
    tests, of its `canary` and `swapchain` modules alone, so that no other ignored unit test
-   runs as a device test, its `integration` binary, and the `device` modules of
-   `lactose-render-graph`'s and `lactose-renderer`'s `integration` binaries, each in a
+   runs as a device test, its `integration` binary, the `device` modules of
+   `lactose-render-graph`'s and `lactose-renderer`'s `integration` binaries, and the
+   `extract`, `upload` and `gpu` modules of `lactose-app-client`'s, the measurements on a device,
+   whose figures are discarded (every device test runs with `LACTOSE_MEASURE_SHORT=1`,
+   which only they read), each in a
    process of its own, built with `cargo test --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
    - the layer is the Khronos validation layer of the Vulkan SDK that
      `tools/xtask/vulkan-layer.toml` pins, refused unless its library's SHA-256 and its

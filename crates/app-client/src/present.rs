@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lactose_app::{Finished, PresentReport, PresentSide, TARGETS};
 use lactose_core::{Error, ErrorKind, Result};
@@ -19,6 +19,7 @@ use lactose_rhi_api::{
 };
 
 use crate::shaders::CookedShaders;
+use crate::stamps::{self, PresentStamp, Stamp};
 
 /// The bound the present side gives its own waits, on the present thread alone.
 const PRESENT_WAIT: Duration = Duration::from_millis(100);
@@ -116,6 +117,31 @@ pub struct ClientPresent {
     slots: [Option<ImageHandle>; TARGETS],
     waiting: Waiting,
     times: Vec<DisplayTime>,
+    /// Where a run takes stamps, the call's timings so far, and the image count last stamped.
+    timed: Timed,
+    images: Option<u32>,
+}
+
+/// A present call's timings (`stamps::PresentStamp`), each zero where it did not happen.
+#[derive(Clone, Copy, Default)]
+struct Timed {
+    waits: Duration,
+    acquire: Duration,
+    record: Duration,
+    driver: Duration,
+    /// The driver call's start.
+    driver_at: Option<Instant>,
+    id: Option<u64>,
+    /// `Swapchain::display_times`'s answer as the call began.
+    times: bool,
+}
+
+/// Runs `f`, its time added to `into` where a run takes stamps.
+fn timed<R>(into: &mut Duration, f: impl FnOnce() -> R) -> R {
+    let Some(start) = stamps::now() else { return f() };
+    let returned = f();
+    *into += start.elapsed();
+    returned
 }
 
 impl ClientPresent {
@@ -158,6 +184,8 @@ impl ClientPresent {
             slots: [None; TARGETS],
             waiting: Waiting::new(),
             times: Vec::new(),
+            timed: Timed::default(),
+            images: None,
         })
     }
 
@@ -171,17 +199,23 @@ impl ClientPresent {
         let source = swapchain.display_times(&mut self.times);
         let reached = device.timeline_value(self.reads)?;
         let waiting = self.waiting.take(source, &self.times, reached);
+        if stamps::on() {
+            self.timed.times = source;
+            for time in &self.times {
+                stamps::stamp(Stamp::Displayed { id: time.present.0, at: time.shown });
+            }
+        }
         self.times.clear();
         let nothing = PresentReport { waiting, ..NOTHING };
         if self.stale || self.asked != Some(finished.extent) {
             // The caller's wait before a resize is for its own points (rhi-api, "The
             // swapchain"). A timeout or a refusal as pending is the next call's to retry.
             if let Some(last) = self.last
-                && !device.wait_timeline(last, PRESENT_WAIT)?
+                && !timed(&mut self.timed.waits, || device.wait_timeline(last, PRESENT_WAIT))?
             {
                 return Ok(nothing);
             }
-            match swapchain.resize(finished.extent) {
+            match timed(&mut self.timed.waits, || swapchain.resize(finished.extent)) {
                 Ok(()) => {}
                 Err(error) if Rule::of(&error) == Some(Rule::Pending) => return Ok(nothing),
                 Err(error) => {
@@ -204,7 +238,7 @@ impl ClientPresent {
         let slot = finished.target.index();
         if self.slots[slot] != Some(finished.image) {
             if let Some(last) = self.last
-                && !device.wait_timeline(last, PRESENT_WAIT)?
+                && !timed(&mut self.timed.waits, || device.wait_timeline(last, PRESENT_WAIT))?
             {
                 return Ok(nothing);
             }
@@ -213,7 +247,7 @@ impl ClientPresent {
         }
         let image = match self.acquired.take() {
             Some(image) => image,
-            None => match swapchain.acquire()? {
+            None => match timed(&mut self.timed.acquire, || swapchain.acquire())? {
                 Acquired::Image(image) => image,
                 Acquired::None => return Ok(nothing),
                 Acquired::Stale => {
@@ -222,32 +256,46 @@ impl ClientPresent {
                 }
             },
         };
-        let mut encoder = match device.create_encoder(QueueRole::Present, "present") {
+        let extent = swapchain.extent();
+        let (pipeline, sampler) = (self.pipeline, self.sampler);
+        let recorded = timed(&mut self.timed.record, || {
+            let mut encoder = device.create_encoder(QueueRole::Present, "present")?;
+            // The acquire half of the hand-off the frame's submit released, with equal
+            // values; where one queue serves both roles it is the whole change (graph,
+            // "Imports").
+            encoder.transition_images(&[ImageTransition {
+                image: finished.image,
+                range: ImageRange::FIRST,
+                from: on(ImageState::ColourAttachment, QueueRole::Graphics),
+                to: on(ImageState::SampledRead, QueueRole::Present),
+            }]);
+            draw_target(&mut *encoder, pipeline, HEAP[slot], sampler, image, extent);
+            Ok(encoder)
+        });
+        let encoder = match recorded {
             Ok(encoder) => encoder,
             Err(error) => {
                 self.keep_unless_lost(image, &error);
                 return Err(error);
             }
         };
-        // The acquire half of the hand-off the frame's submit released, with equal values;
-        // where one queue serves both roles it is the whole change (graph, "Imports").
-        encoder.transition_images(&[ImageTransition {
-            image: finished.image,
-            range: ImageRange::FIRST,
-            from: on(ImageState::ColourAttachment, QueueRole::Graphics),
-            to: on(ImageState::SampledRead, QueueRole::Present),
-        }]);
-        let extent = swapchain.extent();
-        draw_target(&mut *encoder, self.pipeline, HEAP[slot], self.sampler, image, extent);
         let read = TimelinePoint { timeline: self.reads, value: self.next };
         let mut encoders = [encoder];
         let submit = Submit { encoders: &mut encoders, waits: &[finished.point], signals: &[read] };
-        match swapchain.present(image, submit) {
+        self.timed.driver_at = stamps::now();
+        let presented = swapchain.present(image, submit);
+        if let Some(at) = self.timed.driver_at {
+            self.timed.driver = at.elapsed();
+        }
+        let report = match presented {
             Ok(presented) => {
                 self.next += 1;
                 self.last = Some(read);
                 self.stale = presented == Presented::Stale;
                 if let Some(present) = swapchain.last_present() {
+                    if stamps::on() {
+                        self.timed.id = Some(present.0);
+                    }
                     self.waiting.presented(present, read.value);
                 }
                 Ok(PresentReport {
@@ -265,7 +313,12 @@ impl ClientPresent {
                 self.keep_unless_lost(image, &error);
                 if Rule::of(&error) == Some(Rule::Pending) { Ok(nothing) } else { Err(error) }
             }
-        }
+        };
+        // The encoder's drop waits for its submit, which waits for the frame's point: the
+        // call's wait for the frame's GPU work and the blit (`lactose-rhi-api`'s README,
+        // "Behaviour the signatures cannot express").
+        timed(&mut self.timed.waits, move || drop(encoders));
+        report
     }
 
     /// Keeps `image`, the acquired one, for the next call after `error` ended this one with
@@ -329,7 +382,36 @@ impl PresentSide for ClientPresent {
         else {
             return Ok(NOTHING);
         };
+        let Some(began) = stamps::now() else {
+            let report = self.call(&device, &mut *swapchain, finished);
+            self.swapchain = Some(swapchain);
+            return report;
+        };
+        self.timed = Timed::default();
+        let point = finished.point.value;
         let report = self.call(&device, &mut *swapchain, finished);
+        let returned = Instant::now();
+        let Timed { waits, acquire, record, driver, driver_at, id, times } = self.timed;
+        let (waiting, shown) = report.as_ref().map_or((None, false), |r| (r.waiting, r.shown));
+        stamps::stamp(Stamp::Present(PresentStamp {
+            began,
+            waits,
+            acquire,
+            record,
+            driver,
+            driver_at,
+            returned,
+            waiting,
+            source: times,
+            point,
+            id,
+            shown,
+        }));
+        let images = swapchain.image_count();
+        if self.images != Some(images) {
+            self.images = Some(images);
+            stamps::stamp(Stamp::Images(images));
+        }
         self.swapchain = Some(swapchain);
         report
     }

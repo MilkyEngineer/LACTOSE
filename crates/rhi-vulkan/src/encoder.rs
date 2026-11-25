@@ -24,6 +24,7 @@ use crate::device::{BufferObj, ComputeObj, GraphicsObj, ImageObj, Shared, range}
 use crate::heap::GRAPHICS_PUSH;
 use crate::lock;
 use crate::raw::driver;
+use crate::timestamps::QueryObj;
 
 /// What a submit of the encoder does to a buffer it names.
 #[derive(Clone, Copy, Default)]
@@ -99,6 +100,8 @@ pub(crate) struct VulkanEncoder {
     pub(crate) compute: HashMap<ComputePipelineHandle, Arc<ComputeObj>>,
     /// Every slot a pass declared, with the image it resolved to.
     pub(crate) slots: Vec<SlotDecl>,
+    /// The timestamp pools it recorded a write into (`Timestamps::write`).
+    pub(crate) timestamps: Vec<Arc<QueryObj>>,
     /// The pass's push-constant block, and the range written since the last draw or
     /// dispatch.
     push: [u8; PUSH_BYTES_MAX as usize],
@@ -149,6 +152,7 @@ impl VulkanEncoder {
             graphics: HashMap::new(),
             compute: HashMap::new(),
             slots: Vec::new(),
+            timestamps: Vec::new(),
             push: [0; PUSH_BYTES_MAX as usize],
             dirty: None,
         };
@@ -171,7 +175,7 @@ impl VulkanEncoder {
 
     /// Whether a recording call records: the encoder is not taken by a submit and has
     /// found no breach.
-    const fn recording(&self) -> bool {
+    pub(crate) const fn recording(&self) -> bool {
         self.submitted.is_none() && self.breach.is_none() && self.failure.is_none()
     }
 
@@ -656,7 +660,11 @@ impl Drop for VulkanEncoder {
         if pending {
             // Unwinding with its submit pending: the drop does not wait, and the last holder
             // destroys the pools once the device is idle, or leaks them with the device.
-            self.shared.orphan(self.pool, core::mem::take(&mut self.inputs));
+            self.shared.orphan(
+                self.pool,
+                core::mem::take(&mut self.inputs),
+                core::mem::take(&mut self.timestamps),
+            );
         } else if !raw.leaking() {
             // SAFETY: no submit of the command buffer is pending, its submit's driver call
             // failed and left it as it was (`unsent`), or the device is lost; the pools are
@@ -701,6 +709,7 @@ impl Encoder for VulkanEncoder {
         self.graphics.clear();
         self.compute.clear();
         self.slots.clear();
+        self.timestamps.clear();
         self.dirty = None;
         self.begin()
     }

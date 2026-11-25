@@ -203,6 +203,22 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   whose Vulkan header names this device; the driver checks the rest. It is destroyed with the
   device, after every creation that used it.
 
+- A timestamp query pool (`timestamps.rs`) is created with its count above zero and reset
+  from the host (`hostQueryReset`, which the pool is refused without) before any command can
+  name it. A write records a reset of its one query and the write, at an index the pool holds,
+  outside a pass, into an encoder of the pool's device and queue role that is recording, and
+  the encoder holds the pool's count until its reset, as it holds every object it recorded;
+  an encoder dropped while its thread unwinds with its submit pending hands that count to the
+  device with its command pool (`Shared::orphan`, below). So the pool is destroyed only when
+  no command buffer that names it can still run, or is leaked with the device. A read of the
+  results asks for 64-bit values with availability into a buffer of two words a query, the
+  stride the call is given, and is the host's alone: a query reads whole or unavailable,
+  never torn. Whole is not current: the reset a write records is a queue command, so a query
+  written again by a submit the GPU has not yet reached reads its previous value as
+  available until that reset runs (MoltenVK resets at encode time and hides this; the
+  specification does not). `Timestamps::read` says so, and a caller reads a reused query
+  only once its submit is seen complete. The value is stale, not unsound.
+
 ### Mapped memory (`device.rs`, `Mapping`)
 
 - Host-visible memory is mapped whole when its buffer is made and stays mapped until the
@@ -238,8 +254,9 @@ rhi-null makes them. Two residuals are accepted (D158) and are not this crate's 
   failed out of memory, and "VK_ERROR_OUT_OF_*_MEMORY errors do not modify any currently
   existing Vulkan objects" (the spec's "VkResult Return Codes"), so each command buffer is
   as it was, executable or invalid, and never pending. A drop that would wait while the
-  thread unwinds a panic hands its pools to the device instead (`Shared::orphan`), whose
-  last holder destroys them after the device is idle, or leaks them with the device.
+  thread unwinds a panic hands its pools, and the counts of the timestamp pools it wrote, to
+  the device instead (`Shared::orphan`), whose last holder destroys them after the device is
+  idle, or leaks them with the device.
 
 ### Submission and waits (`submit.rs`, `device.rs`)
 

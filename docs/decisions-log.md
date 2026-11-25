@@ -10316,6 +10316,239 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     bound before they poll the wait, so the two limit tests of `lactose-app` fail whenever
     the limit's timer wakes nothing (`timer-never-wakes`: both fail at the bound in each of
     10 iterations, load 21.89 19.60 18.94 before and 20.49 19.67 19.03 after).
+- Addendum (lane `measure-m2`, 2026-11-26; round one, as fix rounds one, three and four leave
+  it): *`cargo xtask measure` gains `extract-50k`, `remote-upload-5k` and `record-stall`*, the
+  ignored tests `extract::cost_of_extract_at_50k_dirty_rows`,
+  `upload::cost_of_the_remote_upload_of_5k` and `stall::the_record_beside_the_physics_phase`
+  of `lactose-app-client`'s `integration` target, selected by module path (D150). Times are
+  printed, never asserted. What the plan left to the lane is settled so:
+  - *A measurement on a device runs on the pinned driver with no layer.* The tool's
+    environment for it clears the inherited variables `cargo xtask gpu` clears (`CLEARED` and
+    `CLEARED_PREFIXES` in `tools/xtask/src/vulkan.rs`), points the loader at the driver
+    `--driver` names (MoltenVK on macOS, the system's elsewhere) and disables every implicit
+    layer; `--adapter` chooses the GPU by name. `cargo xtask gpu` runs the two device tests
+    short under its validators, whose figures it discards; a device message fails either run.
+  - *The header is read from `vulkaninfo`*, run under that same environment: the device, its
+    driver, the API versions, the loader, and the ring's memory type as the rule of
+    `lactose-rhi-vulkan` picks it from the device's types. No surface reports the type the
+    ring's buffer was given (verification, the row after 245). The SDK's directory is
+    written `<sdk>`, so a file names no directory of the machine.
+  - *`--no-device` leaves the device measurements out of `--all`*, and the `measure` workflow
+    passes it: its runners have no Vulkan device.
+  - *`lactose-net-host`'s reader counts its retried reads*: the reader's `retried_reads`
+    counts the reads a write overlapped, each once, by one `Relaxed` add made on a retried
+    read alone, so a read that is not retried costs what it did; and its `bytes` is the slots'
+    footprint (`InterpolationReader`). Row 102's figures read them. A unit test drives the
+    reload path's count deterministically, the stress test holds the count to at most one a
+    read, and one reader racing a writer on one slot over 2,000,000 pushes is counted at least
+    once.
+  - *`record-stall` reads the physics phase from the spans*, by a tracing subscriber the test
+    installs: from the first entry into `physics_api::sync`, `step` or `write_back`, matched
+    by name in the executor's node spans and `lactose-ecs`'s system spans, to the last exit,
+    so the phase is all three. Each record is one `run_job`, as the shown frame runs its own,
+    on `ClientRender` over null, timed from the job's start, with its start wait from
+    `run_job`'s call beside it; the record loop ends when the stepping thread does, so a tick
+    that panics ends the test. The Windows item of row 21 needs a stamp inside `lactose-task`,
+    which this round does not add.
+  - *`extract-50k`'s parts are differences of medians*, signed, so noise larger than a part
+    reads below zero rather than as nothing. Its figure a dirty row (`w1.dirty_row_ns`) is the
+    one-worker median of the ring alone over the moved rows: the snapshot part copies every
+    presented row on every pass after a tick, whatever the dirty count. The 10,000 presented
+    rows are the lane's choice, the plan naming no count (`presented.chosen_by`).
+  - *A timed pass, record or tick is timed inside its bounded future*, from its first poll, so
+    the keeper thread `bounded` spawns is outside the time.
+  - *`remote-upload-5k` records each frame's mode.* Each job first times a fixed chain of
+    dependent `black_box` multiply-adds (safe code, no FFI), and each frame is classed by its
+    chain against the fastest seen across the paced and the unpaced run: `full` under 1.25
+    times it, `reduced` under twice, `half` at twice or more. The bands are relative to that
+    fastest chain, not to a core's rated clock. The file flags a run whose unpaced control has
+    under half its frames `full` (`calibration.flag`): a fastest chain the busy control cannot
+    hold. A run slowed throughout, under Low Power Mode or a thermal limit, has a slow fastest
+    chain and a control nearly all `full` against it, which no band read against the run's own
+    chains can tell. The file gives each band's share of the frames and its medians of the
+    frame, the batch call, the conversion and the write beside the overall ones, and an
+    unpaced control, the same frames back to back with no timer. On the M1 a light job paced
+    at 144 Hz on a frame-critical worker (`USER_INTERACTIVE` QoS) runs much of a run on an
+    efficiency core or at a lower clock, and the paced median follows the share of those
+    frames, whatever the load (review r1's S1 and C1).
+- Addendum (lane `measure-m2`, 2026-11-26; round two, as its fix round leaves it): *`cargo
+  xtask measure` gains `gpu-cost` and `triangle`*; `frame-pace` and `record-stall`'s Windows
+  item are not built. What the plan left to the lane is settled so:
+  - *`gpu-cost` runs once under each of the host's drivers*, MoltenVK and then KosmicKrisp on
+    macOS with no `--driver`, each driver's pair of files named and headed for it
+    (`gpu-cost-<driver>-<machine>-<date>`). It is the ignored test
+    `gpu::cost_of_draws_and_pipelines` of `lactose-app-client`'s `integration` target, run
+    with every layer off as the other device measurements are. The record runs on a thread
+    named `record`, the submit on the test's, and each way's figures name both threads.
+  - *Source-cold is a source the command writes for each run.* `cargo xtask measure` writes
+    `salted.slang`, 96 pairs of entries each folding a link-time constant into its own
+    literal, and its link module giving that constant a salt from the clock, cooks it with the
+    pinned Slang before the test's window opens, and hands the test the cooked directory
+    (`LACTOSE_MEASURE_SALTED`); each driver's run has its own salt, so neither driver's cache
+    nor the system's shader cache has seen its code. Specialisation-cold is
+    `shaders/measure/cost.slang` under 96 values of a specialisation constant both stages use
+    whole, salted for the run from 32 bits of `RandomState`'s hasher. Cold means cold in the
+    Vulkan pipeline cache: Metal's per-user shader cache sits below it, whose hits the
+    pipeline cache's feedback cannot show, so under KosmicKrisp a set is new to it only as its
+    salt's values are unlikely to have been drawn before. The reloaded set is a second device
+    started from the first's cache bytes making the source-cold set again. Each set records
+    the stage hits and misses the device counted. `cargo xtask gpu` runs the test short under
+    its validators without the salted source, so the source-cold set is skipped there.
+  - *The engine's shaders are cooked once a run* (`slang::cook`, which `cargo xtask gpu` now
+    shares) into `target/measure/shaders`, for `gpu-cost` and `triangle` together.
+  - *`triangle` is criterion 1's file, not a test.* Under each of the host's drivers it runs
+    each canary of `cargo xtask gpu`'s plain validators in a process of its own, and under
+    MoltenVK Metal API validation's through the Metal script, then the client binary, built
+    in release, `--fixed 600`, under the environment `cargo xtask gpu` gives its tests. Each
+    is judged by `vulkan::judge`, decision 5.10's rule. The run also fails without an
+    `Outcome` line, without the comparison, with a slot of no pixel surely its colour, or
+    with a line logged at warn or above. The file records each canary's word, the
+    `Outcome`'s figures and the criterion, `met` or why not. The split of the frames that
+    drew between queued, held, shed and dropped is named as one run's. The measurement
+    fails after writing its files where the criterion is not met. It presents, so it needs
+    an unlocked screen and a display held awake. A host with no layer pinned for it
+    (Windows) cannot run it, so criterion 1 on Windows (verification row 243) needs a
+    Windows pin in `tools/xtask/vulkan-layer.toml` first.
+  - *`lactose-rhi-vulkan` gains `Timestamps`*, an addition to the surface D163 gives the
+    crate, outside `lactose-rhi-api`: a pass's GPU time is a cost, and a cost changes no
+    signature of the facade. `VulkanDevice::create_timestamps(role, count)` makes a timestamp
+    query pool for one queue role, reset on the host. `Timestamps::write(encoder, index)`
+    records, outside any pass, the reset and write of one timestamp into an encoder of that
+    role, and the encoder holds the pool until its submit completes. `Timestamps::read()`
+    gives each in nanoseconds of the GPU's clock, `None` until written and made available.
+    `Timestamps::valid_bits()` gives the queue's valid bits; with none, a write records
+    nothing and `gpu-cost` gives host time alone and says so. `Timestamps::elapsed(earlier,
+    later)` subtracts two reads modulo the valid bits, so a pair the clock wrapped between
+    reads its span; a reused timestamp reads its previous write until the GPU runs the new
+    write's reset, which `read`'s doc and `SAFETY.md` say. Both M1 drivers may latch a
+    timestamp at a boundary of a Metal pass near its write, not where the queue's order puts
+    it. MoltenVK writes it as a Metal pass of its own: with the first in an encoder of its own
+    and the second in a render pass's encoder after the pass, in one submit or with the first
+    in a submit of its own, it latched the second at a quarter point of a 21 ms pass in some
+    rounds (0.24 or 0.75 of the host's time). KosmicKrisp read that pass in every layout
+    tried, and around a dispatch it read under 0.12 ms with both writes in the dispatch's
+    encoder. The layout `gpu-cost` uses is each write in an encoder submitted alone, the
+    work's submit between them, each submit waiting on the one before; the device tests
+    `timestamps_around_a_lagging_dispatch_read_its_lag` and
+    `timestamps_in_submits_around_a_lagging_render_pass_read_its_lag` hold it under both
+    drivers, the second over 16 rounds of a pass of about 21 ms, each read between 0.9 of the
+    least host time less 2 ms and its own host time, a band a quarter-point latch fails. The
+    pair reads the work with the queue's handoffs between the three submits, which
+    `gpu-cost`'s `clear` set, a render pass with its clear alone, reads by itself. MoltenVK
+    makes a result available in the command buffer's completion handler, about 1.6 ms after a
+    wait sees the submit's signal, so a reader polls `read`.
+  - *`record-stall`'s Windows item needs more than a hook.* Both of its instants are inside
+    `lactose-task`: the end of `Pool::open_gate` and the first job a worker runs after a
+    park. `gate::Hook` and the pool's hooks compile only in `lactose-task`'s own unit tests
+    (`cfg(all(test, not(feature = "loom")))`). `record-stall` is a test of
+    `lactose-app-client`, which links `lactose-task` as an ordinary dependency and reaches
+    none of them. A stamp it can read is a public, always-compiled surface of `lactose-task`
+    (two process-wide hooks, each a `Relaxed` load where it is reached), or the same surface
+    behind a cargo feature, which unifies across the workspace's builds. Either is an
+    interface decision for `lactose-task`, so row 21's Windows item stays owed.
+- Addendum (lane `measure-m2`, 2026-11-26; round three, as fix rounds two, three and four
+  leave it): *`cargo xtask measure` gains `frame-pace`*. What the plan left to the lane is
+  settled so:
+  - *The stamps are the client binary's own, behind one flag.* `lactose-app-client --stamps
+    FILE` (with `--time-scale THOUSANDTHS` and `--minimised`, each refused beside `--fixed`)
+    takes every instant the file reads into a list behind one lock and writes it when the run
+    ends, one line a stamp. Each site loads one process-wide `AtomicBool`, `Relaxed`, first
+    and takes nothing while it is unset; nothing is `unsafe`. The stamps are a private module
+    of `lactose-app-client`, and no public item of `lactose-app` is added: the frame is
+    stamped in the closure the binary hands `Shown::frame`, the job, `draw`, the submit and
+    its latch in the binary's render side, the present call's parts, its driver call's start
+    and the display times in its present side, and the writer's closure where the binary hands
+    it to `lactose-presentation`'s `upload`. A recorder is stamped by a tracing layer on
+    `lactose-render-graph`'s `pass` span, installed only when the run takes stamps
+    (`install_log`), so a run without them installs the plain log alone. `install_log` must be
+    the process's first subscriber and returns whether it was: the file records `info
+    recorders installed` or `absent`, a run whose recorders are absent warns and reads its
+    width and longest job as unread, and the binary exits 1 where a subscriber was set before
+    it. The binary stamps `JOIN_MARGIN` and `SHED_DEPTH` into the file, and the tool reads
+    them from there. A file without `JOIN_MARGIN` says so (`unread: no join_margin_ns`), so
+    that it does not read as a run in which no join waited to its limit; a file without
+    `SHED_DEPTH` says so too (`unread: no shed_depth`), which stops reading 3's comparison
+    with `SHED_DEPTH`, and nothing more.
+  - *The floor run's scale is whole thousandths*, as `lactose-sim`'s `TimeScale` holds it: the
+    greatest below half the display's rate in ticks, `floor(1000 × rate / 2 × 0.999 ×
+    TICK_PERIOD)`, 499 at 60 Hz (0.499, not the plan's 0.4995), so its frames are two
+    thousandths slower than half the rate and sweep a refresh in about 8.3 s; TICK_PERIOD's
+    truncation to whole nanoseconds gives 998 at 120 Hz.
+  - *The display's rate is read on macOS alone*, by `tools/xtask/display/rate.swift`: every
+    active display, the main one marked, each with its mode's rate
+    (`CGDisplayModeGetRefreshRate`), its display link's nominal period and its screen's
+    greatest frames a second; the file takes the main display's mode unless it is zero, then
+    its link's, and lists the others. No floor run is made for either of two causes, which
+    `floor` names. Off macOS `lactose-rhi-vulkan` has no host clock to pair display times with
+    (`host_clock` is `None` there), so the swapchain reports none, and on Windows and Linux
+    the file prints "no floor: the swapchain reports no display times"; on macOS, where the
+    script fails, it prints "no floor: the display's rate is unread". The latch is then read
+    against no floor: a refresh fitted to the real-time run's display times is a multiple of
+    the refresh wherever the display is faster than that run's 60 Hz frames, so none is taken
+    from it. The refresh a swapchain reports (`VK_GOOGLE_display_timing`'s `refreshDuration`)
+    is not recorded: `lactose-rhi-api` does not expose it.
+  - *The grid test is D162's*: the display mode's refresh refined by a least-squares line
+    through the floor run's display times against their rounded indices, its period bounded to
+    five parts in 10,000 of the mode's; it holds where 99 in 100 of the display times lie
+    within a tenth of that period of one phase, and is refused where the free fit lands
+    outside the bound or more lie further. The free fit's refresh and its distance from the
+    mode's in parts per 10,000 are given beside it. The sweeps are the latches' phase against
+    the free fit, unwrapped, and a floor run that swept fewer than twice is made again
+    (`floor_again`) with its frames set from that fit.
+  - *Width is counted by thread, not by slot*: the job's thread from the job's start to
+    `draw`'s return and every other thread inside a recorder or a closure, merged per thread
+    and swept; the executor names no slot to a closure that does not ask.
+  - *Reading 1 counts the submits that began during a present's driver call*, each submit
+    stamped from its call to its return and each driver call from its start to its return, and
+    gives the count and those submits' figures beside it (`submit.began_during_driver`,
+    `submit.began_during`, and the others `submit.began_outside`). A submit that began before
+    a driver call and ran on into it meets the call by its own length, and on a serialising
+    driver it is the call that would wait, so it is the submit's own cost. It is counted on
+    every queue layout, as D162 reads it on every layout: on two queues a driver that
+    serialises its queues can make a submit wait too. On a shared queue the reading is a
+    defect to report where the P99 of the submits begun during a driver call is as long as the
+    driver call's. On two queues beginning during one is no wait by itself, a submit's cost
+    there being its own encoding, but those submits may have waited, and the reading is a
+    defect to report only where their P99 exceeds the P99 of the submits begun outside one by
+    more than the latter's spread from P50 to P99, the submit's own variation in the same run;
+    the excess is a figure (`submit.began_during.excess_p99_us`), written as under where it is
+    negative. A long submit begun outside a driver call is the submit's own cost and is
+    recorded, which under MoltenVK 1.4.2 is the driver's encoding inside `vkQueueSubmit2`
+    (review r3: none of 3,601 submits overlapped a present call).
+  - *A present call's parts sum to it*: its own waits (both timeline waits, the resize, and
+    the encoder's drop at the call's end, which waits for the present's submit and so for the
+    frame's GPU work and the blit), the acquire, the record (the encoder's creation and the
+    blit's recording), the driver's call (`Swapchain::present`: the wait for the image's
+    last-present fence, then the submit and the present under the queue's lock) and the rest.
+    The drop's wait has no bound; this lane times it and changes nothing of it (review r3's G6
+    is another lane's).
+  - *The lateness is read at its P99*, against D156's 50 µs and D144's 1 ms as criteria read
+    at P99 (review r3's S2), with the count of frames over the criterion a figure beside it,
+    and each lateness is split into the timer's wake (the deadline to `Shown::frame`'s call)
+    and the engine's start (that call to the first tick). The frame before a late one is
+    classed by what it deferred (`first`, `busy`, `waited`, `torn`, `nothing_joined`), or by
+    its return: `joined_at_limit` where its call returned at or after this frame's deadline
+    less `JOIN_MARGIN`, so that its join waited the whole margin, and `joined` where it
+    returned sooner. The lateness after a `joined_at_limit` frame is the `JOIN_MARGIN`
+    reading.
+  - *Reading 3 counts the presents not yet displayed*: `undisplayed`, each earlier present's
+    own display time against the call's start, is read against `SHED_DEPTH`; `waiting`, which
+    also counts presents displayed and not yet reported, is given beside it. A display report
+    earlier than its present's return (MoltenVK files a reading of its own clock for a
+    drawable with no presented time) is dropped by that order and counted; a present with no
+    report kept is counted missing, those dropped by that order and a run's last presents
+    among them, display times being read at the next call's start. A run with no display times
+    reads its latch phase as unread for that reason. The latch's median age at the display
+    depends on the latches' phase against the refresh, which the file gives (`latch_phase`).
+  - *What the file cannot read is said in its header*: whether the window was occluded,
+    `lactose-platform` forwarding none of winit's `WindowEvent::Occluded`, and whether another
+    client drew; and why a driver reports no display times: `lactose-rhi-vulkan` reads them
+    from `VK_GOOGLE_display_timing` alone, D162 admits `VK_EXT_present_timing` and
+    `VK_KHR_present_wait`'s completions only once a run shows they follow the display, and
+    KosmicKrisp offers neither of the first two. Reading the occlusion is owed by whichever
+    lane forwards `WindowEvent::Occluded` from `lactose-platform` (review r3's G10).
+  - *The minimised run is made on Windows alone*, the platform `MainThread::set_minimised` is
+    asked of before the first frame.
 
 **D163. `lactose-rhi-vulkan` without a window, and the Vulkan step of `cargo xtask gpu`** (§12.1, §20, §21, `lactose-rhi-vulkan`, `lactose-rhi-api`, `tools/xtask`, `crate-tiers.toml`)
 - Why: the milestone 2 plan's lane `vulkan`, under its decisions 5.7, 5.10, 5.12 and D158.
@@ -10533,3 +10766,74 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   runs in a recorded test; and section 22 records the exit and two readings of its criteria. Its two
   reviews (not checked in) found nothing blocking, 2 serious and 12 minor findings, all answered in
   the text applied.
+
+**D164. Criteria 4 and 5 of milestone 2 on the M1: the snapshot's fill sorts once and keeps its
+order, the cost scene presents 5,000 rows, and the remote upload is read on performance cores**
+(§2, §5.1, §5.3, §21, §22, `lactose-present-api`, `lactose-task`, `docs/plans/milestone-2.md`)
+- Why: lane `measure-m2`'s first runs on the M1 put both criteria over 1 ms, and their reviews
+  found one cause in the engine and one in the operating system. Extract's pass took a median of
+  1.72 ms on four workers, on the device and on null: 1.08 ms of it the snapshot's fill at 10,000
+  presented rows and 0.65 ms the ring at 50,000 dirty rows, 27 ns a row on one worker, inside
+  D21's 20 to 40. The remote upload's median was 0.39 ms in one run and 1.83 ms in the next with
+  the code unchanged.
+  - *A copy of the presented rows at every pass after a tick is D157's; the sorts are not.* D157
+    chose a whole state in three buffers and ruled out a snapshot of differences, so a pass that
+    follows a tick leaves its buffer whole. `present-impl`'s fill also builds a list of rows for
+    each column and sorts it, and sorts the keys again: 70 to 77% of its time at 10,000 rows in
+    the proposal's review, and little where the rows lie in key order, as in the scene of
+    verification row 192. The fill sorts the presented rows' places once, by key, and keeps the
+    sorted places for the next pass. A pass checks each place against its chunk's key as it copies
+    and sorts again only when a place no longer holds its key or the count of presented rows
+    changed. No public signature changes. The lane is `snapshot-order`.
+  - *A kept place is a hint, never a key.* It says where a row is, not what it holds: the columns
+    a row is copied from are read from its chunk at every pass, since a row can keep its chunk
+    and its row while its archetype changes. No byte of the snapshot depends on a place. The
+    buffer equals the one a fill that keeps nothing writes, and the lane's test holds that under
+    every layout mode SOUR runs. Section 8.2's rule on chunk and row indices stands.
+  - *The cost scene presents 5,000 rows, half of them moved, their keys interleaved across
+    chunks.* The count follows the diagnosis and not the figure: the fill that keeps its order
+    holds the criterion at 10,000 rows too, and the file prints its part there. 5,000 is criterion
+    5's count, the only count of presented rows a criterion of section 22 names, and of another
+    kind: a client's remote rows copy no transform. No document counts milestone 3's lights or
+    its characters, and its plan restates the count if its scene presents more. The layout is
+    stated because `present-impl`'s fill cost 2.6 times less where the keys lay in chunk order.
+  - *Criterion 4 keeps its 1 ms and its snapshot.* D162's join margin counts on the passes within
+    it, and the plan's decision 5.2 rules out a criterion read without the snapshot.
+  - *Criterion 5 is a cost, read on performance cores.* It is the share of a 144 Hz frame the
+    upload takes on the cores a frame's work runs on. The test's frame holds nothing else, 0.3 ms
+    of work every 6.9 ms, and macOS started it on an efficiency core at reduced clock in more than
+    half of a slow run's frames. The job took 0.32 to 0.34 ms on a performance core at full clock,
+    0.55 to 0.65 ms on one at reduced clock and 1.4 to 1.9 ms on an efficiency core at reduced
+    clock. The criterion reads the median of the frames whose job began and ended on a performance
+    core, at whatever clock, with their share of the run. The class is read from the system, so no
+    bound is chosen after the data; the time of a calibration chain cannot stand in for it, since
+    a performance core at reduced clock and an efficiency core read alike. The quiet window's run
+    is the one run. With under a tenth of its frames on performance cores it judges nothing.
+  - *The cost tests run in the foreground task role.* From a terminal a process has
+    `TASK_UNSPECIFIED`, where user-interactive QoS is clamped to priority 31 (verification row
+    78). `lactose-task` gives measurement two safe calls, the role and the class of the calling
+    thread's core, and section 21's entry says so. The lane is `measure-role`.
+  - *Section 2 says what the engine does, not what macOS grants.* "Frame-critical workers on
+    performance cores" was false of 804 to 1,106 of 1,440 jobs in the slow runs. The workers ask
+    by class, and where a frame's job starts is measured.
+  - *Where a frame runs is measured before the engine acts.* In a stand-in of the proposal's
+    review, plain threads and not the executor, a job in the foreground role after 3 ms of work
+    on three other threads began on a performance core in every frame of six runs; alone, or in
+    the unspecified role, it did not. A phase of `lactose-task`'s benchmark repeats the four cases
+    through the executor, in five interleaved rounds or more, before milestone 3 fixes a frame
+    budget on the M1 (verification).
+  - Rules out: criterion 4 read on the ring alone; a snapshot of differences, which D157 ruled out
+    and this keeps out; a row's columns kept beside its place; a run made again for where its
+    frames ran; a band whose bound is set after its data; a spin that holds the clock, which costs
+    a core at all times and did not hold the cores in the lane's review; the time-constraint
+    policy on the frame's workers, under which a thread that spins is demoted
+    (`docs/results/spike-wake-apple-m1-2026-10-06.md`); a work interval for the frame, which the
+    SDK gives to audio alone; a parallel workgroup before the placement rounds; a criterion
+    restated for the M1.
+- Driven by: lane `measure-m2`'s runs, and the three reports of their first review, `reviewer`'s,
+  `reviewer-concurrency`'s and `reviewer-gpu`'s; `docs/proposals/extract-and-upload-on-the-m1.md`
+  and the probes of its review; the owner's ruling.
+- Replaced: the 10,000 presented rows of `present-impl`'s cost test and that scene's key order
+  (verification row 192, the crate README's proof row "Cost"); in the plan's decision 5.3, the
+  median over all frames as the figure criterion 5 reads; section 2's "Frame-critical workers on
+  performance cores".

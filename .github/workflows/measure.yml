@@ -11,7 +11,8 @@ env:
   CARGO_TERM_COLOR: always
 
 # `cargo xtask measure --all --short` on the x86-64 platforms (docs/results/README.md), so the
-# command keeps working on the machines session B runs it on. A runner is shared and its
+# command keeps working on the machines session B runs it on; `--no-device` leaves out the
+# measurements on a Vulkan device, which a hosted runner does not have. A runner is shared and its
 # numbers mean nothing, so every result file is discarded except edit-to-playing's: criterion
 # 9 accepts a runner's figure, marked as one, for an operating system the owner's desktop does
 # not boot (docs/plans/milestone-1.md, section 4). The machine name marks the files.
@@ -38,7 +39,7 @@ jobs:
       - name: Build the CI driver
         run: cargo build --locked -p lactose-xtask
       - name: Every measurement, short
-        run: cargo xtask measure --all --short --out target/measure/results
+        run: cargo xtask measure --all --short --no-device --out target/measure/results
         env:
           LACTOSE_MEASURE_MACHINE: github-runner-${{ matrix.platform }}
       # Whatever the run got to, so a failure elsewhere still keeps a figure written.

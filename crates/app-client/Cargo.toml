@@ -48,8 +48,17 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-# Criterion 3(c)'s second stream, `PhysicsSnapshot::hash` (D145).
+# `remote-upload-5k`'s slots, and the interpolation buffer it samples.
+lactose-net-api.workspace = true
+lactose-net-host.workspace = true
+# Criterion 3(c)'s second stream, `PhysicsSnapshot::hash` (D145); the measurements'
+# transforms and `record-stall`'s bodies.
 lactose-physics-api.workspace = true
+# `record-stall`'s composed tick steps Rapier, on a solver pool sized as `lactose-app`'s.
+lactose-physics-rapier.workspace = true
+rayon.workspace = true
+# The components and resources of the measurements' scenes, declared in tests alone.
+lactose-reflect.workspace = true
 # The device criterion 3(c) and the null run step the render side on.
 lactose-rhi-null.workspace = true
 
