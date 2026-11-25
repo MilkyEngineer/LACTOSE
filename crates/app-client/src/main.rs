@@ -92,10 +92,14 @@ fn crash_dir() -> PathBuf {
 fn main() -> ExitCode {
     install_crash_hook("lactose-app-client", Some(crash_dir()));
     let Some(options) = parse(std::env::args().skip(1)) else {
-        install_log(false);
+        let _ = install_log(false);
         return usage();
     };
-    install_log(matches!(options.mode, Mode::Paced { stamps: Some(_), .. }));
+    let stamps = matches!(options.mode, Mode::Paced { stamps: Some(_), .. });
+    if !install_log(stamps) && stamps {
+        eprintln!("lactose-app-client: a log was installed before `install_log`: no recorders");
+        return ExitCode::FAILURE;
+    }
     match run(options) {
         Ok(outcome) => {
             println!("{outcome:?}");

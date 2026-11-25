@@ -12,8 +12,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use lactose_app::{
-    Cooked, PresentSide, RenderSide, Rendered, Server, Shown, ShownError, ShownKept, Start,
-    Stopped, TICK_PERIOD, Workers, WorldConfig, build_shown, start_executor,
+    Cooked, JOIN_MARGIN, PresentSide, RenderSide, Rendered, SHED_DEPTH, Server, Shown, ShownError,
+    ShownKept, Start, Stopped, TICK_PERIOD, Workers, WorldConfig, build_shown, start_executor,
 };
 use lactose_asset::{Store, pack_set};
 use lactose_core::{Error, ErrorKind, Result, ThreadClass, Tick};
@@ -458,6 +458,17 @@ fn run_on(
                 info("queues", format!("{:?}", device.capabilities().queues));
                 info("scale", scale.map_or(1000, |scale| scale.thousandths).to_string());
                 info("tick_period_ns", TICK_PERIOD.as_nanos().to_string());
+                info("join_margin_ns", JOIN_MARGIN.as_nanos().to_string());
+                info("shed_depth", SHED_DEPTH.to_string());
+                let recorders = stamps::recorders();
+                info("recorders", if recorders { "installed" } else { "absent" }.to_owned());
+                if !recorders {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "the stamps carry no recorder: `install_log` was not the process's \
+                         first subscriber, or was not asked for the recorders' layer"
+                    );
+                }
                 epoch
             });
             let root = paced(executor.clone(), main.clone(), shown, reports, frames, *seconds);
@@ -692,7 +703,9 @@ async fn paced(
         }
     }
     exit(&main);
-    stamps::stamp(Stamp::Stats(shown.stats()));
+    if stamps::on() {
+        stamps::stamp(Stamp::Stats(shown.stats()));
+    }
     let Stopped { server, render } = shown.stop().await?;
     Ok((Ended { server: Some(server), render: Some(render), error: None }, outcome))
 }

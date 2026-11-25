@@ -27,6 +27,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 /// Whether a run takes stamps.
 static ON: AtomicBool = AtomicBool::new(false);
+/// Whether [`install_log`] installed the recorders' layer.
+static RECORDERS: AtomicBool = AtomicBool::new(false);
 /// The stamps taken since [`start`].
 static STAMPS: Mutex<Vec<Stamp>> = Mutex::new(Vec::new());
 /// The next thread's number.
@@ -39,8 +41,8 @@ thread_local! {
     static ENTERED: RefCell<Vec<Instant>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Room for a minute's stamps at 60 frames a second and some forty stamps a frame, so a run
-/// of that length allocates while it takes none.
+/// Room for some four and a half minutes' stamps at 60 frames a second and the eight or so
+/// stamps a frame a run takes, so a run of that length allocates while it takes none.
 const ROOM: usize = 1 << 17;
 
 /// One stamp.
@@ -121,12 +123,18 @@ pub(crate) struct FrameStamp {
 pub(crate) struct PresentStamp {
     /// Its start.
     pub began: Instant,
-    /// The time of its own waits for its last read, and of the resize.
+    /// The time of its own waits: for its last read, the resize, and the encoder's drop,
+    /// which waits for the present's submit and so for the frame's GPU work and the blit.
     pub waits: Duration,
     /// The acquire's time.
     pub acquire: Duration,
-    /// The time of `Swapchain::present`: the driver's submit and present.
+    /// The time of the encoder's creation and the blit's recording.
+    pub record: Duration,
+    /// The time of `Swapchain::present`: the wait for the image's last-present fence, then
+    /// the driver's submit and present under the queue's lock.
     pub driver: Duration,
+    /// When `Swapchain::present` was called, `None` where the call made none.
+    pub driver_at: Option<Instant>,
     /// Its return.
     pub returned: Instant,
     /// The `waiting` it reported, `None` where it reported none or failed.
@@ -259,11 +267,13 @@ fn text(stamps: &[Stamp], epoch: Instant) -> String {
             }
             Stamp::Present(call) => writeln!(
                 out,
-                "present {} {} {} {} {} {} {} {} {} {}",
+                "present {} {} {} {} {} {} {} {} {} {} {} {}",
                 at(call.began),
                 call.waits.as_nanos(),
                 call.acquire.as_nanos(),
+                call.record.as_nanos(),
                 call.driver.as_nanos(),
+                or(call.driver_at.map(|driver| at(driver).to_string())),
                 at(call.returned),
                 or(call.waiting.map(|waiting| waiting.to_string())),
                 u8::from(call.source),
@@ -320,13 +330,22 @@ impl<S: Subscriber> Layer<S> for Recorders {
     }
 }
 
+/// Whether the recorders' layer of [`install_log`] is installed, which the stamps file
+/// records.
+pub(crate) fn recorders() -> bool {
+    RECORDERS.load(Ordering::Relaxed)
+}
+
 /// Installs the binary's log as the process's `tracing` subscriber: every event at `INFO` or
 /// above, formatted to stderr. With `stamps`, also the layer that stamps each recorder of
 /// `lactose-render-graph` from the entry to the exit of its pass's span, which the paced
 /// mode's stamps read; without it the subscriber has no such layer and the graph's spans cost
-/// what they cost with no subscriber that wants them. Called once, first in `main` after the
-/// crash hook; a second call leaves the first's subscriber in place.
-pub fn install_log(stamps: bool) {
+/// what they cost with no subscriber that wants them. Returns whether it installed the
+/// subscriber: it must be the process's first, since a subscriber already set is left in
+/// place, and a paced run that takes stamps then writes `info recorders absent` and carries
+/// no recorder. Called once, first in `main` after the crash hook.
+#[must_use]
+pub fn install_log(stamps: bool) -> bool {
     let log = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_filter(LevelFilter::INFO);
@@ -337,7 +356,11 @@ pub fn install_log(stamps: bool) {
                 && metadata.name() == "pass"
         }))
     });
-    let _ = tracing_subscriber::registry().with(log).with(recorders).try_init();
+    let installed = tracing_subscriber::registry().with(log).with(recorders).try_init().is_ok();
+    if installed {
+        RECORDERS.store(stamps, Ordering::Relaxed);
+    }
+    installed
 }
 
 #[cfg(test)]
@@ -346,9 +369,22 @@ mod tests {
 
     use lactose_app::{Rendered, ShownStats};
 
+    use tracing_subscriber::util::SubscriberInitExt;
+
     use super::{
-        FrameStamp, PresentStamp, Stamp, closure, now, on, stamp, start, taken, text, word,
+        FrameStamp, PresentStamp, Stamp, closure, install_log, now, on, recorders, stamp, start,
+        taken, text, word,
     };
+
+    /// A subscriber set before `install_log` is left in place: the call says so, and the
+    /// stamps then record no recorders' layer.
+    #[test]
+    fn a_subscriber_set_first_leaves_the_recorders_absent() {
+        assert!(!recorders());
+        tracing_subscriber::registry().try_init().expect("the first subscriber");
+        assert!(!install_log(true));
+        assert!(!recorders());
+    }
 
     /// The one test that sets the flag, so no other test of the process meets it set: unset,
     /// a site keeps nothing; set, a stamp of another thread is kept after one taken before it
@@ -395,7 +431,9 @@ mod tests {
                 began: ms(10),
                 waits: Duration::from_nanos(1),
                 acquire: Duration::from_nanos(2),
+                record: Duration::from_nanos(4),
                 driver: Duration::from_nanos(3),
+                driver_at: Some(ms(10)),
                 returned: ms(11),
                 waiting: None,
                 source: true,
@@ -418,7 +456,7 @@ mod tests {
                 "drew 6000000",
                 "closure recorder 1 5000000 6000000",
                 "submit 7000000 8000000 9000000 12",
-                "present 10000000 1 2 3 11000000 - 1 12 40 1",
+                "present 10000000 1 2 4 3 10000000 11000000 - 1 12 40 1",
                 "displayed 40 30000000",
                 "images 3",
                 "stats drawn=1 hidden=0 waited=0 busy=0 torn=0 queued=0 held=0 shed=0 shown=1 \
