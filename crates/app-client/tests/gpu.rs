@@ -11,26 +11,38 @@
 //! draw submission (section 2, "Draw submission"). Each way is recorded on a thread of the
 //! test's own, named `record`, from the encoder's first command to its last, and submitted from
 //! the test's thread, the two timed apart, since MoltenVK encodes Metal inside the submit. Its
-//! GPU time is read from two of `lactose-rhi-vulkan`'s timestamps around the render pass, the
-//! first in an encoder of its own submitted before the pass's and the second after the pass,
-//! the layout that crate's README gives as bracketing the work under both M1 drivers, by the
-//! graphics queue's valid bits; a queue that keeps none is said so, and the run gives host
-//! time alone.
+//! GPU time is read from two of `lactose-rhi-vulkan`'s timestamps, each in an encoder
+//! submitted alone on either side of the pass's submit and each submit waiting on the one
+//! before: the layout that crate's device test holds to a lagging render pass under both M1
+//! drivers. The pair reads the pass with the queue's handoffs between the three submits, which
+//! `clear`, the render pass with its clear alone and no draw, reads by itself. The figures are
+//! by the graphics queue's valid bits; a queue that keeps none is said so, and the run gives
+//! host time alone.
 //!
 //! The pipelines are made three ways on a device whose cache starts empty, each pipeline's
 //! creation timed with the driver's hit bits counted across the set (`PipelineStats`):
 //! source-cold, from the 96 entry pairs of a source the run writes and cooks with a
 //! link-time constant it salts, so that the SPIR-V and the MSL are new; specialisation-cold,
-//! from `shaders/measure/cost.slang` under a specialisation constant the test salts, which
-//! under MoltenVK leaves the MSL the same; and from a reloaded cache, the source-cold set made
-//! again on a second device whose cache starts from the first's bytes. The cooked salted
+//! from `shaders/measure/cost.slang` under a specialisation constant the test salts with 32
+//! bits of full entropy, used whole by both stages, which under MoltenVK leaves the MSL the
+//! same; and from a reloaded cache, the source-cold set made again on a second device whose
+//! cache starts from the first's bytes.
+//!
+//! *Cold* is cold in the Vulkan pipeline cache, which the hit bits show, and new to Metal's
+//! per-user shader cache below it, which nothing here can see: both M1 drivers hand Metal
+//! their code, and Metal keeps what it compiled across processes. Under MoltenVK the constant
+//! reaches Metal as a function constant over the same MSL; under KosmicKrisp it is folded
+//! into the code, so Metal's cache serves any value an earlier run compiled, and its hit bits
+//! read as misses either way. A salt is new to Metal's cache only as its values are unlikely
+//! to have been drawn before: 96 of 2^32 a run. The cooked salted
 //! source is the directory `LACTOSE_MEASURE_SALTED` names, which `cargo xtask measure`
 //! writes; under `cargo xtask gpu`, which sets none, the run is short, the source-cold set is
 //! skipped and said so, and the reloaded set is the specialised one.
 
 use std::path::{Path, PathBuf};
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::hash::{BuildHasher, Hasher};
+use std::time::{Duration, Instant};
 
 use lactose_rhi_api::{
     BufferDesc, BufferHandle, BufferReach, BufferState, BufferTransition, BufferUsage,
@@ -172,9 +184,20 @@ fn pipelines(
     } else {
         figure("source_cold.skipped", "no salted source: a run under `cargo xtask gpu`");
     }
-    // A salt of the clock's low bits, so that no earlier run made these values.
-    let salt = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    // A salt of 32 bits of full entropy, so that no earlier run is likely to have made these
+    // values: the empty hash of a `RandomState`, whose keys std draws from the system's
+    // random source. A clock's nanoseconds are microseconds on macOS, all multiples of 8.
+    let salt = {
+        let hash = std::collections::hash_map::RandomState::new().build_hasher().finish();
+        (hash ^ (hash >> 32)) as u32
+    };
     figure("specialisation_cold.salt", salt);
+    figure("specialisation_cold.salt_source", "the empty hash of a std `RandomState`");
+    figure(
+        "cold.means",
+        "missed by the Vulkan pipeline cache; Metal's per-user shader cache below it is not \
+         seen, and under KosmicKrisp its hits count as misses",
+    );
     let specialised = (0..PIPELINES)
         .map(|at| Stages {
             vertex: cooked(shaders, "measure/cost.vs_main"),
@@ -202,12 +225,14 @@ struct Scene {
     compacted: BufferHandle,
 }
 
-/// One way of drawing the ten thousand triangles.
+/// One way of drawing the ten thousand triangles, or the render pass with its clear alone,
+/// what the timestamps' layout reads around a pass that draws nothing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Way {
     Draws,
     MultiDraw,
     Compacted,
+    Clear,
 }
 
 impl Way {
@@ -216,6 +241,7 @@ impl Way {
             Self::Draws => "draws",
             Self::MultiDraw => "multi_draw",
             Self::Compacted => "compacted",
+            Self::Clear => "clear",
         }
     }
 }
@@ -335,13 +361,48 @@ fn submit_and_wait(device: &VulkanDevice, mut encoders: Vec<Box<dyn Encoder>>) -
     submitted
 }
 
-/// Records one way's render pass into a new encoder, the second timestamp after it.
-fn record(
+/// Submits the encoder of the first timestamp, `pass`'s and the second's, each alone and
+/// each waiting on the one before, the layout `lactose-rhi-vulkan`'s device test holds to a
+/// lagging render pass under both M1 drivers, and waits for the last within [`WAIT_BOUND`];
+/// returns how long the pass's submit call took, and the host's time from the first submit to
+/// the wait's end.
+fn bracketed(
     device: &VulkanDevice,
-    scene: &Scene,
-    stamps: &Timestamps,
-    way: Way,
-) -> (Box<dyn Encoder>, Duration) {
+    first: Box<dyn Encoder>,
+    pass: Box<dyn Encoder>,
+    last: Box<dyn Encoder>,
+) -> (Duration, Duration) {
+    let timeline = device.create_timeline(0).expect("a timeline");
+    let mut before = None;
+    let mut submitted = Duration::ZERO;
+    // Each encoder is held until the wait has seen the last signal.
+    let mut encoders = [[first], [pass], [last]];
+    let began = Instant::now();
+    for (value, encoder) in (1..).zip(&mut encoders) {
+        let point = TimelinePoint { timeline, value };
+        let waits: Vec<TimelinePoint> = before.into_iter().collect();
+        let start = Instant::now();
+        device
+            .submit(
+                QueueRole::Graphics,
+                Submit { encoders: encoder, waits: &waits, signals: &[point] },
+            )
+            .expect("the submit");
+        if value == 2 {
+            submitted = start.elapsed();
+        }
+        before = Some(point);
+    }
+    let last = before.expect("three submits");
+    let reached = device.wait_timeline(last, WAIT_BOUND).expect("the wait");
+    assert!(reached, "the submits did not complete within {WAIT_BOUND:?}");
+    let round_trip = began.elapsed();
+    device.destroy_timeline(timeline).expect("the timeline's destruction");
+    (submitted, round_trip)
+}
+
+/// Records one way's render pass into a new encoder.
+fn record(device: &VulkanDevice, scene: &Scene, way: Way) -> (Box<dyn Encoder>, Duration) {
     let mut encoder = device.create_encoder(QueueRole::Graphics, "gpu-cost").expect("an encoder");
     let start = Instant::now();
     let colour = [ColourAttachment {
@@ -372,9 +433,9 @@ fn record(
         Way::Compacted => {
             encoder.draw_indexed_indirect(scene.compacted, 0, 1, IndexedIndirectArgs::BYTES);
         }
+        Way::Clear => {}
     }
     encoder.end_pass();
-    stamps.write(&mut *encoder, 1).expect("the second timestamp");
     let recorded = start.elapsed();
     (encoder, recorded)
 }
@@ -399,8 +460,8 @@ fn written(stamps: &Timestamps) -> Vec<Option<u64>> {
     }
 }
 
-/// The three ways, each recorded on the `record` thread and submitted from this one, with the
-/// GPU time of its render pass.
+/// The three ways and the clear alone, each recorded on the `record` thread and submitted
+/// from this one, with the GPU time between timestamps on either side of its render pass.
 fn draws(device: &VulkanDevice, shaders: &Path) {
     let scene = scene(device, shaders);
     let stamps = device.create_timestamps(QueueRole::Graphics, 2).expect("the timestamps");
@@ -417,7 +478,7 @@ fn draws(device: &VulkanDevice, shaders: &Path) {
     let submit_thread = here.name().unwrap_or("unnamed").to_owned();
     let rounds = if short() { 3 } else { 50 };
     let multi = device.capabilities().multi_draw_indirect;
-    for way in [Way::Draws, Way::MultiDraw, Way::Compacted] {
+    for way in [Way::Draws, Way::MultiDraw, Way::Compacted, Way::Clear] {
         let prefix = way.name();
         if way == Way::MultiDraw && !multi {
             figure(&format!("{prefix}.skipped"), "the device reports no multi_draw_indirect");
@@ -425,6 +486,7 @@ fn draws(device: &VulkanDevice, shaders: &Path) {
         }
         let (mut recorded, mut submitted, mut gpu) = (Vec::new(), Vec::new(), Vec::new());
         let mut record_thread = None;
+        let mut past_host = 0_u32;
         // One round more than counted: the first is the pipeline's first use.
         for round in 0..=rounds {
             let ((encoder, record_time), thread) = std::thread::scope(|scope| {
@@ -432,18 +494,19 @@ fn draws(device: &VulkanDevice, shaders: &Path) {
                     .name("record".to_owned())
                     .spawn_scoped(scope, || {
                         let thread = std::thread::current().name().map(str::to_owned);
-                        (record(device, &scene, &stamps, way), thread)
+                        (record(device, &scene, way), thread)
                     })
                     .expect("the record thread")
                     .join()
                     .expect("the record thread's result")
             });
-            // The first timestamp in an encoder of its own before the pass's: the one layout
-            // seen to bracket the work under both M1 drivers (`lactose-rhi-vulkan`'s README).
             let mut first =
                 device.create_encoder(QueueRole::Graphics, "gpu-cost").expect("an encoder");
             stamps.write(&mut *first, 0).expect("the first timestamp");
-            let submit_time = submit_and_wait(device, vec![first, encoder]);
+            let mut last =
+                device.create_encoder(QueueRole::Graphics, "gpu-cost").expect("an encoder");
+            stamps.write(&mut *last, 1).expect("the second timestamp");
+            let (submit_time, round_trip) = bracketed(device, first, encoder, last);
             let read = written(&stamps);
             record_thread = thread;
             if round == 0 {
@@ -455,7 +518,9 @@ fn draws(device: &VulkanDevice, shaders: &Path) {
                 let (Some(start), Some(end)) = (read[0], read[1]) else {
                     unreachable!("`written` returned with a timestamp unwritten");
                 };
-                gpu.push(Duration::from_nanos(end.saturating_sub(start)));
+                let between = stamps.elapsed(start, end);
+                past_host += u32::from(between > round_trip);
+                gpu.push(between);
             }
         }
         figure(&format!("{prefix}.record_thread"), record_thread.as_deref().unwrap_or("unnamed"));
@@ -464,6 +529,9 @@ fn draws(device: &VulkanDevice, shaders: &Path) {
         spread(&format!("{prefix}.submit"), submitted);
         if !gpu.is_empty() {
             spread(&format!("{prefix}.gpu"), gpu);
+            // A pair that read more than the host's time from the first submit to the wait's
+            // end did not read this pass: the one bound a run can check of itself.
+            figure(&format!("{prefix}.gpu_past_host_rounds"), past_host);
         }
     }
     figure("draws.rounds", rounds);
