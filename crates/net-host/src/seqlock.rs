@@ -185,9 +185,16 @@ impl<M: Memory, const STATES: usize, const WORDS: usize> Slot<M, STATES, WORDS> 
 
     /// One consistent read, retried until no write overlapped it.
     pub(crate) fn read(&self) -> Snapshot<STATES, WORDS> {
+        self.read_counted().0
+    }
+
+    /// [`read`](Self::read), and how many times it was retried.
+    pub(crate) fn read_counted(&self) -> (Snapshot<STATES, WORDS>, u32) {
+        let mut retries = 0_u32;
         loop {
             let before = M::load_u32(&self.sequence, Acquire);
             if before & 1 == 1 {
+                retries = retries.saturating_add(1);
                 M::pause();
                 continue;
             }
@@ -203,8 +210,9 @@ impl<M: Memory, const STATES: usize, const WORDS: usize> Slot<M, STATES, WORDS> 
             }
             M::fence(Acquire);
             if M::load_u32(&self.sequence, Relaxed) == before {
-                return Snapshot { generation, count, states };
+                return (Snapshot { generation, count, states }, retries);
             }
+            retries = retries.saturating_add(1);
             M::pause();
         }
     }
@@ -321,5 +329,69 @@ mod tests {
         for site in ["M::fence(Release)", "M::fence(Acquire)", ",Release)", ",Acquire)"] {
             assert_eq!(code.matches(site).count(), 1, "`{site}` in seqlock.rs");
         }
+    }
+
+    std::thread_local! {
+        /// How many of this thread's next `Acquire` loads read an odd sequence.
+        static ODD: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    }
+
+    /// The standard atomics, with a reader's first load seeing a write in progress as many
+    /// times as [`ODD`] says.
+    struct Overlapped;
+
+    impl Memory for Overlapped {
+        type U32 = AtomicU32;
+        type U64 = AtomicU64;
+
+        fn new_u32(value: u32) -> AtomicU32 {
+            Native::new_u32(value)
+        }
+
+        fn new_u64(value: u64) -> AtomicU64 {
+            Native::new_u64(value)
+        }
+
+        fn load_u32(atomic: &AtomicU32, order: Ordering) -> u32 {
+            let value = Native::load_u32(atomic, order);
+            let odd = ODD.get();
+            if order == Acquire && odd > 0 {
+                ODD.set(odd - 1);
+                return value | 1;
+            }
+            value
+        }
+
+        fn store_u32(atomic: &AtomicU32, value: u32, order: Ordering) {
+            Native::store_u32(atomic, value, order);
+        }
+
+        fn load_u64(atomic: &AtomicU64, order: Ordering) -> u64 {
+            Native::load_u64(atomic, order)
+        }
+
+        fn store_u64(atomic: &AtomicU64, value: u64, order: Ordering) {
+            Native::store_u64(atomic, value, order);
+        }
+
+        fn fence(order: Ordering) {
+            Native::fence(order);
+        }
+
+        fn pause() {
+            Native::pause();
+        }
+    }
+
+    #[test]
+    fn a_read_counts_its_retries() {
+        let slot = Slot::<Overlapped, 2, 2>::new();
+        slot.reset(1);
+        slot.push([2 << 32, 7]);
+        let (clean, retries) = slot.read_counted();
+        assert_eq!((clean.count, retries), (1, 0));
+        ODD.set(3);
+        let (read, retries) = slot.read_counted();
+        assert_eq!((read, retries), (clean, 3));
     }
 }

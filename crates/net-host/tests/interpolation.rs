@@ -213,6 +213,11 @@ fn a_batch_is_the_sample_of_each_slot() {
         assert_eq!(batch[slots.len()..], [RemoteSample::MISSING; 2], "the tail is untouched");
     }
     assert_eq!(batch[4], RemoteSample::MISSING);
+    assert_eq!(reader.retried_reads(), 0, "no write overlapped a read on this thread");
+    assert!(
+        reader.bytes() >= 8 * STATES_PER_SLOT * 8 * 8,
+        "eight slots of eight states of eight words"
+    );
 }
 
 // ---- The sequence lock under contention ----
