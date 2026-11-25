@@ -606,6 +606,87 @@ fn weakened_a_run_whose_exits_are_relaxed() {
     the_references_at_resolution(Some(quiesce::Weakened::ExitRelaxed), Quiesce::leave);
 }
 
+/// A cancelled run: two jobs that may enter, each making a `Relaxed` write while registered,
+/// and shutdown's `close` on the main thread. Whoever finds the run quiet (the closer, the
+/// last job to exit, or a refused job) reads every job's write with nothing of its own to
+/// order the reads, and keeps the least it saw. After the joins, every job that entered must
+/// have been seen written: the jobs' writes happen before the resolution on the `Cancelled`
+/// path too, where `close` may be the resolver. `weakened` lowers the order of `close` or
+/// `exit`.
+fn the_writes_at_a_cancelled_resolution(weakened: Option<quiesce::Weakened>) {
+    bounded(THREE_THREAD_BOUND, move || {
+        let mut quiesce = Quiesce::new();
+        quiesce.weakened = weakened;
+        let jobs = Arc::new(quiesce);
+        let writes: Vec<_> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let entered: Vec<_> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        // What any resolver saw of each job's write: 0 unwritten, 1 written, 2 nobody looked.
+        let seen: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(2))).collect();
+        let resolve = |writes: &[Arc<AtomicBool>], seen: &[Arc<AtomicUsize>]| {
+            let looked: Vec<_> = writes.iter().map(|write| write.load(Ordering::Relaxed)).collect();
+            for (seen, looked) in seen.iter().zip(looked) {
+                seen.fetch_min(usize::from(looked), Ordering::SeqCst);
+            }
+        };
+        let workers: Vec<_> = (0..2)
+            .map(|job| {
+                let (jobs, writes, entered, seen) =
+                    (jobs.clone(), writes.clone(), entered.clone(), seen.clone());
+                thread::spawn(move || match jobs.enter() {
+                    Entry::Entered => {
+                        entered[job].store(true, Ordering::Relaxed);
+                        writes[job].store(true, Ordering::Relaxed);
+                        if jobs.exit() {
+                            resolve(&writes, &seen);
+                        }
+                    }
+                    Entry::Refused { quiet } => {
+                        if quiet {
+                            resolve(&writes, &seen);
+                        }
+                    }
+                })
+            })
+            .collect();
+        // Shutdown, on the calling thread.
+        if jobs.close() {
+            resolve(&writes, &seen);
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let seen: Vec<_> = seen.iter().map(|seen| seen.load(Ordering::SeqCst)).collect();
+        assert!(seen.iter().any(|&seen| seen != 2), "the cancelled run never resolved");
+        for (entered, seen) in entered.iter().zip(seen) {
+            if entered.load(Ordering::Relaxed) {
+                assert_eq!(seen, 1, "the resolution did not see a write of a job that entered");
+            }
+        }
+    });
+}
+
+/// When a cancelled run resolves, by its close or by its last job, every write its jobs
+/// made happens before the resolution.
+#[test]
+fn a_cancelled_run_resolves_after_its_jobs_writes() {
+    the_writes_at_a_cancelled_resolution(None);
+}
+
+/// `Quiesce::close` that releases and does not acquire: a close that finds the run quiet need
+/// not see what the jobs that left wrote.
+#[test]
+#[should_panic(expected = "the resolution did not see a write of a job that entered")]
+fn weakened_a_close_that_does_not_acquire() {
+    the_writes_at_a_cancelled_resolution(Some(quiesce::Weakened::CloseRelease));
+}
+
+/// `Quiesce::close` that is `Relaxed`.
+#[test]
+#[should_panic(expected = "the resolution did not see a write of a job that entered")]
+fn weakened_a_close_that_is_relaxed() {
+    the_writes_at_a_cancelled_resolution(Some(quiesce::Weakened::CloseRelaxed));
+}
+
 /// The pool as an idle worker's release sees it: `idle_one` really claims a sleeper.
 struct PoolWake {
     sleep: Arc<Sleep>,

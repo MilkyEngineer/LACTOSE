@@ -32,9 +32,9 @@ pub(crate) struct Quiesce {
     pub(crate) weakened: Option<Weakened>,
 }
 
-/// The weakened variants the references' model fails. Each lowers the order of
-/// [`Quiesce::exit`], which is what makes a job's writes, and its drop of what it held, happen
-/// before the resolution.
+/// The weakened variants the models of a run's resolution fail. Each lowers the order of
+/// [`Quiesce::exit`] or [`Quiesce::close`], which are what make a job's writes, and its drop of
+/// what it held, happen before the resolution.
 #[cfg(all(test, feature = "loom"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Weakened {
@@ -42,6 +42,10 @@ pub(crate) enum Weakened {
     ExitRelease,
     /// [`Quiesce::exit`] neither releases nor acquires.
     ExitRelaxed,
+    /// [`Quiesce::close`] releases and does not acquire.
+    CloseRelease,
+    /// [`Quiesce::close`] neither releases nor acquires.
+    CloseRelaxed,
 }
 
 impl Quiesce {
@@ -79,7 +83,7 @@ impl Quiesce {
         match self.weakened {
             Some(Weakened::ExitRelease) => return Ordering::Release,
             Some(Weakened::ExitRelaxed) => return Ordering::Relaxed,
-            None => {}
+            _ => {}
         }
         Ordering::SeqCst
     }
@@ -99,7 +103,19 @@ impl Quiesce {
     /// which case the caller resolves the future; otherwise the last job to leave does.
     #[must_use]
     pub(crate) fn close(&self) -> bool {
-        self.state.fetch_or(CLOSING, Ordering::SeqCst) == 0
+        self.state.fetch_or(CLOSING, self.close_order()) == 0
+    }
+
+    /// The order of [`Quiesce::close`]: a close that finds the run quiet resolves it, so it
+    /// acquires what every exit released.
+    fn close_order(&self) -> Ordering {
+        #[cfg(all(test, feature = "loom"))]
+        match self.weakened {
+            Some(Weakened::CloseRelease) => return Ordering::Release,
+            Some(Weakened::CloseRelaxed) => return Ordering::Relaxed,
+            _ => {}
+        }
+        Ordering::SeqCst
     }
 
     /// Whether the run is closing. A registered job reads this between units to stop early;

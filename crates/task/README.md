@@ -378,7 +378,8 @@ Correctness:
   and with them what is built on them: the opener's wait with its permit and the
   `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, the
   timer keeper's hand-off, the task kept by the worker that fires its timer, the
-  quiescence of a cancelled run (`src/quiesce.rs`), a finished run's jobs dropping their
+  quiescence of a cancelled run (`src/quiesce.rs`) and its jobs' writes before its
+  resolution, a finished run's jobs dropping their
   references to the graph before it resolves (`Quiesce::leave`), and a parking lane's wait
   under a call that takes its thread's unpark (`src/parking.rs`). The models call the
   shipped functions.
@@ -390,13 +391,16 @@ Correctness:
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
   Twelve models are explored exhaustively: two with three threads, the latch's and the
-  references', and ten with two. Four more are bounded: the sleep protocol's wake for every
-  push and the run's quiescence, each with three threads, at five preemptions; the idle
-  release, with three, at four; and the parking lane's, with two, at three
-  (`LOOM_MAX_PREEMPTIONS` overrides the bounds). The references' model checks that every
-  job's drop of its reference happens before the resolution, by a `Relaxed` store in the
-  drop that the waiting thread reads; it fails beside a copy of `Quiesce::leave` that leaves
-  before it drops, and beside a `Quiesce::exit` lowered to `Release` and to `Relaxed`.
+  references', and ten with two. Five more are bounded: the sleep protocol's wake for every
+  push, the run's quiescence and a cancelled run's writes, each with three threads, at five
+  preemptions; the idle release, with three, at four; and the parking lane's, with two, at
+  three (`LOOM_MAX_PREEMPTIONS` overrides the bounds). The references' model checks that
+  every job's drop of its reference happens before the resolution, by a `Relaxed` store in
+  the drop that the waiting thread reads; it fails beside a copy of `Quiesce::leave` that
+  leaves before it drops, and beside a `Quiesce::exit` lowered to `Release` and to
+  `Relaxed`. The cancelled run's model checks the same of the jobs' `Relaxed` writes when the
+  resolver may be shutdown's `Quiesce::close`, and fails beside a `close` lowered to
+  `Release` and to `Relaxed`.
   Eight more hold `run_job`: the completion slot against a dropped `JobRun`, exhaustively; a
   worker taking the job against shutdown beginning, at five preemptions; the width in three
   configurations with the sleep protocol, at two: a width of one, two workers beside a main
