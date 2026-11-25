@@ -9,10 +9,12 @@
 //! walker that a kernel moves one unit along x every tick, and one row in twenty of each
 //! half carries `Shown`, an `extracted` component, so 5,000 presented rows go to the snapshot
 //! beside the ring (D157). Their keys alternate between the two presented archetypes, so no
-//! chunk order is key order, and every chunk holds rows of every region (D164). Each frame is one tick, then `Simulation::run_passes` with
-//! extract alone in the pass stage, timed, then the publication, `Renderer::prepare` and an
-//! empty submit that signals the frame's timeline value, so the ring's regions come free; a
-//! wait for a free region, before the pass, is outside the time and reported.
+//! chunk order is key order (D164), and each presented archetype's rows sit in two of the
+//! sixteen regions (four at 10,000 presented rows). Each frame is one tick, then
+//! `Simulation::run_passes` with extract alone in the pass stage, timed, then the
+//! publication, `Renderer::prepare` and an empty submit that signals the frame's timeline
+//! value, so the ring's regions come free; a wait for a free region, before the pass, is
+//! outside the time and reported.
 //!
 //! The pass is timed three ways on N frame workers (N the performance cores up to eight):
 //! writing the ring and the snapshot, the figure criterion 4 holds to 1 ms on the device;

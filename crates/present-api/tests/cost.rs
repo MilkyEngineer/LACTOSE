@@ -61,9 +61,9 @@ fn region(n: u64) -> RegionId {
 /// A server world of `rows` instances in sixteen regions, row `n` in region `1 + n % 16`, the
 /// even rows walking one unit a tick, and `presented` of them carrying `Shown`: those at 1 and
 /// 2 modulo `2 * rows / presented`, so half the presented rows walk, and each presented
-/// archetype's chunks interleave their keys with the other's, every chunk holding rows of
-/// every region. A null sink
-/// and, if `snapshot`, a snapshot channel are installed.
+/// archetype's chunks interleave their keys with the other's. Each presented archetype's rows
+/// sit in `16 / gcd(2 * rows / presented, 16)` of the regions: two at 5,000 of 100,000, four
+/// at 10,000. A null sink and, if `snapshot`, a snapshot channel are installed.
 fn scene(rows: u64, presented: u64, snapshot: bool, workers: u32) -> (Rig, NullSink) {
     let period = 2 * rows / presented;
     assert!(period >= 3 && period * presented == 2 * rows, "{presented} of {rows} rows");

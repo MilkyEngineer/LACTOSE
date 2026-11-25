@@ -450,12 +450,12 @@ follows is the contract the renderer's sink implements, and a test's sink checks
   holds its key or the count of presented rows changed: after a presented row is spawned or
   despawned or changes archetype and so leaves its place, and under SOUR's layout modes,
   which permute rows at every sync point, at a pass after a permutation moved a presented
-  row (1,409 to 1,551 sorts over 1,682 passes, 1,553 of which wrote, in the unit tests). An archetype change
-  that keeps a row at its chunk and its row, and a move to another region, sort nothing: the
-  place still holds its key, and a region is a column of the chunk. A place is a hint
-  and never a key (architecture section 8.2): no byte of a snapshot depends on one, and the
-  columns a row is copied from are read from its chunk at every pass, since a row can keep
-  its chunk and its row while its archetype changes.
+  row (1,409 to 1,551 sorts over 1,682 passes, 1,553 of which wrote, in the unit tests). An
+  archetype change that keeps a row at its chunk and its row, and a move to another region,
+  sort nothing: the place still holds its key, and a region is a column of the chunk. A place
+  is a hint and never a key (architecture section 8.2): no byte of a snapshot depends on one,
+  and the columns a row is copied from are read from its chunk at every pass, since a row can
+  keep its chunk and its row while its archetype changes.
 
 *The triple buffer.*
 
