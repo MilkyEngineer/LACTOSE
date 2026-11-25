@@ -1190,29 +1190,29 @@ impl Swapchain for VulkanSwapchain {
             return Err(Rule::Bounds.refuse("a swapchain extent with a zero dimension"));
         }
         let pending = self.pending.clone();
-        if !self.wait_fences(&pending, deadline)? {
-            return Err(Rule::Pending.refuse("a resize while a present is pending past the bound"));
-        }
-        if !self.wait_queue(self.chain.unsignalled, deadline)? {
-            return Err(Rule::Pending.refuse(
+        let waited = self.wait_fences(&pending, deadline).and_then(|shown| {
+            if !shown {
+                return Ok(Some("a resize while a present is pending past the bound"));
+            }
+            let done = self.wait_queue(self.chain.unsignalled, deadline)?;
+            Ok((!done).then_some(
                 "a resize while the batch after a present the driver did not take is pending \
                  past the bound",
-            ));
+            ))
+        });
+        match waited {
+            Ok(None) => {}
+            Ok(Some(why)) => return Err(Rule::Pending.refuse(why)),
+            Err(error) => {
+                // A driver's error gives up the acquired image (`lactose-rhi-api`'s `resize`);
+                // where its batch fails too, its semaphore is left signalled for a later one.
+                let _left_signalled = self.give_up();
+                return Err(error);
+            }
         }
-        // The batches that wait for the acquire semaphores no batch had waited for hold the
-        // driver swapchain, which is retired below, as the drop's batches hold it; the
-        // semaphores stay the pool's. Where one fails, the resize is refused here, before
-        // the driver swapchain whose acquire signalled that semaphore is given up.
-        if let Some(seq) = self.spend()? {
-            let spent = Spent {
-                raw: Arc::clone(&self.shared.raw),
-                queue: self.queue,
-                seq,
-                semaphores: Vec::new(),
-                _owner: self.chain.owner.clone(),
-            };
-            lock(&self.shared.left).spent.push(spent);
-        }
+        // Where a batch fails, the resize is refused here, before the driver swapchain whose
+        // acquire signalled that semaphore is given up.
+        self.give_up()?;
         self.reap_left();
         self.make(extent)
     }
@@ -1234,6 +1234,24 @@ impl Swapchain for VulkanSwapchain {
 }
 
 impl VulkanSwapchain {
+    /// Gives up the acquired image (`spend`). The batches that wait for the acquire
+    /// semaphores no batch had waited for hold the driver swapchain, which a `resize` retires,
+    /// as the drop's batches hold it; the semaphores stay the pool's. The first failure, where
+    /// a batch failed and left its semaphore signalled.
+    fn give_up(&mut self) -> Result<()> {
+        if let Some(seq) = self.spend()? {
+            let spent = Spent {
+                raw: Arc::clone(&self.shared.raw),
+                queue: self.queue,
+                seq,
+                semaphores: Vec::new(),
+                _owner: self.chain.owner.clone(),
+            };
+            lock(&self.shared.left).spent.push(spent);
+        }
+        Ok(())
+    }
+
     /// The drop's wait, three bounds, for the presents' fences, which the presentation
     /// engine signals; then every acquire semaphore no batch has waited for is spent by an
     /// empty batch, which is not waited for. Whether the presents ended and each of those
@@ -1968,10 +1986,11 @@ mod tests {
     /// A present the driver did not take (out of host memory, injected) whose empty batch
     /// for the image's present semaphore fails too (injected, the present's own submit let
     /// through) leaves that semaphore to the submit that signals it, here behind released slow
-    /// work: a `resize` returns only once the present queue has reached that submit's stamp,
-    /// rather than destroy the semaphore under it (VUID-vkDestroySemaphore-semaphore-05149).
-    /// On the present role's own queue, where the device gives it one, and on the graphics
-    /// queue. The layer says nothing.
+    /// work: the chain keeps that submit's stamp, and a `resize`, retried while it is refused
+    /// `pending`, returns only once the present queue has reached the stamp, rather than
+    /// destroy the semaphore under it (VUID-vkDestroySemaphore-semaphore-05149). On the
+    /// present role's own queue, where the device gives it one, and on the graphics queue.
+    /// The layer says nothing.
     #[test]
     #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
     fn a_present_semaphore_whose_batch_failed_outlives_the_submit_that_signals_it() {
@@ -2001,8 +2020,25 @@ mod tests {
             let any: &dyn core::any::Any = &*encoders[0];
             let encoder = any.downcast_ref::<VulkanEncoder>().expect("a Vulkan encoder");
             let (_, stamp) = encoder.submitted.expect("the present's submit was stamped");
+            // The work may be done by now, on a fast device or a descheduled thread, and
+            // then neither the layer nor the queue's value tells the stamp was kept.
+            let unsignalled = swapchain.chain.unsignalled;
+            assert!(
+                unsignalled >= stamp,
+                "the chain's unsignalled {unsignalled} is short of the present's stamp {stamp}"
+            );
             let before = shared.settled().queues[swapchain.queue].known;
-            swapchain.resize(Extent { width: 96, height: 48 }).expect("the resize");
+            // Refused `pending` past the bound while the work runs, as on lavapipe's copies,
+            // the resize is retried, as `resize`'s contract tells its caller to.
+            let deadline = Instant::now() + BOUND * 10;
+            loop {
+                match swapchain.resize(Extent { width: 96, height: 48 }) {
+                    Err(error)
+                        if Rule::of(&error) == Some(Rule::Pending) && Instant::now() < deadline => {
+                    }
+                    done => break done.expect("the resize, retried ten bounds while pending"),
+                }
+            }
             let after = shared.settled().queues[swapchain.queue].known;
             eprintln!(
                 "{test}: shared {shares}: the present's stamp {stamp}, the present queue at \

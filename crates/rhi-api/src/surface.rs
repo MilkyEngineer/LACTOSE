@@ -155,9 +155,9 @@ pub trait Swapchain: Send {
     /// `ErrorKind::DeviceLost`; refused while a present is pending after that bound
     /// ([`Rule::Pending`](crate::Rule::Pending)), which the caller retries; refused for an
     /// extent with a zero dimension ([`Rule::Bounds`](crate::Rule::Bounds)). Both on every
-    /// backend. A driver's error (`ErrorKind::ResourceExhausted` among them) leaves the
-    /// swapchain either as it was, though an acquired image may have been given up and another
-    /// is then acquired, or stale until a later `resize`.
+    /// backend. A driver's error (`ErrorKind::ResourceExhausted` among them) has given up any
+    /// acquired image, and leaves the swapchain either as it was or stale until a later
+    /// `resize`.
     fn resize(&mut self, extent: Extent) -> Result<()>;
 
     /// The id of the last present taken ([`PresentId`]): read after a `present` returns

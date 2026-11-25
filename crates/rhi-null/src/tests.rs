@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use lactose_core::Result;
+use lactose_core::{ErrorKind, Result};
 use lactose_rhi_api::{
     Acquired, BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferState, BufferTransition,
     BufferUsage, Capabilities, ColourAttachment, ComputePass, ComputePipelineDesc, CookedShader,
@@ -799,4 +799,49 @@ fn frame_submits_complete_while_a_present_holds_its_queue() {
         drop(encoder);
         drop(swapchain);
     }
+}
+
+/// A `resize` the image table refuses part-way, its second image's insert failing, gives up
+/// the acquired image and leaves the swapchain as it was: its extent, a present of that image
+/// refused, and the next acquire taking an image of it. The image the resize made before the
+/// table filled is forgotten, so its slot takes one image again.
+#[test]
+fn a_resize_refused_by_a_full_image_table_gives_up_the_acquired_image() {
+    let device = device(QueueLayout::SEVERAL, true);
+    let (mut swapchain, image) = swapchain(&device);
+    let desc = ImageDesc {
+        label: "filler",
+        format: lactose_rhi_api::Format::Rgba8Unorm,
+        extent: Extent { width: 4, height: 4 },
+        mips: 1,
+        layers: 1,
+        usage: ImageUsage::SAMPLED,
+        memory: ImageMemory::Own,
+        sharing: Sharing::Exclusive,
+    };
+    let mut fillers = Vec::new();
+    let full = loop {
+        match device.create_image(&desc) {
+            Ok(filler) => fillers.push(filler),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(full.kind(), ErrorKind::ResourceExhausted, "{full}");
+    device.destroy_image(fillers.pop().expect("a filler")).expect("a filler destroyed");
+    let refused = swapchain.resize(Extent { width: 8, height: 8 }).expect_err("room for one");
+    assert_eq!(refused.kind(), ErrorKind::ResourceExhausted, "{refused}");
+    assert_eq!(swapchain.extent(), Extent { width: 4, height: 4 });
+    let mut encoders = [frame(&device, image)];
+    let given_up = present(&mut *swapchain, &mut encoders, image, &[]).expect_err("given up");
+    assert_eq!(Rule::of(&given_up), Some(Rule::Swapchain), "{given_up}");
+    let Acquired::Image(again) = swapchain.acquire().expect("an acquire") else {
+        panic!("no image after the refused resize")
+    };
+    fillers.push(device.create_image(&desc).expect("the slot the refused resize let go"));
+    assert!(device.create_image(&desc).is_err(), "the table holds one more than it did");
+    let mut encoders = [frame(&device, again)];
+    let shown = present(&mut *swapchain, &mut encoders, again, &[]).expect("a present");
+    assert_eq!(shown, Presented::Shown);
+    drop(encoders);
+    drop(swapchain);
 }
