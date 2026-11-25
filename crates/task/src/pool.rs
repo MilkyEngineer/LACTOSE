@@ -169,7 +169,7 @@ thread_local! {
 }
 
 /// Calls `f` with the calling thread's worker state, or `None` on any other thread.
-fn with_local<R>(f: impl FnOnce(Option<&WorkerLocal>) -> R) -> R {
+pub(crate) fn with_local<R>(f: impl FnOnce(Option<&WorkerLocal>) -> R) -> R {
     let mut f = Some(f);
     let on_worker = LOCAL.try_with(|cell| (f.take().expect("called once"))(cell.get()));
     match on_worker {
@@ -217,7 +217,18 @@ pub(crate) struct Pool {
     /// be.
     #[cfg(all(test, not(feature = "loom")))]
     parked_openers: core::sync::atomic::AtomicU32,
+    /// Called on a worker that holds a permit, after its check of the gate at the top of its
+    /// loop and before it looks for work, for the tests that close the gate in between.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) before_find: Mutex<Option<BeforeFind>>,
+    /// How many tasks a worker of this pool has put back unpolled ([`Shared::requeue_task`]).
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) tasks_put_back: core::sync::atomic::AtomicU32,
 }
+
+/// The hook [`Pool::before_find`] holds: the worker's index.
+#[cfg(all(test, not(feature = "loom")))]
+pub(crate) type BeforeFind = Arc<dyn Fn(usize) + Send + Sync>;
 
 impl Pool {
     /// A pool of one worker per stealer. Workers that `keep_timers`, the frame-critical
@@ -233,7 +244,29 @@ impl Pool {
             gate: Gate::new(workers),
             #[cfg(all(test, not(feature = "loom")))]
             parked_openers: core::sync::atomic::AtomicU32::new(0),
+            #[cfg(all(test, not(feature = "loom")))]
+            before_find: Mutex::new(None),
+            #[cfg(all(test, not(feature = "loom")))]
+            tasks_put_back: core::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// The run permits out and the gate's limit, `None` while it is open.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn permits(&self) -> (usize, Option<usize>) {
+        self.gate.permits()
+    }
+
+    /// Sets what a worker of this pool calls just before it parks ([`Gate::before_park`]).
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn set_before_park(&self, hook: Option<gate::BeforePark>) {
+        *lock(&self.gate.before_park) = hook;
+    }
+
+    /// Whether work waits in this pool's queue or on a worker's deque.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn work_queued(&self) -> bool {
+        self.work_visible()
     }
 
     pub(crate) fn workers(&self) -> usize {
@@ -598,6 +631,17 @@ impl Shared {
         self.discard_if_shut_down();
     }
 
+    /// Puts back a task a worker took while a `block_in_place` wanted it parked, behind the
+    /// tasks of its class that are queued. Nobody is woken: no permit came free, every
+    /// worker that holds one is awake and looks at the queue before it sleeps
+    /// (`gate::idle_park`), and the gate's opening wakes every worker.
+    fn requeue_task(&self, class: WorkerClass, task: Arc<dyn RawTask>) {
+        #[cfg(all(test, not(feature = "loom")))]
+        self.pool(class).tasks_put_back.fetch_add(1, Ordering::SeqCst);
+        self.pool(class).injector.push(Entry::Task(task));
+        self.discard_if_shut_down();
+    }
+
     /// Queues a child of a scope of a `run_job` job. `opener` is the scope's opener when the
     /// caller is another worker: it takes its children from this queue and is told.
     pub(crate) fn submit_wide_child(&self, entry: Entry, opener: Option<usize>) {
@@ -884,6 +928,13 @@ fn worker_loop(local: &WorkerLocal) {
             }
         }
         if permit {
+            #[cfg(all(test, not(feature = "loom")))]
+            {
+                let hook = lock(&pool.before_find).clone();
+                if let Some(hook) = hook {
+                    hook(local.index);
+                }
+            }
             if let Some(found) = find_work(local) {
                 scanning_since = None;
                 scans = 0;
@@ -1041,9 +1092,11 @@ fn execute(local: &WorkerLocal, arenas: &mut Arenas, entry: Entry, position: u64
         Entry::Child { scope, job, units } => {
             job::run_child(local, scope, job, units, &mut arenas.child);
         }
+        // A `block_in_place` wants this worker parked: the task goes back unpolled and the
+        // job unstarted, as the rest of a range does. A replay runs the jobs the log names;
+        // it names no task.
+        Entry::Task(task) if local.pool().over_limit() => shared.requeue_task(local.class, task),
         Entry::Task(task) => task.run(false),
-        // A `block_in_place` wants this worker parked: the job goes back unstarted, as the
-        // rest of a range does. A replay runs what the log names.
         Entry::Job(job) if shared.replay().is_none() && local.pool().over_limit() => {
             shared.requeue_job(job);
         }
@@ -1213,13 +1266,13 @@ mod tests {
     use core::sync::atomic::{AtomicBool, Ordering};
     use core::task::{Context, Poll, Waker};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use lactose_core::ErrorKind;
 
-    use super::{Arenas, Entry, Shared, Wide, execute, with_local};
+    use super::{Arenas, Entry, Shared, Wide, execute, fire_timers, with_local};
     use crate::job_run::{self, JobRun};
-    use crate::{Executor, GraphBuilder, GraphNode, JobContext, WorkerClass};
+    use crate::{Executor, GraphBuilder, GraphNode, JobContext, Task, WorkerClass};
 
     /// On the one frame-critical worker, while a `block_in_place` would want that worker
     /// parked, takes the job it queues out of the pool's queue, as a worker does that found
@@ -1309,6 +1362,172 @@ mod tests {
         let run = node.run.lock().unwrap().take().unwrap();
         executor.block_on(run).unwrap();
         assert!(node.started.load(Ordering::SeqCst));
+        executor.shutdown();
+    }
+
+    /// On the one frame-critical worker, while a `block_in_place` would want that worker
+    /// parked, takes a task woken after the gate closed out of the pool's queue, as a worker
+    /// does that passed its look at the gate just before the gate closed, and executes it.
+    struct PollAtAClosedGate {
+        executor: Executor,
+        polled: Arc<AtomicBool>,
+        task: Mutex<Option<Task<()>>>,
+        put_back: AtomicBool,
+    }
+
+    impl GraphNode for PollAtAClosedGate {
+        fn name(&self) -> &'static str {
+            "pool::tests::poll_at_a_closed_gate"
+        }
+
+        fn units(&self) -> u32 {
+            1
+        }
+
+        fn run(&self, _units: Range<u32>, _ctx: &mut JobContext<'_>) {
+            with_local(|local| {
+                let local = local.expect("a graph job runs on a worker");
+                let (shared, pool) = (&*local.shared, local.pool());
+                pool.gate.close(0, pool);
+                pool.gate.retake();
+                assert!(pool.over_limit());
+                let polled = self.polled.clone();
+                let task = self.executor.spawn(WorkerClass::FrameCritical, async move {
+                    polled.store(true, Ordering::SeqCst);
+                });
+                let entry = Wide::take(&shared.frame.injector).expect("the task is queued");
+                assert!(matches!(entry, Entry::Task(_)));
+                execute(local, &mut Arenas::default(), entry, 0);
+                // Back in the queue, unpolled.
+                let back = !self.polled.load(Ordering::SeqCst) && !shared.frame.injector.is_empty();
+                self.put_back.store(back, Ordering::SeqCst);
+                pool.gate.release(pool);
+                pool.gate.open(0, pool);
+                *self.task.lock().unwrap() = Some(task);
+            });
+        }
+    }
+
+    /// A worker that takes a task woken while a `block_in_place` wants it parked puts it back
+    /// unpolled, as it puts back a job and the rest of a range, and the task is polled once
+    /// the gate opens. A worker over the limit holds a permit the block has taken back: it
+    /// took it before the gate closed, and may finish what it was running, not start more.
+    #[test]
+    fn a_task_taken_at_a_closed_gate_is_put_back_unpolled() {
+        let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
+        let node = Arc::new(PollAtAClosedGate {
+            executor: executor.clone(),
+            polled: Arc::new(AtomicBool::new(false)),
+            task: Mutex::new(None),
+            put_back: AtomicBool::new(false),
+        });
+        let mut builder = GraphBuilder::new();
+        builder.add_node(node.clone());
+        executor.block_on(executor.run_graph(builder.build().unwrap())).unwrap();
+        assert!(node.put_back.load(Ordering::SeqCst), "the task was polled at a closed gate");
+        let task = node.task.lock().unwrap().take().unwrap();
+        executor.block_on(task).unwrap();
+        assert!(node.polled.load(Ordering::SeqCst));
+        executor.shutdown();
+    }
+
+    /// A task that parks on its first poll, leaving its waker in the slot, and finishes at
+    /// its second, counting its polls.
+    struct ParksOnce {
+        waker: Arc<Mutex<Option<Waker>>>,
+        polls: Arc<core::sync::atomic::AtomicU32>,
+    }
+
+    impl Future for ParksOnce {
+        type Output = ();
+
+        fn poll(self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Poll::Ready(())
+        }
+    }
+
+    /// On the one frame-critical worker, while a `block_in_place` would want that worker
+    /// parked: a timer falls due, the worker fires it on its way to its next job and keeps
+    /// the task it wakes on its own deque, as `find_work` does, then takes that task from its
+    /// deque and executes it.
+    struct KeepAtAClosedGate {
+        waker: Arc<Mutex<Option<Waker>>>,
+        polls: Arc<core::sync::atomic::AtomicU32>,
+        /// Whether the timer's task was kept, and then put back on the pool's queue unpolled.
+        seen: Mutex<Option<(bool, bool)>>,
+    }
+
+    impl GraphNode for KeepAtAClosedGate {
+        fn name(&self) -> &'static str {
+            "pool::tests::keep_at_a_closed_gate"
+        }
+
+        fn units(&self) -> u32 {
+            1
+        }
+
+        fn run(&self, _units: Range<u32>, _ctx: &mut JobContext<'_>) {
+            with_local(|local| {
+                let local = local.expect("a graph job runs on a worker");
+                let (shared, pool) = (&*local.shared, local.pool());
+                let waker = self.waker.lock().unwrap().take().expect("the task parked");
+                let deadline = Instant::now() + Duration::from_millis(1);
+                // This worker is the one to keep the timer, and is awake: no wake is owed.
+                let _rearm = shared.timers.register(deadline, &mut None, &waker);
+                while Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                pool.gate.close(0, pool);
+                pool.gate.retake();
+                assert!(pool.over_limit());
+                let kept = fire_timers(local);
+                let entry = local.deque.pop().expect("the timer's task is on this worker's deque");
+                assert!(matches!(entry, Entry::Task(_)));
+                execute(local, &mut Arenas::default(), entry, 0);
+                let back = self.polls.load(Ordering::SeqCst) == 1
+                    && local.deque.is_empty()
+                    && !shared.frame.injector.is_empty();
+                *self.seen.lock().unwrap() = Some((kept, back));
+                pool.gate.release(pool);
+                pool.gate.open(0, pool);
+            });
+        }
+    }
+
+    /// A task its timer wakes for a worker that fires it on its way to its next job while a
+    /// `block_in_place` wants that worker parked is kept on the worker's deque, as it is with
+    /// the gate open; taken from there, it goes back unpolled to the pool's queue, not to the
+    /// deque, and is polled once the gate opens. Locality is moot for a worker on its way to
+    /// the gate, and the queue is where every worker the gate lets run looks.
+    #[test]
+    fn a_task_kept_from_its_timer_at_a_closed_gate_goes_back_to_the_queue() {
+        let executor = Executor::builder().frame_workers(1).background_workers(1).build().unwrap();
+        let node = Arc::new(KeepAtAClosedGate {
+            waker: Arc::default(),
+            polls: Arc::default(),
+            seen: Mutex::new(None),
+        });
+        let task = executor.spawn(
+            WorkerClass::FrameCritical,
+            ParksOnce { waker: node.waker.clone(), polls: node.polls.clone() },
+        );
+        let begun = Instant::now();
+        while node.waker.lock().unwrap().is_none() {
+            assert!(begun.elapsed() < LIMIT, "the task never parked");
+            std::thread::yield_now();
+        }
+        let mut builder = GraphBuilder::new();
+        builder.add_node(node.clone());
+        executor.block_on(executor.run_graph(builder.build().unwrap())).unwrap();
+        let (kept, back) = node.seen.lock().unwrap().take().unwrap();
+        assert!(kept, "the firing worker did not keep the timer's task");
+        assert!(back, "the kept task was polled at a closed gate, or not put back on the queue");
+        executor.block_on(task).unwrap();
+        assert_eq!(node.polls.load(Ordering::SeqCst), 2);
         executor.shutdown();
     }
 

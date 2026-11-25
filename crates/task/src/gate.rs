@@ -39,7 +39,17 @@ pub(crate) struct Gate {
     /// their own deque. Only they can be sure to run those children, so a freed permit must
     /// reach them. Uses the sleep protocol's announce, re-check, park discipline.
     openers: Sleep,
+    /// Called by [`idle_park`] on a worker that has looked round and is about to park, with
+    /// what it saw: the window between a worker's check of the gate and its sleep, where the
+    /// tests of a task woken at a closed gate land a wake or the gate's opening. Each pool
+    /// has its own, so a test that sets it reaches no other test's executor.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) before_park: std::sync::Mutex<Option<BeforePark>>,
 }
+
+/// The hook [`Gate::before_park`] holds: the worker's index and what its look saw.
+#[cfg(all(test, not(feature = "loom")))]
+pub(crate) type BeforePark = std::sync::Arc<dyn Fn(usize, Look) + Send + Sync>;
 
 impl Gate {
     pub(crate) fn new(workers: usize) -> Self {
@@ -48,7 +58,16 @@ impl Gate {
             allowed: AtomicUsize::new(OPEN),
             reservations: Mutex::new(Vec::new()),
             openers: Sleep::new(workers),
+            #[cfg(all(test, not(feature = "loom")))]
+            before_park: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The permits out and the limit, `None` while the gate is open.
+    #[cfg(all(test, not(feature = "loom")))]
+    pub(crate) fn permits(&self) -> (usize, Option<usize>) {
+        let allowed = self.allowed.load(Ordering::SeqCst);
+        (self.running.load(Ordering::SeqCst), (allowed != OPEN).then_some(allowed))
     }
 
     fn closed(&self) -> bool {
@@ -210,6 +229,14 @@ pub(crate) fn idle_park(
     if stay_awake {
         sleep.cancel(worker);
     } else {
+        #[cfg(all(test, not(feature = "loom")))]
+        {
+            // Cloned out first: the hook may wait, and another worker may be looking too.
+            let hook = gate.before_park.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
+            if let Some(hook) = hook {
+                hook(worker, seen);
+            }
+        }
         sleep.park(worker, deadline);
     }
 }

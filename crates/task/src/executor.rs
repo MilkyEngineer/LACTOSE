@@ -376,6 +376,9 @@ impl ExecutorBuilder {
 }
 
 #[cfg(all(test, not(feature = "loom")))]
+mod gate_tests;
+
+#[cfg(all(test, not(feature = "loom")))]
 mod job_tests;
 
 #[cfg(all(test, not(feature = "loom")))]
