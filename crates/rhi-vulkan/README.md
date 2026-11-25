@@ -366,34 +366,38 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   queue, a drop behind a graphics submit held there by a host point on the acquired image, which
   neither waits for it nor leaks the device, a second swapchain made at once that presents once the
   point is signalled; a `resize` whose `vkCreateSwapchainKHR` or image fails, stale until a later
-  `resize`; a present refused with nothing enqueued, out of memory and an unlisted error, stale
-  until a `resize`, the unlisted error's fence and semaphore destroyed and the layer silent, and
-  after such a present, behind released slow work, a drop that hands the semaphores over with a
-  stamp at or past the batch that waits for the present semaphore, as a test-only record of the
-  stamp shows whether or not the batch has completed, the layer silent; an acquire semaphore whose
-  batches failed out of host memory, injected (`submit::FAILING`), left signalled and waited for by
-  the image's next present, after a present whose submit and empty batch both failed, and by the
-  next `resize`, after a `resize` refused for its empty batch with its driver swapchain kept, the
-  layer silent; a drop whose empty batch for an acquire fails, which leaks the device and refuses a
-  second swapchain, the layer silent; a present the driver did not take whose empty batch for the
-  present semaphore fails too, the present's own submit behind released slow work, on the present
-  role's own queue and on the graphics queue, the chain's stamp that submit's, and a `resize`,
-  retried while refused `pending`, that returns only once that submit is complete rather than
-  destroy the semaphore under it, the layer silent; the encoders of a present whose submit and empty
-  batch both failed dropped at once, with no later batch of the queue, where each waited until the
-  next present; a graphics submit held by a host point that writes the acquired image, submitted
-  once the host has seen a batch that waits for the image's acquire complete, pending across a
-  `resize` and across the drop with a second swapchain made, the image's object and its driver
-  swapchain kept until the submit is known complete and let go after, with no message; on the device
-  whose present role the graphics queue serves, an acquired image given up by `resize` and by the
-  drop behind a held submit that names no image, the driver swapchain kept by the count handed over
-  with the batch's stamp alone until the point is signalled, and let go after; a frame submit
-  pending on an acquired image, after the host has seen its acquire waited for, held by a host
-  point, at a `resize`, its encoder dropped while a panic unwinds, the replaced driver swapchain
-  kept until the point is signalled, and the layer silent; and frames presented beside a frame
-  thread whose submit each present's walk finds stamped and not yet received, each undecided at
-  least once (a test-only count). With no driver: the zero extent's decision, the images' usage with
-  and without copies, and the display-time report's widening, watermark, order and read guard.
+  `resize`; a `resize` whose wait for a shown present's fence fails out of host memory, injected,
+  which gives the acquired image up and leaves the swapchain as it was, not stale, the image's
+  acquire semaphore waited for by the give-up's empty batch or, where that batch fails too, by a
+  later `resize`, on the present role's own queue and on the graphics queue, the layer silent; a
+  present refused with nothing enqueued, out of memory and an unlisted error, stale until a
+  `resize`, the unlisted error's fence and semaphore destroyed and the layer silent, and after such
+  a present, behind released slow work, a drop that hands the semaphores over with a stamp at or
+  past the batch that waits for the present semaphore, as a test-only record of the stamp shows
+  whether or not the batch has completed, the layer silent; an acquire semaphore whose batches
+  failed out of host memory, injected (`submit::FAILING`), left signalled and waited for by the
+  image's next present, after a present whose submit and empty batch both failed, and by the next
+  `resize`, after a `resize` refused for its empty batch with its driver swapchain kept, the layer
+  silent; a drop whose empty batch for an acquire fails, which leaks the device and refuses a second
+  swapchain, the layer silent; a present the driver did not take whose empty batch for the present
+  semaphore fails too, the present's own submit behind released slow work, on the present role's own
+  queue and on the graphics queue, the chain's stamp that submit's, and a `resize`, retried while
+  refused `pending`, that returns only once that submit is complete rather than destroy the
+  semaphore under it, the layer silent; the encoders of a present whose submit and empty batch both
+  failed dropped at once, with no later batch of the queue, where each waited until the next
+  present; a graphics submit held by a host point that writes the acquired image, submitted once the
+  host has seen a batch that waits for the image's acquire complete, pending across a `resize` and
+  across the drop with a second swapchain made, the image's object and its driver swapchain kept
+  until the submit is known complete and let go after, with no message; on the device whose present
+  role the graphics queue serves, an acquired image given up by `resize` and by the drop behind a
+  held submit that names no image, the driver swapchain kept by the count handed over with the
+  batch's stamp alone until the point is signalled, and let go after; a frame submit pending on an
+  acquired image, after the host has seen its acquire waited for, held by a host point, at a
+  `resize`, its encoder dropped while a panic unwinds, the replaced driver swapchain kept until the
+  point is signalled, and the layer silent; and frames presented beside a frame thread whose submit
+  each present's walk finds stamped and not yet received, each undecided at least once (a test-only
+  count). With no driver: the zero extent's decision, the images' usage with and without copies, and
+  the display-time report's widening, watermark, order and read guard.
 - On a window, in `lactose-platform`'s `tests/window.rs` (`tests/swapchain.rs` there), run on
   the M1 under MoltenVK, with Metal API and shader validation, and under KosmicKrisp, each
   with the layer: 131 frames across a resize to half the window and a rebuild right after a

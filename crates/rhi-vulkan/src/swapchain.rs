@@ -224,6 +224,9 @@ enum Fail {
     /// engine refused the present with nothing enqueued: its fence never signals, and its
     /// semaphore stays signalled.
     Present(vk::Result),
+    /// `vkWaitForFences` is not called and answers this error, as if the driver ran out of
+    /// memory waiting for the presents.
+    Wait(vk::Result),
 }
 
 /// The walks a present left undecided, counted for the threaded test that shows another
@@ -659,6 +662,10 @@ impl VulkanSwapchain {
     /// MoltenVK 1.4.2's present with no command buffer, whose waits and fence go nowhere; its
     /// drawable timeout, the same error, still signals the fence, which is reaped as usual.
     fn wait_fences(&mut self, fences: &[vk::Fence], deadline: Instant) -> Result<bool> {
+        #[cfg(test)]
+        if let Some(Fail::Wait(error)) = self.fail {
+            return Err(self.failed(error, "vkWaitForFences"));
+        }
         let fences: Vec<vk::Fence> =
             fences.iter().copied().filter(|fence| self.pending.contains(fence)).collect();
         if fences.is_empty() {
@@ -2053,6 +2060,75 @@ mod tests {
             let heard = breaches(&kept);
             assert_eq!(heard, Vec::<String>::new(), "on the graphics queue: {on_graphics}");
             assert!(after >= stamp, "the resize returned with the present's submit pending");
+        }
+    }
+
+    /// A `resize` whose wait for its presents' fences fails with a driver's error (out of host
+    /// memory, injected), one present shown and the next image acquired, gives the acquired
+    /// image up, with an empty batch for its acquire semaphore, and leaves the swapchain as it
+    /// was: not stale, its extent and images kept (`lactose-rhi-api`'s `resize`). Where that
+    /// batch fails too (injected), the semaphore stays signalled until the next `resize` waits
+    /// for it. A present of the given-up image is refused, the next acquire and present work,
+    /// and a later `resize` leaves no semaphore signalled. On the present role's own queue,
+    /// where the device gives it one, and on the graphics queue. The layer says nothing.
+    #[test]
+    #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+    fn a_resize_whose_wait_fails_gives_up_the_acquired_image() {
+        let test = "a_resize_whose_wait_fails_gives_up_the_acquired_image";
+        let wider = Extent { width: 96, height: 48 };
+        let signalled_of = |swapchain: &VulkanSwapchain| {
+            swapchain.pool.iter().filter(|entry| entry.1 == Use::Signalled).count()
+        };
+        for (on_graphics, failing) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+            let kept = Arc::new(Kept::default());
+            crate::raw::PRESENT_ON_GRAPHICS.set(on_graphics);
+            let made = device(&kept, test);
+            crate::raw::PRESENT_ON_GRAPHICS.set(false);
+            let Some(device) = made else { return };
+            let shared = Arc::clone(device.shared());
+            let shares = shared.queue_of(P) == shared.queue_of(G);
+            assert!(shares || !on_graphics, "the present role has its own queue");
+            let case = format!("shared {shares}, the give-up's batch failing {failing}");
+            let mut swapchain = VulkanSwapchain::new(&shared, SMALL).expect("a swapchain");
+            let first = image(&mut swapchain);
+            let mut shown = [presentable(&device, first)];
+            let submit = Submit { encoders: &mut shown, waits: &[], signals: &[] };
+            assert_eq!(swapchain.present(first, submit).expect("the present"), Presented::Shown);
+            let second = image(&mut swapchain);
+            let (extent, count) = (swapchain.extent(), swapchain.image_count());
+            swapchain.fail = Some(Fail::Wait(vk::Result::ERROR_OUT_OF_HOST_MEMORY));
+            FAILING.set(failing);
+            let refused = swapchain.resize(wider).expect_err("the injected wait failure");
+            swapchain.fail = None;
+            let left = FAILING.get();
+            FAILING.set(0);
+            assert_eq!(refused.kind(), ErrorKind::ResourceExhausted, "{case}: {refused}");
+            assert!(swapchain.held.is_none(), "{case}: the acquired image was kept");
+            assert_eq!(left, 0, "{case}: the give-up made no batch");
+            assert!(!swapchain.stale, "{case}: stale after a failed wait");
+            assert_eq!((swapchain.extent(), swapchain.image_count()), (extent, count), "{case}");
+            let signalled = signalled_of(&swapchain);
+            assert_eq!(signalled, usize::from(failing > 0), "{case}: semaphores left signalled");
+            let none = Submit { encoders: &mut [], waits: &[], signals: &[] };
+            let again = swapchain.present(second, none).expect_err("a present of the given-up");
+            assert_eq!(again.kind(), ErrorKind::InvalidData, "{case}: {again}");
+            let third = image(&mut swapchain);
+            let mut encoders = [presentable(&device, third)];
+            let submit = Submit { encoders: &mut encoders, waits: &[], signals: &[] };
+            assert_eq!(swapchain.present(third, submit).expect("a present"), Presented::Shown);
+            swapchain.resize(wider).expect("the later resize");
+            assert_eq!(signalled_of(&swapchain), 0, "{case}: signalled after the later resize");
+            let fourth = image(&mut swapchain);
+            let mut last = [presentable(&device, fourth)];
+            let submit = Submit { encoders: &mut last, waits: &[], signals: &[] };
+            assert_eq!(swapchain.present(fourth, submit).expect("a present"), Presented::Shown);
+            drop(swapchain);
+            drop(shown);
+            drop(encoders);
+            drop(last);
+            drop(shared);
+            drop(device);
+            assert_eq!(breaches(&kept), Vec::<String>::new(), "{case}");
         }
     }
 
