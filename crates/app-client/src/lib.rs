@@ -17,6 +17,7 @@ pub mod reference;
 mod render;
 mod run;
 mod shaders;
+mod stamps;
 
 pub use game::{Frames, GAME, InMemory, REGION};
 pub use present::{ClientPresent, HEAP};
@@ -26,3 +27,4 @@ pub use run::{
     Wired, run, wire,
 };
 pub use shaders::{CookedShaders, PipelineCache};
+pub use stamps::install_log;

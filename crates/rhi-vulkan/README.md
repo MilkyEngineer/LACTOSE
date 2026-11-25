@@ -26,6 +26,8 @@ leaves to the backend.
 |---|---|
 | `VulkanDevice::new(DeviceRequest)` | A device on the adapter whose name contains the request's `adapter`, or on the loader's first; its sink takes every warning and error of the validation layer, the loader and the driver through the debug messenger; its pipeline cache starts from the request's bytes, empty, loaded or rejected; with the request's `surface`, a surface of that window and the present queue |
 | `VulkanDevice::headless(DeviceRequest)` | As `new`, presenting to a surface no window shows (`VK_EXT_headless_surface`), for tests that need a swapchain; `InvalidData` for a request that names a window, the caller's error, and `Unsupported` on a driver with no headless surface |
+| `VulkanDevice::create_timestamps(QueueRole, u32)` | A pool of that many GPU timestamps for the role's encoders, reset on the host ("Timestamps"); `Unsupported` where the device offers no `hostQueryReset` |
+| `Timestamps::write(&mut dyn Encoder, u32)`, `Timestamps::read()`, `Timestamps::valid_bits()` | One timestamp's write into an encoder of the role, outside any pass; each timestamp's nanoseconds once its write has completed; the bits the role's queue keeps |
 
 `VulkanDevice` is a `Device`; its encoders are `Box<dyn Encoder>`.
 
@@ -284,6 +286,37 @@ images are colour attachments and nothing else, and nothing that ships turns it 
   median 2 to 3 ms after it was shown, at most 35 ms. A replaced swapchain's history is
   drained before it is destroyed, and none of the runs' replaced swapchains, two in each,
   lost a report; a report that arrives after the drain would be lost.
+
+## Timestamps
+
+A pass's GPU time is a cost, and a cost changes no signature of `lactose-rhi-api` (the milestone
+2 plan's decision on the native Metal spike), so the timestamps `cargo xtask measure gpu-cost`
+reads are this backend's own, an addition to the surface D163 gives the crate (D162's
+`measure-m2` addendum).
+`create_timestamps` makes a query pool of `VK_QUERY_TYPE_TIMESTAMP` for one queue role and
+resets it on the host (`hostQueryReset`, which the device turns on where it is offered), so that
+every timestamp may be read from its making. `write` takes the role's encoder as a `dyn Encoder`
+and records, outside any pass, a reset of the one timestamp and its write at `ALL_COMMANDS`: by
+the specification, once every command before it in the queue's order has completed. Both M1
+drivers may latch it instead at a boundary of a Metal pass near the write. MoltenVK writes it as
+a Metal pass of its own: with the first in an encoder of its own and the second in a render
+pass's encoder after the pass, in one submit or with the first in a submit of its own, it latched
+the second at a quarter point of a 21 ms pass in some rounds (0.24 or 0.75 of the host's time).
+KosmicKrisp read that pass in every layout tried, and around a dispatch it read under 0.12 ms
+with both writes in the dispatch's encoder. The layout the device test holds to a lagging
+dispatch and to 16 rounds of a lagging render pass under both drivers, each within 0.9 of the
+least host time less 2 ms, is each write in an encoder submitted alone, the work's submit between
+them, each submit waiting on the one before. The pair then reads the work with the queue's
+handoffs between the three submits, about 0.4 ms under MoltenVK and 0.7 ms under KosmicKrisp
+around an empty pass on the M1, and `gpu-cost` writes its pair that way and reads a pass with its
+clear alone as well. The encoder holds the pool until its submit has completed or, unwinding with
+it pending, leaks it with the device. `read` asks the driver for every timestamp with its
+availability and waits for nothing: a timestamp is `None` until its write has completed and the
+driver has made it available, which MoltenVK does in the command buffer's completion handler, up
+to a couple of milliseconds after a wait saw the submit's signal on the M1, so a reader polls.
+Each is masked to the role's queue's `timestampValidBits` and scaled by `timestampPeriod`; on a
+queue that keeps none, `write` records nothing and `read` gives `None`, which a caller reports
+as host time alone.
 
 ## Locks
 
