@@ -565,7 +565,7 @@ standard error as it comes.
   test's whole output. A test that prints no figure, a figure line that does not read, or a
   figure named twice fails its measurement. nextest runs it with `--retries 0`, so that no
   failed attempt's output or time is read.
-- A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`) runs under the driver
+- A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`, `gpu-cost`) runs under the driver
   `--driver` names, `moltenvk` by default on macOS and `system` elsewhere, on the adapter
   `--adapter` names or the loader's first, with no layer: the inherited variables `gpu`
   clears are cleared, every implicit layer is disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~`)
@@ -581,7 +581,21 @@ standard error as it comes.
   its file name. Where `vulkaninfo` fails the rows say why and the run goes on. A test that
   hears a message from the device fails. `--no-device` leaves them out of `--all` and refuses
   one named; the `measure` workflow passes it, since its runners have no device. `cargo xtask
-  gpu` runs them too, short, under its validators.
+  gpu` runs them too, short, under its validators. With no `--driver`, `gpu-cost` runs once
+  under each of the host's drivers (MoltenVK, then KosmicKrisp, on macOS), each file named
+  for its driver; before it the engine's shaders are cooked with the pinned Slang into
+  `target/measure/shaders`, once a run, and under each driver a source salted for that run
+  (`salted_source`) is cooked before the test's window opens.
+- `triangle` is criterion 1's file, not a test: under each of the host's drivers it runs
+  each canary of `gpu`'s plain validators (`Validators::Plain`), and under MoltenVK Metal
+  API validation's through the Metal script, each in a process of its own, then the client
+  binary, built in release, `--fixed 600`, under the environment `gpu` gives its tests, with
+  the pinned layer. Each is judged by `vulkan::judge`; the run also fails without an
+  `Outcome` line, without the comparison, with a slot of no pixel surely its colour, or with
+  a line logged at warn or above. The file records each canary's word, the `Outcome`'s
+  figures and the criterion, and the measurement fails after writing it where the criterion
+  is not met. It presents: the screen must be unlocked and the display awake. A host the
+  layer's pin names nothing for (Windows) cannot run it.
 - `spike-net` runs the netcode spike's ten-minute replays one `cargo nextest run` at a time;
   each prints its report as one JSON object, whose values the files carry under
   `<scene>.<clock>.` (nested keys joined by dots, an array as its JSON text), with the
@@ -716,7 +730,7 @@ writes its report.
    tests, of its `canary` and `swapchain` modules alone, so that no other ignored unit test
    runs as a device test, its `integration` binary, the `device` modules of
    `lactose-render-graph`'s and `lactose-renderer`'s `integration` binaries, and the
-   `extract` and `upload` modules of `lactose-app-client`'s, the measurements on a device,
+   `extract`, `upload` and `gpu` modules of `lactose-app-client`'s, the measurements on a device,
    whose figures are discarded (every device test runs with `LACTOSE_MEASURE_SHORT=1`,
    which only they read), each in a
    process of its own, built with `cargo test --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
