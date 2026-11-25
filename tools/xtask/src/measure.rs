@@ -2175,7 +2175,7 @@ const PACE_SECONDS: [(u32, u32); 2] = [(60, 60), (12, 20)];
 /// How long past its seconds a run of `frame-pace` may take: its device, its pipelines and
 /// its shutdown.
 const PACE_GRACE: Duration = Duration::from_secs(120);
-/// The Swift script that reads the main display's refresh rate on macOS.
+/// The Swift script that reads each active display's refresh rate on macOS.
 pub const DISPLAY_SCRIPT: &str = "tools/xtask/display/rate.swift";
 
 /// The display's refresh rate as `frame-pace` reads it.
@@ -2183,29 +2183,56 @@ pub const DISPLAY_SCRIPT: &str = "tools/xtask/display/rate.swift";
 pub struct DisplayRate {
     /// The display mode's exact rate in hertz, where it is read.
     pub hz: Option<f64>,
-    /// Where it came from, or why it is unread, with what the screen reports beside it.
+    /// Where it came from, or why it is unread, with what the screen reports beside it and
+    /// every other display's rate.
     pub source: String,
 }
 
-/// The rate in the display script's output: the display mode's where it is not zero, and
-/// the display link's nominal period where it is (a display of variable rate reports none);
-/// the screen's greatest frames a second, which MoltenVK reports as the swapchain's refresh,
-/// named beside it.
+/// The rate in the display script's output, one line a display: the main display's, where
+/// the window opens, its mode's where that is not zero and its display link's nominal period
+/// where it is (a display of variable rate reports none); its screen's greatest frames a
+/// second, which MoltenVK falls back to only where the mode reports 0, named beside it; and
+/// the mode's rate of each other display.
 #[must_use]
 pub fn display_rate_of(output: &str) -> DisplayRate {
-    let value = |name: &str| {
-        output.lines().find_map(|line| line.strip_prefix(name)?.trim().parse::<f64>().ok())
+    let displays: Vec<Vec<&str>> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("display "))
+        .map(|line| line.split(' ').collect())
+        .collect();
+    let value = |fields: &[&str], name: &str| {
+        let at = fields.iter().position(|field| *field == name)?;
+        fields.get(at + 1)?.parse::<f64>().ok()
     };
-    let screen = value("screen_fps ").map_or_else(
+    let others: Vec<String> = displays
+        .iter()
+        .filter(|fields| !fields.contains(&"main"))
+        .map(|fields| {
+            value(fields, "mode_hz").map_or_else(
+                || format!("display {} no mode's rate", fields[0]),
+                |hz| format!("display {} {hz:.6} Hz", fields[0]),
+            )
+        })
+        .collect();
+    let others = if others.is_empty() {
+        "no other display".to_owned()
+    } else {
+        format!("the other displays: {}", others.join(", "))
+    };
+    let Some(main) = displays.iter().find(|fields| fields.contains(&"main")) else {
+        return DisplayRate { hz: None, source: format!("unread: no main display; {others}") };
+    };
+    let screen = value(main, "screen_fps").map_or_else(
         || "the screen's greatest frames a second unreported".to_owned(),
         |fps| format!("the screen's greatest frames a second {fps}"),
     );
-    match (value("mode_hz ").filter(|hz| *hz > 0.0), value("link_hz ").filter(|hz| *hz > 0.0)) {
+    let mode = value(main, "mode_hz").filter(|hz| *hz > 0.0);
+    match (mode, value(main, "link_hz").filter(|hz| *hz > 0.0)) {
         (Some(hz), link) => DisplayRate {
             hz: Some(hz),
             source: format!(
                 "{hz:.6} Hz, the main display's mode (`CGDisplayModeGetRefreshRate`); {}; \
-                 {screen}",
+                 {screen}; {others}",
                 link.map_or_else(
                     || "the display link's nominal period unreported".to_owned(),
                     |link| format!("the display link's nominal period {link:.6} Hz"),
@@ -2215,13 +2242,16 @@ pub fn display_rate_of(output: &str) -> DisplayRate {
         (None, Some(hz)) => DisplayRate {
             hz: Some(hz),
             source: format!(
-                "{hz:.6} Hz, the display link's nominal period, the mode reporting no rate; \
-                 {screen}"
+                "{hz:.6} Hz, the main display's link's nominal period, the mode reporting no \
+                 rate; {screen}; {others}"
             ),
         },
         (None, None) => DisplayRate {
             hz: None,
-            source: format!("unread: neither the mode nor the display link gave a rate; {screen}"),
+            source: format!(
+                "unread: neither the main display's mode nor its display link gave a rate; \
+                 {screen}; {others}"
+            ),
         },
     }
 }
@@ -2246,6 +2276,33 @@ fn display_rate(root: &Path) -> DisplayRate {
         Err(e) => DisplayRate { hz: None, source: format!("unread: cannot run swift: {e}") },
     }
 }
+
+/// Why a swapchain reports no display times, as `frame-pace`'s file says it.
+const NO_DISPLAY_TIMES: &str = "`lactose-rhi-vulkan` reads display times from \
+    `VK_GOOGLE_display_timing` alone, and D162 admits `VK_EXT_present_timing` and \
+    `VK_KHR_present_wait`'s completions only once a run shows they follow the display: a \
+    driver that offers neither of the first two, as KosmicKrisp offers neither, \
+    reports none";
+
+/// What `frame-pace`'s figures hold, as its file's header says it.
+const READINGS: &str = "the lateness is the first tick's start against the deadline, split \
+    into the timer's wake (the deadline to `Shown::frame`'s call) and the engine's start (the \
+    call to the first tick), and read at its P99, the count over the criterion a figure beside \
+    it; the frame before a late one is classed by what it deferred, or as `joined_at_limit` \
+    where its call returned at or after this frame's deadline less `JOIN_MARGIN`, its join \
+    having waited to its limit, or as `joined` where it returned sooner; reading 1 counts the \
+    submits that overlapped a present's driver call by the two spans' stamps; a present call's \
+    parts are its waits (for its last read, the resize and the encoder's drop, which waits for \
+    the frame's GPU work and the blit), the acquire, the record (the encoder's creation and \
+    the blit's recording), the driver's call (`Swapchain::present`: the wait for the image's \
+    last-present fence, then the submit and the present under the queue's lock) and the rest; \
+    `waiting` counts presents displayed and not yet reported as well, and `undisplayed` counts \
+    those not yet displayed by their own display times; a display report earlier than its \
+    present's return is dropped and counted, and a present with no display report kept, the \
+    last calls' among them, counted as missing; the latch's median age at the display depends \
+    on the latches' phase against the refresh, which `latch_phase` gives; the grid test is \
+    D162's, the reported refresh refined by the floor run's fit to five parts in 10,000 at \
+    most, beside the period the free fit lands on";
 
 /// One run of the client binary for `frame-pace`.
 struct PaceRun<'a> {
@@ -2346,34 +2403,29 @@ fn run_frame_pace(
         let sampler = Sampler::start();
         let (real, ran, said) = runner.run(&workspace.root, "real", real_seconds, None, false)?;
         output.push_str(&said);
-        // The floor, where the swapchain reports display times: from the display mode's
-        // rate, or the refresh fitted to the real-time run's display times where it is
-        // unread; once more from the floor's own fit where it swept fewer than twice.
-        let (mut floor, mut refresh) = (None, mode_period);
-        if real.reports_display_times() {
-            let times = real.display_times();
-            let real_fit = pace::period_guess(&times).and_then(|guess| pace::fit(&times, guess));
-            if let Some(fitted) = real_fit {
-                found.push(("real.fit.hz".to_owned(), format!("{:.4}", 1e9 / fitted.period)));
-            }
-            let period = mode_period.or(real_fit.map(|fitted| fitted.period));
-            let tick = real.tick_period().ok_or("the stamps name no tick period")?;
-            if let Some(period) = period {
+        // The floor, where the swapchain reports display times and the display mode's rate
+        // is read, from that rate; once more from the floor's own fit where it swept fewer
+        // than twice.
+        let mut floor = None;
+        let mut runs = vec![format!("the real-time run of {real_seconds} s")];
+        match pace::floor_period(mode_period, real.reports_display_times()) {
+            Ok(period) => {
+                let tick = real.tick_period().ok_or("the stamps name no tick period")?;
                 let scale = pace::floor_scale(1e9 / period, tick);
                 found.push(("floor.scale_thousandths".to_owned(), scale.to_string()));
                 let (stamps, _, said) =
                     runner.run(&workspace.root, "floor", floor_seconds, Some(scale), false)?;
                 output.push_str(&said);
-                let first = pace::floor_figures("floor", &stamps, period, mode_period);
+                runs.push(format!("the floor run of {floor_seconds} s at {scale} thousandths"));
+                let first = pace::floor_figures("floor", &stamps, period);
                 found.extend(first.figures);
                 floor = first.ages;
-                refresh = refresh.or(first.fit.map(|fitted| fitted.period));
                 if first.ages.is_none()
-                    && let Some(fitted) = first.fit
+                    && let Some(fitted) = first.period
                 {
                     // A scale equal to the first run's is run again all the same: the
                     // thousandths are the finest step the flag takes.
-                    let again = pace::floor_scale(1e9 / fitted.period, tick);
+                    let again = pace::floor_scale(1e9 / fitted, tick);
                     found.push(("floor_again.scale_thousandths".to_owned(), again.to_string()));
                     let (stamps, _, said) = runner.run(
                         &workspace.root,
@@ -2383,23 +2435,21 @@ fn run_frame_pace(
                         false,
                     )?;
                     output.push_str(&said);
-                    let again =
-                        pace::floor_figures("floor_again", &stamps, fitted.period, mode_period);
+                    runs.push(format!(
+                        "the floor run made again, `floor_again`, of {floor_seconds} s at {again} \
+                         thousandths, from the floor run's fitted refresh"
+                    ));
+                    let again = pace::floor_figures("floor_again", &stamps, period);
                     found.extend(again.figures);
                     floor = again.ages;
                 }
-            } else {
-                found.push((
-                    "floor".to_owned(),
-                    "not run: no rate is read and no refresh could be fitted".to_owned(),
-                ));
             }
-        } else {
-            found.push((
-                "floor".to_owned(),
-                "not run: the swapchain reports no display times".to_owned(),
-            ));
+            Err(none) => found.push(("floor".to_owned(), none)),
         }
+        if !real.reports_display_times() {
+            found.push(("display_times.why".to_owned(), NO_DISPLAY_TIMES.to_owned()));
+        }
+        let refresh = mode_period;
         let against = pace::Against { lateness, floor, refresh };
         found.extend(pace::figures("real", &real, against));
         if cfg!(windows) {
@@ -2426,26 +2476,25 @@ fn run_frame_pace(
                 *value = format!(
                     "a window, the present thread drawing each frame's offscreen target to the \
                      swapchain's image, no validator on; the display's rate {}; whether the \
-                     window was occluded and whether another client was drawing are not read; \
-                     the display held awake by the caller",
+                     window was occluded is not read, `lactose-platform` forwarding none of \
+                     winit's `WindowEvent::Occluded`, and whether another client was drawing is \
+                     not read; the display held awake by the caller",
                     rate.source
                 );
             }
         }
+        if cfg!(windows) {
+            runs.push("the minimised run".to_owned());
+        }
         header.notes.push((
             "Runs".to_owned(),
             format!(
-                "the real-time run of {real_seconds} s{}{}, each run's command and load in the \
-                 output below; every figure is the binary's own stamps, taken while a run asks \
-                 for them, each stamp one lock",
-                if floor.is_some() || found.iter().any(|(n, _)| n == "floor.floor") {
-                    format!(", the floor run of {floor_seconds} s")
-                } else {
-                    String::new()
-                },
-                if cfg!(windows) { ", and the minimised run" } else { "" },
+                "{}, each run's command and load in the output below; every figure is the \
+                 binary's own stamps, taken while a run asks for them, each stamp one lock",
+                runs.join(", ")
             ),
         ));
+        header.notes.push(("Readings".to_owned(), READINGS.to_owned()));
         written.extend(write(out, &header, &found, &output)?);
     }
     Ok(written)
@@ -3375,19 +3424,25 @@ mod tests {
         assert!(parse(&["--all", "--out", "a", "--out", "b"]).is_err());
     }
 
-    /// The measure workflow's runners have no device: `--no-device` leaves those that need
-    /// one out of `--all`, and refuses one named.
     #[test]
-    fn the_display_s_rate_is_the_mode_s_then_the_link_s() {
-        let both = display_rate_of("mode_hz 60.000000\nlink_hz 59.999832\nscreen_fps 60\n");
+    fn the_display_s_rate_is_the_main_mode_s_then_its_link_s() {
+        let both = display_rate_of(
+            "display 1 main mode_hz 60.000000 link_hz 59.999832 screen_fps 60\n\
+             display 3 mode_hz 120.000000 screen_fps 120\n",
+        );
         assert_eq!(both.hz, Some(60.0));
         assert!(both.source.contains("mode") && both.source.contains("second 60"), "{both:?}");
-        let variable = display_rate_of("mode_hz 0.000000\nlink_hz 120.000000\n");
+        assert!(both.source.contains("display 3 120.000000 Hz"), "{both:?}");
+        let variable = display_rate_of("display 2 main mode_hz 0.000000 link_hz 120.000000\n");
         assert_eq!(variable.hz, Some(120.0));
-        assert!(variable.source.contains("display link") && variable.source.contains("unreported"));
-        assert_eq!(display_rate_of("screen_fps 60\n").hz, None);
+        assert!(variable.source.contains("link") && variable.source.contains("unreported"));
+        assert!(variable.source.ends_with("no other display"), "{variable:?}");
+        assert_eq!(display_rate_of("display 1 main screen_fps 60\n").hz, None);
+        assert_eq!(display_rate_of("display 1 mode_hz 60.0\n").hz, None);
     }
 
+    /// The measure workflow's runners have no device: `--no-device` leaves those that need
+    /// one out of `--all`, and refuses one named.
     #[test]
     fn the_arguments_select_the_device_and_leave_it_out() {
         let all = parse(&["--all", "--short", "--no-device"]).unwrap();
