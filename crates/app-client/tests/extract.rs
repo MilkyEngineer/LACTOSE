@@ -17,8 +17,16 @@
 //! writing the ring and the snapshot, the figure criterion 4 holds to 1 ms on the device;
 //! the ring alone, with no snapshot installed; and the snapshot alone, beside a sink that
 //! counts the rows and keeps nothing. The snapshot's part is the first less the second, and
-//! the ring's the first less the third, signed. The first again on one worker gives the cost per
-//! dirty row. Each is the median of 60 passes (6 in a short run) after a full pass.
+//! the ring's the first less the third, signed. The first and the second again on one worker
+//! give the one-worker pass, and from the ring alone the cost per dirty row: the snapshot's
+//! part copies every presented row on every pass after a tick, whatever the dirty count, so
+//! it is a cost per presented row and not per dirty one. Each is the median of 60 passes (6
+//! in a short run) after a full pass. The pass is timed inside the bounded future, from its
+//! first poll to its end.
+//!
+//! The presented count, 10,000, is the measuring lane's choice: the plan asks for a stated
+//! count and names none. It stays until the milestone's planner names one, and the file
+//! says so beside the figure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -201,10 +209,15 @@ impl Rig {
         if ring {
             self.waits.open(&mut self.renderer);
         }
-        let start = Instant::now();
-        let run = simulation.run_passes(executor);
-        let mut simulation = bounded(executor, run, "extract's pass").expect("the passes run");
-        let time = start.elapsed();
+        // Timed inside the bounded future: from its first poll to the passes' end, not the
+        // bound's keeping thread, which `bounded` starts before and joins after.
+        let run = async move {
+            let start = Instant::now();
+            let simulation = simulation.run_passes(executor).await;
+            (simulation, start.elapsed())
+        };
+        let (simulation, time) = bounded(executor, run, "extract's pass");
+        let mut simulation = simulation.expect("the passes run");
         let events = simulation.world_mut().take_present_events();
         extract_state(&mut simulation).expect("setup ran").publish(events);
         self.simulation = Some(simulation);
@@ -253,6 +266,7 @@ fn measure(prefix: &str, device: &Arc<dyn Device>, n: u32, passes: usize) {
     wide.shutdown();
     let one = executor(1);
     let single = rig.median(&one, Into::Both, passes);
+    let single_ring = rig.median(&one, Into::Ring, passes);
     one.shutdown();
     figure(&format!("{prefix}.pass_us"), micros(both));
     figure(&format!("{prefix}.ring_alone_us"), micros(ring));
@@ -262,7 +276,10 @@ fn measure(prefix: &str, device: &Arc<dyn Device>, n: u32, passes: usize) {
     figure(&format!("{prefix}.ring_part_us"), part(snapshot));
     figure(&format!("{prefix}.snapshot_part_us"), part(ring));
     figure(&format!("{prefix}.w1.pass_us"), micros(single));
-    let per_row = single.as_secs_f64() * 1e9 / MOVED as f64;
+    figure(&format!("{prefix}.w1.ring_alone_us"), micros(single_ring));
+    // The ring's alone: the snapshot's part copies every presented row on every pass after
+    // a tick, whatever the dirty count, so a pass with it is no cost per dirty row.
+    let per_row = single_ring.as_secs_f64() * 1e9 / MOVED as f64;
     figure(&format!("{prefix}.w1.dirty_row_ns"), format!("{per_row:.1}"));
     rig.waits.report(prefix);
 }
@@ -284,6 +301,7 @@ fn cost_of_extract_at_50k_dirty_rows() {
     figure("rows", ROWS);
     figure("moved", MOVED);
     figure("presented", PRESENTED);
+    figure("presented.chosen_by", "the measuring lane, pending the milestone's planner");
     figure("archetypes", 4);
     figure("regions", REGIONS);
     figure("passes", passes);
