@@ -228,7 +228,8 @@ mod os {
                     &raw mut count,
                 )
             };
-            (status == 0).then_some(info.pth_priority)
+            // A shorter answer than the extended one would leave the priority unwritten.
+            (status == 0 && count == libc::THREAD_EXTENDED_INFO_COUNT).then_some(info.pth_priority)
         })
         .join()
         .ok()

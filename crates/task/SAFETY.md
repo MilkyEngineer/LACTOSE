@@ -155,7 +155,7 @@ What the role grants is read on a thread the call spawns, after its class is ent
 calling thread, which adds no reference and stays valid while the thread runs, a pointer to a
 live `thread_extended_info` built by its `Default`, and its size in integers as the count. The
 call writes at most that many integers through the pointer and the new count through the
-count, and the priority is read only if it returned 0.
+count, and the priority is read only if it returned 0 with the whole structure's count.
 
 ## Process-CPU calls (`benches/whisk.rs`, `tests/idle_cpu.rs`)
 
