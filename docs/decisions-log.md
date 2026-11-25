@@ -2391,6 +2391,15 @@ editorial pass rather than one taken from a review.
   `a_later_timer_does_not_hold_an_earlier_one_back` (the keeper re-arms for a new earliest
   deadline) prove the contract without depending on scheduling, and each fails under the
   mutation of the code it covers.
+- Addendum (lane `gate-task`, 2026-11-25): *a kept task taken over the limit goes back to the
+  queue.* A worker that took its run permit before a `block_in_place` closed the gate polled
+  any task it then took, a kept one included, though it put a job and the rest of a range
+  back. It now puts the task back at the back of its pool's queue, unpolled and waking nobody,
+  and gives its permit up at its next check of the gate. The keep is unchanged; only a kept
+  task's poll waits for a permit within the limit, on whichever worker holds one, which is
+  where its locality is lost and where nothing was owed it: the worker that kept it is on its
+  way to the gate, and it was kept only because the queue was empty, so nothing queued is
+  passed. Held by `pool::tests::a_task_kept_from_its_timer_at_a_closed_gate_goes_back_to_the_queue`.
 - Driven by: the D113 tick-start criterion; the keeper fix round and its review.
 
 **D117. The naive ECS implementation: what the facade left to it** (§6, `lactose-ecs`)

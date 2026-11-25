@@ -145,7 +145,11 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - *The gate and the reservation.* A worker takes it only while it holds a run permit, as it
   takes a graph's job. So while `block_in_place` holds the gate it starts on a worker the
   reservation leaves awake, or waits for the gate; a job that is running when a block begins
-  finishes; and one parked on its own scope's latch holds no permit.
+  finishes; and one parked on its own scope's latch holds no permit. A task woken while a
+  block holds the gate, as the frame's render task is when its present call returns during a
+  physics step, is held to the same: woken from a thread that is no worker, by a job beside the
+  block or by its timer, it is polled on a worker the reservation leaves awake, or once the gate
+  opens, never by a worker over the limit, and its wake is not lost (`src/executor/gate_tests.rs`).
 - *The width.* The jobs `run_job` starts, and the children their scopes fork, occupy
   `run_job_width()` frame-critical workers at most at any moment, counted over all such jobs
   together: `frame_worker_count()` less one, and one where that is one. A worker is occupied
@@ -238,6 +242,16 @@ and list what changed, because `lactose-ecs` is written against this surface.
   worker is inside a scope. A worker that kept its permit through the block may go on as soon
   as the gate reopens, unordered with the closure: the closure's writes reach other nodes
   through the graph, not through the gate.
+- A task is work like any other at the gate: it is polled only by a worker that holds a
+  permit within the limit. A worker that took its permit before a block began and then
+  takes a task, from its pool's queue or from its own deque after firing timers, while over
+  the limit puts it back unpolled at the back of its pool's queue, as it puts back a job, and
+  gives its permit up at its next check of the gate. It wakes nobody, since no permit comes
+  free by that: every worker that holds one is awake and looks at the queue before it sleeps
+  (`gate::idle_park`), an opener that holds one comes back to the queue when its scope ends,
+  one that gave way to the gate is woken when a permit comes free, and the gate's opening
+  wakes every worker. A worker that a task's wake finds held at the gate sleeps again beside
+  the task; the gate's opening wakes it.
 - Dedicated threads owned by other crates (network, present, audio) are created through
   `Executor::platform`, never `std::thread` directly.
 - There is no timer thread. Frame-critical workers fire due timers when they look for work,
@@ -260,8 +274,8 @@ and list what changed, because `lactose-ecs` is written against this surface.
   behind the queued work and wakes a sleeper: a timer never puts a task ahead of work that
   was waiting. The kept task stays visible on the deque; under a closed `block_in_place`
   gate a firing worker without a permit parks beside it, and a worker that holds one takes
-  it. A worker that finds a timer due just as it lies down to sleep queues the task with a
-  wake-up like any other.
+  it, or puts it back on the pool's queue if it is over the limit. A worker that finds a timer
+  due just as it lies down to sleep queues the task with a wake-up like any other.
 - `shutdown` lets running jobs finish, including the scope children they wait for, drops
   queued graph work and cancels every unfinished task. Each `GraphRun`, `Task` or `Sleep`
   that was cut off resolves to `Cancelled` as soon as its guarantee above allows, without
@@ -377,12 +391,12 @@ Correctness:
 - The scope latch and the sleep-and-wake protocol are modelled under `loom` (`src/models.rs`),
   and with them what is built on them: the opener's wait with its permit and the
   `block_in_place` gate (`src/gate.rs`), the wake that is skipped for a kept entry, the
-  timer keeper's hand-off, the task kept by the worker that fires its timer, the
-  quiescence of a cancelled run (`src/quiesce.rs`) and its jobs' writes before its
-  resolution, a finished run's jobs dropping their
-  references to the graph before it resolves (`Quiesce::leave`), and a parking lane's wait
-  under a call that takes its thread's unpark (`src/parking.rs`). The models call the
-  shipped functions.
+  timer keeper's hand-off, the task kept by the worker that fires its timer, a task put
+  back at a closed gate by a worker over the limit, the quiescence of a cancelled run
+  (`src/quiesce.rs`) and its jobs' writes before its resolution, a finished run's jobs
+  dropping their references to the graph before it resolves (`Quiesce::leave`), and a
+  parking lane's wait under a call that takes its thread's unpark (`src/parking.rs`). The
+  models call the shipped functions.
   Under loom a timed park waits on a flag that only `Sleep::wake_worker` sets and that an
   unpark alone does not satisfy, as the Windows wait is not ended by an unpark, so a waker
   that skips it fails the keeper hand-off model.
@@ -390,17 +404,24 @@ Correctness:
   feature on this crate that switches an internal `sync` shim, and run with
   `cargo test -p lactose-task --features loom --release`. Never use loom's documented
   `RUSTFLAGS="--cfg loom"`: the environment variable replaces the x86-64 target pin.
-  Twelve models are explored exhaustively: two with three threads, the latch's and the
-  references', and ten with two. Five more are bounded: the sleep protocol's wake for every
+  Thirteen models are explored exhaustively: two with three threads, the latch's and the
+  references', and eleven with two. Six more are bounded: the sleep protocol's wake for every
   push, the run's quiescence and a cancelled run's writes, each with three threads, at five
-  preemptions; the idle release, with three, at four; and the parking lane's, with two, at
-  three (`LOOM_MAX_PREEMPTIONS` overrides the bounds). The references' model checks that
-  every job's drop of its reference happens before the resolution, by a `Relaxed` store in
-  the drop that the waiting thread reads; it fails beside a copy of `Quiesce::leave` that
-  leaves before it drops, and beside a `Quiesce::exit` lowered to `Release` and to
-  `Relaxed`. The cancelled run's model checks the same of the jobs' `Relaxed` writes when the
-  resolver may be shutdown's `Quiesce::close`, and fails beside a `close` lowered to
-  `Release` and to `Relaxed`.
+  preemptions; the idle release and the put-back beside a retaking opener, with three, at
+  four; and the parking lane's, with two, at three (`LOOM_MAX_PREEMPTIONS` overrides the
+  bounds). The references' model checks that every job's drop of its reference happens
+  before the resolution, by a `Relaxed` store in the drop that the waiting thread reads; it
+  fails beside a copy of `Quiesce::leave` that leaves before it drops, and beside a
+  `Quiesce::exit` lowered to `Release` and to `Relaxed`. The cancelled run's model checks
+  the same of the jobs' `Relaxed` writes when the resolver may be shutdown's
+  `Quiesce::close`, and fails beside a `close` lowered to `Release` and to `Relaxed`. The
+  put-back's model has two workers hold permits at a gate that allows one, the first
+  putting back the task it took; the task is polled, and never taken over the limit, and it
+  fails beside a put-back that skips `Gate::release_if_over` at the top of the loop and, as
+  a deadlock, beside one made between the worker's look round and its park. Beside a third
+  worker that retakes a permit regardless of the limit, as an opener whose latch is set
+  does, a worker takes the task over the limit again and puts it back again, and the task is
+  still polled within the limit.
   Eight more hold `run_job`: the completion slot against a dropped `JobRun`, exhaustively; a
   worker taking the job against shutdown beginning, at five preemptions; the width in three
   configurations with the sleep protocol, at two: a width of one, two workers beside a main
@@ -415,10 +436,25 @@ Correctness:
   (`weakened_*`), each at the model's bound: under loom 0.7.2 a model whose reader is the main
   thread may explore one execution. The parking lane's model fails, as a deadlock, with the
   unpark alone and with the flag alone; both run beside it as `weakened_*` models over a copy
-  of its wake and wait. Five terms are copies in the models, since loom cannot run
-  the types they live in: four of `run_job`'s, and what the pool's three submissions hand
-  `ShutdownFlag::queue` with the sweep they hand it. The module's doc names each and the
-  native test that holds it.
+  of its wake and wait. Six terms are copies in the models, since loom cannot run the types
+  they live in: four of `run_job`'s, what the pool's three submissions hand
+  `ShutdownFlag::queue` with the sweep they hand it, and `execute`'s put-back of a task. The
+  module's doc names each and the native test that holds it.
+- `src/executor/gate_tests.rs` holds a task woken while `block_in_place` holds the gate, by
+  order and never by a time, with two hooks only its tests compile: one a worker calls just
+  before it parks, with what its look round saw, and one it calls holding a permit before it
+  looks for work. Woken from a thread that is no worker, with no permit reserved, the task is
+  not polled at the closed gate, the worker its wake claimed sleeping again beside it, and is
+  polled once the gate opens while the blocking worker stays in its job; with one reserved it
+  is polled at the closed gate under that permit. Woken by a job beside the block, the third
+  worker its wake claimed sleeps again and the job's worker polls it once the job returns,
+  before the gate opens; woken by a job begun before the block, or by its timer, it waits for
+  the gate. A wake landed between a worker's look round and its park, and the gate's opening
+  landed there, are not lost. A worker that passed its check of the gate as the gate closed
+  and takes the task over the limit puts it back once and sleeps, and the task is polled once
+  the gate opens, or at the closed gate by the worker the reservation leaves awake; the
+  put-back wakes no worker, a sleeper held just before its park still announced once the
+  worker that put the task back is about to park.
 - `src/executor/job_tests.rs` holds the width by order and never by a time, each wait bounded
   by a thread of the test's own: with children of a `run_job` job held where they begin, a
   task's `sleep_until` resolves and a graph run completes beside them, on four
@@ -430,11 +466,15 @@ Correctness:
   takes the halves queued after it parked. `tests/jobs.rs` holds where a job runs, shutdown,
   the reservation, who drops the value, a job queued as the one frame-critical worker goes
   idle, 5,000 times with the gaps swept across the window before it sleeps, and a child that
-  crosses to another worker, which the Miri runs check too. `src/pool.rs` holds a job taken
-  at a closed gate and one taken after shutdown began, and a job, a task and a graph's range
-  each queued as shutdown begins, the flag set between the push and the read by a hook that
-  only its tests compile, and swept by the submission itself. `tests/job_alloc.rs` counts a call's
-  allocations, in a binary of its own because it installs a global allocator.
+  crosses to another worker, which the Miri runs check too. `src/pool.rs` holds a job and a
+  task taken at a closed gate, and a task its timer woke and the firing worker kept on its
+  deque, each put back unstarted or unpolled, the tasks on the pool's queue; a job taken after
+  shutdown began, and a task taken then over the limit, swept by its own put-back, since
+  shutdown's first sweep may have passed and a shutdown that does not join sweeps only once;
+  and a job, a task and a graph's range each queued as shutdown begins, the flag set between
+  the push and the read by a hook that only its tests compile, and swept by the submission
+  itself. `tests/job_alloc.rs` counts a call's allocations, in a binary of its own because it
+  installs a global allocator.
 - **The `loom` feature is for that one command.** No other crate may enable it and nothing
   may be built with `--all-features`: features unify across a build, so every executor in it
   would run on loom primitives, which panic outside a loom model.
