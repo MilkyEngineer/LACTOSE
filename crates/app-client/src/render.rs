@@ -3,6 +3,7 @@
 //! the present thread samples. `tests/shown.rs`, section 1, of `lactose-app` is its sketch.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use lactose_app::TargetIndex;
 use lactose_app::{
@@ -31,6 +32,7 @@ use lactose_task::JobContext;
 
 use crate::extracted::Extracted;
 use crate::shaders::CookedShaders;
+use crate::stamps::{self, Stamp};
 
 /// The offscreen targets' format: the renderer's pipelines are made for it.
 pub const TARGET_FORMAT: Format = Format::Rgba8Unorm;
@@ -157,6 +159,8 @@ pub struct ClientRender {
     /// With a readback, the records the frame recorded and not yet submitted should leave,
     /// or why they are not known.
     expected: Option<core::result::Result<Vec<InstanceRecord>, String>>,
+    /// Where a run takes stamps, the latch of the frame `submit` is submitting.
+    latched: Option<Instant>,
     /// Last, so that the graph that submitted the renderer's frames and then the renderer
     /// are dropped before the images and buffers are destroyed (renderer, "Errors and
     /// drops").
@@ -238,6 +242,7 @@ impl ClientRender {
             fraction: 0.0,
             last: None,
             expected: None,
+            latched: None,
             images: Images {
                 device: Arc::clone(device),
                 targets: [None; TARGETS],
@@ -541,6 +546,11 @@ impl RenderSide for ClientRender {
         frame: &PresentFrame<'_>,
         time: FrameTime,
     ) -> Result<()> {
+        // The frame's job starts here: what runs before it in the job is the acquire of
+        // the snapshot's pair alone (`lactose-app`'s `frame_job`).
+        if let Some(start) = stamps::now() {
+            stamps::stamp(Stamp::Job { thread: stamps::thread(), start });
+        }
         let view = PresentView { fraction: time.fraction, focus: None, remote: None };
         let output = self.schedule.frame(frame, &view, &mut NoEvents);
         // With no rig in the scene the schedule names no camera, and the frame keeps its own.
@@ -553,13 +563,38 @@ impl RenderSide for ClientRender {
     }
 
     fn draw(&mut self, ctx: &mut JobContext<'_>, draw: Draw) -> Result<FrameCounts> {
+        let drawn = self.drawn(ctx, draw);
+        if let Some(at) = stamps::now() {
+            stamps::stamp(Stamp::Drew(at));
+        }
+        drawn
+    }
+
+    fn submit(&mut self) -> Result<Submitted> {
+        let entered = stamps::now();
+        let submitted = self.submitted();
+        if let (Some(entered), Some(latched), Ok(submitted)) =
+            (entered, self.latched.take(), &submitted)
+        {
+            let returned = Instant::now();
+            let point = submitted.point.value;
+            stamps::stamp(Stamp::Submit { entered, latched, returned, point });
+        }
+        submitted
+    }
+}
+
+impl ClientRender {
+    /// [`RenderSide::draw`]'s body: the trait's method stamps its return.
+    fn drawn(&mut self, ctx: &mut JobContext<'_>, draw: Draw) -> Result<FrameCounts> {
         // Nothing is prepared yet: an error here ends no frame.
         let (image, new) = self.target(draw)?;
         // The `Client` world's pass ended inside `Simulation::run_passes`, before this job
         // began, so the batch begins after it (renderer, "Writers").
         {
             let writer = self.renderer.remote();
-            lactose_presentation::upload(ctx, self.schedule.remote(), |rows| writer.write(rows));
+            let write = |rows: &[_]| stamps::closure("writer", || writer.write(rows));
+            lactose_presentation::upload(ctx, self.schedule.remote(), write);
         }
         if let Some(readback) = &mut self.images.readback {
             readback.extracted.before_prepare();
@@ -620,7 +655,9 @@ impl RenderSide for ClientRender {
         }
     }
 
-    fn submit(&mut self) -> Result<Submitted> {
+    /// [`RenderSide::submit`]'s body, which sets `latched` where a run takes stamps: the
+    /// trait's method stamps the call with it.
+    fn submitted(&mut self) -> Result<Submitted> {
         let Recorded { frame, target, extent } = self
             .recorded
             .take()
@@ -632,6 +669,8 @@ impl RenderSide for ClientRender {
             boom: self.boom,
             projection: PROJECTION,
         };
+        // The latch's age is counted from here: the latch reads the input next.
+        self.latched = stamps::now();
         let latched = match self.renderer.latch(&latch) {
             Ok(latched) => latched,
             Err(error) => {

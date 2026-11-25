@@ -36,6 +36,7 @@ use crate::present::ClientPresent;
 use crate::reference::{self, Counts};
 use crate::render::ClientRender;
 use crate::shaders::{CookedShaders, PipelineCache};
+use crate::stamps::{self, FrameStamp, Stamp};
 
 /// The log target of the binary's run.
 pub const LOG_TARGET: &str = "lactose_app_client";
@@ -434,17 +435,45 @@ fn run_on(
     if let Err(error) = device.pipeline_cache().and_then(|bytes| cache.store(&bytes)) {
         tracing::warn!(target: LOG_TARGET, "the pipeline cache was not written: {error}");
     }
+    let mut written = Ok(());
     let ran = match &options.mode {
         Mode::Fixed { frames: steps, .. } => {
             fixed_frames(executor, main, &**device, shown, &input, frames, *steps, &mut outcome)
         }
-        Mode::Paced { seconds, .. } => {
+        Mode::Paced { seconds, scale, minimised, stamps: path } => {
+            let mut shown = shown;
+            if let Some(scale) = *scale {
+                shown.server_mut().set_time_scale(scale);
+            }
+            if *minimised {
+                // The answer is the window's reports' to give: a minimised window's frames
+                // are hidden ones.
+                executor.block_on(main.run(|main: &mut MainThread| main.set_minimised(true)))?;
+            }
+            let epoch = path.as_ref().map(|_| {
+                let epoch = stamps::start();
+                let info = |name, value: String| stamps::stamp(Stamp::Info(name, value));
+                info("frame_worker_count", executor.frame_worker_count().to_string());
+                info("run_job_width", executor.run_job_width().to_string());
+                info("queues", format!("{:?}", device.capabilities().queues));
+                info("scale", scale.map_or(1000, |scale| scale.thousandths).to_string());
+                info("tick_period_ns", TICK_PERIOD.as_nanos().to_string());
+                epoch
+            });
             let root = paced(executor.clone(), main.clone(), shown, reports, frames, *seconds);
-            executor.block_on(executor.spawn(WorkerClass::FrameCritical, root)).and_then(|result| {
-                let (ended, counted) = result?;
-                outcome = counted;
-                Ok(ended)
-            })
+            let ran = executor.block_on(executor.spawn(WorkerClass::FrameCritical, root)).and_then(
+                |result| {
+                    let (ended, counted) = result?;
+                    outcome = counted;
+                    Ok(ended)
+                },
+            );
+            // Written once the frames have ended and before the shutdown's steps, which
+            // take no stamps; an error here is the run's once those steps are done.
+            if let (Some(path), Some(epoch)) = (path, epoch) {
+                written = stamps::finish(path, epoch);
+            }
+            ran
         }
     };
     // "Shutdown": step 1, `exit`, was queued as the frames ended, and step 2 was
@@ -482,6 +511,7 @@ fn run_on(
     if let Some(error) = error {
         return Err(error);
     }
+    written?;
     compared.map(|()| outcome)
 }
 
@@ -612,7 +642,6 @@ async fn paced(
 ) -> Result<(Ended, Outcome)> {
     let mut outcome = Outcome::default();
     let until = seconds.map(|seconds| Instant::now() + Duration::from_secs(u64::from(seconds)));
-    let mut next = move |tick: Tick| Some(frames.next(tick));
     let mut deadline = Instant::now();
     loop {
         if let Err(error) = executor.sleep_until(deadline).await {
@@ -625,8 +654,29 @@ async fn paced(
             break;
         }
         let extent = extent_of(reports.size());
-        match shown.frame(&executor, Instant::now(), &mut next, extent).await {
+        let called = Instant::now();
+        // Where a run takes stamps, the first tick's start: the callback is called as each
+        // tick begins.
+        let mut first_tick = None;
+        let mut next = |tick: Tick| {
+            if first_tick.is_none() {
+                first_tick = stamps::now();
+            }
+            Some(frames.next(tick))
+        };
+        match shown.frame(&executor, called, &mut next, extent).await {
             Ok((stepped, output)) => {
+                if let Some(returned) = stamps::now() {
+                    stamps::stamp(Stamp::Frame(FrameStamp {
+                        deadline,
+                        first_tick,
+                        called,
+                        returned,
+                        joined: output.joined,
+                        deferred: output.deferred,
+                        behind: output.world.behind,
+                    }));
+                }
                 shown = stepped;
                 outcome.frames += 1;
                 deadline = output.world.next_deadline;
@@ -642,6 +692,7 @@ async fn paced(
         }
     }
     exit(&main);
+    stamps::stamp(Stamp::Stats(shown.stats()));
     let Stopped { server, render } = shown.stop().await?;
     Ok((Ended { server: Some(server), render: Some(render), error: None }, outcome))
 }
