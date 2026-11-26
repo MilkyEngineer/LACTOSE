@@ -10570,6 +10570,72 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
     lane forwards `WindowEvent::Occluded` from `lactose-platform` (review r3's G10).
   - *The minimised run is made on Windows alone*, the platform `MainThread::set_minimised` is
     asked of before the first frame.
+- Addendum (lane `present-encoder`, 2026-11-26; review r3's G6, as its fix round two leaves it):
+  *the present call keeps its encoders.* The part named above as the encoder's drop at the call's
+  end is gone. `ClientPresent` holds each submitted encoder with the read its submit signals. As a
+  call begins, once `reached` has been read, every one whose read is reached is reset and kept free;
+  the call records into a free one, or into the oldest, reset behind the bound's wait, or makes one
+  where none is free, and a pending encoder is never dropped by a call. The side holds four at most
+  in all (`ENCODERS`): a call that holds four submitted, none reached, waits within `PRESENT_WAIT`
+  for the oldest one's read before its acquire, and a timeout presents nothing. Four is reasoned and
+  not measured: a present waits on the device for its frame's point, that frame waits for the read
+  of the call before last, or, for a new image, which waits for no read, the side waits for that
+  read itself before the slot's write, and the renderer's two regions open a frame only once the
+  point of the frame two submits before it is reached, so where every call presents at most three
+  reads are pending as a call begins. A kept encoder holds what it recorded until its reset: the
+  target, the swapchain image and through it the swapchain, a retired one after a resize among them;
+  the reset at each call's head lets those go once the read is reached. A new image's heap slot is
+  written behind the read of the last present that declared that slot, and not behind the last read,
+  which the other target's present renews each call: with the GPU behind by more than
+  `PRESENT_WAIT`, a slot that waited for the last read was never written and its target never
+  presented (review r1's G3). A present that submitted nothing gives its encoder back reset, kept
+  free; on a lost device every encoder is reset, which a lost device accepts, and dropped. So a
+  call's `waits` are the resize's, the slot's and the bound's, none for its own submit, and its
+  `record` includes the encoders' resets. `close`, after its bounded wait for the last read, drops
+  the encoders, then empties the heap slots and drops the swapchain, whose drop is bounded: past the
+  bound a pending encoder's drop waits for its submit with no bound in `lactose-rhi-vulkan`,
+  accepted on the close path, which runs on the present thread after the host has signalled every
+  point it owes (`crates/platform/README.md`, "Shutdown", step 2), and the slots are then emptied
+  behind every submit. Neither `lactose-rhi-vulkan` nor `lactose-rhi-api` changed. `cargo xtask gpu
+  --client` runs the release client on a window under each driver's validators, as shipped and with
+  each present lagged by extra passes (`--extra-present-passes`, 100 under MoltenVK and 200 under
+  KosmicKrisp) so that calls begin with their oldest read pending, and fails a lagged run in which
+  none did; against a side that resets an encoder one read early, with `lactose-rhi-vulkan`'s
+  refusal of a pending reset removed, its lagged run failed under both drivers
+  (`VUID-vkResetCommandPool-commandPool-00040`) and its plain run passed (review r1's G1). The side
+  counts the resets of an encoder it read as reached that the device refused, and logs the count at
+  its close beside the pending figure; the gate fails any run whose count is above zero, so that the
+  same side with that refusal kept fails its lagged run under both drivers too, where the refusal
+  was silent (263 refused in 135 calls under MoltenVK, 369 in 214 under KosmicKrisp; its plain run
+  refused none and passed; review r2's G4). KosmicKrisp's lag stays at 200: its figure there was 17
+  to 81 of 209 to 247 calls over six runs, and 300 and 400 passes, three runs each, left 2 calls of
+  110 to 170 with their oldest read pending, the frame finding the GPU busy for 129 to 188 of 301
+  frames (review r2's G2). A screen locked before a client run fails that run, unrun, and the gate
+  exits 3 only where such runs are its only failures, else as failed; the lock is read again after
+  each run and named with it (review r2's G1). `cargo xtask measure frame-pace` in the lane's
+  alternated runs on the M1 (not the record), three pairs per driver, each run in its own hold of
+  the GPU lock, the before arm being `713aaf3` with cddd606's `present.rs` and a no-op
+  `set_extra_passes`, and the after arm `713aaf3`, on the built-in display at the main display's
+  mode of 60.000000 Hz with no other display, as each run's file records, no other agent's GPU or
+  window run beside it, the lock being held, and whether another client of the GPU was drawing not
+  read (review r2's G7), at P50, the range over the three runs of each arm: under MoltenVK 1.4.2 the
+  waits fell from 591.7 to 702.9 µs to 0 µs and the record from 54.3 to 69.3 µs to 20.8 to 23.0 µs,
+  while the acquire (132.9 to 181.4 µs, then 146.3 to 149.4 µs) and the driver's call (376.5 to
+  473.1 µs, then 384.5 to 406.0 µs) stayed, the whole call from 1,174.3 to 1,377.6 µs to 567.7 to
+  594.9 µs; under KosmicKrisp vulkan-sdk-1.4.363 the waits from 926.2 to 1,583.0 µs to 0 µs, the
+  record, most of it the pool's creation (its destruction, the encoder's drop, timed among the waits
+  in the before arm), from 1,127.1 to 1,312.5 µs to 69.5 to 160.6 µs and the driver's call from
+  356.6 to 436.8 µs to 122.1 to 317.9 µs, the whole call from 2,947.8 to 13,551.9 µs to 352.0 to
+  894.6 µs, the top before being the run whose acquire was 10,324.2 µs, and 2,947.8 to 3,691.0 µs
+  without it. KosmicKrisp's acquire is not read as the change's: it was 372.0 µs, 922.3 µs and
+  10,324.2 µs at P50 in the runs before and 157.9 to 393.6 µs after, and in three pairs at
+  `b83f823`, which timed the resets at the call's head as its rest and not its record, 328.4 to
+  5,020.0 µs before and 333.2 to 3,790.0 µs after, near 4 to 5 ms in both arms of one pair. Under
+  MoltenVK one frame of 3,600 was shed by D162's rule in two runs before and two after, and none
+  dropped; the call's greatest was 7,552.5 to 15,652.8 µs before, its waits', and 1,559.8 to
+  14,047.6 µs after, its driver's call's. Every call presented, and under KosmicKrisp one frame of
+  3,600 was held in two runs before and none after. Load averages from 3.22 4.13 4.78 at the lowest
+  to 6.30 5.40 5.40 at the highest across the twelve runs.
 
 **D163. `lactose-rhi-vulkan` without a window, and the Vulkan step of `cargo xtask gpu`** (§12.1, §20, §21, `lactose-rhi-vulkan`, `lactose-rhi-api`, `tools/xtask`, `crate-tiers.toml`)
 - Why: the milestone 2 plan's lane `vulkan`, under its decisions 5.7, 5.10, 5.12 and D158.
