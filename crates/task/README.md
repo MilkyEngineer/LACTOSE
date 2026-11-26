@@ -29,6 +29,7 @@ and list what changed, because `lactose-ecs` is written against this surface.
 | `lane`, `Lane`, `LanePump`, `LaneCall` | Calls onto one particular thread, returned as futures |
 | `parking_lane`, `ParkingPump` | A lane whose thread parks while nothing is queued, for a thread that runs nothing but its calls |
 | `ChaosConfig`, `ExecutionLog`, `Executor::execution_log`, `Executor::chaos_config` | Seeded schedule perturbation and exact replay for SOUR, and the configuration a run reports it applied |
+| `take_foreground_task_role`, `TaskRole`, `current_core_class`, `CoreClass` | For measurement only: the foreground task role on macOS, and the class of the core the calling thread is on ("Measurement calls" below) |
 
 `GraphRun`, `Task`, `JobRun` and `Sleep` resolve to a `lactose_core::Result`. The error is of kind
 `Cancelled` and means the executor shut down first. What each resolution guarantees:
@@ -336,6 +337,72 @@ and list what changed, because `lactose-ecs` is written against this surface.
   log whose next job belongs to a graph run the program has not started yet is not stuck:
   replay waits for the program, however slow.
 
+## Measurement calls
+
+`take_foreground_task_role` and `current_core_class` are for cost tests and the benchmark
+(D164). The executor calls neither, and nothing in a frame should: the role is the whole
+process's, and a core's class is a reading of where the scheduler put a thread, which it may
+change at the next instruction. A test takes the role once, before it times anything, and
+reads the class around the work it times, never inside it.
+
+**The task role.** On macOS `take_foreground_task_role` asks for
+`TASK_FOREGROUND_APPLICATION` with `task_policy_set` on the process's own task, the category
+flavor, and returns what `task_policy_get` then reports, with what the role grants: the
+scheduled priority (`thread_info`, `THREAD_EXTENDED_INFO`, `pth_priority`) of a thread it then
+starts in the frame-critical class, user-interactive QoS. `TaskRole`'s `Display` is the role's
+name in `<mach/task_policy.h>`, the two calls' results and that priority, the text a result
+file records. The role read back is the request: macOS accepts it however the process was
+started, so `is_foreground` holds under `taskpolicy -b` or `-c` and in every launchd job alike,
+and only the priority shows what was granted. The record is the priority read back, whatever
+it is; there is no one value that means unclamped. A process started from a terminal is in
+`TASK_UNSPECIFIED`, where user-interactive QoS is clamped to priority 31. On the M1 under
+macOS 27.2, before the request and then after it:
+
+| Started by | Before | After |
+|---|---|---|
+| A terminal | 31 | 47 |
+| launchd, `ProcessType` `Interactive` | 37 | 37 |
+| launchd, no `ProcessType` or `Standard` | 20 | 20 |
+| launchd, `ProcessType` `Background` or `Adaptive` | 4 | 4 |
+| `taskpolicy -c utility` | 20 | 20 |
+| `taskpolicy -b` | 4 | 4 |
+
+A child process inherits the start it was given: cargo and nextest started by a launchd job read
+as that job does. Every other target has no task roles: the call asks nothing and returns
+`TaskRole::NotApplicable`.
+
+The role cannot be given back. On the Apple M1 under macOS 27.2 a request for
+`TASK_UNSPECIFIED` returns `KERN_INVALID_ARGUMENT` (4) and the role stays as it was;
+`TASK_DEFAULT_APPLICATION` and `TASK_BACKGROUND_APPLICATION` are accepted, and a
+user-interactive thread then runs at 46, which is neither role's priority. So a case that
+needs the unspecified role runs in a process of its own that never takes the foreground one.
+
+**The class of the current core.** `current_core_class` reads the CPU the calling thread is
+on and looks it up in a map of the machine's CPUs, built at the first call and kept for the
+process. The map follows the rule `CoreTopology` counts by, so the two agree on a machine:
+
+| Target | Current CPU | Its class |
+|---|---|---|
+| macOS | `pthread_cpu_number_np` | The logical CPUs of each performance level at boot, `hw.perflevel<n>.logicalcpu_max`: level 0 is the performance class and every other level the efficiency class |
+| Windows | `GetCurrentProcessorNumberEx`, its group and number | The efficiency class of its core, from the group masks of the core records `GetLogicalProcessorInformationEx` reports; the lowest class is the efficiency class and every class above it the performance class |
+| Linux | `sched_getcpu` | The `cpu_capacity` of its core in sysfs, by the same rule, or on an Intel hybrid part the CPU lists of the `cpu_core` and `cpu_atom` PMUs. A core is its package, cluster and core id (`topology/cluster_id`, 0 where the kernel has none): device-tree arm64 kernels put every CPU in package 0 and restart core ids in each cluster |
+
+Where the system reports every core as one class (one performance level, equal efficiency
+classes, equal capacities), every core is `CoreClass::Performance`. The call returns `None`
+where it cannot tell: a Linux kernel that exports neither capacities nor the PMU lists, which
+is every x86 kernel on a part that is not hybrid; a CPU the map does not hold; every other
+target; and Miri.
+
+What it assumes on macOS: that the kernel numbers its CPUs from the slowest performance level
+up, efficiency cores first. macOS documents no map from a CPU number to its level. The device
+tree of Apple silicon reports one (`ioreg -p IODeviceTree -n cpus`: each CPU's
+`logical-cpu-id` and `cluster-type`, `E` or `P`), and on the M1 it names CPUs 0 to 3 `E` and
+4 to 7 `P`. The test `the_apple_numbering_is_the_device_trees` holds the map against the device
+tree on every Mac it runs on that reports two levels, and fails there if the tree does not
+parse; the call itself reads only the sysctls. The counts are the boot's (`logicalcpu_max`),
+not the current power mode's (`logicalcpu`): a CPU's number is fixed in `[0, hw.ncpu)`, so a
+CPU taken offline must not shift the numbers above it.
+
 ## Proof for milestone 0
 
 Benchmarks live in `benches/` and their results are checked in under `docs/results/`, since CI
@@ -504,6 +571,21 @@ Correctness:
 - `tests/abort.rs` re-runs itself as a subprocess and checks that a panic in a job, a
   finalize, a scope child, a scope body, a task or the drop of a cancelled task's future
   aborts the process, and that an unfollowable replay log does.
+- `src/measure.rs` holds the measurement calls: on macOS the foreground role taken and read
+  back with the priority it grants, 47 where the process started at 31, never below the
+  priority before it, and again with no change; the class map against the device tree's
+  (above) and against the topology's counts; a class read on every call on four threads
+  wherever the system reports the cores' types; on a Mac with two levels, as many spinning
+  user-interactive threads as CPUs reading both classes between them, since macOS cannot pin
+  and the performance cores alone cannot hold them all; and on Linux and Windows a thread
+  pinned to each CPU the process may use in turn, where every reading is the same and is that
+  CPU's. `src/platform.rs` holds the maps built from hand-made input: Apple levels, Linux
+  capacities and PMU lists (and a device-tree arm64 machine where each cluster restarts its
+  core ids at 0), and Windows core records with their group masks, on any host; and the Linux
+  sysfs reader over a temporary tree, with and without `topology/cluster_id` and with an
+  offline CPU. The tests that call the system are ignored under Miri. CI's macOS leg runs the
+  role read-back and the class-map tests again with their output shown, so its log records
+  the priority before and after the request and the levels the runner reports.
 
 What the implementation relies on in its pinned dependencies:
 

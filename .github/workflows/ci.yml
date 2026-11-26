@@ -140,6 +140,19 @@ jobs:
       # nextest does not run doctests; the compile_fail ones pin safety arguments.
       - name: Doctests
         run: cargo test --doc ${{ steps.group.outputs.packages }} --locked
+      # What the macOS runner grants a measurement run: the role read-back test prints the
+      # user-interactive priority before and after the request, and the class-map tests print
+      # the performance levels the runner reports. nextest hides a passing test's output, so
+      # this runs them again with it shown (crates/task/README.md, "Measurement calls"), and
+      # also when Test failed, the case its output explains.
+      - name: Task role and core classes on this runner
+        if: ${{ !cancelled() && steps.group.outcome == 'success' && matrix.os == 'macos-latest' && matrix.group == 'base' }}
+        run: >-
+          cargo nextest run --locked -p lactose-task --no-capture
+          -E 'test(=measure::tests::the_foreground_role_is_taken_and_read_back)
+          | test(=measure::tests::the_classes_agree_with_the_topology)
+          | test(=measure::tests::the_apple_numbering_is_the_device_trees)
+          | test(=platform::tests::detected_topology_is_usable)'
       # Release codegen differs from debug; the golden table must hold in both. It runs with
       # the group that holds the three packages. Windows runs it in the windows-lint-release
       # job.

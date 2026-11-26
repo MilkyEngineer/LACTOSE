@@ -253,7 +253,7 @@ pub const MEASUREMENTS: [Measurement; 18] = [
     Measurement {
         name: "remote-upload-5k",
         what: "Milestone 2's criterion 5: the remote upload of 5,000 interpolated entities into the device's ring, paced at 144 Hz, one writer pushing every slot at 30 Hz",
-        threshold: "1 ms for the median frame, a P99 over 2 ms a finding (milestone 2 plan, section 4, criterion 5; verification rows 19 and 102)",
+        threshold: "1 ms for the median of the paced frames that began and ended on a performance core, every frame on a machine with one class of core, with their share, and no verdict with under a tenth of them or with the numbering flagged; their P99 over 2 ms a finding (milestone 2 plan, section 4, criterion 5; D164; verification rows 19 and 102)",
         run: device(
             "lactose-app-client",
             "crates/app-client/tests/upload.rs",
