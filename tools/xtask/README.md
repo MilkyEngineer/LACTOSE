@@ -26,7 +26,7 @@ of a manifest it writes under the target directory.
 | `heavy` | nothing: it bounds how many heavy commands run at once on one machine (below) |
 | `measure` | nothing: it runs the milestone measurements and writes their result files (below) |
 | `slang` | nothing: it installs the pinned Slang release under the target directory and prints its `slangc` (below) |
-| `gpu [--driver <name>] [--adapter <name>] [--only <metal\|vulkan>] [--gpu-assisted] [--cooked <dir>]` | the GPU run's rule of decision 5.10 of the milestone 2 plan: the Metal step on macOS and the Vulkan step (below); with no `--driver`, the M1's gate, under MoltenVK and KosmicKrisp |
+| `gpu [--driver <name>] [--adapter <name>] [--only <metal\|vulkan>] [--gpu-assisted] [--cooked <dir>] [--client]` | the GPU run's rule of decision 5.10 of the milestone 2 plan: the Metal step on macOS and the Vulkan step (below); with no `--driver`, the M1's gate, under MoltenVK and KosmicKrisp; with `--client`, the release client on a window under each driver, plain and lagged |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
 is printed there. The exit status is 0 for none, 1 for findings and 2 when a check could not
