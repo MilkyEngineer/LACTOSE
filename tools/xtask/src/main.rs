@@ -434,7 +434,10 @@ impl<'a> GpuArgs<'a> {
             }
             parsed.drivers = match parsed.validators {
                 vulkan::Validators::Plain => vulkan::MACOS_GATE.to_vec(),
-                vulkan::Validators::GpuAssisted => vec![vulkan::Driver::KosmicKrisp],
+                vulkan::Validators::GpuAssisted => vulkan::MACOS_GATE
+                    .into_iter()
+                    .filter(|driver| driver.takes_gpu_assisted())
+                    .collect(),
             };
         }
         if parsed.adapter.is_some() && parsed.drivers != [vulkan::Driver::System] {

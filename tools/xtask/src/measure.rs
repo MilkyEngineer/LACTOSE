@@ -102,6 +102,11 @@ pub enum Run {
     Headless,
     /// The edit-to-playing loop of decision 5.9.
     EditToPlaying,
+    /// `rhi-conformance`: the gate's Vulkan step (`cargo xtask gpu --only vulkan`), once under
+    /// each of [`Options::drivers`] and again under GPU-assisted validation where the driver
+    /// takes it, each run's report under the target directory written out under a header of
+    /// its own ([`conformance_markdown`]).
+    Conformance,
 }
 
 impl Run {
@@ -126,7 +131,11 @@ impl Run {
     pub const fn on_device(self) -> bool {
         matches!(
             self,
-            Self::Device { .. } | Self::GpuCost { .. } | Self::Triangle | Self::FramePace
+            Self::Device { .. }
+                | Self::GpuCost { .. }
+                | Self::Triangle
+                | Self::FramePace
+                | Self::Conformance
         )
     }
 
@@ -163,7 +172,7 @@ const fn device(package: &'static str, file: &'static str, test: &'static str) -
 }
 
 /// Every measurement, in the order `--all` runs them.
-pub const MEASUREMENTS: [Measurement; 18] = [
+pub const MEASUREMENTS: [Measurement; 19] = [
     Measurement {
         name: "tick-100k",
         what: "Criterion 1: the median step of the 100k scene on one frame worker and on N, S and the projected eight-core tick",
@@ -291,6 +300,12 @@ pub const MEASUREMENTS: [Measurement; 18] = [
         what: "The client binary shown and paced by its timer root, each frame and each present call stamped: the lateness of each frame's first tick, the record, its width and longest job, the submit and the hold, the present call's parts, `waiting`, and the latch's age at the display against the floor swept across the refresh",
         threshold: "none: recorded; the lateness read against D144's 1 ms on Windows and D156's 50 us on macOS, and D162's four readings (milestone 2 plan, section 4, row `frame-pace`)",
         run: Run::FramePace,
+    },
+    Measurement {
+        name: "rhi-conformance",
+        what: "Milestone 2's criterion 2: the gate's Vulkan step, every device test of `lactose-rhi-vulkan`, `lactose-render-graph`, `lactose-renderer` and `lactose-app-client` in a process of its own under the pinned layer, the validators' canaries first: the cases run, the capabilities the device reports, each canary's message and the count of other messages by source",
+        threshold: "decision 5.10's rule: every case passes or skips for a reason it names, each canary is heard, and no other message is sent (milestone 2 plan, section 4 and criterion 2)",
+        run: Run::Conformance,
     },
 ];
 
@@ -755,6 +770,18 @@ fn redacted(value: &str, sdk: Option<&Path>) -> String {
     }
 }
 
+/// `value` as a result file writes it: a path inside `sdk` from `<sdk>`, one inside the
+/// repository `root` relative to it, and any other absolute one cut to its file name
+/// ([`redacted`]).
+fn cut_path(value: &str, root: &Path, sdk: Option<&Path>) -> String {
+    let path = Path::new(value);
+    if !sdk.is_some_and(|sdk| path.starts_with(sdk)) && path.starts_with(root) {
+        shown_path(root, path)
+    } else {
+        redacted(value, sdk)
+    }
+}
+
 /// How the measurements on a device run, for their headers.
 #[derive(Clone, Debug)]
 struct DeviceSetting {
@@ -810,8 +837,9 @@ fn device_notes(setting: &DeviceSetting, adapter: Option<&str>) -> Vec<(String, 
     note("Loader", loader);
     note(
         "Validation",
-        "off: no layer enabled and every implicit one disabled \
-         (`VK_LOADER_LAYERS_DISABLE=~implicit~`), and no Metal API or shader validation"
+        "off: no layer loaded, the loader's implicit and explicit layer paths an empty \
+         directory (`VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_PATH`), and no Metal API or shader \
+         validation"
             .to_owned(),
     );
     note(
@@ -984,6 +1012,336 @@ fn shell_line(env: &[(&str, String)], program: &str, args: &[String]) -> String 
     words.push(program.to_owned());
     words.extend(args.iter().map(|arg| quote(arg)));
     words.join(" ")
+}
+
+/// The report of one Vulkan step of the gate, `<driver>-vulkan[-gpu-assisted].txt` under the
+/// target directory's `gpu`, as `cargo xtask gpu` writes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GateReport {
+    /// Its `name: value` lines before the entries: `driver`, `shaders`, `layer`, `inherited
+    /// and cleared`, `canaries` and `failed`.
+    fields: Vec<(String, String)>,
+    /// The variables the run set, in order.
+    environment: Vec<(String, String)>,
+    /// The `DeviceInfo` line, as the suite printed it.
+    device: Option<String>,
+    /// The `Capabilities` line, as the suite printed it.
+    capabilities: Option<String>,
+    entries: Vec<GateEntry>,
+}
+
+/// One entry of a [`GateReport`]: a test's verdict and what it heard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GateEntry {
+    /// The package, where the entry names one: a listed canary no test binary holds has none.
+    package: Option<String>,
+    test: String,
+    /// `passed`, `skipped, <why>` or `FAILED, <why>`.
+    word: String,
+    /// The messages and the lines of the driver's or Metal's log the entry records; not a
+    /// retry's line, nor how a failed test ended and its output's tail.
+    heard: Vec<String>,
+}
+
+impl GateReport {
+    fn field(&self, name: &str) -> Option<&str> {
+        self.fields.iter().find(|(field, _)| field == name).map(|(_, value)| value.as_str())
+    }
+}
+
+/// Reads the gate's report.
+///
+/// # Errors
+/// On a report with no `driver`, `layer` or `failed` line, or with a line after them that is
+/// no entry.
+fn gate_report(text: &str) -> Result<GateReport, String> {
+    let mut report = GateReport::default();
+    let mut lines = text.lines();
+    let mut in_environment = false;
+    for line in lines.by_ref() {
+        if in_environment && let Some(set) = line.strip_prefix("  ") {
+            let (name, value) = set.split_once('=').unwrap_or((set, ""));
+            report.environment.push((name.to_owned(), value.to_owned()));
+            continue;
+        }
+        in_environment = line == "environment:";
+        if in_environment {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(": ") else {
+            return Err(format!("the gate's report has a line that is no field: `{line}`"));
+        };
+        report.fields.push((name.to_owned(), value.to_owned()));
+        if name == "failed" {
+            break;
+        }
+    }
+    for needed in ["driver", "layer", "failed"] {
+        if report.field(needed).is_none() {
+            return Err(format!("the gate's report has no `{needed}` line"));
+        }
+    }
+    // Past how a failed test ended, an entry's lines are its output's tail.
+    let mut ended = false;
+    for line in lines {
+        if line.starts_with("DeviceInfo") {
+            report.device = Some(line.to_owned());
+        } else if line.starts_with("Capabilities") {
+            report.capabilities = Some(line.to_owned());
+        } else if let Some(heard) = line.strip_prefix("  ") {
+            let Some(entry) = report.entries.last_mut() else {
+                return Err(format!(
+                    "the gate's report has a line before its first entry: `{line}`"
+                ));
+            };
+            ended |= heard.starts_with("ended with ");
+            if !ended && !heard.starts_with(' ') && !heard.ends_with("retrying") {
+                entry.heard.push(heard.to_owned());
+            }
+        } else if let Some((name, word)) = line.split_once(": ") {
+            let (package, test) = match name.split_once(' ') {
+                Some((package, test)) => (Some(package.to_owned()), test),
+                None => (None, name),
+            };
+            report.entries.push(GateEntry {
+                package,
+                test: test.to_owned(),
+                word: word.to_owned(),
+                heard: Vec::new(),
+            });
+            ended = false;
+        } else if !line.is_empty() {
+            return Err(format!("the gate's report has a line that is no entry: `{line}`"));
+        }
+    }
+    Ok(report)
+}
+
+/// What a line an entry heard came from: the debug messenger's `MessageSource` in its
+/// message, or the driver's or Metal's own log.
+fn source_of(heard: &str) -> &'static str {
+    match heard.strip_prefix("message: ") {
+        Some(message) if message.contains("source: Driver") => "Driver",
+        Some(_) => "Validation",
+        None => "log",
+    }
+}
+
+/// The top-level fields of a line the suite printed with `Debug`, `Name { a: 1, b: B { .. } }`,
+/// each `(a, 1)`; `None` for a line not of that form.
+fn debug_fields(line: &str) -> Option<Vec<(String, String)>> {
+    let inner = line.split_once(" { ")?.1.strip_suffix(" }")?;
+    let (mut fields, mut depth, mut start) = (Vec::new(), 0_i32, 0);
+    let mut push = |part: &str| -> Option<()> {
+        let (name, value) = part.trim().split_once(": ")?;
+        fields.push((name.to_owned(), value.to_owned()));
+        Some(())
+    };
+    for (at, character) in inner.char_indices() {
+        match character {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                push(&inner[start..at])?;
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    push(&inner[start..])?;
+    Some(fields)
+}
+
+/// The directories of the machine a result file names by no absolute path: the repository's
+/// root, the SDK's and the home directory.
+struct Cut {
+    root: PathBuf,
+    sdk: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
+
+impl Cut {
+    /// A value that may be a path, as [`cut_path`] writes it.
+    fn value(&self, value: &str) -> String {
+        cut_path(value, &self.root, self.sdk.as_deref())
+    }
+
+    /// `text` with each of the directories in it written as `<sdk>`, relative to the
+    /// repository, or as `~`, in that order: the SDK may be inside either.
+    fn text(&self, text: &str) -> String {
+        let mut text = text.to_owned();
+        let named =
+            [(self.sdk.as_deref(), "<sdk>"), (Some(&*self.root), "."), (self.home.as_deref(), "~")];
+        for (dir, name) in named {
+            let Some(dir) = dir.map(|dir| dir.to_string_lossy().into_owned()) else { continue };
+            if !dir.is_empty() {
+                text = text.replace(&dir, name);
+            }
+        }
+        text
+    }
+}
+
+/// What a file of `rhi-conformance` says of its run, beside the gate's report.
+struct ConformanceHeader {
+    /// The driver's flag, `-gpu-assisted` after it for that run.
+    variant: String,
+    machine: String,
+    date: String,
+    cpu: String,
+    os: String,
+    arch: &'static str,
+    commit: String,
+    command: String,
+    ran: String,
+    load: Load,
+    /// `--adapter`, where one was given.
+    adapter: Option<String>,
+}
+
+/// A cell of a Markdown table: no `|` in it ends the cell, and no line break the row.
+fn cell(text: &str) -> String {
+    text.replace('|', "\\|").replace('\n', " ")
+}
+
+/// A code span of `text`, in which no backtick of its own ends the span.
+fn code(text: &str) -> String {
+    format!("`{}`", text.replace('`', "'"))
+}
+
+/// The file of one `rhi-conformance` run: a header of its own, for the gate is no timed
+/// measurement and its run no device file's, then section 4's four contents, the cases run,
+/// the capabilities reported, each canary's message and the count of other messages by
+/// source. Every path in it is `cut`.
+fn conformance_markdown(
+    m: &Measurement,
+    header: &ConformanceHeader,
+    report: &GateReport,
+    cut: &Cut,
+) -> String {
+    let field = |name: &str| report.field(name).unwrap_or("unreported");
+    let mut text = String::new();
+    let (variant, machine, date) = (&header.variant, &header.machine, &header.date);
+    let _ = writeln!(text, "# {} under {variant}, {machine}, {date}\n", m.name);
+    let _ = writeln!(text, "{}. Threshold: {}.\n", m.what, m.threshold);
+    let (load_name, load) = load_text(&header.load);
+    let device = report.device.as_deref();
+    let named = device.and_then(debug_fields).and_then(|fields| {
+        let (_, value) = fields.into_iter().find(|(name, _)| name == "adapter")?;
+        Some(value.trim_matches('"').to_owned())
+    });
+    let adapter = match (named, &header.adapter) {
+        (Some(name), Some(given)) => format!("{name}, chosen by `--adapter {given}`"),
+        (Some(name), None) => format!("{name}, the loader's first device (no `--adapter`)"),
+        (None, _) => "unreported: no case printed the device".to_owned(),
+    };
+    let (layer, library) = match field("layer").split_once(", library ") {
+        Some((layer, library)) => (layer.to_owned(), format!(", library `{}`", cut.value(library))),
+        None => (field("layer").to_owned(), String::new()),
+    };
+    let validating =
+        |name: &str| name.starts_with("VK_KHRONOS_VALIDATION_") || name.starts_with("MTL_");
+    let shown = |(name, value): &(String, String)| code(&format!("{name}={}", cut.value(value)));
+    let settings: Vec<String> =
+        report.environment.iter().filter(|(name, _)| validating(name)).map(shown).collect();
+    let others: Vec<String> =
+        report.environment.iter().filter(|(name, _)| !validating(name)).map(shown).collect();
+    let rows = [
+        ("CPU", format!("{} ({}, {})", header.cpu, header.os, header.arch)),
+        ("Commit", format!("`{}`", header.commit)),
+        ("Command", format!("`{}`, which ran `{}`", header.command, header.ran)),
+        (load_name, load),
+        ("Adapter", adapter),
+        ("Device", device.map_or_else(|| "unreported".to_owned(), code)),
+        ("Driver", format!("`--driver {}`", field("driver"))),
+        ("Shaders", cut.text(field("shaders"))),
+        (
+            "Validation",
+            format!(
+                "{layer}{library}, loaded from the implicit layer path alone: {}",
+                settings.join(", ")
+            ),
+        ),
+        ("Environment", others.join(", ")),
+        ("Inherited and cleared", field("inherited and cleared").to_owned()),
+    ];
+    let _ = writeln!(text, "| | |\n|---|---|");
+    for (name, value) in rows {
+        let _ = writeln!(text, "| {name} | {} |", cell(&value));
+    }
+    // The cases, counted by verdict, then each.
+    let mut words: Vec<(&str, usize)> = Vec::new();
+    for entry in &report.entries {
+        let word = if entry.word.starts_with("FAILED") { "FAILED" } else { entry.word.as_str() };
+        match words.iter_mut().find(|(seen, _)| *seen == word) {
+            Some((_, count)) => *count += 1,
+            None => words.push((word, 1)),
+        }
+    }
+    let counted: Vec<String> =
+        words.iter().map(|(word, count)| format!("{count} {word}")).collect();
+    let _ = writeln!(text, "\n## Cases run\n");
+    let _ = writeln!(
+        text,
+        "{} entries, the gate's `failed: {}`: {}.\n",
+        report.entries.len(),
+        field("failed"),
+        counted.join("; ")
+    );
+    let _ = writeln!(text, "| Package | Case | Verdict |\n|---|---|---|");
+    for entry in &report.entries {
+        let package = entry.package.as_deref().map_or_else(|| "none".to_owned(), code);
+        let _ = writeln!(
+            text,
+            "| {package} | {} | {} |",
+            code(&entry.test),
+            cell(&cut.text(&entry.word))
+        );
+    }
+    let _ = writeln!(text, "\n## Capabilities reported\n");
+    match report.capabilities.as_deref() {
+        Some(line) => match debug_fields(line) {
+            Some(fields) => {
+                let _ = writeln!(text, "| Capability | Value |\n|---|---|");
+                for (name, value) in fields {
+                    let _ = writeln!(text, "| `{name}` | {} |", cell(&code(&value)));
+                }
+            }
+            None => {
+                let _ = writeln!(text, "{}", code(line));
+            }
+        },
+        None => {
+            let _ = writeln!(text, "Unreported: no case printed the device's capabilities.");
+        }
+    }
+    let _ = writeln!(text, "\n## Each canary's message\n");
+    let _ = writeln!(text, "The gate's canaries: {}.\n", cut.text(field("canaries")));
+    let canary = |entry: &&GateEntry| vulkan::is_canary(&entry.test);
+    for entry in report.entries.iter().filter(canary) {
+        let _ = writeln!(text, "- {}: {}", code(&entry.test), cut.text(&entry.word));
+        for heard in &entry.heard {
+            let _ = writeln!(text, "  - {}", code(&cut.text(heard)));
+        }
+    }
+    let _ = writeln!(text, "\n## Other messages by source\n");
+    let mut sources = [("Validation", 0_usize), ("Driver", 0), ("log", 0)];
+    for entry in report.entries.iter().filter(|entry| !canary(entry)) {
+        for heard in &entry.heard {
+            if let Some((_, count)) =
+                sources.iter_mut().find(|(source, _)| *source == source_of(heard))
+            {
+                *count += 1;
+            }
+        }
+    }
+    let _ = writeln!(text, "| Source | Messages |\n|---|---|");
+    let [validation, driver, log] = sources.map(|(_, count)| count);
+    let _ =
+        writeln!(text, "| `Validation`: the layer's, through the debug messenger | {validation} |");
+    let _ = writeln!(text, "| `Driver`: the driver's, through the debug messenger | {driver} |");
+    let _ = writeln!(text, "| The driver's or Metal's own log, on standard error | {log} |");
+    text
 }
 
 // ---- Running ----
@@ -1224,6 +1582,7 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
             Run::TaskBench => run_task_bench(workspace, options, &machine, &out),
             Run::Headless => run_headless(workspace, options, &machine, m, &out),
             Run::EditToPlaying => run_edit_to_playing(workspace, options, &machine, m, &out),
+            Run::Conformance => run_conformance(workspace, options, &machine, m, &out),
         };
         match result {
             Ok(files) => {
@@ -1618,12 +1977,14 @@ fn on_device(
         let sdk = vulkan::sdk(&pin, &workspace.target_dir)?;
         Some((pin.version, sdk))
     };
+    let no_layers = vulkan::no_layer_dir(&workspace.target_dir.join("measure"))?;
     let run = vulkan::Run::measured(
         driver,
         sdk.as_ref().map(|(_, sdk)| sdk),
+        &no_layers,
         options.adapter.as_deref(),
     )?;
-    let root = sdk.as_ref().and_then(|(_, sdk)| sdk.loader.parent());
+    let root = sdk.as_ref().map(|(_, sdk)| sdk.root.as_path());
     let program =
         root.map_or_else(|| PathBuf::from("vulkaninfo"), |root| root.join("bin/vulkaninfo"));
     let mut command = Command::new(&program);
@@ -1639,8 +2000,11 @@ fn on_device(
     if let Err(why) = &info {
         eprintln!("measure: the device's identity is {why}");
     }
-    let environment =
-        run.set.iter().map(|(name, value)| (name.clone(), redacted(value, root))).collect();
+    let environment = run
+        .set
+        .iter()
+        .map(|(name, value)| (name.clone(), cut_path(value, &workspace.root, root)))
+        .collect();
     let setting = DeviceSetting {
         driver: driver.name(),
         sdk_version: sdk.map(|(version, _)| version),
@@ -2110,17 +2474,11 @@ fn run_triangle(
             line[at..].split('"').next().map(str::to_owned)
         });
         header.notes.extend(device_notes(&device.setting, adapter.as_deref()));
-        // Paths inside the repository relative to its root, the SDK's from `<sdk>`.
         let environment: Vec<String> = run
             .set
             .iter()
             .map(|(name, value)| {
-                let value = if Path::new(value).starts_with(&workspace.root) {
-                    shown_path(&workspace.root, Path::new(value))
-                } else {
-                    redacted(value, sdk.loader.parent())
-                };
-                format!("`{name}={value}`")
+                format!("`{name}={}`", cut_path(value, &workspace.root, Some(&sdk.root)))
             })
             .collect();
         for (name, value) in &mut header.notes {
@@ -2877,6 +3235,124 @@ fn run_edit_to_playing(
     write(out, &header, &found, "")
 }
 
+/// `rhi-conformance`: the gate's Vulkan step, this binary's own `gpu --only vulkan`, once
+/// under each of [`Options::drivers`] and again under GPU-assisted validation where the
+/// driver takes it, each run's report read from the target directory and written out as
+/// `rhi-conformance-<driver>[-gpu-assisted]-<machine>-<date>.md` ([`conformance_markdown`]).
+/// A run whose gate fails still writes its file, and fails the measurement after the rest.
+fn run_conformance(
+    workspace: &Workspace,
+    options: &Options,
+    machine: &Machine,
+    m: &'static Measurement,
+    out: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let host = vulkan::Host::this()?;
+    let file = workspace.root.join(vulkan::PIN_FILE);
+    let pin = fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let pin = vulkan::Pin::parse(&pin)?;
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let sdk = vulkan::sdk_root(
+        host,
+        &pin,
+        &workspace.target_dir,
+        std::env::var_os("VULKAN_SDK"),
+        home.clone(),
+    );
+    let cut = Cut { root: workspace.root.clone(), sdk: sdk.ok(), home: home.map(PathBuf::from) };
+    let gate = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?;
+    let (mut written, mut failed) = (Vec::new(), Vec::new());
+    for driver in options.drivers() {
+        if options.adapter.is_some() && driver != vulkan::Driver::System {
+            return Err(format!(
+                "`--adapter` names the device under `--driver system` alone, as `cargo xtask \
+                 gpu` takes it, and this run is under {}",
+                driver.name()
+            ));
+        }
+        let mut forms = vec![vulkan::Validators::Plain];
+        if driver.takes_gpu_assisted() {
+            forms.push(vulkan::Validators::GpuAssisted);
+        }
+        for validators in forms {
+            let suffix = match validators {
+                vulkan::Validators::Plain => "",
+                vulkan::Validators::GpuAssisted => "-gpu-assisted",
+            };
+            let variant = format!("{}{suffix}", driver.name());
+            let mut args = vec!["gpu", "--driver", driver.name(), "--only", "vulkan"];
+            if !suffix.is_empty() {
+                args.push("--gpu-assisted");
+            }
+            if let Some(adapter) = &options.adapter {
+                args.extend(["--adapter", adapter]);
+            }
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            let ran = shell_line(&[], "cargo xtask", &args);
+            // An earlier run's report would be read as this one's.
+            let report_file = workspace
+                .target_dir
+                .join("gpu")
+                .join(format!("{}-vulkan{suffix}.txt", driver.name()));
+            match fs::remove_file(&report_file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(format!("{}: {e}", report_file.display()));
+                }
+                _ => {}
+            }
+            eprintln!("measure: rhi-conformance under {variant}: {ran}");
+            let sampler = Sampler::start();
+            let status = Command::new(&gate)
+                .args(&args)
+                .current_dir(&workspace.root)
+                // Standard output stays the measurement's; the gate's goes to standard error.
+                .stdout(std::io::stderr())
+                .stdin(Stdio::null())
+                .status();
+            let load = sampler.stop();
+            let status = status.map_err(|e| format!("cannot run `{}`: {e}", gate.display()))?;
+            let report = fs::read_to_string(&report_file)
+                .map_err(|e| format!("{}: {e}", report_file.display()))
+                .and_then(|text| gate_report(&text));
+            let report = match report {
+                Ok(report) => report,
+                Err(error) => {
+                    failed.push(format!("under {variant} the gate ended with {status}: {error}"));
+                    continue;
+                }
+            };
+            let header = ConformanceHeader {
+                variant: variant.clone(),
+                machine: machine.name.clone(),
+                date: machine.date.clone(),
+                cpu: machine.cpu.clone(),
+                os: machine.os.clone(),
+                arch: std::env::consts::ARCH,
+                commit: machine.commit.clone(),
+                command: options.command(),
+                ran,
+                load,
+                adapter: options.adapter.clone(),
+            };
+            let stem =
+                file_stem(&format!("{}-{variant}", m.name), &machine.name, &machine.date, false);
+            let md = out.join(format!("{stem}.md"));
+            fs::write(&md, conformance_markdown(m, &header, &report, &cut))
+                .map_err(|e| format!("{}: {e}", md.display()))?;
+            if !status.success() {
+                failed.push(format!(
+                    "under {variant} the gate ended with {status}, {} case(s) failed; its file \
+                     {} is written",
+                    report.field("failed").unwrap_or("unreported"),
+                    md.display()
+                ));
+            }
+            written.push(md);
+        }
+    }
+    if failed.is_empty() { Ok(written) } else { Err(failed.join("; ")) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3455,8 +3931,8 @@ mod tests {
         assert!(names.contains(&"record-stall") && names.contains(&"tick-100k"), "{names:?}");
         assert!(!names.contains(&"extract-50k") && !names.contains(&"remote-upload-5k"));
         assert!(!names.contains(&"gpu-cost") && !names.contains(&"triangle"), "{names:?}");
-        assert!(!names.contains(&"frame-pace"), "{names:?}");
-        assert_eq!(all.selected.len() + 5, MEASUREMENTS.len());
+        assert!(!names.contains(&"frame-pace") && !names.contains(&"rhi-conformance"));
+        assert_eq!(all.selected.len() + 6, MEASUREMENTS.len());
         let error = parse(&["extract-50k", "--no-device"]).unwrap_err();
         assert!(error.contains("`extract-50k`"), "{error}");
         let named = parse(&["extract-50k", "--driver", "kosmickrisp", "--adapter", "Apple M1"]);
@@ -3533,7 +4009,20 @@ mod tests {
         assert_eq!(redacted(icd, Some(&sdk)), "<sdk>/share/vulkan/icd.d/MoltenVK_icd.json");
         let elsewhere = std::env::temp_dir().join("lvp_icd.json");
         assert_eq!(redacted(elsewhere.to_str().unwrap(), Some(&sdk)), ".../lvp_icd.json");
-        assert_eq!(redacted("~implicit~", Some(&sdk)), "~implicit~");
+        assert_eq!(redacted("2", Some(&sdk)), "2");
+        // The run's empty layer directory is the repository's, written relative to it.
+        let root = std::env::temp_dir().join("repository");
+        let no_layers = root.join("target").join("measure").join("no-layers");
+        let no_layers = cut_path(no_layers.to_str().unwrap(), &root, Some(&sdk));
+        assert_eq!(no_layers, "target/measure/no-layers");
+        assert_eq!(cut_path(icd, &root, Some(&sdk)), "<sdk>/share/vulkan/icd.d/MoltenVK_icd.json");
+        // An SDK inside the repository, as Linux's under the target directory, is `<sdk>`.
+        let unpacked = root.join("target").join("vulkan-sdk");
+        let inside = unpacked.join("lib").join("VulkanLoader");
+        assert_eq!(
+            cut_path(inside.to_str().unwrap(), &root, Some(&unpacked)),
+            "<sdk>/lib/VulkanLoader"
+        );
         let mut setting = DeviceSetting {
             driver: "moltenvk",
             sdk_version: Some("1.4.363.1".into()),
@@ -3550,7 +4039,9 @@ mod tests {
             "| Loader | the Vulkan SDK 1.4.363.1's |",
             "| Ring memory | type 1 of 3, DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT + HOST_CACHED (0x000f):",
             "| Environment | `VK_DRIVER_FILES=<sdk>/share/vulkan/icd.d/MoltenVK_icd.json` |",
-            "| Validation | off: no layer enabled",
+            "| Validation | off: no layer loaded, the loader's implicit and explicit layer \
+             paths an empty directory (`VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_PATH`), and no Metal \
+             API or shader validation |",
             "| Presentation | none:",
         ] {
             assert!(text.contains(expected), "{expected} in\n{text}");
@@ -3583,6 +4074,155 @@ mod tests {
             let error = parse(&["--all", "--out", out]).unwrap().resolved(&root).unwrap_err();
             assert!(error.contains("outside the repository"), "{out}: {error}");
         }
+    }
+
+    /// A gate's report as `cargo xtask gpu` writes it under MoltenVK on the M1, cut to one of
+    /// each kind of entry, its paths under `root` and `sdk`: a canary heard, a case passed and
+    /// one skipped, a case that failed on a message with its tail, a retry, and a listed
+    /// canary no binary holds.
+    fn gate_text(root: &Path, sdk: &Path) -> String {
+        let (root, sdk) = (root.display(), sdk.display());
+        format!(
+            "driver: moltenvk\n\
+             shaders: Slang 2026.20\n\
+             layer: VK_LAYER_KHRONOS_validation 1.4.363 of the Vulkan SDK 1.4.363.1, library \
+             {sdk}/lib/libVkLayer_khronos_validation.dylib\n\
+             inherited and cleared: VK_LOADER_DEBUG\n\
+             environment:\n\
+             \x20 DYLD_FALLBACK_LIBRARY_PATH={sdk}/lib\n\
+             \x20 VK_DRIVER_FILES={sdk}/share/vulkan/icd.d/MoltenVK_icd.json\n\
+             \x20 VK_IMPLICIT_LAYER_PATH={root}/target/gpu/layers\n\
+             \x20 VK_LAYER_PATH={root}/target/gpu/no-layers\n\
+             \x20 VK_KHRONOS_VALIDATION_VALIDATE_CORE=true\n\
+             \x20 MTL_DEBUG_LAYER=1\n\
+             \x20 MVK_CONFIG_LOG_LEVEL=2\n\
+             \x20 LACTOSE_GPU_SHADERS={root}/target/gpu/shaders\n\
+             canaries: device::canary_core_validation_reports_a_wrong_layout heard 1\n\
+             failed: 2\n\
+             lactose-rhi-vulkan device::canary_core_validation_reports_a_wrong_layout: passed\n\
+             \x20 message: Message {{ source: Validation, severity: Error, id: \
+             \"VUID-vkCmdDraw-None-09600\", text: \"expects VkImage 0x14 in {sdk}/x\" }}\n\
+             lactose-rhi-vulkan conformance::address_is_read_in_a_shader: passed\n\
+             \x20 conformance::address_is_read_in_a_shader: Lag at 2 rounds: retrying\n\
+             DeviceInfo {{ backend: \"vulkan\", adapter: \"Apple M1\", driver: \"MoltenVK 1.4.2\" }}\n\
+             Capabilities {{ multi_draw_indirect: true, queues: QueueLayout {{ compute: Own, \
+             present: Shared }}, compute_groups: [1, 2, 3] }}\n\
+             lactose-rhi-vulkan device::device_reports_its_driver_and_sends_nothing_when_clean: passed\n\
+             lactose-rhi-vulkan conformance::acquire_without_a_release_is_refused: skipped, a case \
+             of a check the null backend alone makes\n\
+             lactose-renderer device::a_case: FAILED, 2 message(s)\n\
+             \x20 message: Message {{ source: Validation, severity: Error, id: \"VUID-x\", text: \"t\" }}\n\
+             \x20 message: Message {{ source: Driver, severity: Warning, id: \"\", text: \"t\" }}\n\
+             \x20 [mvk-warn] a line of the driver's\n\
+             \x20 ended with exit status: 0\n\
+             \x20 standard output, its last 1 of 1 line(s):\n\
+             \x20   message: Message {{ source: Validation, severity: Error, id: \"VUID-x\", text: \"t\" }}\n\
+             \x20 standard error: nothing\n\
+             device::canary_gpu_assisted_validation_reports_a_read_past_a_buffer: FAILED, a \
+             listed canary no test binary holds\n"
+        )
+    }
+
+    /// The gate's report reads: its fields, its environment, the device's lines, and each
+    /// entry with what it heard, a retry's line and a failed test's tail left out.
+    #[test]
+    fn the_gate_s_report_reads_as_its_entries() {
+        let root = std::env::temp_dir().join("repository");
+        let sdk = std::env::temp_dir().join("VulkanSDK").join("macOS");
+        let report = gate_report(&gate_text(&root, &sdk)).unwrap();
+        assert_eq!(report.field("driver"), Some("moltenvk"));
+        assert_eq!(report.field("failed"), Some("2"));
+        assert_eq!(report.environment.len(), 8);
+        assert_eq!(report.environment[6], ("MVK_CONFIG_LOG_LEVEL".to_owned(), "2".to_owned()));
+        assert!(report.device.as_deref().unwrap().contains("\"Apple M1\""));
+        let tests: Vec<&str> = report.entries.iter().map(|entry| entry.test.as_str()).collect();
+        assert_eq!(tests.len(), 6, "{tests:?}");
+        assert_eq!(report.entries[1].heard, Vec::<String>::new());
+        let failed = &report.entries[4];
+        assert_eq!(failed.package.as_deref(), Some("lactose-renderer"));
+        assert_eq!(failed.word, "FAILED, 2 message(s)");
+        let sources: Vec<&str> = failed.heard.iter().map(|line| source_of(line)).collect();
+        assert_eq!(sources, ["Validation", "Driver", "log"]);
+        assert_eq!(report.entries[5].package, None);
+        let fields = debug_fields(report.capabilities.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            fields[1],
+            ("queues".into(), "QueueLayout { compute: Own, present: Shared }".into())
+        );
+        assert_eq!(fields[2], ("compute_groups".into(), "[1, 2, 3]".into()));
+        assert_eq!(debug_fields("no fields"), None);
+        assert!(gate_report("driver: moltenvk\nlayer: x\n").unwrap_err().contains("`failed`"));
+        let stray = format!("{}a line of nothing\n", gate_text(&root, &sdk));
+        assert!(gate_report(&stray).unwrap_err().contains("no entry"));
+    }
+
+    /// Section 4's four contents under the file's own header, and no directory of the
+    /// machine in it: the SDK's is `<sdk>`, the repository's relative, the home's `~`.
+    #[test]
+    fn a_conformance_file_has_section_4_s_contents_and_no_path_of_the_machine() {
+        let home = std::env::temp_dir().join("home-of-someone");
+        let root = home.join("repository");
+        let sdk = home.join("VulkanSDK").join("1.4.363.1").join("macOS");
+        let report = gate_report(&gate_text(&root, &sdk)).unwrap();
+        let cut = Cut { root: root.clone(), sdk: Some(sdk), home: Some(home.clone()) };
+        let header = ConformanceHeader {
+            variant: "moltenvk".into(),
+            machine: "apple-m1".into(),
+            date: "2026-11-26".into(),
+            cpu: "Apple M1".into(),
+            os: "macos 27.2.1".into(),
+            arch: "aarch64",
+            commit: "0123456789ab".into(),
+            command: "cargo xtask measure rhi-conformance".into(),
+            ran: "cargo xtask gpu --driver moltenvk --only vulkan".into(),
+            load: Load::Averages { before: "1.0".into(), after: "2.0".into() },
+            adapter: None,
+        };
+        let m = find("rhi-conformance").unwrap();
+        let text = conformance_markdown(m, &header, &report, &cut);
+        assert!(text.starts_with("# rhi-conformance under moltenvk, apple-m1, 2026-11-26\n"));
+        for expected in [
+            "| Adapter | Apple M1, the loader's first device (no `--adapter`) |",
+            "| Device | `DeviceInfo { backend: \"vulkan\", adapter: \"Apple M1\", driver: \"MoltenVK 1.4.2\" }` |",
+            "| Validation | VK_LAYER_KHRONOS_validation 1.4.363 of the Vulkan SDK 1.4.363.1, library \
+             `<sdk>/lib/libVkLayer_khronos_validation.dylib`, loaded from the implicit layer path \
+             alone: `VK_KHRONOS_VALIDATION_VALIDATE_CORE=true`, `MTL_DEBUG_LAYER=1` |",
+            "`VK_IMPLICIT_LAYER_PATH=target/gpu/layers`",
+            "`VK_DRIVER_FILES=<sdk>/share/vulkan/icd.d/MoltenVK_icd.json`",
+            "| Load average | 1.0 before, 2.0 after |",
+            "## Cases run\n\n6 entries, the gate's `failed: 2`: 3 passed; 1 skipped, a case of a \
+             check the null backend alone makes; 2 FAILED.",
+            "| `lactose-renderer` | `device::a_case` | FAILED, 2 message(s) |",
+            "| `queues` | `QueueLayout { compute: Own, present: Shared }` |",
+            "- `device::canary_core_validation_reports_a_wrong_layout`: passed\n  - `message: \
+             Message { source: Validation, severity: Error, id: \"VUID-vkCmdDraw-None-09600\", \
+             text: \"expects VkImage 0x14 in <sdk>/x\" }`",
+            "- `device::canary_gpu_assisted_validation_reports_a_read_past_a_buffer`: FAILED",
+            "| `Validation`: the layer's, through the debug messenger | 1 |",
+            "| `Driver`: the driver's, through the debug messenger | 1 |",
+            "| The driver's or Metal's own log, on standard error | 1 |",
+        ] {
+            assert!(text.contains(expected), "{expected}\nin\n{text}");
+        }
+        assert!(!text.contains(&*home.to_string_lossy()), "{text}");
+        assert!(!text.contains("retrying") && !text.contains("ended with"), "{text}");
+        let given = ConformanceHeader { adapter: Some("Apple M1".into()), ..header };
+        let text = conformance_markdown(m, &given, &report, &cut);
+        assert!(text.contains("| Adapter | Apple M1, chosen by `--adapter Apple M1` |"));
+        // Outside every named directory, an absolute path in a message is left as the layer
+        // wrote it: the message is the record. A value is cut to its file name.
+        let other = std::env::temp_dir().join("elsewhere").join("icd.json");
+        assert_eq!(cut.value(&other.to_string_lossy()), ".../icd.json");
+    }
+
+    /// `--all` runs `rhi-conformance` last, and it is a measurement on a device.
+    #[test]
+    fn rhi_conformance_runs_last_and_on_a_device() {
+        let all = parse(&["--all"]).unwrap();
+        assert_eq!(all.selected.last().map(|m| m.name), Some("rhi-conformance"));
+        assert!(find("rhi-conformance").unwrap().run.on_device());
+        assert!(!find("rhi-conformance").unwrap().run.cut_by_short());
+        assert!(parse(&["rhi-conformance", "--no-device"]).is_err());
     }
 
     fn sample_header() -> Header {
