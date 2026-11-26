@@ -304,7 +304,9 @@ to the planner.
 177 from the same base. This proposal changes none of those lines but row 150, and of row 150 only
 the clause on the laptop, which the lane leaves. That block is a fragment and is applied to the row
 as the lane's merge leaves it. Rows 170 and 232, the nightly's, and section 3's line on the
-measurement commit are this proposal's.
+measurement commit are this proposal's. The lane merged at `b0c5f44` while this was written. Every
+block here was applied in memory to the plan and the verification file of that commit: each OLD
+was found once.
 
 ~~~text
 === docs/plans/milestone-2.md line 185: the lane table: two lanes after its last row
