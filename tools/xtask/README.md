@@ -869,10 +869,15 @@ writes its report.
      `target/gpu/layers/` that names its library by its absolute path. `VK_IMPLICIT_LAYER_PATH`
      is that directory, which the loader then reads in place of every other place it looks for
      an implicit layer: no layer the machine registers joins the run, the Windows registry's
-     `ImplicitLayers` (an OBS capture hook, on the work desktop) and Linux's
-     `/usr/share/vulkan/implicit_layer.d` (Mesa's device-select layer, on the CI runner) among
-     them. `VK_LAYER_PATH` is an empty directory, which hides the explicit layers, the SDK's
-     own registry entry among them. `VK_ADD_IMPLICIT_LAYER_PATH` would add the directory beside
+     `ImplicitLayers` (a capture tool's hook and the GPU driver's own layer, on a Windows
+     desktop) and Linux's `/usr/share/vulkan/implicit_layer.d` (Mesa's device-select layer, on
+     the CI runner) among them. `VK_LAYER_PATH` is an empty directory, which hides the explicit
+     layers, the SDK's own registry entry among them; a measured run sets both paths to it. On
+     Windows the second is needed even where no explicit layer is installed: with the implicit
+     path alone the loader still reads the registry's `ExplicitLayers` key, and where the key is
+     absent it sends "Registry lookup failed to get layer manifest files" as a warning through
+     the debug messenger, which failed a clean device test on loader 1.4.357 and would fail a
+     measured run. `VK_ADD_IMPLICIT_LAYER_PATH` would add the directory beside
      the machine's layers, and no run sets it. A layer forced through `VK_INSTANCE_LAYERS` or
      `VK_LOADER_LAYERS_ENABLE`, or found twice, makes the loader warn, and the warning reaches
      the debug messenger, which counts it. The loader ignores all of these variables in an

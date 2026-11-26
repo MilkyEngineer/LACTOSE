@@ -590,7 +590,10 @@ fn loader_and_driver(driver: Driver, sdk: &Sdk) -> Result<Vec<(String, String)>,
 /// The variables that give the loader its layers: the implicit ones from `implicit` alone,
 /// which the loader then reads in place of every other place it looks for them, the Windows
 /// registry's keys among them, and the explicit ones from the empty `no_layers`, which hides
-/// the SDK's, the installer's registry entries among them. A layer the loader is made to skip
+/// the SDK's, the installer's registry entries among them. Both are needed on Windows: with
+/// the implicit path alone the loader still reads the registry's `ExplicitLayers` key, and
+/// where the key is absent it warns through the debug messenger that the lookup failed, which
+/// fails a device test and a measured run. A layer the loader is made to skip
 /// by `VK_LOADER_LAYERS_DISABLE` it warns of instead, and the debug messenger counts the
 /// warning; one added beside the registry's by `VK_ADD_IMPLICIT_LAYER_PATH` joins every
 /// layer the machine registers.
@@ -1313,6 +1316,10 @@ mod tests {
     /// On Windows a run loads the system's loader, which the GPU's driver installs, and the
     /// system's drivers: it sets no library path, which would make Windows look for DLLs where
     /// the SDK is, and names no driver manifest. A driver the SDK ships elsewhere is refused.
+    /// Every run there, validated or measured, empties the explicit layer path as well as
+    /// naming the implicit one: on a Windows desktop, loader 1.4.357, the implicit path alone
+    /// left the loader reading the registry's absent `ExplicitLayers` key, and its warning
+    /// ("Registry lookup failed to get layer manifest files") failed a clean device test.
     #[test]
     fn on_windows_a_run_takes_the_systems_loader_and_drivers() {
         let root = PathBuf::from(r"C:\VulkanSDK\1.4.363.1");
@@ -1330,6 +1337,16 @@ mod tests {
         }
         assert_eq!(value(&run, "VK_IMPLICIT_LAYER_PATH").as_deref(), Some("layers"));
         assert_eq!(value(&run, "LACTOSE_GPU_ADAPTER").as_deref(), Some("AMD"));
+        let plain = Run::environment(Driver::System, &sdk, dirs, Validators::Plain, None);
+        // `measure` takes no SDK under `system` off the Mac, and one where it is given.
+        let measured = [None, Some(&sdk)]
+            .map(|sdk| Run::measured(Driver::System, sdk, dirs[1], Some("AMD")).unwrap());
+        for run in [&run, &plain.unwrap(), &measured[0], &measured[1]] {
+            assert_eq!(value(run, "VK_LAYER_PATH").as_deref(), Some("no-layers"), "{:?}", run.set);
+        }
+        for run in &measured {
+            assert_eq!(value(run, "VK_IMPLICIT_LAYER_PATH").as_deref(), Some("no-layers"));
+        }
         for driver in [Driver::Lavapipe, Driver::MoltenVk, Driver::KosmicKrisp] {
             let error =
                 Run::environment(driver, &sdk, dirs, Validators::Plain, None).err().unwrap();
