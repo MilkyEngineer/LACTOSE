@@ -20,15 +20,31 @@
 //! and not the phase is *beside the tick*; and the same records made with no tick running
 //! are *alone*. The file gives the median, the 99th percentile and the worst of each, with
 //! the same of each group's start wait, from `run_job`'s call to the job's start; and the
-//! physics phase's and the tick's medians, the tick timed inside its bounded future. 60
-//! ticks at each reservation (6 in a short run) after 10 of warm-up.
+//! physics phase's and the tick's medians, the tick timed inside its bounded future.
 //!
-//! Not measured here: on Windows, the time from each `block_in_place`'s end to the record's
-//! next job on a worker that was parked (the `SetEvent` item of row 164's unmeasured list).
-//! It needs a stamp where a frame-critical worker parks and wakes, inside `lactose-task`.
+//! The gate's wake (D165, D162) is read from `lactose-task`'s two debug spans: `open_gate`,
+//! from the end of the step's `block_in_place` closure to the gate's return, and `park`,
+//! around each wait a frame worker makes without a permit, in the idle protocol or on a
+//! scope's latch. A worker is *parked across* an opening when its `park` began before the
+//! opening's start and ended after it. At each reservation the file gives the time from
+//! each opening's start to the `park` exit of each worker parked across it, with the count of
+//! each kind of wait; the opening's own length, which bounds it on the opener's side; for the
+//! openings after which a worker parked across it took the record's next job, the first to
+//! start after the opening's start, that job's start from the opening's start and its start
+//! wait; and the count of the openings after which a worker that was awake took it, the
+//! opener among them. A figure of fewer than 100 samples gives its median and its worst and
+//! no 99th percentile. On Windows these are what the `SetEvent` for each frame worker that
+//! `Pool::open_gate` makes costs (row 164's unmeasured list). Every tick asserts that it saw
+//! an `open_gate` span, and each reservation that it saw `park` spans, so a build that
+//! compiles debug spans out fails.
+//!
+//! 360 ticks at each reservation (6 in a short run) after 10 of warm-up, so that the wakes
+//! number over a thousand on six frame workers.
 
 #![allow(dead_code, reason = "the scene as `lactose-sim`'s cost test has it")]
 
+use std::cell::Cell;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,7 +74,7 @@ use tracing::subscriber::Interest;
 use tracing::{Metadata, Subscriber};
 
 use crate::support::{bounded, lock, null_device, null_shaders};
-use crate::timing::{enter, figure, measured_workers, median, micros, short, spread};
+use crate::timing::{enter, figure, measured_workers, median, micros, percentile, short, spread};
 
 include!("../../sim/tests/cost/scene.rs");
 
@@ -68,6 +84,8 @@ const FIRST_BODY: u64 = 2_000_000;
 /// The instances the binary's scene shows.
 const INSTANCES: u64 = 7;
 const WARM_UP: u32 = 10;
+/// Under this many samples a figure gives its median and its worst, and no 99th percentile.
+const PERCENTILE_SAMPLES: usize = 100;
 
 fn s(value: f64) -> Scalar {
     Scalar::from_f64(value)
@@ -134,6 +152,10 @@ const PHYSICS: [&str; 3] = ["physics_api::sync", "physics_api::step", "physics_a
 
 /// The id of a span of no physics system: every system span is seen, to read its name.
 const OTHER: u64 = 1 + PHYSICS.len() as u64;
+/// The ids of `lactose-task`'s `open_gate` span and of its `park` span at each wait.
+const OPENING: u64 = OTHER + 1;
+const PARK_IDLE: u64 = OTHER + 2;
+const PARK_LATCH: u64 = OTHER + 3;
 
 /// What the spans of one tick's physics systems showed.
 #[derive(Default)]
@@ -144,18 +166,123 @@ struct Phase {
     seen: [bool; PHYSICS.len()],
 }
 
+/// A frame worker's wait without a permit, from a `park` span.
+#[derive(Clone, Copy)]
+struct Park {
+    worker: usize,
+    latch: bool,
+    began: Instant,
+    /// `None` while the worker waits.
+    ended: Option<Instant>,
+}
+
+/// What the `open_gate` and `park` spans of the frame workers showed since the last take.
+#[derive(Default)]
+struct Gate {
+    /// Each opening's start and end, the end `None` until the gate has returned.
+    openings: Vec<(Instant, Option<Instant>)>,
+    parks: Vec<Park>,
+    /// The index in `parks` of each frame worker's wait in progress.
+    waiting: Vec<Option<usize>>,
+}
+
 /// The first entry into a physics system's span and the last exit since the last take: the
 /// physics phase of one tick. A subscriber of its own: it sees the executor's node and range
 /// spans of the three systems, and `lactose-ecs`'s system span of every system, whose name
 /// it reads to keep the three. `step` runs as a node of the executor's; `sync` and
 /// `write_back` are exclusive and run as no node, so only their system spans show them.
+///
+/// It also sees `lactose-task`'s `open_gate` and `park` spans and keeps the frame workers'
+/// ([`Gate`]). A `park` callback runs on a worker that is going to sleep or has just been
+/// woken, where it must not block or call the executor (`lactose-task`'s README,
+/// "Tracing"): it reads the clock, takes a lock that only these callbacks take and the test
+/// thread between ticks, and pushes.
 #[derive(Default)]
-struct PhysicsPhase(Mutex<Phase>);
+struct PhysicsPhase {
+    phase: Mutex<Phase>,
+    gate: Mutex<Gate>,
+}
 
 impl PhysicsPhase {
     /// The phase since the last take, and which of the three systems it saw.
     fn take(&self) -> Phase {
-        std::mem::take(&mut *lock(&self.0))
+        std::mem::take(&mut *lock(&self.phase))
+    }
+
+    /// How many openings were seen since the last take of the gate's spans.
+    fn openings(&self) -> usize {
+        lock(&self.gate).openings.len()
+    }
+
+    /// The gate's spans since the last take. A wait in progress is dropped with the rest: it
+    /// began before any opening the next take holds.
+    fn take_gate(&self) -> Gate {
+        std::mem::take(&mut *lock(&self.gate))
+    }
+
+    fn gate_entered(&self, id: u64, worker: usize, now: Instant) {
+        let mut gate = lock(&self.gate);
+        if id == OPENING {
+            gate.openings.push((now, None));
+            return;
+        }
+        let park = Park { worker, latch: id == PARK_LATCH, began: now, ended: None };
+        gate.parks.push(park);
+        let at = gate.parks.len() - 1;
+        if gate.waiting.len() <= worker {
+            gate.waiting.resize(worker + 1, None);
+        }
+        gate.waiting[worker] = Some(at);
+    }
+
+    fn gate_exited(&self, id: u64, worker: usize, now: Instant) {
+        let mut gate = lock(&self.gate);
+        if id == OPENING {
+            if let Some(opening) = gate.openings.last_mut() {
+                opening.1 = Some(now);
+            }
+            return;
+        }
+        if let Some(at) = gate.waiting.get_mut(worker).and_then(Option::take) {
+            gate.parks[at].ended = Some(now);
+        }
+    }
+}
+
+/// The calling thread's index among the executor's frame-critical workers, which
+/// `lactose-task` names `whisk-frame-<index>`, else `None`. Read from the name once a thread.
+fn frame_worker() -> Option<usize> {
+    thread_local! {
+        static INDEX: Cell<Option<Option<usize>>> = const { Cell::new(None) };
+    }
+    INDEX.with(|index| {
+        if let Some(known) = index.get() {
+            return known;
+        }
+        let known = std::thread::current()
+            .name()
+            .and_then(|name| name.strip_prefix("whisk-frame-"))
+            .and_then(|at| at.parse().ok());
+        index.set(Some(known));
+        known
+    })
+}
+
+/// Reads a `park` span's `wait` field.
+#[derive(Default)]
+struct Wait(Option<String>);
+
+impl tracing::field::Visit for Wait {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "wait" {
+            self.0 = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "wait" {
+            self.0 = Some(format!("{value:?}").trim_matches('"').to_owned());
+        }
     }
 }
 
@@ -195,13 +322,28 @@ impl Subscriber for &'static PhysicsPhase {
                 .is_some_and(|path| path == "lactose_task::node" || path == "lactose_task::range")
             && PHYSICS.contains(&metadata.name());
         let system = metadata.target() == "casein" && metadata.name() == "system";
-        metadata.is_span() && (node || system)
+        let gate = metadata.target() == "whisk"
+            && matches!(metadata.name(), "open_gate" | "park")
+            && *metadata.level() == tracing::Level::DEBUG;
+        metadata.is_span() && (node || system || gate)
     }
 
     fn new_span(&self, attributes: &Attributes<'_>) -> Id {
         let metadata = attributes.metadata();
         if metadata.target() == "whisk" {
-            return physics_id(metadata.name());
+            return match metadata.name() {
+                "open_gate" => Id::from_u64(OPENING),
+                "park" => {
+                    let mut wait = Wait::default();
+                    attributes.record(&mut wait);
+                    match wait.0.as_deref() {
+                        Some("idle") => Id::from_u64(PARK_IDLE),
+                        Some("latch") => Id::from_u64(PARK_LATCH),
+                        other => panic!("a `park` span whose wait is {other:?}"),
+                    }
+                }
+                name => physics_id(name),
+            };
         }
         let mut name = SystemName::default();
         attributes.record(&mut name);
@@ -215,22 +357,36 @@ impl Subscriber for &'static PhysicsPhase {
     fn event(&self, _: &tracing::Event<'_>) {}
 
     fn enter(&self, id: &Id) {
+        if id.into_u64() >= OPENING {
+            let now = Instant::now();
+            if let Some(worker) = frame_worker() {
+                self.gate_entered(id.into_u64(), worker, now);
+            }
+            return;
+        }
         let Some(index) = (id.into_u64() as usize).checked_sub(1).filter(|&i| i < PHYSICS.len())
         else {
             return;
         };
         let now = Instant::now();
-        let mut phase = lock(&self.0);
+        let mut phase = lock(&self.phase);
         phase.seen[index] = true;
         phase.span = Some(phase.span.map_or((now, now), |(first, last)| (first.min(now), last)));
     }
 
     fn exit(&self, id: &Id) {
+        if id.into_u64() >= OPENING {
+            let now = Instant::now();
+            if let Some(worker) = frame_worker() {
+                self.gate_exited(id.into_u64(), worker, now);
+            }
+            return;
+        }
         if !(1..OTHER).contains(&id.into_u64()) {
             return;
         }
         let now = Instant::now();
-        let mut phase = lock(&self.0);
+        let mut phase = lock(&self.phase);
         phase.span = Some(phase.span.map_or((now, now), |(first, last)| (first, last.max(now))));
     }
 }
@@ -276,6 +432,7 @@ impl Recorder {
             let (render, rows) = (Arc::clone(&self.render), Arc::clone(&self.rows));
             executor.run_job(move |ctx| {
                 let start = Instant::now();
+                let worker = frame_worker();
                 let mut render = lock(&render);
                 assert_eq!(render.open(ctx).expect("a region"), Region::Ready, "null frees each");
                 let mut sink = render.sink();
@@ -285,21 +442,24 @@ impl Recorder {
                 drop(sink);
                 let draw = Draw { target, extent: FIXED_EXTENT, ready: None };
                 render.draw(ctx, draw).expect("the frame records");
-                (start, Instant::now())
+                (start, Instant::now(), worker)
             })
         };
-        let (start, end) = bounded(executor, job, "a frame's record").expect("the job runs");
+        let (start, end, worker) =
+            bounded(executor, job, "a frame's record").expect("the job runs");
         lock(&self.render).submit().expect("the frame submits");
-        Timed { asked, start, end }
+        Timed { asked, start, end, worker }
     }
 }
 
-/// One record's times: `run_job` called, the job begun, `draw` returned.
+/// One record's times: `run_job` called, the job begun, `draw` returned; and the frame
+/// worker that ran it.
 #[derive(Clone, Copy)]
 struct Timed {
     asked: Instant,
     start: Instant,
     end: Instant,
+    worker: Option<usize>,
 }
 
 impl Timed {
@@ -323,14 +483,84 @@ fn records(prefix: &str, records: &[Timed]) {
     spread(&format!("{prefix}.start_wait"), records.iter().map(Timed::start_wait).collect());
 }
 
+/// The median and the worst of `spans`, as figures `<name>.p50_us` and `<name>.max_us`;
+/// nothing for none.
+fn median_and_worst(name: &str, mut spans: Vec<Duration>) {
+    if spans.is_empty() {
+        return;
+    }
+    spans.sort_unstable();
+    figure(&format!("{name}.p50_us"), micros(percentile(&spans, 0.5)));
+    figure(&format!("{name}.max_us"), micros(spans[spans.len() - 1]));
+}
+
+/// [`spread`] from [`PERCENTILE_SAMPLES`] on, else [`median_and_worst`].
+fn spread_of_enough(name: &str, spans: Vec<Duration>) {
+    if spans.len() >= PERCENTILE_SAMPLES {
+        spread(name, spans);
+    } else {
+        median_and_worst(name, spans);
+    }
+}
+
+/// The gate's figures of one reservation under `<prefix>.gate`, over the openings of the
+/// measured ticks: each tick's range of `gate.openings` and the records it made.
+fn gate_figures(prefix: &str, gate: &Gate, ticks: &[(Range<usize>, Vec<Timed>)]) {
+    let (mut lengths, mut wakes, mut idle, mut latch) = (Vec::new(), Vec::new(), 0, 0);
+    let (mut from_opening, mut start_wait, mut awake_took) = (Vec::new(), Vec::new(), 0);
+    for (openings, made) in ticks {
+        for &(start, end) in &gate.openings[openings.clone()] {
+            lengths.push(end.expect("the gate returns before its tick ends") - start);
+            let mut parked = Vec::new();
+            for park in &gate.parks {
+                if park.began >= start || park.ended.is_some_and(|ended| ended <= start) {
+                    continue;
+                }
+                parked.push(park.worker);
+                // A wait still in progress when the reservation ends is parked but not timed.
+                if let Some(ended) = park.ended {
+                    wakes.push(ended - start);
+                    if park.latch {
+                        latch += 1;
+                    } else {
+                        idle += 1;
+                    }
+                }
+            }
+            let Some(next) = made.iter().find(|record| record.start >= start) else {
+                continue;
+            };
+            if next.worker.is_some_and(|worker| parked.contains(&worker)) {
+                from_opening.push(next.start - start);
+                start_wait.push(next.start_wait());
+            } else {
+                awake_took += 1;
+            }
+        }
+    }
+    let prefix = format!("{prefix}.gate");
+    figure(&format!("{prefix}.openings"), lengths.len());
+    spread(&format!("{prefix}.opening"), lengths);
+    figure(&format!("{prefix}.wakes_idle"), idle);
+    figure(&format!("{prefix}.wakes_latch"), latch);
+    spread_of_enough(&format!("{prefix}.wake"), wakes);
+    figure(&format!("{prefix}.parked_took"), from_opening.len());
+    median_and_worst(&format!("{prefix}.parked_took.from_opening"), from_opening);
+    median_and_worst(&format!("{prefix}.parked_took.start_wait"), start_wait);
+    figure(&format!("{prefix}.awake_took"), awake_took);
+}
+
 /// Every figure of one reservation, under `r<reserved>`.
 fn beside(executor: &Executor, recorder: &mut Recorder, workers: u32, reserved: u32, ticks: u32) {
     let phase: &'static PhysicsPhase = physics_phase();
     let mut simulation = composed(workers, reserved);
     let (mut physics, mut steps) = (Vec::new(), Vec::new());
     let (mut by_physics, mut by_tick) = (Vec::new(), Vec::new());
+    let mut gated = Vec::new();
+    phase.take_gate();
     for tick in 0..WARM_UP + ticks {
         phase.take();
+        let opened = phase.openings();
         let stepping = {
             let executor = executor.clone();
             std::thread::spawn(move || {
@@ -358,11 +588,14 @@ fn beside(executor: &Executor, recorder: &mut Recorder, workers: u32, reserved: 
         let Phase { span, seen } = phase.take();
         let (first, last) = span.expect("the tick ran its physics systems");
         assert!(seen.iter().all(|&seen| seen), "the phase saw {seen:?} of {PHYSICS:?}");
+        let openings = opened..phase.openings();
+        assert!(!openings.is_empty(), "tick {tick} at {reserved} saw no `open_gate` span");
         if tick < WARM_UP {
             continue;
         }
         steps.push(ended - began);
         physics.push(last - first);
+        gated.push((openings, made.clone()));
         for record in made {
             if record.start < last && record.end > first {
                 by_physics.push(record);
@@ -376,6 +609,9 @@ fn beside(executor: &Executor, recorder: &mut Recorder, workers: u32, reserved: 
     figure(&format!("{prefix}.step_us"), micros(median(steps)));
     records(&format!("{prefix}.beside_physics"), &by_physics);
     records(&format!("{prefix}.beside_tick"), &by_tick);
+    let gate = phase.take_gate();
+    assert!(!gate.parks.is_empty(), "the reservation of {reserved} saw no `park` span");
+    gate_figures(&prefix, &gate, &gated);
 }
 
 /// The subscriber, installed once per process (nextest runs each test in its own).
@@ -392,7 +628,7 @@ fn physics_phase() -> &'static PhysicsPhase {
 #[test]
 #[ignore = "a measurement, run by `cargo xtask measure`: times are reported, not asserted"]
 fn the_record_beside_the_physics_phase() {
-    let ticks = if short() { 6 } else { 60 };
+    let ticks = if short() { 6 } else { 360 };
     let workers = measured_workers();
     let executor = start_executor(Workers { frame_workers: Some(workers), ..Workers::default() })
         .expect("an executor");
