@@ -1,14 +1,16 @@
 # Proposal: the sittings that close milestone 2
 
 Status: decided. The owner ruled on its five questions and on the order, and this is the proposal as
-ruled, for the coordinator to apply as D165. It answers the exit pass's audit of main at `ad1a99d`
-(26 November 2026): what stands between main and milestone 2's exit (`docs/plans/milestone-2.md`,
-section 7), and in what order it is done. It settles four things: the measurement commit, the order
-of the sittings and what each asks of the owner, the Khronos layer's pin on Windows, and the stamp
-verification row 21's Windows item waits for. The rulings are near the end, where the questions
-were, and after them what the reviews changed. It amends no sentence of `docs/architecture.md`. It
-is applied as one decision entry, the plan's and the verification rows' text below, and two lanes,
-of which `park-stamp` is running.
+ruled, for the coordinator to apply as D165. It is the fifth version: the fourth's diff review found
+one serious defect, in a commands file and not in this text, five minor ones and five nits, and its
+answers are near the end. It answers the exit pass's audit of main at `ad1a99d` (26 November 2026):
+what stands between main and milestone 2's exit (`docs/plans/milestone-2.md`, section 7), and in
+what order it is done. It settles four things: the measurement commit, the order of the sittings and
+what each asks of the owner, the Khronos layer's pin on Windows, and the stamp verification row 21's
+Windows item waits for. The rulings are near the end, where the questions were, and after them what
+the reviews changed. It amends no sentence of `docs/architecture.md`. It is applied as one decision
+entry, the plan's and the verification rows' text below, and two lanes, of which `park-stamp` is
+running.
 
 This proposal ran no measurement and no device. It read the tree, the audit, `reviewer-gpu`'s
 reading for row 34, the two reviews with their probes and the diff review of the second version. It
@@ -69,14 +71,22 @@ main at `1c62676`, which is `b0c5f44` with lane `present-encoder` merged.
 ## The measurement commit
 
 **The decision.** The measurement commit is the first commit of main that holds the three lanes that
-change a measured input after `measure-role`: `present-encoder`, `park-stamp` and `layer-windows`.
-The coordinator records its hash in a verification row of its own, which this proposal adds, once
-three things hold: `check` is green at it, the `measure` workflow is green at it, and the work
-desktop has run the Windows pin on its RX 9060 XT at `layer-windows`' last merge. A failure of any
-of the three is a fix round of the lane it names, and the commit is then that round's merge. The
-third version's third condition was the laptop's first session. The owner has no Windows machine
-until 7 December 2026, and ruled that the work desktop's pin run takes its place: the commit is
-recorded once the pin has passed there, and the M1's hour follows.
+change a measured input after `measure-role`, which are `present-encoder`, `park-stamp` and
+`layer-windows`, and the fix round of each defect found before it. The coordinator records its hash
+in a verification row of its own, which this proposal adds, once three things hold: `check` is green
+at it, the `measure` workflow is green at it, and the work desktop's run of the Windows pin on its
+RX 9060 XT has passed, at a commit that holds `layer-windows`' last merge and every such fix round.
+A failure of `check` or of `measure` is a fix round of the lane it names. A defect a run of the work
+desktop's finds, an early run's as the pin's, is a fix round of the lane whose code it is, whichever
+crate that is, and a pin run from before that round's merge does not count. The fourth version wrote
+"has run the Windows pin" and sent a failure to "the lane it names". A pin run that failed met those
+words, a defect of the engine's that the pin found was no lane's by them, and nothing made the pin
+run again after a fix in a crate that is not `layer-windows`'. The rule has a first case already:
+the coordinator relays that the work desktop's first early run found the shader cook failing on
+Windows. That is `tools/cook`, a measured input and none of the three lanes' code. This proposal did
+not read the defect. The third version's third condition was the laptop's first session. The owner
+has no Windows machine until 7 December 2026, and ruled that the work desktop's pin run takes its
+place: the commit is recorded once the pin has passed there, and the M1's hour follows.
 
 **A measured input** is anything a measurement builds, runs or computes a figure with. Among them:
 the crates under `crates/` and `game/`, `tools/cook` and `tools/xtask`, the Slang and layer pins,
@@ -120,8 +130,9 @@ finding says which file is the record (section 7, step 7).
 **A defect a later sitting finds.** The work desktop shows AMD's driver and no other. A defect of a
 measured input that only NVIDIA's or Intel's driver shows is found on the laptop, from 7 December,
 after the M1's hour. It moves the commit to its fix: the M1's hour runs again there, or the owner
-rules that its files stand. The owner's ruling takes that cost for the days before 7 December it
-saves, and the fourth option below names it.
+rules that its files stand. A case of the pin's that the owner ruled the work desktop's own and that
+then fails in the laptop's gate is such a defect. The owner's ruling takes that cost for the days
+before 7 December it saves, and the fourth option below names it.
 
 **The nightly.** Exit step 3's nightly is the first at or after the measurement commit whose four
 `sour` jobs pass: `sour (linux-x64)`, `sour (windows-x64)`, `sour (macos-arm64)`, and `sour
@@ -138,7 +149,7 @@ are a runner's and are discarded (`.github/workflows/measure.yml`).
 
 | Option | What it rules out |
 |---|---|
-| A. The commit holds the three lanes and is recorded after the Windows pin's first run, which is the work desktop's (ruled) | Sittings at the commit before the lanes merge and the work desktop has run the pin. A defect that only NVIDIA's or Intel's driver shows is not found before the M1's hour |
+| A. The commit holds the three lanes and is recorded once the Windows pin has passed in its first run, which is the work desktop's (ruled) | Sittings at the commit before the lanes merge and the work desktop's pin run has passed. A defect that only NVIDIA's or Intel's driver shows is not found before the M1's hour |
 | B. Main's head now. The lanes merge after it | One commit for the record. `present-encoder` then changes what `frame-pace` and `triangle` measured, `park-stamp` changes the executor under all eighteen measurements and `layer-windows` every device run's environment: each is run again as steering, and the files the criteria rest on are of a tree the exit does not ship |
 | C. The commit holds `present-encoder` and `layer-windows` alone | Row 21's Windows item measured at the commit. It was the right commit had the owner re-gated that item |
 | D. Recorded before any Windows run, as the first version had it | A defect of the first Windows run found before the record is taken. Its fix moves the commit and the M1's hour is run again, or the owner rules that the M1's files stand. It was the third question's second option, and for NVIDIA's and Intel's drivers it is what the ruling takes |
@@ -147,9 +158,10 @@ are a runner's and are discarded (`.github/workflows/measure.yml`).
 **What would change it.** `park-stamp` running past two days or failing its review: the commit is
 taken without it, and its item is re-gated. The other two cannot be left out: `present-encoder`
 changes the client the criteria run, and without `layer-windows` nothing validated runs on Windows.
-The work desktop unable to run the pin at all, for a control of the machine: the commit is then
-recorded on `check` and `measure` alone, which is the fourth option, or waits for the laptop, and
-the owner rules which.
+The work desktop unable to run the pin at all, for a control of the machine, or left with a failure
+that no fix round ends and that is not the owner's to rule the machine's: the pin has not passed,
+and the commit is then recorded on `check` and `measure` alone, which is the fourth option, or waits
+for the laptop. The owner rules which, and neither is ruled here.
 
 ## The sittings, in order
 
@@ -158,10 +170,10 @@ no machine.
 
 | Order | Sitting | Machine and commit | What it needs from the owner | What it writes | Rows it closes or advances |
 |---|---|---|---|---|---|
-| Now | The work desktop's early runs | The work desktop, at main's head | Its installs approved at their prompts: the MSVC C++ build tools, rustup, nextest and Python. The remote session connected while a run opens a window | Nothing of record and nothing checked in. As steering: the gate's device tests, without their canaries, by hand on the RX 9060 XT, with no validation layer on the machine, which is the first run of `lactose-rhi-vulkan` on a Windows driver; the window cases, fifteen on Windows, in a remote session; `cargo xtask measure --all --no-device` as `work-desktop-windows`, thirteen measurements on an x86 desktop part | None closed. The row of the work desktop's runs. A defect of a measured input goes to a fix round before the commit |
+| Now | The work desktop's early runs | The work desktop, at main's head | Its installs approved at their prompts: the MSVC C++ build tools, rustup, nextest and Python. The remote session connected, its window open and not minimised, while a run opens a window | Nothing of record and nothing checked in. As steering: the gate's device tests, without their canaries, by hand on the RX 9060 XT, with no validation layer on the machine, which is the first run of `lactose-rhi-vulkan` on a Windows driver; the window cases, fifteen on Windows, in a remote session; `cargo xtask measure --all --no-device` as `work-desktop-windows`, thirteen measurements on an x86 desktop part | None closed. The row of the work desktop's runs. A defect goes to a fix round of the lane whose code it is, before the commit |
 | Now | The lanes, and the rows not yet read | None | Nothing | `layer-windows` and `park-stamp` in parallel, `present-encoder` having merged. `park-stamp` runs from `b0c5f44` and takes that merge for its `record-stall` part. One read-only pass over the 37 rows gated at milestone 2 that neither the audit nor this proposal read, so that what they owe a machine is in a commands file before the commit | None yet |
-| 1 | The work desktop's pin run | The work desktop, at `layer-windows`' last merge | The Vulkan SDK 1.4.363.1 installed there, approved at its prompt. The remote session connected while a run opens a window | Nothing of record and nothing checked in. The pin: the installed manifest's version and the layer's digest, the loader's implicit layers from its own log, the gate, plain and GPU-assisted, on the RX 9060 XT, and a short run of the four device measurements. Then, as rehearsal and as steering: the same on the integrated Radeon under a name of its own; all eighteen measurements; `cargo xtask gpu --client`; the three mutations' outcome | None closed. The pin's row and the row of the work desktop's runs. The measurement commit is not recorded before the pin has passed |
-| 2 | The quiet window | The M1, at the measurement commit, as soon as it is recorded: before 7 December if the lanes merge in time | The Mac on mains, awake, its screen unlocked, and unused for about an hour. One hand at the start: a window resized by its corner for a few seconds (row 209) | Eighteen measurements' files: milestone 1's twelve again, `extract-50k`, `remote-upload-5k` and `record-stall`, and `triangle`, `gpu-cost` and `frame-pace` under MoltenVK and under KosmicKrisp. The `rhi-conformance` files, under both drivers and under KosmicKrisp with GPU-assisted validation. The renderer's cost tests' figures, into their rows. The system daemon's CPU time before and after | The M1's half of 15, 16, 19, 21, 34, 102, 176, 192, 220, 228, 229 and 238; 171's files; 173's tick start read again; 209's M1 half |
+| 1 | The work desktop's pin run | The work desktop, at main's head once it holds `layer-windows`' last merge and the fix round of each defect found so far | The Vulkan SDK 1.4.363.1 installed there, approved at its prompt. The remote session connected, its window open and not minimised, while a run opens a window | Nothing of record and nothing checked in. The pin: the installed manifest's version and the layer's digest, the loader's implicit layers from its own log, the gate, plain and GPU-assisted, on the RX 9060 XT, and a short run of the four device measurements. Then, as rehearsal and as steering: the same on the integrated Radeon under a name of its own; all eighteen measurements; `cargo xtask gpu --client`; the three mutations' outcome | None closed. The pin's row and the row of the work desktop's runs. The measurement commit is not recorded before the pin has passed |
+| 2 | The quiet window | The M1, at the measurement commit, as soon as it is recorded: before 7 December if the lanes and each fix round merge in time | The Mac on mains, awake, its screen unlocked, and unused for about an hour. One hand at the start: a window resized by its corner for a few seconds (row 209) | Eighteen measurements' files: milestone 1's twelve again, `extract-50k`, `remote-upload-5k` and `record-stall`, and `triangle`, `gpu-cost` and `frame-pace` under MoltenVK and under KosmicKrisp. The `rhi-conformance` files, under both drivers and under KosmicKrisp with GPU-assisted validation. The renderer's cost tests' figures, into their rows. The system daemon's CPU time before and after | The M1's half of 15, 16, 19, 21, 34, 102, 176, 192, 220, 228, 229 and 238; 171's files; 173's tick start read again; 209's M1 half |
 | From 7 December 2026 | The desktop's first sitting | The desktop, under each system it boots, at `a539d60` | The owner at the desk for all of it. Mains power. Git, rustup with the pinned toolchain installed by name, a C toolchain, nextest. Under Windows, as administrator: `LocalDumps` before the run and, after it, the Vulkan SDK 1.4.363.1 installed, so session C needs no second setup | Milestone 1's twelve files for each system, the hash file `cargo xtask sour run --emit` writes, nextest's summary for `lactose-task`. The owner returns the CPU model, the systems, the GPU and `vulkaninfo`'s whole output; the `whisk` file's topology row says whether the processor is a hybrid one (row 80) | 64, 77, 80, 81, 164, 169; the desktop's half of 190; the desktop's queue families and memory types for 176 and 246; the facts decision 5.19 wants, which make session C's commands exact |
 | 3, from 7 December 2026 | The laptop's session | The laptop, at the measurement commit; row 63's runs at `a75596b` and its first parent | Once, as administrator: the SDK's installer and `LocalDumps`. Then the laptop on mains, logged in, its screen unlocked, its screen and sleep set to Never for the session and put back after it, and the agent session opened in a shell that is not elevated, with the session's brief. The session is about five hours, an estimate. One hand in its first ten minutes: a window dragged by its title bar (row 209). The display's refresh rate read out once | With the owner there: the checkouts' refresh, the SDK as installed, the loader's implicit layers, each GPU's queue families and memory types, and the latency tool's lines. Then the gate's reports, plain and GPU-assisted, on each GPU, and a short run of the four device measurements, thrown away. Then the record: all eighteen measurements on the RTX 4070 as `laptop-windows`, its `triangle` file criterion 1's proof on Windows; `triangle`, `gpu-cost` and `frame-pace` on the integrated GPU as `laptop-windows-intel`; `rhi-conformance`, plain and GPU-assisted, on each GPU. Last: `cargo xtask gpu --client` on each GPU, row 63's three `whisk` files at their own commits, the window cases' output, and the three mutations' outcome on the RTX 4070, as labelled data | 243; 63, 109, 189, 208, 209, 210, 234 and 236; the laptop's half of 190 and 247; 150's files and the machine's facts for 150, 176 and 246; the laptop's half of 21, 164's two items that `frame-pace` reads, 176, 228 and 229; labelled figures for 15, 16, 19 and 102; the pin's row, on NVIDIA's driver and Intel's |
 | 4, from 7 December 2026 | Session C | The desktop, under each system it boots, at the measurement commit; row 63's runs at their own commits if its processor is a hybrid one | The owner at the desk for all of it. Mains power. Python 3 for the mutation script | All eighteen measurements under Windows; under a system that is not a client platform, the sixteen that need no window. `rhi-conformance`, plain and GPU-assisted, on each GPU. `cargo xtask gpu --client`. The renderer's cost tests' figures. The three mutations' outcome, each beside its control | The x86 desktop's half of 15, 16, 19 and 102; 176; 212, 214, 216, 218 to 220, 222, 224, 225, 238 to 241 and 244; 246 and 247; 63's desktop half if it has one |
@@ -176,16 +188,16 @@ and the pin as soon as `layer-windows` merges. It is on the commit's critical pa
 was: the commit waits for its pin run, and for a fix and a second run if it finds a defect. What it
 cannot stand for is NVIDIA's driver and Intel's. The owner ruled that the commit and the M1's hour
 do not wait for them: the hour runs once the pin has passed on the RX 9060 XT, likely before 7
-December, and a defect that only the laptop's or the desktop's driver shows then moves the commit,
-with the M1's hour run again or its files ruled to stand. The quiet window is first at the commit
-because it is the cheapest and it reads the M1's half of every criterion a result file proves: a
-criterion that misses there needs an engine lane, and the files of a laptop's session and a desk
-sitting taken before that lane would be steering. From 7 December the desktop's first sitting waits
-for nothing but the machine: its commit is fixed, its commands are written, and what it returns of
-the desktop's GPU and second system is what session C's commands need. The laptop is before session
-C because it needs no owner after its first minutes. Session C is last because the owner's time at a
-desk is the scarcest thing in the plan, and it then runs once, on a tree two machines have measured
-and with a mutation script that has run on Windows.
+December, and a defect that only NVIDIA's or Intel's driver shows then moves the commit, with the
+M1's hour run again or its files ruled to stand. The quiet window is first at the commit because it
+is the cheapest and it reads the M1's half of every criterion a result file proves: a criterion that
+misses there needs an engine lane, and the files of a laptop's session and a desk sitting taken
+before that lane would be steering. From 7 December the desktop's first sitting waits for nothing
+but the machine: its commit is fixed, its commands are written, and what it returns of the desktop's
+GPU and second system is what session C's commands need. The laptop is before session C because it
+needs no owner after its first minutes. Session C is last because the owner's time at a desk is the
+scarcest thing in the plan, and it then runs once, on a tree two machines have measured and with a
+mutation script that has run on Windows.
 
 **The laptop is opened once.** The third version opened it twice, the first time before the commit.
 Nothing is left that must come before the commit: the pin's first run is the work desktop's, and the
@@ -199,15 +211,15 @@ step that needs a hand (row 209). Then, with nobody at it: the gate, plain and G
 GPU, which is the first run of the backend on NVIDIA's and on Intel's Windows driver and fails in
 its first minutes if the tool cannot use the pin; and a short run of the four device measurements
 under each GPU's machine name, which checks the adapters' names and the files' names and is thrown
-away. A gate run or a short run that fails stops the record there: the failure is read first, so
-that no file of record is written at a commit that will move, and what needs no measurement commit
-still runs. Then the record: all eighteen measurements on the RTX 4070, and the four device
-measurements on the integrated GPU. Last: `cargo xtask gpu --client` on each GPU; row 63's three
-runs at their own commits; the window cases (rows 208, 210, 234 and 236), fifteen on Windows; and
-the three mutations on the RTX 4070. `frame-impl`'s by-hand form of criterion 1 is dropped: `cargo
-xtask measure triangle` is that run once the pin exists (row 243). A session cut short, or stopped
-before the record, runs what is left in a second sitting of the laptop, which needs the owner only
-to start it.
+away. A case the owner ruled the work desktop's own is read first among the gate's. A gate run or a
+short run that fails stops the record there: the failure is read first, so that no file of record is
+written at a commit that will move, and what needs no measurement commit still runs. Then the
+record: all eighteen measurements on the RTX 4070, and the four device measurements on the
+integrated GPU. Last: `cargo xtask gpu --client` on each GPU; row 63's three runs at their own
+commits; the window cases (rows 208, 210, 234 and 236), fifteen on Windows; and the three mutations
+on the RTX 4070. `frame-impl`'s by-hand form of criterion 1 is dropped: `cargo xtask measure
+triangle` is that run once the pin exists (row 243). A session cut short, or stopped before the
+record, runs what is left in a second sitting of the laptop, which needs the owner only to start it.
 
 **The work desktop.** It is the owner's desktop at work, lent for early runs and reached through its
 own agent session over a remote desktop session. Its inventory, as that session gave it: an AMD
@@ -218,7 +230,10 @@ program's `VK_LAYER_OBS_HOOK`. The owner ruled its role: early runs, as steering
 the machine name `work-desktop-windows` and are never the record. This proposal adds what follows
 from that on a machine that is not the owner's own and in a repository that is public: none of its
 files is checked in, a figure of its is quoted in the row it steers, and its reports name no host,
-user or domain.
+user or domain. It adds a second machine name too, `work-desktop-windows-igpu`, for the rehearsal on
+the integrated Radeon: two GPUs under one name write over each other's files, and that rehearsal is
+there to show the laptop's two-GPU commands do not, before the laptop's one session. Only a
+measurement's file carries a machine name: the gate's report and a test's log carry none.
 
 It runs twice. *From 26 November*, at main's head, with the toolchain the owner approved and no
 validation layer on the machine. The toolchain is installed by name, `rustup toolchain install` in
@@ -233,8 +248,9 @@ canary's misuse reaches the driver unheard, and its own assert fails
 (`crates/rhi-vulkan/src/canary.rs`). A clean run so proves no barrier. What it shows is whether the
 backend makes a device, draws, reads back and presents on a Windows driver at all. With it:
 `lactose-platform`'s window cases, and `cargo xtask measure --all --no-device`, the first figures of
-milestone 2's tree on an x86 desktop part. *When `layer-windows` merges*, at its last merge and with
-the SDK installed: the pin, and then the laptop's and session C's commands rehearsed at full length.
+milestone 2's tree on an x86 desktop part. *When `layer-windows` merges*, at main's head once it
+holds that lane's last merge and the fix round of each defect found so far, and with the SDK
+installed: the pin, and then the laptop's and session C's commands rehearsed at full length.
 
 **What the pin's pass is.** Four things, all on the RX 9060 XT: the tool takes the installed layer,
 its manifest's version and then its digest; each canary is heard, seven under the plain validators
@@ -243,20 +259,35 @@ of either gate run fails; and in a short run of the four device measurements the
 no message. The third version wrote "the seven canaries", which is the plain run's count alone. The
 fourth is a sharper test there than on a clean machine: the registry's implicit layer would join a
 validated run under the old form and fail a measured one, which G3 found by reading the loader's
-source and no run has shown. A failure that is the machine's and not the engine's is reported as
-that, and the owner rules whether the pin has passed. There are three kinds: AMD's driver's, as
-KosmicKrisp has defects of its own; the remote session's, where a window or a present behaves as no
-panel does; and a control's, where the scanning, the lock or an update cuts a run.
+source and no run has shown. A failure is reported with whose it looks to be, and beside the
+engine's there are three kinds: AMD's driver's, as KosmicKrisp has defects of its own; the remote
+session's, where a window or a present behaves as no panel does; and a control's, where the
+scanning, the lock or an update cuts a run. The four conditions are not equally showable on this
+machine, which the fourth version did not say. The layer's check and the canaries open no window,
+and a control shows in them as a refusal or a timeout: that run is run again. The gate's swapchain
+cases and the short run's `triangle` and `frame-pace` present into a remote session, and a failure
+of theirs cannot be told there from a Win32 present defect of the engine's. AMD's driver's cannot be
+told apart at all: both of the machine's GPUs run the one driver, and the first other Windows driver
+is the laptop's, after the commit. So the ruling is bounded. The owner may rule a failed case the
+machine's, and the pin passed with it, only where the case presents into the remote session: never
+the layer's check, a canary or a message. The laptop's gate runs that case first, and where it fails
+there it is a defect of a measured input and moves the commit. Any other failure that no fix round
+ends leaves the pin not passed, and what the commit then waits for is the owner's to rule, as "What
+would change it" has it.
 
 **What the work desktop cannot show.** It has no hybrid part: nothing of row 63 and nothing of an
 efficiency core. Its windows are a remote session's: a present's timing, frame pacing and the
-latency tool's lines mean nothing there, and a run that opens a window needs the session connected.
+latency tool's lines mean nothing there, and a run that opens a window needs the session connected
+and its window open and not minimised: the diff review expects a minimised remote session to stop
+updating and a present to stall there, which would read as the engine's, and no run has shown it.
 Its endpoint protection scans in real time, so no figure of its is quiet. It locks after fifteen
 minutes without input, and on Windows `cargo xtask gpu --client` reads no lock
 (`tools/xtask/src/main.rs`, `screen_locked`), so a run a lock fell in is named by the session and
 not by the tool. Its controls stand: no command asks for an exclusion from scanning, a changed lock,
-a changed GPU timeout or an elevated run, and `LocalDumps` is not set there. It shows nothing of
-NVIDIA's driver or Intel's.
+a changed GPU timeout or an elevated run, and `LocalDumps` is not set there. PowerShell's execution
+policy is one of them. No command overrides it for a process or for the machine, and a script it
+refuses stops the run and is reported as the machine's. It shows nothing of NVIDIA's driver or
+Intel's.
 
 **Row 150's four hardware questions are not shown.** The spike's file leaves four to hardware
 (`docs/results/spike-rhi-apple-m1-2026-11-15.md`, "Design questions for the lavapipe run"): an
@@ -558,14 +589,18 @@ replaces the run. Row 150's block is the whole row, as lane `exit-pass-rows` lef
 each other by D165 and by their heads, never by a row number this proposal adds. There are
 twenty-one blocks: fourteen in the plan, six in the verification file, and one that appends five
 rows to it. The third version had twenty: the new one is the work desktop's row in section 4's table
-of machines. Every block was applied in memory to the two files of `1c62676`: each OLD was found
-once, at the lines its head states. If a merge before the decision is applied moves a line, the
-blocks are built again from the merged files. `present-encoder`'s merge at `1c62676` inserted an
-addendum of D162 into the decisions log and replaced verification row 229, one line by one. It did
-not touch the plan, it moved no line of the verification file, and no block here names row 229, so
-the third version's blocks kept their lines and the next decision number is the one after D164. The
-plan's own record of the text it once appended to row 150, in its section "Verification rows", still
-reads "probed on the laptop's devices": it records an edit that was made, and it stays.
+of machines, and the block of appended rows grew from four rows to five, by the row of the work
+desktop's runs. The fifth version adds no block and changes six for its diff review: the lane
+table's, the measurement commit's, the machine's row, the work desktop's paragraph, the owner's
+actions and the appended rows. Every block was applied in memory to the two files of `1c62676`: each
+OLD was found once, at the lines its head states. If a merge before the decision is applied moves a
+line, the blocks are built again from the merged files. `present-encoder`'s merge at `1c62676`
+inserted an addendum of D162 into the decisions log and replaced verification row 229, one line by
+one. It did not touch the plan, it moved no line of the verification file, and no block here names
+row 229, so the third version's blocks kept their lines and the next decision number is the one
+after D164. The plan's own record of the text it once appended to row 150, in its section
+"Verification rows", still reads "probed on the laptop's devices": it records an edit that was made,
+and it stays.
 
 The text is written for the owner's rulings.
 
@@ -587,7 +622,7 @@ OLD:
 | `measure-role` | Two safe calls for measurement in `lactose-task` (D164): the foreground task role on macOS, moved out of the benchmark, which returns the role the system reports, and the class of the core the calling thread is on, on macOS, Windows and Linux. The three cost tests of `lactose-app-client`'s `integration` target take the role and print it, in their shared support. `remote-upload-5k` records for each frame the class of core its job began and ended on and gives the figures of section 4's row | `measure-m2` merged | The role read back in each file. In `remote-upload-5k`'s file, the fastest chain on each class of core, the efficiency class's the slower: the numbering the macOS call rests on, shown on the machine. The loom models and the cross-target clippy runs for `lactose-task`. Section 21's entry for `task`, reworded at the merge | 6 |
 NEW:
 | `measure-role` | Two safe calls for measurement in `lactose-task` (D164): the foreground task role on macOS, moved out of the benchmark, which returns the role the system reports, and the class of the core the calling thread is on, on macOS, Windows and Linux. The three cost tests of `lactose-app-client`'s `integration` target take the role and print it, in their shared support. `remote-upload-5k` records for each frame the class of core its job began and ended on and gives the figures of section 4's row | `measure-m2` merged | The role read back in each file. In `remote-upload-5k`'s file, the fastest chain on each class of core, the efficiency class's the slower: the numbering the macOS call rests on, shown on the machine. The loom models and the cross-target clippy runs for `lactose-task`. Section 21's entry for `task`, reworded at the merge | 6 |
-| `layer-windows` | The Khronos layer pinned on Windows (D165; D153's "pinned on every host"), in `tools/xtask`. `vulkan-layer.toml` gains `[host.windows-x86_64]` in the Mac's form: the SDK the owner installs, found at `VULKAN_SDK` or at `C:\VulkanSDK\<version>`, its `Bin\VkLayer_khronos_validation.dll` held to `library_sha256`, and its manifest `Bin\VkLayer_khronos_validation.json` read for the layer's name and version before the digest is taken, so that another SDK at `VULKAN_SDK` is named as that; the installer's `url` and `sha256` beside it, named in the error for an SDK that is not there and never fetched. The lane derives the digest on the Mac out of LunarG's installer, fetched by the SHA-256 LunarG publishes and never run, and writes the steps into `tools/xtask/README.md`; the proposal's reading, which its GPU review repeated, is `451ed11cbc799f858cbc0e843766d2990527c03f93f7a85f03bc1e67b605a435`. On Windows a run takes the system's loader and drivers, `--driver system` alone, and sets no library path. On every host a run sets the exclusive `VK_IMPLICIT_LAYER_PATH`, to the tool's layers directory for a validated run and to its empty directory for a measured one, in place of `VK_ADD_IMPLICIT_LAYER_PATH` and of `VK_LOADER_LAYERS_DISABLE=~implicit~`: a layer the Windows registry enables then joins no run, and the loader has nothing to warn of in a measured one. The device files' Validation line, the README and the unit tests follow. A measurement `rhi-conformance` in `cargo xtask measure`: the gate's Vulkan step under each driver `measure` takes, and under GPU-assisted validation where the host's gate has it, written as `rhi-conformance-<driver>[-gpu-assisted]-<machine>-<date>.md` with section 4's four contents under a header of its own: the machine's rows, the adapter's name, the device as `DeviceInfo` reports it, and a Validation row with the layer's version and the validators' settings, every path cut as a device file's is; `--all` runs it last and `--no-device` leaves it out. `renderer-impl`'s barrier-mutation script, checked in as `tools/xtask/barrier-mutations.py` beside `line-endings.sh`, with its verdict read from the gate's report under the target directory, `caught` only on the named test's `FAILED` line, `MISSED` on its `passed` line and `NOT RUN` on neither, since the gate has printed no passing line since `7424e7c`; its files read and written as UTF-8 and each copy made into a fresh directory, for Windows | Nothing | On the M1: the pin's parse and the Windows paths, environment and manifest check as unit tests; a unit test that no run sets `VK_ADD_IMPLICIT_LAYER_PATH` or `VK_LOADER_LAYERS_DISABLE`; clippy for `x86_64-pc-windows-msvc`; the digest derived by the lane and equal to the proposal's; under the exclusive path, `cargo xtask gpu` in both forms and `triangle`, `gpu-cost` and `frame-pace` under both drivers with no message, as steering, and `gpu (lavapipe)` green in CI; the three `rhi-conformance` files, with no path of the machine in them; the script's control, and `between-dispatches` read `MISSED` under MoltenVK and `caught` under KosmicKrisp, as the row of that barrier records the two drivers. The Windows run is the work desktop's, on its RX 9060 XT at this lane's last merge, as steering and before the measurement commit is recorded, and a defect it finds is a fix round of this lane; the laptop's and the desktop's runs follow from 7 December 2026 | 7 |
+| `layer-windows` | The Khronos layer pinned on Windows (D165; D153's "pinned on every host"), in `tools/xtask`. `vulkan-layer.toml` gains `[host.windows-x86_64]` in the Mac's form: the SDK the owner installs, found at `VULKAN_SDK` or at `C:\VulkanSDK\<version>`, its `Bin\VkLayer_khronos_validation.dll` held to `library_sha256`, and its manifest `Bin\VkLayer_khronos_validation.json` read for the layer's name and version before the digest is taken, so that another SDK at `VULKAN_SDK` is named as that; the installer's `url` and `sha256` beside it, named in the error for an SDK that is not there and never fetched. The lane derives the digest on the Mac out of LunarG's installer, fetched by the SHA-256 LunarG publishes and never run, and writes the steps into `tools/xtask/README.md`; the proposal's reading, which its GPU review repeated, is `451ed11cbc799f858cbc0e843766d2990527c03f93f7a85f03bc1e67b605a435`. On Windows a run takes the system's loader and drivers, `--driver system` alone, and sets no library path. On every host a run sets the exclusive `VK_IMPLICIT_LAYER_PATH`, to the tool's layers directory for a validated run and to its empty directory for a measured one, in place of `VK_ADD_IMPLICIT_LAYER_PATH` and of `VK_LOADER_LAYERS_DISABLE=~implicit~`: a layer the Windows registry enables then joins no run, and the loader has nothing to warn of in a measured one. The device files' Validation line, the README and the unit tests follow. A measurement `rhi-conformance` in `cargo xtask measure`: the gate's Vulkan step under each driver `measure` takes, and under GPU-assisted validation where the host's gate has it, written as `rhi-conformance-<driver>[-gpu-assisted]-<machine>-<date>.md` with section 4's four contents under a header of its own: the machine's rows, the adapter's name, the device as `DeviceInfo` reports it, and a Validation row with the layer's version and the validators' settings, every path cut as a device file's is; `--all` runs it last and `--no-device` leaves it out. `renderer-impl`'s barrier-mutation script, checked in as `tools/xtask/barrier-mutations.py` beside `line-endings.sh`, with its verdict read from the gate's report under the target directory, `caught` only on the named test's `FAILED` line, `MISSED` on its `passed` line and `NOT RUN` on neither, since the gate has printed no passing line since `7424e7c`; its files read and written as UTF-8 and each copy made into a fresh directory, for Windows | Nothing | On the M1: the pin's parse and the Windows paths, environment and manifest check as unit tests; a unit test that no run sets `VK_ADD_IMPLICIT_LAYER_PATH` or `VK_LOADER_LAYERS_DISABLE`; clippy for `x86_64-pc-windows-msvc`; the digest derived by the lane and equal to the proposal's; under the exclusive path, `cargo xtask gpu` in both forms and `triangle`, `gpu-cost` and `frame-pace` under both drivers with no message, as steering, and `gpu (lavapipe)` green in CI; the three `rhi-conformance` files, with no path of the machine in them; the script's control, and `between-dispatches` read `MISSED` under MoltenVK and `caught` under KosmicKrisp, as the row of that barrier records the two drivers. The Windows run is the work desktop's, on its RX 9060 XT at this lane's last merge, as steering and before the measurement commit is recorded, and a defect it finds is a fix round of the lane whose code it is, this lane's where it is the pin's or the tool's; the laptop's and the desktop's runs follow from 7 December 2026 | 7 |
 | `park-stamp` | Two `tracing` spans of `lactose-task` at debug level, target `whisk` (D165, D162): `open_gate`, around `Pool::open_gate` in `JobContext::block_in_place`, from the return of the closure to the gate's return; and `park`, around each of the two waits a worker makes without a permit, entered before the wait and exited when it returns: `sleep.park` in `gate::idle_park`, whenever a worker parks in the idle protocol, whatever its look saw, nothing or work with no permit to take it; and `opener.park(latch)` in `gate::wait_for_children`, a scope's opener on its latch, which `Pool::open_gate` wakes with every other worker. A field of the span says which wait it is. A replay's wait on a latch is not spanned. The loom models still run the shipped functions. No public item, no `unsafe`, no hook and no cargo feature; architecture section 21's entry stands. The crate's README, "Tracing", names both spans and says that the node and range spans are the info level's, that both debug spans are in every build until section 5.1's compile-out is built, and that a listener's callbacks for `park` run on a worker that is going to sleep or has just been woken, in the idle protocol after it has announced it is asleep, so they must not block or call the executor. `record-stall`'s subscriber reads the two, and its file gains at each reservation: for each worker parked across an opening, in the idle protocol or on a latch, the time from the opening's start to that worker's `park` exit, with the count of each kind, the median, P99 and the worst; the opening's own length, which bounds it; for the openings after which a worker that was parked took the record's next job, that job's start from the opening's start and its start wait, with the count, the median and the worst; and the count of openings after which a worker that was awake took it. A full run makes 360 ticks at each reservation, so that the first row can hold over 1,000 wakes on the laptop's six frame workers. Every tick asserts that it saw an `open_gate` span, and each reservation that it saw `park` spans, so a build that compiles debug spans out fails. The rows are written on every host; on Windows they are the `SetEvent` item | `measure-role` merged | The rows in `record-stall`'s file on the M1. On the M1, as steering, what listening costs: the record phase's figures and the time from an opening to the record's next job with nothing listening at debug, with `open_gate` listened to and with both, interleaved and three times each, by a means that is the lane's; the three within one another's spread, or the difference stated in the README. `cargo xtask measure whisk` before and after. The loom models, Miri and the cross-target clippy runs for `lactose-task`, with the span at the latch's wait, which no probe has run. `tests/spans.rs` holds both spans' names, target and level, `park` at each of its two waits, and that neither is emitted at info. On Windows the `measure` workflow at the commit shows the test passing with the spans, the work desktop's run gives the rows first, as steering, and the rows of record are the laptop's session's | 7 |
 
 === docs/plans/milestone-2.md lines 285 to 287: section 3: the measurement commit, a measured input, and what a figure before it is
@@ -597,34 +632,37 @@ OLD:
   it and edits a measured crate runs the measurements it touches and reports them as steering.
 NEW:
 - The measurement commit is the first commit of main that holds the three lanes that change a
-  measured input after `measure-role`: `present-encoder`, `park-stamp` and `layer-windows` (D165). A
-  measured input is anything a measurement builds, runs or computes a figure with, among them the
-  crates under `crates/` and `game/`, `tools/cook` and `tools/xtask`, the Slang and layer pins,
-  `shaders/`, `vendor/`, the manifests and `Cargo.lock`, `rust-toolchain.toml`,
-  `.cargo/config.toml`, `.config/nextest.toml` and `.gitattributes`; where the list is short the
-  definition holds. The coordinator records the commit's hash in the verification row that names it
-  once `check` and the `measure` workflow are green at it and the work desktop has run the Windows
-  pin on its RX 9060 XT at `layer-windows`' last merge; a failure of any of the three is a fix round
-  of the lane it names, and the commit is then that round's merge. The quiet window checks it out as
-  soon as it is recorded, and the laptop's session and session C from 7 December 2026 (section 4). A
-  defect of a measured input that only the laptop's or the desktop's sitting shows moves the commit
-  to its fix: the quiet window runs again there, or the owner rules that its files stand. A file is
-  the record at it. A file of a later commit is the record as `-at-<commit>` only where the diff
-  from the measurement commit changes no measured input the file's measurement reads, and its row
-  gives the diff; otherwise the owner's ruling says which file is the record (section 7). A figure
-  one of section 4's measurements gave before it is steering: it stays in its row, proves no
-  criterion and stands for no file of record. A run on the work desktop is steering at any commit:
-  it closes no row, and none of its files is checked in. A row that asks a machine for a run and
-  names no commit is closed by that machine's run and records the commit it ran at. A lane that
-  merges after it and changes a measured input runs the measurements it touches and reports them as
-  steering.
+  measured input after `measure-role`, which are `present-encoder`, `park-stamp` and
+  `layer-windows`, and the fix round of each defect found before it (D165). A measured input is
+  anything a measurement builds, runs or computes a figure with, among them the crates under
+  `crates/` and `game/`, `tools/cook` and `tools/xtask`, the Slang and layer pins, `shaders/`,
+  `vendor/`, the manifests and `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`,
+  `.config/nextest.toml` and `.gitattributes`; where the list is short the definition holds. The
+  coordinator records the commit's hash in the verification row that names it once `check` and the
+  `measure` workflow are green at it and the work desktop's run of the Windows pin on its RX 9060 XT
+  has passed (section 4), at a commit that holds `layer-windows`' last merge and every such fix
+  round. A failure of `check` or of `measure` is a fix round of the lane it names. A defect a run of
+  the work desktop's finds, an early run's as the pin's, is a fix round of the lane whose code it
+  is, whichever crate that is, and a pin run from before that round's merge does not count. The
+  quiet window checks the commit out as soon as it is recorded, and the laptop's session and session
+  C from 7 December 2026 (section 4). A defect of a measured input that only NVIDIA's or Intel's
+  driver shows, neither of which the work desktop has, moves the commit to its fix: the quiet window
+  runs again there, or the owner rules that its files stand. A file is the record at the commit. A
+  file of a later commit is the record as `-at-<commit>` only where the diff from the measurement
+  commit changes no measured input the file's measurement reads, and its row gives the diff;
+  otherwise the owner's ruling says which file is the record (section 7). A figure one of section
+  4's measurements gave before it is steering: it stays in its row, proves no criterion and stands
+  for no file of record. A run on the work desktop is steering at any commit: it closes no row, and
+  none of its files is checked in. A row that asks a machine for a run and names no commit is closed
+  by that machine's run and records the commit it ran at. A lane that merges after it and changes a
+  measured input runs the measurements it touches and reports them as steering.
 
 === docs/plans/milestone-2.md line 297: section 4's table of machines: the work desktop, after the desktop's row
 OLD:
 | The desktop: the owner's, eight or more performance cores, booting Windows and another system (D144). Its CPU model, its GPU and its other system are unknown until its first sitting, which returns them (decision 5.19) | The x86 desktop figures section 20 asks for, and the x86 half of milestones 0 and 1 (D151). A second discrete GPU | Anything without the owner at it |
 NEW:
 | The desktop: the owner's, eight or more performance cores, booting Windows and another system (D144). Its CPU model, its GPU and its other system are unknown until its first sitting, which returns them (decision 5.19) | The x86 desktop figures section 20 asks for, and the x86 half of milestones 0 and 1 (D151). A second discrete GPU | Anything without the owner at it |
-| The work desktop: the owner's desktop at work, which is not the plan's desktop, lent for early runs (D165) and driven through its own agent session over a remote desktop session. AMD Ryzen 9 9950X, sixteen cores of one kind, 64 GB, an AMD Radeon RX 9060 XT on AMD's driver 26.11.2, which reports Vulkan 1.4.359, and the processor's integrated Radeon, Windows 11 Enterprise 25H2, the system's loader at 1.4.357, and a capture program's implicit layer, `VK_LAYER_OBS_HOOK`, registered for the whole machine. Its controls stand, and no command asks for an exception to one: endpoint protection that scans in real time, a lock after fifteen minutes without input, updates installed on a daily schedule, and the default two-second GPU timeout | As steering alone, under the machine name `work-desktop-windows`: `lactose-rhi-vulkan` on a Windows driver while the owner's machines are out of reach, first by hand with no validator and then under the Windows pin; the tool's check of the installed layer; the exclusive layer path against a registered implicit layer; the canaries on AMD's driver; the laptop's and session C's commands, rehearsed; and a first look at the measurements on an x86 desktop part | The record: none of its files is checked in and no run of its closes a row. NVIDIA's driver or Intel's. A hybrid part: nothing of row 63 or of an efficiency core. A quiet figure: the scanning is in every one. A panel: its windows are a remote session's, so a present's timing, frame pacing and the latency tool's lines mean nothing there, and a run that opens a window needs the session connected. A crash dump: `LocalDumps` is not set there |
+| The work desktop: the owner's desktop at work, which is not the plan's desktop, lent for early runs (D165) and driven through its own agent session over a remote desktop session. AMD Ryzen 9 9950X, sixteen cores of one kind, 64 GB, an AMD Radeon RX 9060 XT on AMD's driver 26.11.2, which reports Vulkan 1.4.359, and the processor's integrated Radeon, Windows 11 Enterprise 25H2, the system's loader at 1.4.357, and a capture program's implicit layer, `VK_LAYER_OBS_HOOK`, registered for the whole machine. Its controls stand, and no command asks for an exception to one or overrides one: endpoint protection that scans in real time, PowerShell's execution policy as the machine has it, a lock after fifteen minutes without input, updates installed on a daily schedule, and the default two-second GPU timeout | As steering alone, under the machine name `work-desktop-windows`, and `work-desktop-windows-igpu` on its integrated Radeon: `lactose-rhi-vulkan` on a Windows driver while the owner's machines are out of reach, first by hand with no validator and then under the Windows pin; the tool's check of the installed layer; the exclusive layer path against a registered implicit layer; the canaries on AMD's driver; the laptop's and session C's commands, rehearsed; and a first look at the measurements on an x86 desktop part | The record: none of its files is checked in and no run of its closes a row. NVIDIA's driver or Intel's. A hybrid part: nothing of row 63 or of an efficiency core. A quiet figure: the scanning is in every one. A panel: its windows are a remote session's, so a present's timing, frame pacing and the latency tool's lines mean nothing there, and a run that opens a window needs the session connected and its window not minimised. A crash dump: `LocalDumps` is not set there |
 
 === docs/plans/milestone-2.md lines 308 to 312: section 4: the quiet window
 OLD:
@@ -700,26 +738,31 @@ are out of reach until 7 December 2026, and the work desktop runs first what the
 `cargo xtask gpu` lists, without their canaries, by hand on its RX 9060 XT, which is the first run
 of `lactose-rhi-vulkan` on a Windows driver; `lactose-platform`'s window cases; and `cargo xtask
 measure --all --no-device`. Once lane `layer-windows` has merged and the pinned Vulkan SDK is
-installed there, at that lane's last merge, the Windows pin: the installed layer as the tool checks
-it, `cargo xtask gpu --driver system` plain and under GPU-assisted validation, and a short run of
-the four device measurements. After the pin, as rehearsal of the laptop's session and of session C:
-`cargo xtask measure --all`, `cargo xtask gpu --client` and the barrier mutations. The pin has
-passed when the tool takes the installed layer, each canary is heard on the RX 9060 XT, seven under
-the plain validators and two under GPU-assisted validation, no case of either gate run fails, and
-the short run's measured runs hear no message. A failure that is the machine's and not the engine's,
-which is AMD's driver's, the remote session's or one of the machine's controls', is reported as
-that, and the owner rules whether the pin has passed. A defect of a measured input is a fix round
-that merges before the measurement commit is recorded. Every file a run writes carries the machine
-name `work-desktop-windows`, none is checked in, and a report names no host, user or domain.
+installed there, at or after that lane's last merge, the Windows pin: the installed layer as the
+tool checks it, `cargo xtask gpu --driver system` plain and under GPU-assisted validation, and a
+short run of the four device measurements. After the pin, as rehearsal of the laptop's session and
+of session C: `cargo xtask measure --all`, `cargo xtask gpu --client` and the barrier mutations. The
+pin has passed when the tool takes the installed layer, each canary is heard on the RX 9060 XT,
+seven under the plain validators and two under GPU-assisted validation, no case of either gate run
+fails, and the short run's measured runs hear no message. A failure is reported with whose it looks
+to be: the engine's, AMD's driver's, the remote session's or one of the machine's controls'. A run
+that a control cut is run again. The owner may rule a failed case the machine's, and the pin passed
+with it, only where the case presents into the remote session: never the layer's check, a canary or
+a message. The laptop's gate runs that case first, and where it fails there it is a defect of a
+measured input and moves the commit (section 3). A defect a run here finds is a fix round of the
+lane whose code it is, whichever crate that is: it merges before the measurement commit is recorded,
+and the pin's pass is at or after its merge. Every measurement's file carries the machine name
+`work-desktop-windows`, or `work-desktop-windows-igpu` where it ran on the integrated Radeon, none
+is checked in, and a report names no host, user or domain.
 
 Only the desktop's two sittings need the owner at a desk. The laptop's session needs the owner as
 administrator once and the owner's hand once in its first minutes. The quiet window needs the
 owner's hand once at its start, and then the Mac unused. The work desktop's runs need the owner to
-approve its installs at their prompts and to keep its remote session connected while a run opens a
-window. The laptop's runs need the laptop awake with its agent session open, and a run that opens a
-window needs a person logged in at it. On each machine the toolchain `rust-toolchain.toml` pins is
-installed by name before the first build, by `rustup toolchain install` in the clone: rustup's
-install of it on a first use is deprecated.
+approve its installs at their prompts and to keep its remote session connected, with its window open
+and not minimised, while a run opens a window. The laptop's runs need the laptop awake with its
+agent session open, and a run that opens a window needs a person logged in at it. On each machine
+the toolchain `rust-toolchain.toml` pins is installed by name before the first build, by `rustup
+toolchain install` in the clone: rustup's install of it on a first use is deprecated.
 
 === docs/plans/milestone-2.md line 341: section 4, row `record-stall`: the gate's rows come from two spans, on every host
 OLD:
@@ -748,12 +791,13 @@ NEW:
 The owner's actions, in order: the upgrade to macOS 27.2.1 and the Xcode install, before the first
 lane (section 9); from 26 November 2026, on the work desktop, its installs approved at their
 prompts, which are the MSVC C++ build tools, rustup, nextest and Python, and its remote session kept
-connected while a run opens a window; once `layer-windows` has merged, the pinned Vulkan SDK
-installed there, approved at its prompt; at the measurement commit, one window resized at the quiet
-window's start and the Mac then left unused; from 7 December 2026, the desktop's first sitting, with
-`LocalDumps` set on the desktop and the pinned Vulkan SDK installed under its Windows; the laptop's
-session, with the pinned Vulkan SDK installed and `LocalDumps` set as administrator, its checkouts
-refreshed (D148) and one window dragged in its first minutes; then session C (D165).
+connected, its window open and not minimised, while a run opens a window; once `layer-windows` has
+merged, the pinned Vulkan SDK installed there, approved at its prompt; at the measurement commit,
+one window resized at the quiet window's start and the Mac then left unused; from 7 December 2026,
+the desktop's first sitting, with `LocalDumps` set on the desktop and the pinned Vulkan SDK
+installed under its Windows; the laptop's session, with the pinned Vulkan SDK installed and
+`LocalDumps` set as administrator, its checkouts refreshed (D148) and one window dragged in its
+first minutes; then session C (D165).
 
 === docs/plans/milestone-2.md lines 1884 to 1887: section 7, step 3: which nightly
 OLD:
@@ -815,9 +859,9 @@ NEW:
 
 === docs/verification.md: five rows appended at the end of the file, after the table's last row
 NEW:
-| The measurement commit of milestone 2 (D165): the first commit of main that holds `present-encoder`, `park-stamp` and `layer-windows`, the three lanes that change a measured input after `measure-role`, of which `present-encoder` merged at `1c62676`. It is recorded once `check` and the `measure` workflow are green at it and the work desktop has run the Windows pin on its RX 9060 XT at `layer-windows`' last merge. A measured input is anything a measurement builds, runs or computes a figure with, among them the crates under `crates/` and `game/`, `tools/cook` and `tools/xtask`, the Slang and layer pins, `shaders/`, `vendor/`, the manifests and `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, `.config/nextest.toml` and `.gitattributes`; where the list is short the definition holds. The quiet window on the M1 checks it out as soon as it is recorded, and from 7 December 2026 the laptop's session and session C on the desktop, in that order, each read before the next. A defect of a measured input that only the laptop's or the desktop's sitting shows moves the commit to its fix: the quiet window runs again there, or the owner rules that its files stand. A file is the record at it. A file of a later commit is the record as `-at-<commit>` only where the diff from it changes no measured input the file's measurement reads, and the row that cites the file gives the diff; otherwise the owner's ruling at the plan's exit step 7 names the record. A figure a measurement gave before it is steering and stands for no file of record, and a run on the work desktop is steering at any commit. A row that asks a machine for a run and names no commit is closed by that machine's run and records the commit it ran at. Two sittings keep commits of their own: the desktop's first at `a539d60` (D151), and `eco-qos`'s runs at `a75596b` and its first parent. To record here: the commit's hash; the commit and the date of the work desktop's pin run; for each sitting its date, its load and the files it wrote; the ids of the `measure` workflow's run and of the first nightly at or after the commit whose four `sour` jobs pass | 2. **Owed**: no such commit exists at `1c62676` |
-| The Khronos layer on Windows is pinned as installed (D165, D153; lane `layer-windows`): `library_sha256` is the SHA-256 of `Bin/VkLayer_khronos_validation.dll` as read on the development Mac, by the proposal and again by its GPU review, out of LunarG's installer `vulkansdk-windows-X64-1.4.363.1.exe`, which was fetched by the SHA-256 LunarG publishes for it and never run. No Windows host has checked it. The work desktop's pin run is the first to, on AMD's driver and as steering, and the measurement commit's row waits for it; the laptop's session, from 7 December 2026, is the check on NVIDIA's driver and Intel's, and the desktop's Windows is the third host. What a host's first run shows, and nothing before it: that the installed manifest names the layer at `1.4.363` and the installed file is the archived one, which the tool checks in that order; that the system's loader, whose version the run records, takes the layer's manifest from the exclusive `VK_IMPLICIT_LAYER_PATH` in a shell that is not elevated and loads no layer of the registry's with it, the loader ignoring every such variable in an elevated process; that each canary is heard on each of the host's GPUs, seven under the plain validators and two under GPU-assisted validation; that a measured run under the empty path hears no message; and which implicit layers the registry holds, read from the loader's own log (`VK_LOADER_DEBUG=layer`), each with its enable and disable variables. The work desktop's registry holds one for the whole machine, `VK_LAYER_OBS_HOOK`, so its runs show the exclusive path against a layer that would otherwise join. A digest that differs is a finding, and no run re-pins: a second pin is proposed only for a file whose version is 1.4.363.x and whose signature is LunarG's, and it is the owner's to approve | 2 |
-| The work desktop's runs (D165): steering alone, under the machine name `work-desktop-windows`, on a machine that is not the owner's own and is reached over a remote session: an AMD Ryzen 9 9950X and a Radeon RX 9060 XT, with endpoint scanning in every figure. None of its files is checked in, no run of its closes a row, and its reports name no host, user or domain. Owed, in two parts. Before lane `layer-windows` merges, at main's head and with no validation layer on the machine: the device tests `cargo xtask gpu` lists, without their canaries, by hand on the RX 9060 XT, which is the first run of `lactose-rhi-vulkan` on a Windows driver; `lactose-platform`'s window cases; and `cargo xtask measure --all --no-device`. At `layer-windows`' last merge, with the pinned SDK installed: the Windows pin, whose pass the measurement commit's row waits for; then `cargo xtask measure --all`, `cargo xtask gpu --client` and the barrier mutations, as rehearsal of the laptop's session and of session C. To record here: each run's date and commit; each failure and whose it was, the engine's, AMD's driver's, the remote session's or one of the machine's controls'; and the fix round each defect of a measured input went to. A figure of its is quoted in the row it steers, labelled as the work desktop's | 2 |
+| The measurement commit of milestone 2 (D165): the first commit of main that holds `present-encoder`, `park-stamp` and `layer-windows`, the three lanes that change a measured input after `measure-role`, of which `present-encoder` merged at `1c62676`, and the fix round of each defect found before it. It is recorded once `check` and the `measure` workflow are green at it and the work desktop's run of the Windows pin on its RX 9060 XT has passed, at a commit that holds `layer-windows`' last merge and every such fix round: a defect a run of the work desktop's finds, an early run's as the pin's, is a fix round of the lane whose code it is, whichever crate that is, and a pin run from before that round's merge does not count. A measured input is anything a measurement builds, runs or computes a figure with, among them the crates under `crates/` and `game/`, `tools/cook` and `tools/xtask`, the Slang and layer pins, `shaders/`, `vendor/`, the manifests and `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, `.config/nextest.toml` and `.gitattributes`; where the list is short the definition holds. The quiet window on the M1 checks it out as soon as it is recorded, and from 7 December 2026 the laptop's session and session C on the desktop, in that order, each read before the next. A defect of a measured input that only NVIDIA's or Intel's driver shows, neither of which the work desktop has, moves the commit to its fix: the quiet window runs again there, or the owner rules that its files stand. A file is the record at it. A file of a later commit is the record as `-at-<commit>` only where the diff from it changes no measured input the file's measurement reads, and the row that cites the file gives the diff; otherwise the owner's ruling at the plan's exit step 7 names the record. A figure a measurement gave before it is steering and stands for no file of record, and a run on the work desktop is steering at any commit. A row that asks a machine for a run and names no commit is closed by that machine's run and records the commit it ran at. Two sittings keep commits of their own: the desktop's first at `a539d60` (D151), and `eco-qos`'s runs at `a75596b` and its first parent. To record here: the commit's hash; the commit and the date of the work desktop's pin run that passed, and each fix round before it; for each sitting its date, its load and the files it wrote; the ids of the `measure` workflow's run and of the first nightly at or after the commit whose four `sour` jobs pass | 2. **Owed**: no such commit exists at `1c62676` |
+| The Khronos layer on Windows is pinned as installed (D165, D153; lane `layer-windows`): `library_sha256` is the SHA-256 of `Bin/VkLayer_khronos_validation.dll` as read on the development Mac, by the proposal and again by its GPU review, out of LunarG's installer `vulkansdk-windows-X64-1.4.363.1.exe`, which was fetched by the SHA-256 LunarG publishes for it and never run. No Windows host has checked it. The work desktop's pin run is the first to, on AMD's driver and as steering, and the measurement commit's row waits for its pass; the laptop's session, from 7 December 2026, is the check on NVIDIA's driver and Intel's, and the desktop's Windows is the third host. What a host's first run shows, and nothing before it: that the installed manifest names the layer at `1.4.363` and the installed file is the archived one, which the tool checks in that order; that the system's loader, whose version the run records, takes the layer's manifest from the exclusive `VK_IMPLICIT_LAYER_PATH` in a shell that is not elevated and loads no layer of the registry's with it, the loader ignoring every such variable in an elevated process; that each canary is heard on each of the host's GPUs, seven under the plain validators and two under GPU-assisted validation; that a measured run under the empty path hears no message; and which implicit layers the registry holds, read from the loader's own log (`VK_LOADER_DEBUG=layer`), each with its enable and disable variables. The work desktop's registry holds one for the whole machine, `VK_LAYER_OBS_HOOK`, so its runs show the exclusive path against a layer that would otherwise join. A digest that differs is a finding, and no run re-pins: a second pin is proposed only for a file whose version is 1.4.363.x and whose signature is LunarG's, and it is the owner's to approve | 2 |
+| The work desktop's runs (D165): steering alone, under the machine name `work-desktop-windows`, and `work-desktop-windows-igpu` on its integrated Radeon, on a machine that is not the owner's own and is reached over a remote session: an AMD Ryzen 9 9950X and a Radeon RX 9060 XT, with endpoint scanning in every figure. None of its files is checked in, no run of its closes a row, and its reports name no host, user or domain. Owed, in two parts. Before lane `layer-windows` merges, at main's head and with no validation layer on the machine: the device tests `cargo xtask gpu` lists, without their canaries, by hand on the RX 9060 XT, which is the first run of `lactose-rhi-vulkan` on a Windows driver; `lactose-platform`'s window cases; and `cargo xtask measure --all --no-device`. At `layer-windows`' last merge, with the pinned SDK installed: the Windows pin, whose pass the measurement commit's row waits for; then `cargo xtask measure --all`, `cargo xtask gpu --client` and the barrier mutations, as rehearsal of the laptop's session and of session C. The owner may rule a failed case of the pin's the machine's only where the case presents into the remote session, never the layer's check, a canary or a message, and the laptop's gate runs that case first. The rehearsals are owed while the machine is lent: the exit's read re-gates what is left of them if it no longer is. To record here: each run's date and commit; each failure and whose it was, the engine's, AMD's driver's, the remote session's or one of the machine's controls'; the lane each defect's fix round went to, and the pin's run after it; and each case the owner ruled the machine's, with what the laptop's gate then gave for it. A figure of its is quoted in the row it steers, labelled as the work desktop's | 2 |
 | `lactose-task`'s two debug spans (D165; lane `park-stamp`): `open_gate` and `park`, target `whisk`, which `record-stall` reads. `park` is around both waits a worker makes without a permit, the idle protocol's and a scope opener's on its latch, which an opening of the gate wakes too. Both are in every build: section 5.1's compile-out of finer levels is not built, and a span costs about 1 ns where nothing listens at debug. `park`'s callbacks run on a worker that is going to sleep or has just been woken, in the idle protocol after it has announced it is asleep: a listener that blocks there, or calls the executor, delays a wake sent to that worker. Owed by the lane, on the M1 as steering: the record phase's figures and the time from an opening to the record's next job with nothing listening at debug, with `open_gate` listened to and with both, interleaved; `cargo xtask measure whisk` before and after; the loom models, Miri and the cross-target clippy runs, with the span at the latch's wait, which no probe has run. Owed by the quiet window: the WHISK file at the measurement commit, read against D156 as the plan has it. `record-stall` fails where a build compiles debug spans out, so when section 5.1's compile-out is built it is set where `record-stall`'s build does not inherit it | 2 |
 | The client's fault probe on x86 and on lavapipe (D162, D165; from the row of lane `frame-impl`'s runs on the x86 desktop): the paced runs of a probe build, in which each present call sleeps 40 ms, every 13th makes no submit and every 97th draw is torn, ran on the M1 under both drivers and nowhere else. The probe is a build of a scratch copy that no checkout holds, so session C cannot run it, and no runner of lavapipe's presents to a window. Owed to the first change after milestone 2's exit that edits the client's present path, which checks the probe in or says why not, and to the first run of `lactose-platform` on Linux | 3 |
 ~~~
@@ -828,9 +872,9 @@ The entry is written for the owner's rulings, as the rows are, and the coordinat
 D165.
 
 **D165. Milestone 2's sittings: the measurement commit holds every lane that changes a measured
-input and is recorded after the work desktop's run of the Windows pin, the owner's Windows machines
-sit from 7 December 2026, the Khronos layer is pinned on Windows as installed, and the gate's wake
-is read from two debug spans** (§5.1, §20, §21, §22, `lactose-task`, `tools/xtask`,
+input and is recorded once the Windows pin has passed on the work desktop, the owner's Windows
+machines sit from 7 December 2026, the Khronos layer is pinned on Windows as installed, and the
+gate's wake is read from two debug spans** (§5.1, §20, §21, §22, `lactose-task`, `tools/xtask`,
 `docs/plans/milestone-2.md`)
 - Why: the exit pass's audit of main at `ad1a99d` found no measurement commit named, no result file
   of milestone 2 on main, the laptop unable to run criterion 1 for want of a pinned layer, and row
@@ -839,35 +883,42 @@ is read from two debug spans** (§5.1, §20, §21, §22, `lactose-task`, `tools/
   and the barrier mutations too. The owner then had no Windows machine until 7 December 2026, and
   lent a work desktop for early runs.
   - *The measurement commit holds every lane that changes a measured input.* It is the first commit
-    of main that holds `present-encoder`, `park-stamp` and `layer-windows`. A measured input is
-    anything a measurement builds, runs or computes a figure with, among them the crates under
-    `crates/` and `game/`, `tools/cook` and `tools/xtask`, the Slang and layer pins, `shaders/`,
-    `vendor/`, the manifests and `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`,
-    `.config/nextest.toml` and `.gitattributes`; where the list is short the definition holds.
-    `tools/xtask` is one: it times `edit-to-playing`, computes `frame-pace`'s figures, cooks the
-    shaders and sets every device run's environment. A file is the record at that commit. A file of
-    a later commit is the record as `-at-<commit>` only where the diff changes no measured input its
-    measurement reads; otherwise the owner's ruling names the record. A figure a measurement gave
-    before the commit is steering: it stays in its row, proves no criterion and stands for no file
-    of record. A row that asks a machine for a run and names no commit is closed by that machine's
-    run and records the commit it ran at. Two sittings keep commits of their own: the desktop's
-    first, at `a539d60`; and `eco-qos`'s runs, at `a75596b` and its first parent.
-  - *The commit is recorded after the Windows pin's first run, which is the work desktop's.* No line
-    of `lactose-rhi-vulkan` had run on a Windows driver, and the owner's laptop and desktop are out
-    of reach until 7 December 2026. The work desktop runs the backend on AMD's Windows driver first,
-    by hand and with no validator, and then the pin, on its RX 9060 XT at `layer-windows`' last
-    merge. The pin has passed when the tool takes the installed layer, each canary is heard, seven
-    under the plain validators and two under GPU-assisted validation, no case of either gate run
-    fails, and the measured runs of a short run hear no message. A failure that is the machine's and
-    not the engine's is the owner's to rule on. A defect it finds is fixed before any file of record
-    is taken. The hash is recorded once the pin has passed and `check` and the `measure` workflow
-    are green at the commit.
+    of main that holds `present-encoder`, `park-stamp` and `layer-windows`, and the fix round of
+    each defect found before it. A measured input is anything a measurement builds, runs or computes
+    a figure with, among them the crates under `crates/` and `game/`, `tools/cook` and
+    `tools/xtask`, the Slang and layer pins, `shaders/`, `vendor/`, the manifests and `Cargo.lock`,
+    `rust-toolchain.toml`, `.cargo/config.toml`, `.config/nextest.toml` and `.gitattributes`; where
+    the list is short the definition holds. `tools/xtask` is one: it times `edit-to-playing`,
+    computes `frame-pace`'s figures, cooks the shaders and sets every device run's environment. A
+    file is the record at that commit. A file of a later commit is the record as `-at-<commit>` only
+    where the diff changes no measured input its measurement reads; otherwise the owner's ruling
+    names the record. A figure a measurement gave before the commit is steering: it stays in its
+    row, proves no criterion and stands for no file of record. A row that asks a machine for a run
+    and names no commit is closed by that machine's run and records the commit it ran at. Two
+    sittings keep commits of their own: the desktop's first, at `a539d60`; and `eco-qos`'s runs, at
+    `a75596b` and its first parent.
+  - *The commit is recorded once the Windows pin has passed, and the pin's first run is the work
+    desktop's.* No line of `lactose-rhi-vulkan` had run on a Windows driver, and the owner's laptop
+    and desktop are out of reach until 7 December 2026. The work desktop runs the backend on AMD's
+    Windows driver first, by hand and with no validator, and then the pin, on its RX 9060 XT. The
+    pin has passed when the tool takes the installed layer, each canary is heard, seven under the
+    plain validators and two under GPU-assisted validation, no case of either gate run fails, and
+    the measured runs of a short run hear no message. A defect a run of the work desktop's finds, an
+    early run's as the pin's, is a fix round of the lane whose code it is, whichever crate that is,
+    merged before the commit. The pin's pass is at a commit that holds `layer-windows`' last merge
+    and every such round: a run from before one does not count. The owner may rule a failed case the
+    machine's, and the pin passed with it, only where the case presents into the remote session:
+    never the layer's check, a canary or a message. The laptop's gate runs that case first, and a
+    failure of it there is a defect of a measured input and moves the commit. The hash is recorded
+    once the pin has passed and `check` and the `measure` workflow are green at the commit.
   - *The work desktop is steering.* It is no machine the criteria name, and it is not the owner's
-    own. Its files carry the machine name `work-desktop-windows` and are never the record: none is
-    checked in, no run of its closes a row, and a figure of its is quoted in the row it steers. It
-    has no hybrid part, its windows are a remote session's, and its endpoint scanning is in every
-    figure. Its controls stand: no command asks for an exception to one. Its reports name no host,
-    user or domain.
+    own. Its measurements' files carry the machine name `work-desktop-windows`, or
+    `work-desktop-windows-igpu` on its integrated Radeon, and are never the record: none is checked
+    in, no run of its closes a row, and a figure of its is quoted in the row it steers. It has no
+    hybrid part, its windows are a remote session's, and its endpoint scanning is in every figure.
+    Its controls stand, PowerShell's execution policy among them: no command asks for an exception
+    to one or overrides one, and a step a control refuses is reported as the machine's. Its reports
+    name no host, user or domain.
   - *The sittings at the commit run in one order, and each is read before the next.* The M1's quiet
     window, as soon as the commit is recorded; then, from 7 December 2026, the laptop's session,
     opened once, and session C. A criterion that misses on the M1 needs an engine lane, and a
@@ -916,18 +967,20 @@ is read from two debug spans** (§5.1, §20, §21, §22, `lactose-task`, `tools/
   - *The exit reads every row gated at milestone 2.* Section 2 lists the 26 gated at `a561b36`; 85
     are gated at `ad1a99d`. Step 4 reads them all.
   - Rules out: a measurement commit named before a lane that changes a measured input has merged, or
-    before `lactose-rhi-vulkan` has run on a Windows driver; a file of the work desktop's as the
-    record, checked in, or closing a row; a sitting of the laptop or the desktop before 7 December
-    2026; a file at another commit cited as the record where the diff changes what its measurement
-    reads; a sitting at the measurement commit on the laptop or the desktop before the M1's files
-    are read; a layer on Windows taken unchecked from whatever the machine has, and a pin changed by
-    the session that found it wrong; a download the tool unpacks out of an installer; an implicit
-    layer of the machine's in a validated or a measured run; a public hook in `lactose-task` for row
-    21's stamp, and a cargo feature for it; a probe program written for row 150's four questions; a
-    lane for the client's fault probe before the exit; a window measurement run on a system
-    `lactose-platform` has not been run on.
+    before `lactose-rhi-vulkan` has run on a Windows driver; the Windows pin counted as passed on a
+    run from before a fix round's merge, or on a ruling that the layer's check, a canary or a
+    message was the machine's; a command that overrides a control of the work desktop's; a file of
+    the work desktop's as the record, checked in, or closing a row; a sitting of the laptop or the
+    desktop before 7 December 2026; a file at another commit cited as the record where the diff
+    changes what its measurement reads; a sitting at the measurement commit on the laptop or the
+    desktop before the M1's files are read; a layer on Windows taken unchecked from whatever the
+    machine has, and a pin changed by the session that found it wrong; a download the tool unpacks
+    out of an installer; an implicit layer of the machine's in a validated or a measured run; a
+    public hook in `lactose-task` for row 21's stamp, and a cargo feature for it; a probe program
+    written for row 150's four questions; a lane for the client's fault probe before the exit; a
+    window measurement run on a system `lactose-platform` has not been run on.
 - Driven by: the exit pass's audit at `ad1a99d`; `docs/proposals/milestone-2-sittings.md`, its probe
-  of LunarG's installer and its three reviews; `reviewer-gpu`'s reading for row 34; the owner's
+  of LunarG's installer and its four reviews; `reviewer-gpu`'s reading for row 34; the owner's
   rulings on its five questions and on the order; the work desktop's inventory, from its own agent
   session.
 - Replaced: in the plan's section 2, row 150's four hardware questions as "probed on the laptop's
@@ -966,7 +1019,7 @@ desktop's pin": the commit is recorded once the pin has passed on the RX 9060 XT
 7 December, and a defect that only NVIDIA's or Intel's driver shows then moves the commit, with the
 Mac's hour run again or its files ruled to stand.
 
-**What this text adds to the rulings.** Six things the rulings do not say and this text decides,
+**What this text adds to the rulings.** Eight things the rulings do not say and this text decides,
 each the smallest reading of them.
 
 - *The laptop is opened once*, from 7 December, where the third version opened it twice. Nothing it
@@ -977,9 +1030,16 @@ each the smallest reading of them.
 - *None of the work desktop's files is checked in*, and its reports name no host, user or domain. It
   is not the owner's own machine and the repository is public. A figure of its is quoted in the row
   it steers, as a lane's figure before the commit is.
-- *The pin's pass is four things*, and a failure that is the machine's and not the engine's is the
-  owner's to rule on.
-- *The work desktop's controls stand.* No command asks for an exception to one.
+- *The pin's pass is four things*, and the owner's ruling of a failure as the machine's is bounded:
+  a case that presents into the remote session alone, never the layer's check, a canary or a
+  message, and the laptop's gate runs that case first.
+- *A fix round moves the pin's pass.* A defect a run of the work desktop's finds goes to the lane
+  whose code it is, whichever crate that is, and a pin run from before that round's merge does not
+  count.
+- *The work desktop's controls stand.* No command asks for an exception to one or overrides one,
+  PowerShell's execution policy among them.
+- *A second machine name*, `work-desktop-windows-igpu`, for the rehearsal on the work desktop's
+  integrated Radeon. The ruling names `work-desktop-windows` alone.
 - *The toolchain is installed by name* on every machine, since rustup's install of a pinned
   toolchain on first use is deprecated.
 
@@ -998,6 +1058,7 @@ as soon as the desktop is in reach, and its install of the SDK comes after its m
 | `present-encoder`'s fix round and merge | Merged at `1c62676` | Spent |
 | `layer-windows`: the pin, the exclusive path on every host, `rhi-conformance`, the script | A lane from main, `reviewer` and `reviewer-gpu`, a fix round and a second where the diff review asks for one, `reviewer-diff`, `merger` | 7 |
 | `park-stamp`: the two spans, `record-stall`'s rows, the paired runs | A lane from `b0c5f44`, running, `reviewer` and `reviewer-concurrency`, a fix round and a second where the diff review asks for one, `reviewer-diff`, `merger` | 7 |
+| The fix round of each defect the work desktop finds before the commit, the shader cook's the first | A lane for the crate whose code it is, a review and `merger`, opened by the coordinator | About 3 each, an estimate |
 | The work desktop's pin run and its rehearsal | The work desktop's own agent session; the owner approves the SDK's install | 1 |
 | The nightly and the `measure` workflow at the commit | The coordinator, by dispatch | None |
 | The quiet window | The coordinator, with every agent stopped | None |
@@ -1007,18 +1068,19 @@ as soon as the desktop is in reach, and its install of the SDK comes after its m
 | The files checked in and the rows written | The coordinator's pass, or a lane as `exit-pass-rows` was | 2 |
 | The freeze decision, the exit's read and the milestone 3 plan | As section 7 has them | Already counted |
 
-About twenty agent runs are to spend, some of `park-stamp`'s seven already spent. `park-stamp` and
-`layer-windows` touch different crates: `crates/task` with `crates/app-client/tests/stall.rs`, and
-`tools/xtask`. `present-encoder` merged at `1c62676`: it edited `crates/app-client/src` and, for its
-client step, `tools/xtask/src/main.rs`, so `layer-windows` starts from main now and `park-stamp`
-takes that merge. The two lanes each edit `docs/results/README.md`, and the later merge takes the
-earlier one's.
+About twenty agent runs are to spend, some of `park-stamp`'s seven already spent, and about three
+more for each defect the work desktop finds. `park-stamp` and `layer-windows` touch different
+crates: `crates/task` with `crates/app-client/tests/stall.rs`, and `tools/xtask`. `present-encoder`
+merged at `1c62676`: it edited `crates/app-client/src` and, for its client step,
+`tools/xtask/src/main.rs`, so `layer-windows` starts from main now and `park-stamp` takes that
+merge. The two lanes each edit `docs/results/README.md`, and the later merge takes the earlier
+one's.
 
 **The calendar.** From 26 November 2026: the lanes, and the work desktop's early runs. At
-`layer-windows`' merge: the work desktop's pin run, then the commit, the nightly and the M1's hour,
-before 7 December if the lanes merge in time. From 7 December 2026: the desktop's first sitting, the
-laptop's session and session C, about three days if nothing misses. The exit is not read before
-then.
+`layer-windows`' merge, or the last fix round's where that is later: the work desktop's pin run,
+then the commit, the nightly and the M1's hour, before 7 December if the lanes and each fix round
+merge in time. From 7 December 2026: the desktop's first sitting, the laptop's session and session
+C, about three days if nothing misses. The exit is not read before then.
 
 ## What the reviews changed
 
@@ -1098,6 +1160,27 @@ commit's critical path: that place is the work desktop's pin run. Where another 
 laptop's first session, it is the work desktop's pin run for what had to come before the commit, as
 in S3, and the laptop's one session for the rest, as in M2.
 
+**The diff review of the fourth version.** `reviewer-diff` read the fourth version, the decision
+entry, the twenty-one blocks, the checker and the five commands files against the rulings and main
+at `1c62676`. It found no blocking defect, one serious, five minor and five nits, and all eleven are
+accepted. The serious one and three of the minor ones are defects of the work desktop's and the
+laptop's commands files, which are not checked in: they are fixed there, and this text gains the
+rule each broke.
+
+| Finding | Answer |
+|---|---|
+| W1. The work desktop's commands told the session to override PowerShell's execution policy for a process, and to run a block another way where that was refused | Accepted. Both Windows commands files run a saved block with no policy argument, and a script the policy refuses stops the run and is reported as the machine's. No command passes an execution policy or an encoded command, sets the policy or unblocks a file, and each Windows commands file says so once in its rules. The decision entry, the machine's row and this text name the execution policy among the controls that stand, and say that no command overrides one |
+| W2. The commit waited for a pin run that has "run", not one that has "passed", and a defect went to "a fix round of this lane" | Accepted, and taken one step further. The plan's bullet, the commit's row, the decision entry and this text say the pin's run has passed, at a commit that holds `layer-windows`' last merge and the fix round of each defect found before the commit, so a pin run from before a fix in any crate does not count. A defect goes to the lane whose code it is. The review's wording named the fix round a failure of the pin went to; a defect an early run finds is held to the same rule, and the shader cook's is the first |
+| W3. The lock's reading sees every session's sign-in process, and a minimised remote window is not seen at all | Accepted. The commands read the sign-in process of the one Windows session they run in, as the review wrote it, still as a heuristic that no run has checked. The owner's actions, the machine's row, the paragraph on what each sitting needs and the table of sittings ask for the remote session's window open and not minimised |
+| W4. The pin's four conditions are not equally showable, and a failure ruled the machine's had no rule after it | Accepted, with the review's rule. The owner may rule a failed case the machine's only where it presents into the remote session, never the layer's check, a canary or a message. The laptop's gate runs that case first, and a failure of it there moves the commit. It is in the decision entry, the plan's paragraph, the row of the work desktop's runs and the section on the pin's pass, and the commands files carry it. A run a control cut is run again, and any other failure that no fix ends leaves the pin not passed |
+| W5. `rustup show active-toolchain` prints the clone's path, and the commands had it sent | Accepted. The Windows commands print the line's first word, which is the toolchain, and whether the line names `rust-toolchain.toml`, and send neither the line nor a path. The desk sittings' commands say to send the first word alone |
+| W6. An environment variable set by one block reached the next where the shell keeps state | Accepted, for every block and not for the two the review named: a block that sets an environment variable removes it at its end, in both Windows commands files |
+| n-a. `work-desktop-windows-igpu` is a second label, not listed among the additions, and not every file carries a machine name | Accepted. The second name is kept, listed as an addition and named in the decision entry and the rows. "Every measurement's file" carries a name, and the gate's report and a test's log are said to carry none |
+| n-b. "Only the laptop's or the desktop's sitting shows" is not the ruling's "only NVIDIA's or Intel's driver" | Accepted: the ruling's words, in the plan's bullet, the commit's row and the paragraph on the order. A defect another sitting shows falls under the rule for a file of a later commit, as before |
+| n-c. The row of the work desktop's runs is gated at 2 and owes rehearsals of a lent machine | Accepted. The row says the rehearsals are owed while the machine is lent, and that the exit's read re-gates what is left of them if it no longer is |
+| n-d. `work-desktop-windows-2` stood for the first digit of the date | Accepted: `work-desktop-windows-<date>`, and `laptop-windows-<date>` in the laptop's commands, which had the same form |
+| n-e. The integrated Radeon's files went to a folder the scrub does not read | Accepted. They are copied into the scrubbed folder under a prefix of their own, so that a name the two GPUs share overwrites nothing there |
+
 ## What this proposal could not verify
 
 - That the file LunarG's installer leaves on a Windows disk is the file in its archive. The digest
@@ -1146,8 +1229,17 @@ in S3, and the laptop's one session for the rest, as in M2.
   Whether `record-stall` leaves an opener parked on its latch across an opening was not shown
   either: the file's count of each kind of wait answers it. Lane `park-stamp`'s commit `a5ce394` was
   found on its branch and not read.
-- The laptop's agent shell: which shell runs its commands, and whether it keeps a variable or a
-  directory between two of them. The commands no longer rest on it.
+- The laptop's agent shell and the work desktop's: which shell runs the commands, and whether it
+  keeps a variable or a directory between two of them. The commands rest on it in one way. Where the
+  shell is not PowerShell a block is saved as a script, and Windows' default execution policy for a
+  client refuses a script file, as remembered. The run then stops, it is reported as the machine's,
+  and the owner says how the blocks are run.
+- The lock's reading on the work desktop. The check of the sign-in process of the one Windows
+  session a command runs in is the diff review's, from Windows' behaviour and not run. Whether a
+  locked, a disconnected or a minimised remote session shows in it, and what each does to a window
+  that is presenting, is found by the first part that opens a window.
+- The shader cook's defect on Windows. The coordinator relayed it from the work desktop's early run,
+  and it was not read here.
 - Whether the CI runner's Mesa registers an implicit layer of its own, which the exclusive path
   would drop from the `gpu (lavapipe)` jobs. The diff review says so from memory. Nothing chooses a
   device by it, and the lane's `gpu (lavapipe)` run is the check.
