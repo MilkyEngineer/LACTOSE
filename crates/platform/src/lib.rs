@@ -123,7 +123,8 @@
 //!     // 2. No present and no frame submit is queued from here, and every point a pending
 //!     //    submit waits on that no submit made will signal is signalled from the host
 //!     //    first: what the host owes, and the points of a submit that failed or will now
-//!     //    not be made; the swapchain's drop waits for the submits that use its images.
+//!     //    not be made; the drop of an encoder the present side keeps waits for its
+//!     //    submit.
 //!     //    Then the last present-thread call signals in the same way the points of a
 //!     //    refused present of its own, waits, within a bound, for the points its presents
 //!     //    signalled, and drops the swapchain; here the thread holds only a device clone.

@@ -8,9 +8,11 @@
 //! decision 5.1's fixed-frame mode for `FRAMES` steps, writes the last frame's dump into the
 //! directory `DUMP`, and holds the last frame to the CPU reference. `DIR` for `--shaders` is
 //! the cooked shaders' directory, which `cargo xtask gpu` writes under `target/gpu/shaders`.
-//! The cache file is `pipeline-cache.bin` in the working directory unless named. A flag
-//! given twice, a paced mode's flag with `--fixed`, or a time scale of zero is refused with
-//! the usage, as is an unknown flag.
+//! The cache file is `pipeline-cache.bin` in the working directory unless named. In either
+//! mode `--extra-present-passes N`, a test and measurement knob, makes each present draw its
+//! image `N` more times (`Options::extra_present_passes`). A flag given twice, a paced
+//! mode's flag with `--fixed`, or a time scale of zero is refused with the usage, as is an
+//! unknown flag.
 //!
 //! Prints the outcome and exits 0; exits 1 with the error, or 1 where a validator sent any
 //! message. A panic aborts through `lactose-app`'s crash hook, which writes its report to
@@ -29,8 +31,8 @@ use lactose_sim::TimeScale;
 fn usage() -> ExitCode {
     eprintln!(
         "usage: lactose-app-client --shaders DIR [--packs DIR] [--cache FILE] \
-         [[--seconds N] [--time-scale THOUSANDTHS] [--minimised] [--stamps FILE] \
-         | --fixed FRAMES DUMP]"
+         [--extra-present-passes N] [[--seconds N] [--time-scale THOUSANDTHS] [--minimised] \
+         [--stamps FILE] | --fixed FRAMES DUMP]"
     );
     ExitCode::from(2)
 }
@@ -46,6 +48,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Option<Options> {
     let mut minimised = None;
     let mut stamps = None;
     let mut fixed = None;
+    let mut extra = None;
     // Each flag is set once: a second sets nothing and fails the parse.
     fn once<T>(slot: &mut Option<T>, value: T) -> Option<()> {
         slot.replace(value).is_none().then_some(())
@@ -62,6 +65,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Option<Options> {
             }
             "--minimised" => once(&mut minimised, true)?,
             "--stamps" => once(&mut stamps, PathBuf::from(args.next()?))?,
+            "--extra-present-passes" => once(&mut extra, args.next()?.parse().ok()?)?,
             "--fixed" => {
                 let frames = args.next()?.parse().ok()?;
                 once(&mut fixed, Mode::Fixed { frames, dump: PathBuf::from(args.next()?) })?;
@@ -80,6 +84,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Option<Options> {
         packs,
         cache: cache.unwrap_or_else(|| PathBuf::from("pipeline-cache.bin")),
         mode,
+        extra_present_passes: extra.unwrap_or(0),
     })
 }
 
@@ -144,6 +149,15 @@ mod tests {
         assert!(parsed(&["--shaders", "s", "--seconds", "3", "--seconds", "4"]).is_none());
         assert!(parsed(&["--shaders", "s", "--seconds", "3", "--fixed", "6", "d"]).is_none());
         assert!(parsed(&["--seconds", "3"]).is_none(), "no shaders");
+        assert_eq!(plain.extra_present_passes, 0, "none unless asked");
+        let extra = parsed(&["--shaders", "s", "--extra-present-passes", "40"]).expect("extra");
+        assert_eq!(extra.extra_present_passes, 40);
+        let fixed = parsed(&["--fixed", "6", "d", "--shaders", "s", "--extra-present-passes", "2"]);
+        assert_eq!(fixed.map(|fixed| fixed.extra_present_passes), Some(2), "beside --fixed");
+        let twice =
+            ["--shaders", "s", "--extra-present-passes", "1", "--extra-present-passes", "2"];
+        assert!(parsed(&twice).is_none());
+        assert!(parsed(&["--shaders", "s", "--extra-present-passes", "many"]).is_none());
     }
 
     #[test]

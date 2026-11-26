@@ -154,6 +154,12 @@ pub struct Watch {
     pub fail_encoder: AtomicBool,
     /// The encoders of the present role a [`WatchedDevice`] made.
     pub encoders: AtomicUsize,
+    /// The values of a timeline presents signal that a [`WatchedDevice`] was asked to wait
+    /// for, in order.
+    pub waited_reads: Mutex<Vec<u64>>,
+    /// Where set, a [`WatchedDevice`] answers a wait for a value of a timeline presents
+    /// signal above it as timed out, at once and without asking null: the GPU held behind.
+    pub reads_held_past: Mutex<Option<u64>>,
     /// The images a [`WatchedDevice`] made, and those it destroyed.
     pub made: Mutex<Vec<ImageHandle>>,
     pub destroyed: Mutex<Vec<ImageHandle>>,
@@ -425,6 +431,12 @@ impl Device for WatchedDevice {
     }
 
     fn wait_timeline(&self, point: TimelinePoint, timeout: Duration) -> Result<bool> {
+        if lock(&self.watch.reads).contains(&point.timeline) {
+            lock(&self.watch.waited_reads).push(point.value);
+            if lock(&self.watch.reads_held_past).is_some_and(|held| point.value > held) {
+                return Ok(false);
+            }
+        }
         let reached = self.inner.wait_timeline(point, timeout)?;
         if reached {
             let mut seen = lock(&self.watch.seen);

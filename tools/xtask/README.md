@@ -762,7 +762,7 @@ another version, the SDK's among them, is refused by the cook too.
 ## GPU runs
 
 `cargo xtask gpu [--driver <lavapipe|moltenvk|kosmickrisp|system>] [--adapter <name>] [--only
-<metal|vulkan>] [--gpu-assisted] [--cooked <dir>]` is the command decision 5.10 of the
+<metal|vulkan>] [--gpu-assisted] [--cooked <dir>] [--client]` is the command decision 5.10 of the
 milestone 2 plan names. It cooks, then runs the Metal step on macOS and the Vulkan step on
 every host the layer's pin names; `--only` runs one of them, and the Metal step asked for on
 another host than macOS exits 2. The Metal step is the same under each driver name, since the
@@ -927,6 +927,30 @@ writes its report.
    says how. It prints the same to standard error, the job's log, followed by the test's whole
    standard output and standard error, each under a heading of its own: the log keeps all of
    a failed test's output, the file its tail. A failed test fails the run, under every driver.
+7. With `--client`, which is opt-in and needs a window, the Vulkan step then runs the release
+   `lactose-app-client`, built first with `cargo build --locked --release`, on a window, under the
+   device tests' environment: the layer, the driver and its validators, Metal's API and shader
+   validation under MoltenVK among them. No device test reaches the client's present side
+   (`crates/app-client/README.md`, "What proves it"): these runs do. Each runs in a process of its
+   own for `CLIENT_SECONDS` (5) from its first frame, in `target/gpu/client/`, with the deadline of
+   a device test past them, and is judged as one is, the client exiting 1 on any validator's
+   message. It runs twice under each driver: plain, as shipped, and lagged, with
+   `--extra-present-passes` from `client_lag` in `src/main.rs`, which draws each present's image
+   that many times more, so that the GPU runs behind the present thread. The present side logs at
+   its close how many calls it took and how many of them found their oldest read unreached at their
+   head, so that the call kept an encoder whose submit was pending; each run prints that figure and
+   the file records it, a run that logs none fails, and the lagged one fails where the figure is
+   zero, since its lag then reached nothing it is for. The lag was set on the M1 under each driver's
+   validators (26 November 2026, load averages near 9): 100 passes under MoltenVK, where 31 of 136
+   calls found their oldest read unreached, and 200 under KosmicKrisp, where 45 of 217 did and 100
+   passes left 2 of 301; plain, none of 301 did under either, so the plain run alone reaches no
+   pending encoder. The other drivers take KosmicKrisp's. Against a present side that resets an
+   encoder one read early, with `lactose-rhi-vulkan`'s refusal of a pending reset removed, the
+   lagged run fails under both drivers (`VUID-vkResetCommandPool-commandPool-00040`, a reset of a
+   pool whose command buffer is pending, and the begin and submit of that buffer), and the plain run
+   passes. Before it builds anything, and before each run, it reads the screen's state: while the
+   screen is locked no window presents, so it exits 3, having run nothing more, and never skips the
+   runs in silence.
 
 The `shaders` CI job runs `gpu --driver system --only metal` on the macOS runner that cooks,
 and the `shaders-oldest` job runs `gpu --driver system --only metal --cooked` on the oldest

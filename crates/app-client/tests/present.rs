@@ -2,11 +2,13 @@
 //! targets this test draws: the swapchain resized at the first call and at each change of the
 //! frame's extent and at no other call, and a heap slot rewritten for each new image, so that
 //! an image replaced in its slot is destroyed once the read of its successor is reached; the
-//! present's wait for the frame that drew its target, and the slot's wait for the last read,
-//! with what null would refuse kept pending; a present refused as pending, and a resize that
-//! fails with a driver's error; and the encoders the side keeps, counted as the device makes
-//! them: made only where none is reached, held to their bound, given back by a refused
-//! present, and let go on a lost device.
+//! present's wait for the frame that drew its target, and the slot's wait for the read of
+//! the last present that declared it, with what null would refuse kept pending and with the
+//! GPU held behind; a present refused as pending, and a resize that fails with a driver's
+//! error; and the encoders the side keeps, counted as the device makes them: made only where
+//! none is reached, taken again behind the reach the side's own waits learn, held to their
+//! bound by a wait for the oldest read alone, given back by a refused present, let go on a
+//! lost device, and gone with the device's last hold at `close`.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -25,6 +27,9 @@ use lactose_rhi_null::Control;
 use crate::support::{
     Said, WAIT_BOUND, Watch, Watched, WatchedDevice, lock, null_device, null_shaders,
 };
+
+/// Each target's last present, with its read, where it has one.
+type Last = [Option<(Finished, TimelinePoint)>; 2];
 
 const E1: Extent = Extent { width: 64, height: 48 };
 const E2: Extent = Extent { width: 80, height: 40 };
@@ -229,17 +234,20 @@ fn the_present_waits_for_the_frame_that_drew_its_target() {
 
 /// With every present's read kept pending until a wait sees it, at E1 with no resize after
 /// the first call, each slot written anew while a present that declared it may be pending
-/// unless a call waited for its read. Each slot's write waits for the last read first, so
-/// null refuses nothing; a slot written with no wait, or behind an earlier read, is refused
-/// (`uuwp-used`; `crates/app/README.md`, "The targets and the present thread").
+/// unless a call waited for its read. Each slot's write waits first for the read of the last
+/// present that declared it, so null refuses nothing; a slot written with no wait, or behind
+/// an earlier read, is refused (`uuwp-used`; `crates/app/README.md`, "The targets and the
+/// present thread").
 ///
 /// Targets 0, 1 and 0, each a new image: the third call's write of slot 0 meets the first
 /// present pending (`slot-no-wait`). Then targets 0, 1 and 0 again: the first two images
 /// drawn again behind their reads, the second's present refused as pending, so that it makes
-/// no read, and a new image in slot 0, whose write meets pending the present that declared
-/// slot 0 last, which is now the last read and not the one before it (`slot-wait-stale`).
+/// no read, and a new image in slot 0, whose write meets pending the third call's present,
+/// which redrew the image the slot held and is now the last read. A side that took a slot's
+/// read from its write alone, and not from each present that declared it, would wait for the
+/// first call's read and be refused (`slot-wait-stale`).
 #[test]
-fn a_heap_slot_is_written_anew_only_behind_the_last_read() {
+fn a_heap_slot_is_written_anew_only_behind_the_last_present_that_declared_it() {
     for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
         let mut side = Side::new(queues, true);
         for (call, slot) in [0, 1, 0].into_iter().enumerate() {
@@ -340,10 +348,10 @@ const ENCODERS: usize = 4;
 
 /// Targets 0 and 1 drawn once each, then `calls - 2` times again, each behind the read of
 /// its last present, so that no call after the second writes a slot or resizes: every call
-/// presents. Returns the side.
-fn redrawn_in_turn(queues: QueueLayout, lag: bool, calls: usize) -> Side {
+/// presents. Returns the side, with each target's last present.
+fn redrawn_in_turn(queues: QueueLayout, lag: bool, calls: usize) -> (Side, Last) {
     let mut side = Side::new(queues, lag);
-    let mut last: [Option<(Finished, TimelinePoint)>; 2] = [None, None];
+    let mut last: Last = [None, None];
     for call in 0..calls {
         let slot = call % 2;
         let finished = match last[slot] {
@@ -357,7 +365,7 @@ fn redrawn_in_turn(queues: QueueLayout, lag: bool, calls: usize) -> Side {
         last[slot] = Some((finished, read));
     }
     assert_eq!(side.watch.presents(), calls);
-    side
+    (side, last)
 }
 
 /// The side keeps each present's encoder and records into it again once its read is
@@ -367,7 +375,7 @@ fn redrawn_in_turn(queues: QueueLayout, lag: bool, calls: usize) -> Side {
 #[test]
 fn the_side_keeps_its_encoders_and_makes_one_only_where_none_is_reached() {
     for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
-        let side = redrawn_in_turn(queues, false, 40);
+        let (side, _) = redrawn_in_turn(queues, false, 40);
         assert_eq!(side.watch.encoders.load(Ordering::Relaxed), 1, "{queues:?}");
         side.close();
     }
@@ -381,7 +389,7 @@ fn the_side_keeps_its_encoders_and_makes_one_only_where_none_is_reached() {
 #[test]
 fn the_side_holds_its_bound_of_encoders_and_resets_each_only_behind_its_read() {
     for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
-        let side = redrawn_in_turn(queues, true, 40);
+        let (side, _) = redrawn_in_turn(queues, true, 40);
         assert_eq!(side.watch.encoders.load(Ordering::Relaxed), ENCODERS, "{queues:?}");
         side.close();
     }
@@ -389,10 +397,10 @@ fn the_side_holds_its_bound_of_encoders_and_resets_each_only_behind_its_read() {
 
 /// A present refused, by a rule other than pending and as pending, submitted nothing: its
 /// encoder is reset at once and the next call records into it. With every read kept
-/// pending, the third call's encoder is a new one, since the first is behind an unseen read,
-/// and its present is refused; the fourth records into it, so two are made. A side that
-/// dropped it would make a third (`unsubmitted-dropped`), and one that kept it as submitted
-/// would too, behind a read no submit signals.
+/// pending, the third call's encoder is a new one, since the first two are behind unseen
+/// reads, and its present is refused; the fourth records into it, so three are made. A side
+/// that dropped it would make a fourth (`unsubmitted-dropped`), and one that kept it as
+/// submitted would too, behind a read no submit signals.
 #[test]
 fn a_refused_presents_encoder_is_reset_at_once_and_recorded_into_by_the_next_call() {
     for rule in [Rule::State, Rule::Pending] {
@@ -409,21 +417,21 @@ fn a_refused_presents_encoder_is_reset_at_once_and_recorded_into_by_the_next_cal
         }
         let again = side.redrawn(b, b_read);
         assert!(side.call(again).expect("call 3").read.is_some(), "{rule:?}: call 3");
-        assert_eq!(side.watch.encoders.load(Ordering::Relaxed), 2, "{rule:?}");
+        assert_eq!(side.watch.encoders.load(Ordering::Relaxed), 3, "{rule:?}");
         assert_eq!(side.watch.presents(), 3, "{rule:?}");
         side.close();
     }
 }
 
 /// A device lost with encoders held, their reads pending: the next call fails with
-/// `DeviceLost` and makes no encoder, the side lets its encoders go, and its `close`
-/// returns. Null's drops never wait, so the reset before each drop, which a lost device
-/// accepts, is shown here only as accepted; `lactose-rhi-vulkan`'s drop waits for nothing on
-/// a lost device either way.
+/// `DeviceLost` and makes no encoder, and its `close` returns. That the side lets its
+/// encoders go at the loss, each reset first, is not shown: null's drops never wait, and
+/// `lactose-rhi-vulkan`'s waits for nothing on a lost device, so a side that kept them, or
+/// dropped them unreset, is the same on both (`no-forget-if-lost`, `lost-without-reset`).
 #[test]
 fn a_lost_device_ends_the_call_and_the_side_closes_with_its_encoders_let_go() {
     for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
-        let mut side = redrawn_in_turn(queues, true, 6);
+        let (mut side, _) = redrawn_in_turn(queues, true, 6);
         let made = side.watch.encoders.load(Ordering::Relaxed);
         assert_eq!(made, ENCODERS, "{queues:?}");
         let finished = side.finished(0, E1);
@@ -479,4 +487,125 @@ fn a_resize_that_fails_gives_up_the_acquired_image() {
     assert!(report.read.is_some(), "{report:?}");
     assert_eq!(*lock(&side.watch.resizes), [E1, E2]);
     side.close();
+}
+
+/// With the GPU held one present behind the last, so that a wait for the last read times
+/// out, targets 0 and 1 in turn, each a new image, so that every call writes its slot: each
+/// call's write waits for the read of the call before last, which declared that slot, and is
+/// reached, and every call presents, both targets in turn. A side whose write waited for the
+/// last read, which the other target's present renews each call, would present nothing past
+/// the second call (`slot-wait-last`).
+#[test]
+fn a_new_image_waits_for_its_own_slots_read_so_both_targets_present_behind_a_lagging_gpu() {
+    for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
+        let mut side = Side::new(queues, true);
+        for call in 0..8_u64 {
+            // Call `k`'s read signals `k + 1`, every call presenting: the reads of the calls
+            // before last and earlier are reached, the last one's is not.
+            *lock(&side.watch.reads_held_past) = call.checked_sub(1);
+            let finished = side.finished(usize::try_from(call % 2).expect("an index"), E1);
+            let report = side.call(finished).unwrap_or_else(|error| panic!("call {call}: {error}"));
+            assert!(report.read.is_some(), "{queues:?}: call {call} presented nothing");
+        }
+        assert_eq!(side.watch.presents(), 8, "{queues:?}");
+        assert_eq!(*lock(&side.watch.waited_reads), [1, 2, 3, 4, 5, 6], "{queues:?}");
+        *lock(&side.watch.reads_held_past) = None;
+        side.close();
+    }
+}
+
+/// The reach a call learns by its own waits is carried to its take of an encoder, with every
+/// read kept pending: a new image in slot 0 at the third call waits for the first call's
+/// read, which declared that slot, so the third records into the first's encoder, and two are
+/// made, not three (`slot-wait-no-reach`); a resize at the second call waits for the first
+/// call's read, so the second records into the first's encoder, and one is made, not two
+/// (`resize-wait-no-reach`).
+#[test]
+fn the_reach_of_the_resize_and_slot_waits_lets_the_call_take_a_reached_encoder() {
+    for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
+        let mut side = Side::new(queues, true);
+        for (call, slot) in [0, 1, 0].into_iter().enumerate() {
+            let finished = side.finished(slot, E1);
+            let report = side.call(finished).unwrap_or_else(|error| panic!("call {call}: {error}"));
+            assert!(report.read.is_some(), "call {call}: {report:?}");
+        }
+        assert_eq!(*lock(&side.watch.waited_reads), [1], "{queues:?}: the slot's wait");
+        assert_eq!(side.watch.encoders.load(Ordering::Relaxed), 2, "{queues:?}: the slot's wait");
+        side.close();
+
+        let mut side = Side::new(queues, true);
+        let a = side.finished(0, E1);
+        assert!(side.call(a).expect("call 0").read.is_some());
+        let b = side.finished(1, E2);
+        assert!(side.call(b).expect("call 1").read.is_some());
+        assert_eq!(*lock(&side.watch.resizes), [E1, E2]);
+        assert_eq!(*lock(&side.watch.waited_reads), [1], "{queues:?}: the resize's wait");
+        assert_eq!(side.watch.encoders.load(Ordering::Relaxed), 1, "{queues:?}: the resize's wait");
+        side.close();
+    }
+}
+
+/// At its bound the side waits for its oldest present's read, and for no later one, with
+/// every read kept pending. After five calls it holds the reads of calls 1 to 4 and has
+/// waited once, for read 1, at the fifth call's bound; the sixth waits for read 2 alone. A
+/// side that waited for its newest read would wait for 4 and then 5
+/// (`bound-waits-for-newest`).
+#[test]
+fn the_bound_waits_for_the_oldest_read_alone() {
+    for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
+        let (mut side, last) = redrawn_in_turn(queues, true, 5);
+        assert_eq!(*lock(&side.watch.waited_reads), [1], "{queues:?}: before the sixth call");
+        let (finished, read) = last[1].expect("target 1's last present");
+        let again = side.redrawn(finished, read);
+        assert!(side.call(again).expect("call 5").read.is_some(), "{queues:?}");
+        assert_eq!(*lock(&side.watch.waited_reads), [1, 2], "{queues:?}: the sixth call");
+        assert_eq!(side.watch.encoders.load(Ordering::Relaxed), ENCODERS, "{queues:?}");
+        side.close();
+    }
+}
+
+/// Past the bound's wait, the GPU held behind, the call presents nothing and acquires
+/// nothing, with no error, and the next call, the GPU caught up, presents; nothing is
+/// refused and no encoder is made past the bound. A side that went on past the timeout
+/// would reset a pending encoder, which null refuses (`bound-ignores-timeout`); one that
+/// acquired before its wait would hold an image through it (`bound-after-acquire`).
+#[test]
+fn the_bound_waits_timeout_presents_nothing_and_the_next_call_presents() {
+    for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
+        let (mut side, last) = redrawn_in_turn(queues, true, 5);
+        let (finished, read) = last[1].expect("target 1's last present");
+        let again = side.redrawn(finished, read);
+        let acquires = side.watch.acquires.load(Ordering::Relaxed);
+        *lock(&side.watch.reads_held_past) = Some(1);
+        let report = side.call(again).unwrap_or_else(|error| panic!("{queues:?}: {error}"));
+        assert_eq!(report.read, None, "{queues:?}");
+        assert_eq!(side.watch.acquires.load(Ordering::Relaxed), acquires, "{queues:?}");
+        *lock(&side.watch.reads_held_past) = None;
+        assert!(side.call(again).expect("the next call").read.is_some(), "{queues:?}");
+        assert_eq!(*lock(&side.watch.waited_reads), [1, 2, 2], "{queues:?}");
+        assert_eq!(side.watch.encoders.load(Ordering::Relaxed), ENCODERS, "{queues:?}");
+        side.close();
+    }
+}
+
+/// A closed side holds nothing of the device: once every other holder is gone, the device
+/// is gone (`Control::lose` answers `false`), the closed side still alive. A side whose
+/// `close` left its encoders or its swapchain would keep the device until its own drop,
+/// wherever the present thread's state is dropped (`close-keeps-encoders`).
+#[test]
+fn a_closed_side_holds_nothing_of_the_device() {
+    for queues in [QueueLayout::ONE, QueueLayout::SEVERAL] {
+        let (side, _) = redrawn_in_turn(queues, true, 6);
+        let Side { device, control, mut present, frames, value, images, .. } = side;
+        present.close();
+        let last = TimelinePoint { timeline: frames, value };
+        assert!(device.wait_timeline(last, WAIT_BOUND).expect("a wait"), "the frames");
+        for image in images {
+            device.destroy_image(image).expect("a target the closed side let go");
+        }
+        device.destroy_timeline(frames).expect("the frames' timeline");
+        drop(device);
+        assert!(!control.lose(), "{queues:?}: the closed side still holds the device");
+        drop(present);
+    }
 }

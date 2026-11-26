@@ -2,7 +2,8 @@
 //!
 //! Findings go to standard output, one `path: message` line each, and nothing else does, so
 //! the output can be fed to a problem matcher. Progress and summaries go to standard error.
-//! The exit status is 0 for no findings, 1 for findings and 2 when a check could not run.
+//! The exit status is 0 for no findings, 1 for findings and 2 when a check could not run;
+//! `gpu --client` exits 3, having run nothing, while the screen is locked.
 //! `heavy` is not a check: it prints only progress to standard error, and exits with the
 //! status of the program it runs, or 2 when it could not run it. `group` is not a check
 //! either: it prints one line of cargo arguments to standard output, and exits with 2,
@@ -83,7 +84,8 @@ cargo xtask <command>
   slang                      install the pinned Slang release under the target directory,
                              from tools/cook/slang.toml, and print its slangc's path
   gpu [--driver <name>] [--adapter <name>] [--only <metal|vulkan>] [--gpu-assisted]
-      [--cooked <dir>]       cook the engine shaders, or with --cooked take the code
+      [--cooked <dir>] [--client]
+                             cook the engine shaders, or with --cooked take the code
                              `ricotta --code` wrote to <dir> (Metal step alone); on macOS
                              make a Metal pipeline state from each under Metal's
                              validation; then run every device test under the pinned
@@ -91,10 +93,14 @@ cargo xtask <command>
                              moltenvk, kosmickrisp or system, whose device --adapter
                              names), with GPU-assisted validation for --gpu-assisted;
                              with no --driver, on macOS, under moltenvk then kosmickrisp,
-                             or kosmickrisp alone with --gpu-assisted
+                             or kosmickrisp alone with --gpu-assisted; with --client,
+                             then the release client on a window under each driver's
+                             environment, as shipped and with each present lagged,
+                             exiting 3 while the screen is locked
   help                       print this text
 
-Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 could not run.";
+Findings are printed as `path: message`. Exit status: 0 clean, 1 findings, 2 could not run,
+3 the screen locked for `gpu --client`.";
 
 /// The package that holds the stand-in tests of `sour self-test`: this one.
 const STAND_IN_PACKAGE: &str = env!("CARGO_PKG_NAME");
@@ -309,6 +315,28 @@ const DEVICE_TESTS: [(&str, Option<&str>, &str); 8] = [
     ("lactose-app-client", Some("integration"), "gpu::"),
 ];
 
+/// The client binary `gpu --client` runs.
+const CLIENT: &str = "lactose-app-client";
+
+/// How long each of `gpu --client`'s runs of the client presents, in seconds, from its
+/// first frame.
+const CLIENT_SECONDS: u32 = 5;
+
+/// The passes each present adds in `gpu --client`'s lagged run under `driver`
+/// (`--extra-present-passes`), set on the M1 under each driver's validators so that calls
+/// begin with their oldest read pending (`README.md`, "GPU runs"). The other drivers take
+/// KosmicKrisp's, the heavier: no runner of theirs presents to a window.
+fn client_lag(driver: vulkan::Driver) -> u32 {
+    match driver {
+        vulkan::Driver::MoltenVk => 100,
+        vulkan::Driver::KosmicKrisp | vulkan::Driver::Lavapipe | vulkan::Driver::System => 200,
+    }
+}
+
+/// The status `gpu --client` exits with, having run nothing, while the screen is locked:
+/// no window presents then, so a run would show nothing of the present side.
+const SCREEN_LOCKED: i32 = 3;
+
 /// What `gpu` was asked to run.
 struct GpuArgs<'a> {
     /// The drivers of the Vulkan step, one after the other; the Metal step's report is named
@@ -319,13 +347,15 @@ struct GpuArgs<'a> {
     metal: bool,
     vulkan: bool,
     validators: vulkan::Validators,
+    /// Whether the Vulkan step runs the release client on a window after the device tests.
+    client: bool,
 }
 
 impl<'a> GpuArgs<'a> {
     fn parse(args: &[&'a str]) -> Result<Self, String> {
         let usage = || {
             "expected `[--driver <lavapipe|moltenvk|kosmickrisp|system>] [--adapter <name>] \
-             [--only <metal|vulkan>] [--gpu-assisted] [--cooked <dir>]`"
+             [--only <metal|vulkan>] [--gpu-assisted] [--cooked <dir>] [--client]`"
                 .to_owned()
         };
         let mut parsed = Self {
@@ -335,6 +365,7 @@ impl<'a> GpuArgs<'a> {
             metal: cfg!(target_os = "macos"),
             vulkan: true,
             validators: vulkan::Validators::Plain,
+            client: false,
         };
         let mut rest = args;
         while let [flag, ref tail @ ..] = *rest {
@@ -361,6 +392,10 @@ impl<'a> GpuArgs<'a> {
                 }
                 ("--gpu-assisted", tail) => {
                     parsed.validators = vulkan::Validators::GpuAssisted;
+                    tail
+                }
+                ("--client", tail) if !parsed.client => {
+                    parsed.client = true;
                     tail
                 }
                 _ => return Err(usage()),
@@ -392,18 +427,25 @@ impl<'a> GpuArgs<'a> {
         if !parsed.metal && !parsed.vulkan {
             return Err("no step to run".to_owned());
         }
+        if parsed.client && !parsed.vulkan {
+            return Err("`--client` runs in the Vulkan step: drop `--only metal`".to_owned());
+        }
         Ok(parsed)
     }
 }
 
 /// `gpu [--driver <name>] [--adapter <name>] [--only <metal|vulkan>] [--gpu-assisted]
-/// [--cooked <dir>]`: cooks the engine's shaders with the pinned Slang, or takes the code
-/// another runner cooked to `<dir>`, then runs the Metal step on macOS and the Vulkan step
-/// under the named driver, or under each of the M1's gate with none (`README.md`, "GPU
-/// runs"). Each step writes its report to `target/gpu/` and to standard error, and every
-/// step runs before a failure of any fails the run.
+/// [--cooked <dir>] [--client]`: cooks the engine's shaders with the pinned Slang, or takes
+/// the code another runner cooked to `<dir>`, then runs the Metal step on macOS and the
+/// Vulkan step under the named driver, or under each of the M1's gate with none, the client
+/// step in it for `--client` (`README.md`, "GPU runs"). Each step writes its report to
+/// `target/gpu/` and to standard error, and every step runs before a failure of any fails
+/// the run.
 fn run_gpu(args: &[&str]) -> Checked {
     let args = GpuArgs::parse(args)?;
+    if args.client {
+        exit_if_locked()?;
+    }
     let context = Context::load()?;
     let pin = slang::Pin::parse(&read(slang::PIN_FILE)?)?;
     let out = context.target_dir.join("gpu");
@@ -412,6 +454,7 @@ fn run_gpu(args: &[&str]) -> Checked {
         Some(dir) => (PathBuf::from(dir), format!("cooked elsewhere, in {dir}")),
         None => (cook_engine_shaders(&context, &pin, &out)?, format!("Slang {}", pin.version)),
     };
+    let client = if args.client { Some(build_client(&context)?) } else { None };
     let mut failures = Vec::new();
     if args.metal {
         failures.extend(
@@ -421,7 +464,7 @@ fn run_gpu(args: &[&str]) -> Checked {
     if args.vulkan {
         for &driver in &args.drivers {
             failures.extend(
-                run_vulkan(&context, &args, driver, &cooked_by, &out)
+                run_vulkan(&context, &args, driver, client.as_deref(), &cooked_by, &out)
                     .err()
                     .map(|failure| format!("under {}: {failure}", driver.name())),
             );
@@ -494,12 +537,14 @@ fn run_metal(
 
 /// The Vulkan step: every device test of [`DEVICE_TESTS`] in a process of its own, under the
 /// pinned layer and `driver`, each judged by decision 5.10's rule; the run's validators'
-/// canaries first. Its report is `<out>/<driver>-vulkan[-gpu-assisted].txt`, and a failed
-/// test fails the run.
+/// canaries first; then, given the release `client`, its runs on a window ([`run_client`]).
+/// Its report is `<out>/<driver>-vulkan[-gpu-assisted].txt`, and a failed test or run fails
+/// the run.
 fn run_vulkan(
     context: &Context,
     args: &GpuArgs<'_>,
     driver: vulkan::Driver,
+    client: Option<&Path>,
     cooked_by: &str,
     out: &Path,
 ) -> Result<(), String> {
@@ -587,6 +632,18 @@ fn run_vulkan(
             failed.push((*canary).to_owned());
         }
     }
+    if let Some(binary) = client {
+        let dir = context.root.join(out).join("client");
+        fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for passes in [0, client_lag(driver)] {
+            exit_if_locked()?;
+            let (entry, failure) = run_client(binary, &run, &shaders, &dir, driver, passes)?;
+            if let Some(failure) = failure {
+                failed.push(failure);
+            }
+            lines.push(entry);
+        }
+    }
     let file = out.join(format!("{}-vulkan{form}.txt", driver.name()));
     let settings: String =
         run.set.iter().map(|(name, value)| format!("  {name}={value}\n")).collect();
@@ -607,12 +664,129 @@ fn run_vulkan(
     eprintln!("gpu: the report is {}", file.display());
     if !failed.is_empty() {
         return Err(format!(
-            "{} device test(s) failed decision 5.10's rule: {}",
+            "{} device test(s) or client run(s) failed decision 5.10's rule: {}",
             failed.len(),
             failed.join(", ")
         ));
     }
     Ok(())
+}
+
+/// Exits with [`SCREEN_LOCKED`], having printed why, where the screen is locked.
+///
+/// # Errors
+///
+/// The screen's state cannot be read.
+fn exit_if_locked() -> Result<(), String> {
+    if screen_locked()? {
+        eprintln!("gpu: the screen is locked, so no window presents: no client run");
+        process::exit(SCREEN_LOCKED);
+    }
+    Ok(())
+}
+
+/// Whether the console session's screen is locked: on macOS the registry's
+/// `CGSSessionScreenIsLocked`, which is absent while it is not; elsewhere never.
+fn screen_locked() -> Result<bool, String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+    let output = Command::new("ioreg")
+        .args(["-n", "Root", "-d1", "-a"])
+        .output()
+        .map_err(|e| format!("cannot run ioreg: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("ioreg ended with {}", output.status));
+    }
+    Ok(locked_in(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Whether the property list `ioreg -a` printed says a session's screen is locked.
+fn locked_in(plist: &str) -> bool {
+    const KEY: &str = "<key>CGSSessionScreenIsLocked</key>";
+    plist
+        .match_indices(KEY)
+        .any(|(at, _)| plist[at + KEY.len()..].trim_start().starts_with("<true/>"))
+}
+
+/// Builds the release client and returns its path.
+fn build_client(context: &Context) -> Result<PathBuf, String> {
+    eprintln!("gpu: building the release {CLIENT}");
+    let status = Command::new(&context.cargo)
+        .args(["build", "--locked", "--release", "-p", CLIENT, "--bin", CLIENT])
+        .status()
+        .map_err(|e| format!("cannot run cargo: {e}"))?;
+    if !status.success() {
+        return Err(format!("the build of {CLIENT} ended with {status}"));
+    }
+    Ok(context.target_dir.join("release").join(format!("{CLIENT}{}", env::consts::EXE_SUFFIX)))
+}
+
+/// The figure the client's present side logs at its close: the calls it took, and those of
+/// them that began with their oldest encoder's read pending.
+fn present_figure(stderr: &str) -> Option<(u64, u64)> {
+    const AT: &str = "the present side's close: ";
+    let line = stderr.lines().rev().find_map(|line| Some(&line[line.find(AT)? + AT.len()..]))?;
+    let (calls, rest) = line.split_once(" calls, ")?;
+    let (pending, _) = rest.split_once(" of them began with their oldest read pending")?;
+    Some((calls.parse().ok()?, pending.parse().ok()?))
+}
+
+/// One run of the release client `binary` on a window, in a process of its own, under
+/// `run`'s environment, for [`CLIENT_SECONDS`], each present adding `passes` passes
+/// (`--extra-present-passes`): as shipped for none, lagged otherwise. It passes by decision
+/// 5.10's rule as a device test does, the binary exiting 1 on any validator's message, with
+/// its present side's figure logged; a lagged run passes only where a call began with its
+/// oldest read pending, which shows the lag reached the case it is for. Returns its entry in
+/// the report, and its name where it failed.
+fn run_client(
+    binary: &Path,
+    run: &vulkan::Run,
+    shaders: &Path,
+    dir: &Path,
+    driver: vulkan::Driver,
+    passes: u32,
+) -> Result<(String, Option<String>), String> {
+    let arm = if passes == 0 { "plain".to_owned() } else { format!("lagged by {passes} passes") };
+    let name = format!("client, {arm}");
+    let cache = dir.join(format!("{}-{passes}.cache", driver.name()));
+    let mut command = Command::new(binary);
+    run.apply(&mut command)
+        .args(["--shaders", &shaders.to_string_lossy(), "--cache", &cache.to_string_lossy()])
+        .args(["--seconds", &CLIENT_SECONDS.to_string()])
+        .args(["--extra-present-passes", &passes.to_string()])
+        .current_dir(dir)
+        .stdin(Stdio::null());
+    eprintln!("gpu: {CLIENT} under {}, {arm}, {CLIENT_SECONDS} s", driver.name());
+    let deadline = std::time::Duration::from_secs(CLIENT_SECONDS.into()) + vulkan::DEADLINE;
+    let ended = vulkan::run_bounded(&mut command, deadline)
+        .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
+    let mut verdict = vulkan::judge_ended(CLIENT, &ended, None, run.metal);
+    let figure = present_figure(&ended.stderr);
+    if verdict.failure.is_none() {
+        verdict.failure = match figure {
+            None => Some("its present side logged no figure at its close".to_owned()),
+            Some((0, _)) => Some("its present side took no call".to_owned()),
+            Some((_, 0)) if passes > 0 => Some(
+                "no call began with its oldest read pending: the lag is too light here".to_owned(),
+            ),
+            Some(_) => None,
+        };
+    }
+    let shown = figure.map_or_else(
+        || "no figure".to_owned(),
+        |(calls, pending)| {
+            format!("{pending} of {calls} calls began with their oldest read pending")
+        },
+    );
+    eprintln!("gpu: {CLIENT} under {}, {arm}: {shown}", driver.name());
+    let mut entry = vulkan::entry(CLIENT, &arm, &verdict, &ended);
+    entry.push_str(&format!("  {shown}\n"));
+    let failed = verdict.failure.is_some().then(|| {
+        eprint!("gpu: {entry}{}", vulkan::output(&name, &ended));
+        name
+    });
+    Ok((entry, failed))
 }
 
 /// Cooks the engine's shaders with the pinned Slang: the code into `<out>/code` and each
@@ -909,7 +1083,7 @@ fn heavy(args: &[&str]) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEVICE_TESTS, GpuArgs, vulkan};
+    use super::{DEVICE_TESTS, GpuArgs, locked_in, present_figure, vulkan};
     use lactose_xtask::vulkan::{METAL_CANARIES, said};
 
     #[test]
@@ -935,6 +1109,39 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(adapter.unwrap_err().contains("--driver system"));
         }
+    }
+
+    #[test]
+    fn the_client_step_is_asked_once_and_runs_in_the_vulkan_step() {
+        let client = |args: &[&str]| GpuArgs::parse(args).map(|parsed| parsed.client);
+        let driver = ["--driver", "moltenvk"];
+        assert!(!client(&driver).unwrap());
+        assert!(client(&[&driver[..], &["--client"]].concat()).unwrap());
+        assert!(client(&[&driver[..], &["--only", "vulkan", "--client"]].concat()).unwrap());
+        assert!(client(&[&driver[..], &["--client", "--client"]].concat()).is_err());
+        if cfg!(target_os = "macos") {
+            let metal = client(&[&driver[..], &["--only", "metal", "--client"]].concat());
+            assert!(metal.unwrap_err().contains("Vulkan step"));
+        }
+    }
+
+    #[test]
+    fn the_present_sides_figure_is_read_from_its_close() {
+        let log = "2026-11-26T10:00:00.000000Z  INFO lactose_app_client: the present side's \
+                   close: 312 calls, 7 of them began with their oldest read pending\n\
+                   Outcome { frames: 300 }\n";
+        assert_eq!(present_figure(log), Some((312, 7)));
+        assert_eq!(present_figure("the present side's close: many calls"), None);
+        assert_eq!(present_figure(""), None);
+    }
+
+    #[test]
+    fn a_locked_screen_is_read_from_the_registry() {
+        let locked = "<dict>\n\t<key>CGSSessionScreenIsLocked</key>\n\t<true/>\n</dict>";
+        let unlocked = "<dict>\n\t<key>CGSSessionScreenIsLocked</key>\n\t<false/>\n</dict>";
+        assert!(locked_in(locked));
+        assert!(!locked_in(unlocked));
+        assert!(!locked_in("<dict>\n\t<key>kCGSSessionOnConsoleKey</key>\n\t<true/>\n</dict>"));
     }
 
     #[test]

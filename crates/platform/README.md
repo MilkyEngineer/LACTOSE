@@ -334,10 +334,10 @@ The crate's documentation carries this as a doctest, and `tests/consumers.rs` in
   flag or park for it.
 - A call may block for as long as an acquire or a present does. It holds the calls queued
   behind it and nothing else: not the main thread, not a worker, and not its caller, which
-  holds a future. Every wait inside a present call is bounded, by the caller, save the
-  swapchain's drop in the last call, which waits for the submits that use its images
-  (`lactose-rhi-api`, "Handles and lifetimes") and so returns once step 2's host signals
-  are made ("Shutdown"). A call that never returns holds every call behind it, and the
+  holds a future. Every wait inside a present call is bounded, by the caller, save the drop
+  in the last call of the encoders the present side keeps, each of which waits for its
+  submit (`lactose-rhi-api`, "Handles and lifetimes") and so returns once step 2's host
+  signals are made ("Shutdown"). A call that never returns holds every call behind it, and the
   stop.
 - The lane has no bound. A caller that queues a call for every frame while one blocks
   adds a call a frame, and each of them then runs. So the frame keeps at most one present
