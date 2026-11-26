@@ -42,10 +42,11 @@ of LunarG's installer, which was fetched and never run.
   as the machine has them, and under `--driver system` a second adapter's run overwrites the
   first's.
 - *Session C as the plan has it is one command.* The rows owe the desktop more than
-  `cargo xtask measure --all`: the device tests on a device whose present family is not its
-  graphics family (rows 212, 214, 216, 218, 219, 222, 224 and 244), the renderer's cost tests
-  (rows 220 and 238) and the three barrier mutations (rows 225 and 239 to 241). The mutation
-  script is in no checkout: lane `renderer-impl` left it outside the repository.
+  `cargo xtask measure --all`: the device tests on a desktop's driver (rows 212, 214, 216, 218,
+  219, 222, 224 and 244, two of them on a device whose present family is not its graphics
+  family), the renderer's cost tests (rows 220 and 238) and the three barrier mutations (rows 225
+  and 239 to 241). The mutation script is in no checkout: lane `renderer-impl` left it outside
+  the repository.
 - *Nothing skips a window on a system that is not a client platform.* Section 4 says the
   measurements that need a window are skipped there and the file says so. `cargo xtask measure` has
   no such rule, and on Linux `lactose-platform` "builds over X11 and is not run" (its README,
@@ -60,7 +61,9 @@ of LunarG's installer, which was fetched and never run.
 **The decision.** The measurement commit is the first commit of main that holds every lane that
 edits a measured crate. At `ad1a99d` four are in: `frame-impl`, `measure-m2`, `snapshot-order` and
 `measure-role`. Two are owed: `present-encoder`, and `park-stamp` below. The coordinator records
-its hash in a verification row of its own, which this proposal adds, when the last of them merges.
+its hash in a verification row of its own, which this proposal adds, once the last of them has
+merged and `check` and the `measure` workflow are green at that commit. A failure there is a fix
+round of the lane it names, and the commit is that round's merge.
 
 A measured crate is one that a measurement of `cargo xtask measure` builds into what it times.
 `tools/xtask` is not one. Lane `layer-windows` below edits `tools/xtask` alone and changes no
@@ -90,6 +93,8 @@ test, so a nightly before them compares release with dev on three platforms for 
 does not ship. The coordinator dispatches the nightly at the commit if the schedule did not run on
 it, and the `measure` workflow with it, as section 9's step 6 did at the re-run's commit. The
 `measure` workflow there is the first run of `record-stall` on Windows with `park-stamp`'s spans.
+It shows the test passing there before the laptop is asked. Its figures are a runner's and are
+discarded (`.github/workflows/measure.yml`).
 
 | Option | What it rules out |
 |---|---|
@@ -109,8 +114,8 @@ once.
 |---|---|---|---|---|---|
 | Now | The desktop's first sitting | The desktop, under each system it boots, at `a539d60` | The owner at the desk for all of it. Mains power. Git, rustup, a C toolchain, nextest. Under Windows, as administrator: `LocalDumps`, and the Vulkan SDK 1.4.363.1 installed, so session C needs no second setup | Milestone 1's twelve files for each system, the hash file `cargo xtask sour run --emit` writes, nextest's summary for `lactose-task`. The owner returns the CPU model, the systems, the GPU and `vulkaninfo`'s output | 64, 77, 80, 81, 164, 169; the desktop's half of 190; the desktop's queue families for 176; the facts decision 5.19 wants, which make session C's commands exact |
 | Now | The lanes, and the rows not yet read | None | Nothing | `present-encoder`, `layer-windows` and `park-stamp` in parallel. One read-only pass over the 37 rows gated at milestone 2 that neither the audit nor this proposal read, so that what they owe a machine is in a commands file before the commit | None yet |
-| 1 | The quiet window | The M1, at the measurement commit | The Mac on mains, awake, its screen unlocked, and unused for about an hour. One hand at the end: a window resized by its corner for a few seconds (row 209) | Eighteen measurements' files: milestone 1's twelve again, `extract-50k`, `remote-upload-5k` and `record-stall`, and `triangle`, `gpu-cost` and `frame-pace` under MoltenVK and under KosmicKrisp. The `rhi-conformance` files, under both drivers and under KosmicKrisp with GPU-assisted validation. The renderer's cost tests' figures, into their rows. The system daemon's CPU time before and after | The M1's half of 15, 16, 19, 21, 34, 102, 176, 192, 220, 228, 229 and 238; 171's files; 173's tick start read again; 209's M1 half |
-| 2 | The laptop's session | The laptop, at the measurement commit; row 63's runs at `a75596b` and its first parent | Once, as administrator: the SDK's installer and `LocalDumps`. Then the laptop on mains, logged in, its screen unlocked, and the agent session opened in a shell that is not elevated, with the session's brief. One hand when the session asks: a window dragged by its title bar (row 209). The display's refresh rate read out once | Row 63's three `whisk` files. All eighteen measurements on the RTX 4070 as `laptop-windows`, its `triangle` file criterion 1's proof on Windows. `triangle`, `gpu-cost` and `frame-pace` on the integrated GPU as `laptop-windows-intel`. `rhi-conformance`, plain and GPU-assisted, on each GPU. The window cases' output and the latency tool's lines | 63, 109, 150's hardware half, 189, 208, 209, 210, 234, 236, 243; the laptop's half of 21, 164's two items that `frame-pace` reads, 176, 190, 228, 229, 246 and 247; labelled figures for 15, 16, 19 and 102 |
+| 1 | The quiet window | The M1, at the measurement commit | The Mac on mains, awake, its screen unlocked, and unused for about an hour. One hand at the start: a window resized by its corner for a few seconds (row 209) | Eighteen measurements' files: milestone 1's twelve again, `extract-50k`, `remote-upload-5k` and `record-stall`, and `triangle`, `gpu-cost` and `frame-pace` under MoltenVK and under KosmicKrisp. The `rhi-conformance` files, under both drivers and under KosmicKrisp with GPU-assisted validation. The renderer's cost tests' figures, into their rows. The system daemon's CPU time before and after | The M1's half of 15, 16, 19, 21, 34, 102, 176, 192, 220, 228, 229 and 238; 171's files; 173's tick start read again; 209's M1 half |
+| 2 | The laptop's session | The laptop, at the measurement commit; row 63's runs at `a75596b` and its first parent | Once, as administrator: the SDK's installer and `LocalDumps`. Then the laptop on mains, logged in, its screen unlocked and set not to turn off, and the agent session opened in a shell that is not elevated, with the session's brief. One hand in the session's first minutes: a window dragged by its title bar (row 209). The display's refresh rate read out once | Row 63's three `whisk` files. All eighteen measurements on the RTX 4070 as `laptop-windows`, its `triangle` file criterion 1's proof on Windows. `triangle`, `gpu-cost` and `frame-pace` on the integrated GPU as `laptop-windows-intel`. `rhi-conformance`, plain and GPU-assisted, on each GPU. The window cases' output and the latency tool's lines | 63, 109, 150's hardware half, 189, 208, 209, 210, 234, 236, 243; the laptop's half of 21, 164's two items that `frame-pace` reads, 176, 190, 228, 229, 246 and 247; labelled figures for 15, 16, 19 and 102 |
 | 3 | Session C | The desktop, under each system it boots, at the measurement commit | The owner at the desk for all of it. Mains power. Python 3 for the mutation script | All eighteen measurements under Windows; under a system that is not a client platform, the sixteen that need no window. `rhi-conformance`, plain and GPU-assisted, on each GPU. The renderer's cost tests' figures. The three mutations' outcome, each beside its control | The x86 desktop's half of 15, 16, 19 and 102; 176; 212, 214, 216, 218 to 220, 222, 224, 225, 238 to 241 and 244; 246 and 247 |
 | After | Files, rows and the exit's steps | None | The rulings of step 7 | The coordinator checks each machine's files in, scanned for paths as a public repository needs. The pass writes the rows. The first green nightly at or after the commit gives rows 170 and 232 their run id. Then section 7's steps 5 to 8 | Every row gated at milestone 2, Done or re-gated |
 
@@ -124,12 +129,13 @@ defect of the tool found there is fixed before the owner sits at the desktop, wh
 the same pin. Session C is last because the owner's time at a desk is the scarcest thing in the
 plan, and it then runs once, on a tree two machines have measured.
 
-**The laptop is asked once.** Its session holds, in this order: the checkouts' refresh (row 109);
-row 63's three runs at their own commits; then at the measurement commit the pin's first run on
-each GPU, which fails in its first minutes if the pin is wrong; the measurements; the window cases
-(rows 208, 210, 234 and 236); and last the latency tool, which is the one step that needs a hand
-(row 209). `frame-impl`'s by-hand form of criterion 1 is dropped: `cargo xtask measure triangle` is
-that run once the pin exists (row 243).
+**The laptop is asked once.** Its session holds, in this order. While the owner is still there:
+the checkouts' refresh (row 109), before anything is built; the installed layer's digest and the
+devices' list; and the latency tool, which is the one step that needs a hand (row 209). Then,
+with nobody at it: at the measurement commit the pin's first run on each GPU, which fails in its
+first minutes if the tool cannot use the pin, and the measurements; row 63's three runs at their
+own commits; and the window cases (rows 208, 210, 234 and 236). `frame-impl`'s by-hand form of
+criterion 1 is dropped: `cargo xtask measure triangle` is that run once the pin exists (row 243).
 
 **Row 150's four hardware questions.** The spike's file leaves four to hardware
 (`docs/results/spike-rhi-apple-m1-2026-11-15.md`, "Design questions for the lavapipe run"): an
@@ -151,9 +157,9 @@ with `reviewer-gpu`. It is the owner's fourth question.
 15 November carry, and the integrated GPU as `laptop-windows-intel`, each with `--adapter`. The
 desktop runs as `desktop-windows` and `desktop-<system>`. No code is needed.
 
-**A system that is not a client platform.** Session C there names its sixteen measurements and
-leaves out `triangle` and `frame-pace`. Nothing is built for it: the plan's sentence is amended
-to say so.
+**A system that is not a client platform.** Session C there names its measurements and leaves
+out `triangle` and `frame-pace`. Nothing is built for it: the plan's sentence is amended to say
+so.
 
 **What would change the order.** The owner preferring one day to three: the three sittings at the
 commit then run without waiting for each other's reading, and a miss that needs an engine lane
@@ -306,8 +312,8 @@ OLD:
 | `measure-role` | Two safe calls for measurement in `lactose-task` (D164): the foreground task role on macOS, moved out of the benchmark, which returns the role the system reports, and the class of the core the calling thread is on, on macOS, Windows and Linux. The three cost tests of `lactose-app-client`'s `integration` target take the role and print it, in their shared support. `remote-upload-5k` records for each frame the class of core its job began and ended on and gives the figures of section 4's row | `measure-m2` merged | The role read back in each file. In `remote-upload-5k`'s file, the fastest chain on each class of core, the efficiency class's the slower: the numbering the macOS call rests on, shown on the machine. The loom models and the cross-target clippy runs for `lactose-task`. Section 21's entry for `task`, reworded at the merge | 6 |
 NEW:
 | `measure-role` | Two safe calls for measurement in `lactose-task` (D164): the foreground task role on macOS, moved out of the benchmark, which returns the role the system reports, and the class of the core the calling thread is on, on macOS, Windows and Linux. The three cost tests of `lactose-app-client`'s `integration` target take the role and print it, in their shared support. `remote-upload-5k` records for each frame the class of core its job began and ended on and gives the figures of section 4's row | `measure-m2` merged | The role read back in each file. In `remote-upload-5k`'s file, the fastest chain on each class of core, the efficiency class's the slower: the numbering the macOS call rests on, shown on the machine. The loom models and the cross-target clippy runs for `lactose-task`. Section 21's entry for `task`, reworded at the merge | 6 |
-| `layer-windows` | The Khronos layer pinned on Windows (D16x; D153's "pinned on every host"), in `tools/xtask` alone. `vulkan-layer.toml` gains `[host.windows-x86_64]` in the Mac's form: the SDK the owner installs, found at `VULKAN_SDK` or at `C:\VulkanSDK\<version>`, its `Bin\VkLayer_khronos_validation.dll` held to `library_sha256`, with the installer's `url` and `sha256` beside it, named in the error for an SDK that is not there and never fetched. The lane reads the digest on the Mac out of LunarG's installer, fetched by the SHA-256 LunarG publishes and never run, and writes the steps into `tools/xtask/README.md`; the proposal's own reading is `451ed11cbc799f858cbc0e843766d2990527c03f93f7a85f03bc1e67b605a435`. On Windows a run takes the system's loader and drivers, `--driver system` alone, sets no library path and writes the layer's implicit manifest as on the other hosts. A measurement `rhi-conformance` in `cargo xtask measure`: the gate's Vulkan step under each driver `measure` takes, and under GPU-assisted validation where the host's gate has it, written as `rhi-conformance-<driver>[-gpu-assisted]-<machine>-<date>.md` under the measurements' header, with every path cut as a device file's is; `--all` runs it last and `--no-device` leaves it out. No existing measurement's code changes. `renderer-impl`'s barrier-mutation script, checked in beside `line-endings.sh` | Nothing | On the M1: the pin's parse and the Windows paths, environment and manifest as unit tests; clippy for `x86_64-pc-windows-msvc`; the digest derived by the lane and equal to the proposal's; the three `rhi-conformance` files, with no path of the machine in them; the script's control run under KosmicKrisp. The Windows run is the laptop's session's, and a defect it finds is a fix round of this lane | 6 |
-| `park-stamp` | Two `tracing` spans of `lactose-task` at debug level, target `whisk` (D16x, D162): `open_gate`, from the return of a `block_in_place`'s closure to the return of `Pool::open_gate`, and `park`, a worker's wait in the idle protocol, entered after the look that found nothing and exited when the wait returns. Where each span sits is the lane's; the loom models still run the shipped functions. No public item, no `unsafe`, no hook and no cargo feature: the crate's README names both under "Tracing", and architecture section 21's entry stands. `record-stall`'s subscriber reads them, and its file gains at each reservation, for each opening: the time from its start to the start of the record's next job on a worker that was parked across it, that job's start wait, the opening's own length, and the count of openings after which the next record ran on a worker that was awake. Every tick asserts that it saw an opening, so a build that compiles debug spans out fails. The rows are written on every host; on Windows they are the `SetEvent` item | `measure-role` merged | The rows in `record-stall`'s file on the M1. `cargo xtask measure whisk` before and after, as steering: the 60 Hz row and the wake row within the two before runs' spread. The loom models, Miri and the cross-target clippy runs for `lactose-task`. `tests/spans.rs` holds both spans' names, target and level, and that neither is emitted at info. The Windows rows are the `measure` workflow's first, then the laptop's session's | 6 |
+| `layer-windows` | The Khronos layer pinned on Windows (D16x; D153's "pinned on every host"), in `tools/xtask` alone. `vulkan-layer.toml` gains `[host.windows-x86_64]` in the Mac's form: the SDK the owner installs, found at `VULKAN_SDK` or at `C:\VulkanSDK\<version>`, its `Bin\VkLayer_khronos_validation.dll` held to `library_sha256`, with the installer's `url` and `sha256` beside it, named in the error for an SDK that is not there and never fetched. The lane reads the digest on the Mac out of LunarG's installer, fetched by the SHA-256 LunarG publishes and never run, and writes the steps into `tools/xtask/README.md`; the proposal's own reading is `451ed11cbc799f858cbc0e843766d2990527c03f93f7a85f03bc1e67b605a435`. On Windows a run takes the system's loader and drivers, `--driver system` alone, sets no library path and writes the layer's implicit manifest as on the other hosts. A measurement `rhi-conformance` in `cargo xtask measure`: the gate's Vulkan step under each driver `measure` takes, and under GPU-assisted validation where the host's gate has it, written as `rhi-conformance-<driver>[-gpu-assisted]-<machine>-<date>.md` under the measurements' header, with every path cut as a device file's is; `--all` runs it last and `--no-device` leaves it out. No existing measurement's code changes. `renderer-impl`'s barrier-mutation script, checked in beside `line-endings.sh` and made to read and write its files as UTF-8 on every host, since its first run on Windows is session C's | Nothing | On the M1: the pin's parse and the Windows paths, environment and manifest as unit tests; clippy for `x86_64-pc-windows-msvc`; the digest derived by the lane and equal to the proposal's; the three `rhi-conformance` files, with no path of the machine in them; the script's control run under KosmicKrisp. The Windows run is the laptop's session's, and a defect it finds is a fix round of this lane | 6 |
+| `park-stamp` | Two `tracing` spans of `lactose-task` at debug level, target `whisk` (D16x, D162): `open_gate`, from the return of a `block_in_place`'s closure to the return of `Pool::open_gate`, and `park`, a worker's wait in the idle protocol, entered after the look that found nothing and exited when the wait returns. Where each span sits is the lane's; the loom models still run the shipped functions. No public item, no `unsafe`, no hook and no cargo feature: the crate's README names both under "Tracing", and architecture section 21's entry stands. `record-stall`'s subscriber reads them, and its file gains at each reservation, for each opening: the time from its start to the start of the record's next job on a worker that was parked across it, that job's start wait, the opening's own length, and the count of openings after which the next record ran on a worker that was awake. Every tick asserts that it saw an opening, so a build that compiles debug spans out fails. The rows are written on every host; on Windows they are the `SetEvent` item | `measure-role` merged | The rows in `record-stall`'s file on the M1. `cargo xtask measure whisk` before and after, as steering: the 60 Hz row and the wake row within the two before runs' spread. The loom models, Miri and the cross-target clippy runs for `lactose-task`. `tests/spans.rs` holds both spans' names, target and level, and that neither is emitted at info. On Windows the `measure` workflow at the commit shows the test passing with the spans, and the rows are the laptop's session's | 6 |
 
 === docs/plans/milestone-2.md lines 285 to 287: section 3: the measurement commit, and what a figure before it is
 OLD:
@@ -319,12 +325,14 @@ NEW:
   crate: `frame-impl`, `measure-m2`, `snapshot-order`, `measure-role`, `present-encoder` and
   `park-stamp` (D16x). A measured crate is one a measurement builds into what it times, and
   `tools/xtask` is not one. The coordinator records the commit's hash in the verification row that
-  names it. The quiet window, the laptop's session and session C check it out (section 4). A file
-  is the record at it, or at a later commit as `-at-<commit>` where its row gives the diff and why
-  no figure of the file reads it. A figure taken before it is steering: it stays in its row,
-  proves no criterion and closes no row. A lane that merges after it and edits a measured crate
-  runs the measurements it touches and reports them as steering; where it answers a sitting's
-  finding, the owner's ruling says which file is the record (section 7).
+  names it, once `check` and the `measure` workflow are green at it; a failure there is a fix
+  round of the lane it names, and the commit is that round's merge. The quiet window, the laptop's
+  session and session C check it out (section 4). A file is the record at it, or at a later commit
+  as `-at-<commit>` where its row gives the diff and why no figure of the file reads it. A figure
+  taken before it is steering: it stays in its row, proves no criterion and closes no row. A lane
+  that merges after it and edits a measured crate runs the measurements it touches and reports
+  them as steering; where it answers a sitting's finding, the owner's ruling says which file is
+  the record (section 7).
 
 === docs/plans/milestone-2.md lines 308 to 312: section 4: the quiet window
 OLD:
@@ -336,14 +344,14 @@ OLD:
 NEW:
 - *The quiet window*, the coordinator's, at the measurement commit, the first of the three
   sittings there (D16x). Every track stops, the machine is on mains power with low power mode off
-  and its screen unlocked, it holds `caffeinate -i -s -d`, and `cargo xtask measure --all` runs
-  once. It writes milestone 2's six files beside milestone 1's, with `triangle`, `gpu-cost` and
-  `frame-pace` under MoltenVK and under KosmicKrisp, and the `rhi-conformance` files. The
-  renderer's cost tests run once after it, for rows 220 and 238, and the owner resizes the latency
-  tool's window by a corner, for row 209. The WHISK file's 60 Hz P99 is read against D156: under
-  30 µs, the planner proposes 35 µs again; the system daemon's CPU time is read before and after
-  the run, as the remeasurement of 17 November 2026 did. Its files are read before the laptop's
-  session starts.
+  and its screen unlocked, and it holds `caffeinate -i -s -d`. The owner first resizes the latency
+  tool's window by a corner, for row 209, and then leaves the machine. `cargo xtask measure --all`
+  runs once. It writes milestone 2's six files beside milestone 1's, with `triangle`, `gpu-cost`
+  and `frame-pace` under MoltenVK and under KosmicKrisp, and the `rhi-conformance` files. The
+  renderer's cost tests run once after it, for rows 220 and 238. The WHISK file's 60 Hz P99 is
+  read against D156: under 30 µs, the planner proposes 35 µs again; the system daemon's CPU time
+  is read before and after the run, as the remeasurement of 17 November 2026 did. Its files are
+  read before the laptop's session starts.
 
 === docs/plans/milestone-2.md lines 313 to 315: section 4: the laptop's one session
 OLD:
@@ -352,15 +360,16 @@ OLD:
   (the owner's answer 2).
 NEW:
 - *The laptop's session*, once, at the same commit, after the quiet window's files are read, with
-  nothing else running there and in a shell that is not elevated: `cargo xtask measure --all` and
-  `cargo xtask gpu --driver system`, plain and with `--gpu-assisted`, on each of its GPUs by
-  `--adapter`, the integrated GPU under a machine name of its own. Its `triangle` file on the
-  RTX 4070 is criterion 1's proof on Windows (the owner's answer 2). The owner installs the pinned
-  Vulkan SDK first, as administrator (D16x). The same session holds what the laptop owes at
-  commits of its own or at none: `eco-qos`'s before-and-after runs (row 63), the checkouts'
-  refresh (row 109), `LocalDumps` (row 190), the window cases (rows 208, 210, 234 and 236) and the
-  latency tool under the owner's hand (row 209). Its two gate runs on each GPU are row 150's
-  probes.
+  nothing else running there and in a shell that is not elevated: `cargo xtask measure --all` on
+  the RTX 4070, and `triangle`, `gpu-cost`, `frame-pace` and `rhi-conformance` again on the
+  integrated GPU under a machine name of its own, each GPU chosen by `--adapter`.
+  `rhi-conformance` is the gate's run, plain and under GPU-assisted validation, and on each GPU
+  it is row 150's probe. Its `triangle` file on the RTX 4070 is criterion 1's proof on Windows
+  (the owner's answer 2). The owner installs the pinned Vulkan SDK first, as administrator
+  (D16x). The same session holds what the laptop owes at commits of its own or at none: the
+  checkouts' refresh (row 109), before anything is built; the latency tool under the owner's hand
+  (row 209), while the owner is still there; `eco-qos`'s before-and-after runs (row 63);
+  `LocalDumps` (row 190); and the window cases (rows 208, 210, 234 and 236).
 
 === docs/plans/milestone-2.md lines 326 to 330: section 4: session C
 OLD:
@@ -371,8 +380,8 @@ OLD:
   skipped and the file says so.
 NEW:
 - *Session C*, the owner's, at the measurement commit, last, on the desktop under each system it
-  boots (D16x): `cargo xtask measure --all`; `cargo xtask gpu --driver system`, plain and with
-  `--gpu-assisted`, on each GPU; the renderer's cost tests; and the barrier mutations, each beside
+  boots (D16x): `cargo xtask measure --all`, whose `rhi-conformance` is the gate's run, plain and
+  under GPU-assisted validation; the renderer's cost tests; and the barrier mutations, each beside
   its control (rows 225 and 239 to 241). Its `extract-50k` and `remote-upload-5k` files are the
   x86 desktop's figures. The command writes milestone 1's files again, which shows what milestone
   2's lanes moved on x86. Under a system that is not a client platform the session names its
@@ -384,11 +393,11 @@ OLD:
 Only the desktop's two sittings need the owner at a desk. The laptop's runs need the laptop awake
 with its agent session open, and a run that opens a window needs a person logged in at it.
 NEW:
-Only the desktop's two sittings need the owner at a desk. The quiet window needs the Mac unused,
-and the owner's hand once at its end. The laptop's session needs the owner as administrator once,
-the laptop awake with its agent session open and a person logged in at it, and the owner's hand
-once. The laptop's runs after a merge need the laptop awake with its agent session open, and a
-run that opens a window needs a person logged in at it.
+Only the desktop's two sittings need the owner at a desk. The quiet window needs the owner's hand
+once at its start, and then the Mac unused. The laptop's session needs the owner as administrator
+once and the owner's hand once in its first minutes, and then the laptop awake with its agent
+session open and a person logged in at it. The laptop's runs after a merge need the laptop awake
+with its agent session open, and a run that opens a window needs a person logged in at it.
 
 === docs/plans/milestone-2.md line 341: section 4, row `record-stall`: the gate's rows come from two spans, on every host
 OLD:
@@ -416,10 +425,10 @@ NEW:
 The owner's actions, in order: the upgrade to macOS 27.2.1 and the Xcode install, before the first
 lane (section 9); the desktop's first sitting, once the M1's re-run is on main, with `LocalDumps`
 set on the desktop and the pinned Vulkan SDK installed under its Windows; at the measurement
-commit, the Mac left unused for the quiet window and one window resized at its end; then the
+commit, one window resized at the quiet window's start and the Mac then left unused; then the
 laptop's one session, with the pinned Vulkan SDK installed and `LocalDumps` set as administrator,
-its checkouts refreshed (D148) and one window dragged when the session asks; then session C
-(D16x).
+its checkouts refreshed (D148) and one window dragged in the session's first minutes; then
+session C (D16x).
 
 === docs/plans/milestone-2.md lines 1884 to 1887: section 7, step 3: which nightly
 OLD:
@@ -474,7 +483,7 @@ NEW:
 
 === docs/verification.md: three rows appended at the end of the file, after the table's last row
 NEW:
-| The measurement commit of milestone 2 (D16x): the first commit of main that holds every lane that edits a measured crate, `present-encoder` and `park-stamp` the last of them. The quiet window on the M1, the laptop's session and session C on the desktop each check it out, in that order, each read before the next. A file is the record at it, or at a later commit as `-at-<commit>` where the row that cites it gives the diff and why no figure of the file reads it; a figure taken before it is steering. The desktop's first sitting is at `a539d60` (D151) and `eco-qos`'s runs on the laptop are at `a75596b` and its first parent. To record here: the commit's hash; for each sitting its date, its load and the files it wrote; the ids of the `measure` workflow's run and of the first green nightly at or after the commit | 2. **Owed**: no such commit exists at `ad1a99d` |
+| The measurement commit of milestone 2 (D16x): the first commit of main that holds every lane that edits a measured crate, `present-encoder` and `park-stamp` the last of them, recorded once `check` and the `measure` workflow are green at it. The quiet window on the M1, the laptop's session and session C on the desktop each check it out, in that order, each read before the next. A file is the record at it, or at a later commit as `-at-<commit>` where the row that cites it gives the diff and why no figure of the file reads it; a figure taken before it is steering. The desktop's first sitting is at `a539d60` (D151) and `eco-qos`'s runs on the laptop are at `a75596b` and its first parent. To record here: the commit's hash; for each sitting its date, its load and the files it wrote; the ids of the `measure` workflow's run and of the first green nightly at or after the commit | 2. **Owed**: no such commit exists at `ad1a99d` |
 | The Khronos layer on Windows is pinned as installed (D16x, D153; lane `layer-windows`): `library_sha256` is the SHA-256 of `Bin/VkLayer_khronos_validation.dll` as read on the development Mac out of LunarG's installer `vulkansdk-windows-X64-1.4.363.1.exe`, which was fetched by the SHA-256 LunarG publishes for it and never run. No Windows host has checked it. Four things the laptop's session shows, and nothing before it: that the file the installer leaves is the archived one, which the tool's own digest check answers at its first run; that the system's loader takes the layer's manifest from `VK_ADD_IMPLICIT_LAYER_PATH` in a shell that is not elevated, the loader's documentation saying it ignores such variables in an elevated process; that each of the seven canaries is heard on each of the laptop's GPUs; and which implicit layers the laptop's registry adds to a validated run, read from `vulkaninfo`'s list and recorded. A digest that differs is a finding for the planner, and the pin then takes the installed file's digest on the owner's word, as the Mac's was taken. The desktop's Windows is the second host to check it | 2 |
 | `lactose-task`'s two debug spans (D16x; lane `park-stamp`): `open_gate` and `park`, target `whisk`, which `record-stall` reads. Owed by the lane: `cargo xtask measure whisk` before and after on the M1, the 60 Hz row and the wake row within the two before runs' spread, as steering; the loom models, Miri and the cross-target clippy runs. Owed by the quiet window: the WHISK file at the measurement commit, the first quiet figure of an executor that holds the spans, read against D156 as the plan has it. A row that moved beyond the spread sends the spans back to the planner, and the item is then re-gated to the change that revisits the keeper's wait. `record-stall` fails where a build compiles debug spans out, so a static maximum level for a shipping build is a decision about this measurement, to be taken when such a level is first set | 2 |
 ~~~
@@ -491,13 +500,13 @@ debug spans** (§5.1, §20, §21, §22, `lactose-task`, `tools/xtask`, `docs/pla
   the device tests and the barrier mutations too.
   - *The measurement commit holds every lane that edits a measured crate.* It is the first commit
     of main that holds `frame-impl`, `measure-m2`, `snapshot-order`, `measure-role`,
-    `present-encoder` and `park-stamp`, and its hash is recorded in a verification row when it
-    exists. A measured crate is one a measurement builds into what it times, and `tools/xtask` is
-    not one. A file is the record at that commit, or at a later one as `-at-<commit>` where its
-    row gives the diff and why no figure of the file reads it. A figure taken before it is
-    steering: it stays in its row, proves no criterion and closes no row. The desktop's first
-    sitting, at `a539d60`, and `eco-qos`'s runs on the laptop, at `a75596b` and its first parent,
-    keep their own commits.
+    `present-encoder` and `park-stamp`, and its hash is recorded in a verification row once
+    `check` and the `measure` workflow are green at it. A measured crate is one a measurement
+    builds into what it times, and `tools/xtask` is not one. A file is the record at that
+    commit, or at a later one as `-at-<commit>` where its row gives the diff and why no figure
+    of the file reads it. A figure taken before it is steering: it stays in its row, proves no
+    criterion and closes no row. The desktop's first sitting, at `a539d60`, and `eco-qos`'s runs
+    on the laptop, at `a75596b` and its first parent, keep their own commits.
   - *The sittings run in one order, and each is read before the next.* The desktop's first
     sitting, which waits for nothing; then at the measurement commit the M1's quiet window, the
     laptop's one session and session C. A criterion that misses on the M1 needs an engine lane,
@@ -658,9 +667,13 @@ takes the first's.
   documentation as remembered, not from a page read for this proposal. So is the installer
   setting `VULKAN_SDK` and installing to `C:\VulkanSDK\<version>`.
 - Whether the Vulkan SDK is already on the laptop, and at which version.
-- The desktop: its CPU, its GPU, its second system, and whether any of its devices has a present
-  family that is not its graphics family. Eight rows need such a device, and the first sitting's
-  `vulkaninfo` output says whether the desktop has one.
+- The desktop: its CPU, its GPU, its second system, and its devices' queue families. Rows 212
+  and 244 need a device whose present family is not its graphics family, and row 214 a family
+  without the graphics bit. The first sitting's `vulkaninfo` output says whether the desktop has
+  them, and a row it cannot run is the exit read's to re-gate.
+- The laptop's second device. The plan expects an Intel integrated GPU and none was listed
+  (section 3's table of machines). `vulkaninfo`'s list at the session's start answers, and with
+  one device the session runs once.
 - How long `cargo xtask measure --all` runs at eighteen measurements. "About an hour" on the M1 is
   an estimate from the lanes' runs on a loaded machine.
 - That Windows' own `tar` reads a 7z archive. Option B of the pin rests on it, and nothing here
