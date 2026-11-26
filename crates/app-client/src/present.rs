@@ -42,7 +42,8 @@ pub const HEAP: [HeapSlot; TARGETS] = [HeapSlot(0), HeapSlot(1)];
 /// the fourth.
 const ENCODERS: usize = 4;
 
-/// The passes each present of a side made after it adds ([`set_extra_passes`]).
+/// The passes each present of a side made after it adds ([`set_extra_passes`]). It is the
+/// process's: a side `wire` makes after a `run` in the same process takes that run's value.
 static EXTRA_PASSES: AtomicU32 = AtomicU32::new(0);
 
 /// Makes each present of a side made after this call draw `passes` more passes over its
@@ -129,6 +130,10 @@ struct Encoders {
     submitted: VecDeque<(u64, Box<dyn Encoder>)>,
     /// Those reset and not submitted since.
     free: Vec<Box<dyn Encoder>>,
+    /// The resets of submitted encoders whose read was reached that the backend refused,
+    /// which `close` logs: none where `reached` comes from the device's own reads, which a
+    /// backend has folded before it answers.
+    refused: u64,
 }
 
 impl Encoders {
@@ -138,14 +143,15 @@ impl Encoders {
     }
 
     /// Resets every submitted encoder whose read is `reached` or less, oldest first, and
-    /// keeps it free. One whose reset is refused stays submitted, and the next call's settle
-    /// tries it again: a backend that has not yet seen its submit complete refuses it as
+    /// keeps it free. One whose reset is refused stays submitted, counted, and the next call's
+    /// settle tries it again: a backend that has not yet seen its submit complete refuses it as
     /// pending.
     fn settle(&mut self, reached: u64) {
         while let Some((read, mut encoder)) =
             self.submitted.pop_front_if(|&mut (read, _)| read <= reached)
         {
             if encoder.reset().is_err() {
+                self.refused += 1;
                 self.submitted.push_front((read, encoder));
                 return;
             }
@@ -616,9 +622,11 @@ impl PresentSide for ClientPresent {
         let Some(device) = self.device.take() else { return };
         tracing::info!(
             target: crate::LOG_TARGET,
-            "the present side's close: {} calls, {} of them began with their oldest read pending",
+            "the present side's close: {} calls, {} of them began with their oldest read pending, \
+             {} resets of a reached encoder refused",
             self.calls,
             self.pending_at_head,
+            self.encoders.refused,
         );
         if let Some(last) = self.last
             && let Err(error) = device.wait_timeline(last, PRESENT_WAIT)
@@ -800,7 +808,7 @@ mod encoders {
     /// not the oldest alone (`settle-front-only`), and the next takes are theirs: none is
     /// made. The third stays submitted behind its read. Before null has seen the reads, the
     /// settle's resets are refused and every encoder stays submitted
-    /// (`settle-keeps-refused-free`).
+    /// (`settle-keeps-refused-free`), each settle's refusal counted once, where it stops.
     #[test]
     fn every_encoder_whose_read_is_reached_is_reset_and_kept_free() {
         let device = device();
@@ -809,10 +817,12 @@ mod encoders {
         assert!(encoders.pending(0));
         encoders.settle(2);
         assert_eq!((encoders.free.len(), encoders.submitted.len()), (0, 3), "unseen");
+        assert_eq!(encoders.refused, 1);
         // Null's reset is refused until the point is seen: `timeline_value` sees it.
         assert_eq!(device.timeline_value(reads).expect("a read"), 3);
         encoders.settle(2);
         assert_eq!((encoders.free.len(), encoders.submitted.len()), (2, 1));
+        assert_eq!(encoders.refused, 1, "no refusal once seen");
         assert!(encoders.pending(2));
         assert!(!encoders.pending(3));
         for _ in 0..2 {

@@ -937,20 +937,33 @@ writes its report.
    message. It runs twice under each driver: plain, as shipped, and lagged, with
    `--extra-present-passes` from `client_lag` in `src/main.rs`, which draws each present's image
    that many times more, so that the GPU runs behind the present thread. The present side logs at
-   its close how many calls it took and how many of them found their oldest read unreached at their
-   head, so that the call kept an encoder whose submit was pending; each run prints that figure and
-   the file records it, a run that logs none fails, and the lagged one fails where the figure is
-   zero, since its lag then reached nothing it is for. The lag was set on the M1 under each driver's
-   validators (26 November 2026, load averages near 9): 100 passes under MoltenVK, where 31 of 136
-   calls found their oldest read unreached, and 200 under KosmicKrisp, where 45 of 217 did and 100
-   passes left 2 of 301; plain, none of 301 did under either, so the plain run alone reaches no
-   pending encoder. The other drivers take KosmicKrisp's. Against a present side that resets an
-   encoder one read early, with `lactose-rhi-vulkan`'s refusal of a pending reset removed, the
-   lagged run fails under both drivers (`VUID-vkResetCommandPool-commandPool-00040`, a reset of a
-   pool whose command buffer is pending, and the begin and submit of that buffer), and the plain run
-   passes. Before it builds anything, and before each run, it reads the screen's state: while the
-   screen is locked no window presents, so it exits 3, having run nothing more, and never skips the
-   runs in silence.
+   its close how many calls it took, how many of them found their oldest read unreached at their
+   head, so that the call kept an encoder whose submit was pending, and how many resets of an
+   encoder whose read it had read as reached the device refused; each run prints those figures and
+   the file records them. A run that logs none fails; a run with a refused reset fails, since its
+   side then reset an encoder before the device had seen its submit complete; and the lagged one
+   fails where the pending figure is zero, since its lag then reached nothing it is for. The lag
+   was set on the M1 under each driver's validators (26 November 2026, load averages near 9): 100
+   passes under MoltenVK, where 31 of 136 calls found their oldest read unreached, and 200 under
+   KosmicKrisp, where 45 of 217 did and 100 passes left 2 of 301; plain, none of 301 did under
+   either, so the plain run alone reaches no pending encoder. KosmicKrisp's figure at 200 is wide,
+   17 to 81 of 209 to 247 calls over six runs, below a tenth of the calls in one, and more passes
+   do not raise it: at 300, in three runs at load averages from 6.81 to 13.61, 2 of 165 to 170
+   calls, and at 400, in three at 3.85 to 4.97, 2 of 110 to 121, the frame finding the GPU busy for
+   129 to 188 of 301 frames. So it stays at 200, and a lagged run whose figure is zero fails as too
+   light rather than passing. The other drivers take KosmicKrisp's. Against a present side that
+   resets an encoder one read early, the lagged run fails under both drivers: with
+   `lactose-rhi-vulkan`'s refusal of a pending reset removed, by
+   `VUID-vkResetCommandPool-commandPool-00040`, a reset of a pool whose command buffer is pending,
+   and the begin and submit of that buffer; with it kept, by the resets the device refused. The
+   plain run passes in both. Before it builds anything it reads the screen's state, the console
+   session's `CGSSessionScreenIsLocked` in the registry's `IOConsoleUsers` (`ioreg -n Root -d1
+   -a`), with no session on the console counting as locked: while the screen is locked no window
+   presents, so it exits 3, having run nothing. It reads it again before each run: a run the lock
+   keeps from running fails, unrun, with its driver's report written, and `gpu` exits 3, having run
+   nothing more, only where such runs are its only failures, and otherwise 2, as for any failed
+   run. It reads it once more after each run, and names a lock found then in the run's entry and in
+   its failure. It never skips the runs in silence.
 
 The `shaders` CI job runs `gpu --driver system --only metal` on the macOS runner that cooks,
 and the `shaders-oldest` job runs `gpu --driver system --only metal --cooked` on the oldest
