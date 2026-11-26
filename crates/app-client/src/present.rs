@@ -340,7 +340,9 @@ impl ClientPresent {
         if self.encoders.pending(reached) {
             self.pending_at_head += 1;
         }
-        self.encoders.settle(reached);
+        // The resets are the record's part of the call, as the reset behind the bound is.
+        let encoders = &mut self.encoders;
+        timed(&mut self.timed.record, || encoders.settle(reached));
         let waiting = self.waiting.take(source, &self.times, reached);
         if stamps::on() {
             self.timed.times = source;
