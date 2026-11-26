@@ -226,8 +226,9 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - Every worker thread is created through the `Platform`, which applies its
   `lactose_core::ThreadClass` (`StdPlatform` calls `ThreadClass::enter`) before the worker
   runs; the worker re-asserts the deterministic floating-point state itself. Every job and
-  every scope wait is wrapped in an abort-on-unwind guard, and so is the drop of a task's
-  future, on whichever thread it happens. The crate installs no panic hook; binaries do.
+  every scope wait is wrapped in an abort-on-unwind guard, and so is a worker's idle wait,
+  where a tracing listener's callbacks run, and the drop of a task's future, on whichever
+  thread it happens. The crate installs no panic hook; binaries do.
 - A task inherits the spawner's `lactose_core::AllocTag`, and the executor re-enters it on
   whichever worker polls the task, and around the drop of its future. Scope children inherit
   the opener's tag the same way. A graph job runs untagged unless its node enters a tag
@@ -293,7 +294,9 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - Everything is under target `whisk`. The info level's spans are the node and range spans: one
   `tracing` span per node run and one per range split off it, named by `GraphNode::name`, and
   never one per unit. Each distinct node name gets its own call sites, created when a graph is
-  built. A job of `run_job` runs under one span named `run_job`, at info too.
+  built. A job of `run_job` runs under one span named `run_job`, and each drain of a
+  `LanePump` that runs a call under one named `lane`, with the lane's name as its field `name`,
+  both at info too.
 - Two spans at debug level, which `lactose-app-client`'s `record-stall` reads by name, so a
   rename or a removal fails it (D165, D162):
   - `open_gate`, around `Pool::open_gate` in `JobContext::block_in_place`: from the closure's
@@ -308,10 +311,21 @@ and list what changed, because `lactose-ecs` is written against this surface.
 - Both debug spans are in every build until architecture section 5.1's compile-out of finer
   levels is built: the workspace's `tracing` sets no static maximum level. Where nothing
   listens at debug, each costs what a span nobody wants costs (see the end of this file).
+- A listener's callbacks for `open_gate` run on the opener. Those for its creation and entry
+  run while the gate is still closed: every frame worker it holds, and the work queued beside
+  them, waits for them to return.
 - A listener's callbacks for `park` run on a worker that is going to sleep or has just been
   woken, in the idle protocol after it has announced it is asleep, so a waker may already have
-  claimed it. They must not block or call the executor: one that does delays a wake sent to
-  that worker.
+  claimed it. They must return promptly, with no wait on another thread beyond a short lock
+  that is rarely contended, and must never call into the executor. A callback that waits
+  delays that worker's wake and loses none, whatever it waits on: a wait through the thread's
+  parker (on macOS a contended `RwLock`, a contended `OnceLock` initialisation or a
+  `sync_channel` hand-off) takes the token an unpark left, but the idle wait parks only while
+  its sleeper bit says nobody has claimed the worker, and the latch wait checks its latch, its
+  permit and shutdown again once the `park` span is entered, after the callbacks, before it
+  parks. The repository's own listeners at debug, `record-stall` and this crate's span tests,
+  take a `Mutex` there, held by any thread for a few pushes and reads at most: a wait that
+  short is what the rule allows, and a wake `record-stall` times includes it.
 
 **Lanes**
 
@@ -588,8 +602,15 @@ Correctness:
   Windows holds the median lateness of fifty 2 ms deadlines under half a timer tick in one
   of up to three batches.
 - `tests/abort.rs` re-runs itself as a subprocess and checks that a panic in a job, a
-  finalize, a scope child, a scope body, a task or the drop of a cancelled task's future
-  aborts the process, and that an unfollowable replay log does.
+  finalize, a scope child, a scope body, a task, a tracing listener's callback in a worker's
+  idle wait or the drop of a cancelled task's future aborts the process, and that an
+  unfollowable replay log does.
+- `tests/spans.rs` checks the spans by level, and where the two debug spans stand against
+  what they bracket: a frame worker held at a closed gate beside work is inside an idle
+  `park`; `open_gate` is entered after the closure returns and while that worker is still
+  held, and exited after the gate has let it go; an opener stays inside its latch `park` for
+  as long as it waits; and a listener whose callback waits through the thread's parker after
+  the last child's unpark does not cost the opener its wake-up.
 - `src/measure.rs` holds the measurement calls: on macOS the foreground role taken and read
   back with the priority it grants, 47 where the process started at 31, never below the
   priority before it, and again with no change; the class map against the device tree's
