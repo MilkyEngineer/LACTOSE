@@ -26,7 +26,7 @@ of a manifest it writes under the target directory.
 | `heavy` | nothing: it bounds how many heavy commands run at once on one machine (below) |
 | `measure` | nothing: it runs the milestone measurements and writes their result files (below) |
 | `slang` | nothing: it installs the pinned Slang release under the target directory and prints its `slangc` (below) |
-| `gpu [--driver <name>] [--adapter <name>] [--only <metal\|vulkan>] [--gpu-assisted] [--cooked <dir>]` | the GPU run's rule of decision 5.10 of the milestone 2 plan: the Metal step on macOS and the Vulkan step (below); with no `--driver`, the M1's gate, under MoltenVK and KosmicKrisp |
+| `gpu [--driver <name>] [--adapter <name>] [--only <metal\|vulkan>] [--gpu-assisted] [--cooked <dir>] [--client]` | the GPU run's rule of decision 5.10 of the milestone 2 plan: the Metal step on macOS and the Vulkan step (below); with no `--driver`, the M1's gate, under MoltenVK and KosmicKrisp; with `--client`, the release client on a window under each driver, plain and lagged |
 
 Findings are printed to standard output as `path: message`, one per line, and nothing else
 is printed there. The exit status is 0 for none, 1 for findings and 2 when a check could not
@@ -565,8 +565,8 @@ standard error as it comes.
   test's whole output. A test that prints no figure, a figure line that does not read, or a
   figure named twice fails its measurement. nextest runs it with `--retries 0`, so that no
   failed attempt's output or time is read.
-- A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`, `gpu-cost`) runs under the driver
-  `--driver` names, `moltenvk` by default on macOS and `system` elsewhere, on the adapter
+- A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`, `gpu-cost`) runs under the
+  driver `--driver` names, `moltenvk` by default on macOS and `system` elsewhere, on the adapter
   `--adapter` names or the loader's first, with no layer: the inherited variables `gpu`
   clears are cleared, every implicit layer is disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~`)
   and no Metal validation is set. The loader is the pinned SDK's (`vulkan-layer.toml`) on
@@ -681,9 +681,9 @@ unlocked and the display awake (`caffeinate -d` on macOS).
   (`--minimised`).
 - **The reading** (`src/pace.rs`). A display report earlier than its present's return is no
   display and is dropped and counted (`display.dropped_before_return`); a present with no
-  report kept is counted (`display.missing`), those dropped by order and the last calls'
-  among them, whose reports no later call reads. The floor run's refresh is fitted freely to its display times from the
-  reported refresh by least squares against each time's refresh index, the window doubling
+  report kept is counted (`display.missing`), those dropped by order and the last calls' among them,
+  whose reports no later call reads. The floor run's refresh is fitted freely to its display times
+  from the reported refresh by least squares against each time's refresh index, the window doubling
   from 32 periods so a report off by a part in a hundred keeps each time on its own refresh
   (`fit.hz`, and `fit.from_reported_parts_per_10000`). The sweeps are the latches' phase
   against that refresh, unwrapped from one latch to the next. The grid test is D162's
@@ -705,8 +705,9 @@ unlocked and the display awake (`caffeinate -d` on macOS).
   `submit.began_during`) and the rest (`submit.began_outside`), and on a shared queue the
   hold
   (`draw`'s return to the submit's entry); each present call's parts with P90: its waits (for
-  its last read, the resize and the encoder's drop, which waits for the frame's GPU work and
-  the blit), the acquire, the record (the encoder's creation and the blit's recording), the
+  its last read, the resize and, where the present side holds its bound of four encoders,
+  the oldest one's read; none waits for the present's own submit), the acquire, the record
+  (the encoder's reset or creation and the blit's recording), the
   driver's call (the wait for the image's last-present fence, then the submit and the present
   under the queue's lock), the rest and the whole; `waiting`'s greatest and the share of calls
   that reported two or more, a count that includes presents displayed and not yet reported,
@@ -761,7 +762,7 @@ another version, the SDK's among them, is refused by the cook too.
 ## GPU runs
 
 `cargo xtask gpu [--driver <lavapipe|moltenvk|kosmickrisp|system>] [--adapter <name>] [--only
-<metal|vulkan>] [--gpu-assisted] [--cooked <dir>]` is the command decision 5.10 of the
+<metal|vulkan>] [--gpu-assisted] [--cooked <dir>] [--client]` is the command decision 5.10 of the
 milestone 2 plan names. It cooks, then runs the Metal step on macOS and the Vulkan step on
 every host the layer's pin names; `--only` runs one of them, and the Metal step asked for on
 another host than macOS exits 2. The Metal step is the same under each driver name, since the
@@ -926,6 +927,43 @@ writes its report.
    says how. It prints the same to standard error, the job's log, followed by the test's whole
    standard output and standard error, each under a heading of its own: the log keeps all of
    a failed test's output, the file its tail. A failed test fails the run, under every driver.
+7. With `--client`, which is opt-in and needs a window, the Vulkan step then runs the release
+   `lactose-app-client`, built first with `cargo build --locked --release`, on a window, under the
+   device tests' environment: the layer, the driver and its validators, Metal's API and shader
+   validation under MoltenVK among them. No device test reaches the client's present side
+   (`crates/app-client/README.md`, "What proves it"): these runs do. Each runs in a process of its
+   own for `CLIENT_SECONDS` (5) from its first frame, in `target/gpu/client/`, with the deadline of
+   a device test past them, and is judged as one is, the client exiting 1 on any validator's
+   message. It runs twice under each driver: plain, as shipped, and lagged, with
+   `--extra-present-passes` from `client_lag` in `src/main.rs`, which draws each present's image
+   that many times more, so that the GPU runs behind the present thread. The present side logs at
+   its close how many calls it took, how many of them found their oldest read unreached at their
+   head, so that the call kept an encoder whose submit was pending, and how many resets of an
+   encoder whose read it had read as reached the device refused; each run prints those figures and
+   the file records them. A run that logs none fails; a run with a refused reset fails, since its
+   side then reset an encoder before the device had seen its submit complete; and the lagged one
+   fails where the pending figure is zero, since its lag then reached nothing it is for. The lag
+   was set on the M1 under each driver's validators (26 November 2026, load averages near 9): 100
+   passes under MoltenVK, where 31 of 136 calls found their oldest read unreached, and 200 under
+   KosmicKrisp, where 45 of 217 did and 100 passes left 2 of 301; plain, none of 301 did under
+   either, so the plain run alone reaches no pending encoder. KosmicKrisp's figure at 200 is wide,
+   17 to 81 of 209 to 247 calls over six runs, below a tenth of the calls in one, and more passes
+   do not raise it: at 300, in three runs at load averages from 6.81 to 13.61, 2 of 165 to 170
+   calls, and at 400, in three at 3.85 to 4.97, 2 of 110 to 121, the frame finding the GPU busy for
+   129 to 188 of 301 frames. So it stays at 200, and a lagged run whose figure is zero fails as too
+   light rather than passing. The other drivers take KosmicKrisp's. Against a present side that
+   resets an encoder one read early, the lagged run fails under both drivers: with
+   `lactose-rhi-vulkan`'s refusal of a pending reset removed, by
+   `VUID-vkResetCommandPool-commandPool-00040`, a reset of a pool whose command buffer is pending,
+   and the begin and submit of that buffer; with it kept, by the resets the device refused. The
+   plain run passes in both. Before it builds anything it reads the screen's state, the console
+   session's `CGSSessionScreenIsLocked` in the registry's `IOConsoleUsers` (`ioreg -n Root -d1
+   -a`), with no session on the console counting as locked: while the screen is locked no window
+   presents, so it exits 3, having run nothing. It reads it again before each run: a run the lock
+   keeps from running fails, unrun, with its driver's report written, and `gpu` exits 3, having run
+   nothing more, only where such runs are its only failures, and otherwise 2, as for any failed
+   run. It reads it once more after each run, and names a lock found then in the run's entry and in
+   its failure. It never skips the runs in silence.
 
 The `shaders` CI job runs `gpu --driver system --only metal` on the macOS runner that cooks,
 and the `shaders-oldest` job runs `gpu --driver system --only metal --cooked` on the oldest

@@ -96,6 +96,11 @@ pub struct Options {
     pub cache: PathBuf,
     /// How the frames run.
     pub mode: Mode,
+    /// The passes each present adds over its image, each loading and storing the whole
+    /// image behind a barrier and drawing it again unchanged: GPU work that makes each
+    /// present's read later, so that reads are pending as later present calls begin. A test
+    /// and measurement knob (`README.md`, "Usage"), zero in the binary as shipped.
+    pub extra_present_passes: u32,
 }
 
 /// What a run did. The four counts of frames that drew are the present side's, in both
@@ -203,6 +208,7 @@ fn extent_of(size: PixelSize) -> Option<Extent> {
 /// The window's, the device's, the frame's and the comparison's; `Cancelled` where the
 /// driver thread did not end within its bound after the pump stopped with an error.
 pub fn run(options: Options) -> Result<Outcome> {
+    crate::present::set_extra_passes(options.extra_present_passes);
     let size = window_size(&options.mode);
     let (main, pump) = event_pump(WindowDesc { title: "LACTOSE".to_owned(), size })?;
     let platform: Arc<dyn Platform> = Arc::new(ClientPlatform::new());

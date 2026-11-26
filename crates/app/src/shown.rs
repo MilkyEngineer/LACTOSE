@@ -353,15 +353,15 @@ pub trait PresentSide: Send + 'static {
     /// report, neither of which waits; where it reports none, `waiting` is `None`.
     fn present(&mut self, finished: Finished) -> Result<PresentReport>;
 
-    /// Empties the heap slots this side wrote, after a wait within its bound for the last
-    /// `read` it reported, then drops the swapchain and everything of the device this side
-    /// holds: the last call the frame makes on the present thread
-    /// (`crates/platform/README.md`, "Shutdown"). Its waits are bounded, save the
-    /// swapchain's drop, which waits for the submits that use its images. Where the wait
-    /// for the read runs past its bound, the device refuses to empty the slot and the slot
-    /// is left: the device then refuses the destroy of the target it holds, and that image
-    /// is freed with the device. On a lost device every wait returns at once and nothing
-    /// is left.
+    /// After a wait within its bound for the last `read` it reported, drops the encoders it
+    /// keeps, empties the heap slots this side wrote, then drops the swapchain and everything
+    /// of the device this side holds: the last call the frame makes on the present thread
+    /// (`crates/platform/README.md`, "Shutdown"). Its waits are bounded, save the drop of the
+    /// encoders it keeps, each of which waits for its submit (`lactose-rhi-api`, "Handles and
+    /// lifetimes"), so that past the bound the slots are emptied behind every submit. A slot
+    /// the device refuses to empty all the same, while a pending pass declares it, is left:
+    /// the device then refuses the destroy of the target it holds, and that image is freed
+    /// with the device. On a lost device every wait returns at once and nothing is left.
     fn close(&mut self);
 }
 
