@@ -290,9 +290,28 @@ and list what changed, because `lactose-ecs` is written against this surface.
 
 **Tracing**
 
-- One `tracing` span per node run and one per range split off it, named by `GraphNode::name`,
-  target `whisk`. Never one per unit. Each distinct node name gets its own call sites, created
-  when a graph is built.
+- Everything is under target `whisk`. The info level's spans are the node and range spans: one
+  `tracing` span per node run and one per range split off it, named by `GraphNode::name`, and
+  never one per unit. Each distinct node name gets its own call sites, created when a graph is
+  built. A job of `run_job` runs under one span named `run_job`, at info too.
+- Two spans at debug level, which `lactose-app-client`'s `record-stall` reads by name, so a
+  rename or a removal fails it (D165, D162):
+  - `open_gate`, around `Pool::open_gate` in `JobContext::block_in_place`: from the closure's
+    return to the gate's return.
+  - `park`, around each of the two waits a worker makes without a permit, entered before the
+    wait and exited when it returns. Its field `wait` says which: `"idle"` for `sleep.park` in
+    `gate::idle_park`, whenever a worker parks in the idle protocol, whatever its last look saw,
+    nothing or work with no permit to take it; `"latch"` for `opener.park(latch)` in
+    `gate::wait_for_children`, a scope's opener on its latch, which `Pool::open_gate` wakes with
+    every other worker. A replay's wait on a latch is not spanned: under a replay the log
+    decides when each worker runs.
+- Both debug spans are in every build until architecture section 5.1's compile-out of finer
+  levels is built: the workspace's `tracing` sets no static maximum level. Where nothing
+  listens at debug, each costs what a span nobody wants costs (see the end of this file).
+- A listener's callbacks for `park` run on a worker that is going to sleep or has just been
+  woken, in the idle protocol after it has announced it is asleep, so a waker may already have
+  claimed it. They must not block or call the executor: one that does delays a wake sent to
+  that worker.
 
 **Lanes**
 

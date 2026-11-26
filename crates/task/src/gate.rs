@@ -12,6 +12,7 @@
 
 use crate::latch::Latch;
 use crate::sleep::Sleep;
+use crate::span::TARGET;
 use std::time::Instant;
 
 use crate::sync::{AtomicUsize, Mutex, Ordering};
@@ -271,6 +272,9 @@ pub(crate) fn idle_park(
         if let Some(hook) = gate.before_park.get() {
             hook(worker, seen);
         }
+        // After the announcement: a listener's callbacks run on a worker that a waker may
+        // already have claimed, so they must not block or call the executor.
+        let _park = tracing::debug_span!(target: TARGET, "park", wait = "idle").entered();
         sleep.park(worker, deadline);
     }
 }
@@ -348,6 +352,7 @@ pub(crate) fn wait_for_children(
             } else if children_here && gate.try_acquire() {
                 Some(true)
             } else {
+                let _park = tracing::debug_span!(target: TARGET, "park", wait = "latch").entered();
                 opener.park(latch);
                 None
             };
