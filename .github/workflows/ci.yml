@@ -102,7 +102,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         group: [base, physics]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # D148: the line-ending rule on this host's own checkout, before anything reads a file.
       # The workflow sets no default shell, and Windows would run PowerShell.
       - name: Line endings
@@ -170,7 +170,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
@@ -193,7 +193,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # Pinned: an upgrade is a change of this line, and docs/verification.md's re-check of
@@ -228,7 +228,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -243,7 +243,7 @@ jobs:
       # Hash files of every run, and the execution log of any chaos test that failed.
       - name: Keep SOUR output
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: sour-output
           path: target/sour
@@ -265,7 +265,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -309,7 +309,7 @@ jobs:
           cd target/gpu/code
           find . -type f ! -name '*.metallib' -print | LC_ALL=C sort | xargs shasum -a 256 > ../hashes.txt
           cat ../hashes.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: success() || failure()
         with:
           name: shaders-${{ runner.os }}
@@ -336,20 +336,20 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install lavapipe
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends mesa-vulkan-drivers
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: target/vulkan-sdk/download
           key: vulkan-sdk-${{ hashFiles('tools/xtask/vulkan-layer.toml') }}
       - name: The device tests under lavapipe
         run: cargo xtask gpu --driver lavapipe --only vulkan
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: success() || failure()
         with:
           name: gpu-lavapipe
@@ -363,7 +363,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: shaders-*
       - name: The two hosts' SPIR-V and MSL are equal
@@ -385,10 +385,10 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: shaders-macOS
           path: cooked
@@ -397,7 +397,7 @@ jobs:
         run: bash tools/xtask/runner-facts.sh --metal-optional target/gpu/facts.txt
       - name: Load each metallib and MSL
         run: cargo xtask gpu --driver system --only metal --cooked cooked/code
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: success() || failure()
         with:
           name: gpu-oldest-macOS
