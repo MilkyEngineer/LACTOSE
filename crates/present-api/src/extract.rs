@@ -11,8 +11,6 @@
 //! resource, no event and no log entry. Every row it produces is keyed by `StableKey`, and
 //! the one conversion to floats it makes is `lactose_math`'s.
 
-use std::collections::BTreeMap;
-
 use lactose_asset_api::AssetRef;
 use lactose_core::{ComponentKey, StableKey, Tick};
 use lactose_ecs::{
@@ -23,6 +21,7 @@ use lactose_math::render::RenderPosition;
 use lactose_physics_api::{Teleported, Transform};
 use lactose_reflect::{Reflect, TypeRole};
 
+use self::order::{Order, Settled};
 use crate::components::{MeshAsset, MeshInstance};
 use crate::snapshot::SnapshotWriter;
 use crate::{tick_after, tick_before};
@@ -177,9 +176,11 @@ pub struct ExtractState {
     /// that same tick, what the previous pass compared with (`README.md`, "The
     /// no-interpolate flag").
     covered: Option<Tick>,
-    /// The keys of the presented rows in the snapshot the last pass wrote, ascending: an idle
-    /// pass writes a snapshot when a row entered or left them.
-    presented: Vec<StableKey>,
+    /// The presented rows' places, in the order of their keys: those of the snapshot the last
+    /// pass wrote, whose keys an idle pass compares with the rows it finds.
+    presented: Order,
+    #[cfg(test)]
+    test: tests::Hooks,
 }
 
 impl ExtractState {
@@ -193,7 +194,9 @@ impl ExtractState {
             settle: None,
             tick: None,
             covered: None,
-            presented: Vec::new(),
+            presented: Order::new(),
+            #[cfg(test)]
+            test: tests::Hooks::new(),
         }
     }
 
@@ -270,13 +273,17 @@ impl ExtractState {
             let chunks: Vec<ChunkRef<'_>> =
                 world.chunks().filter(|chunk| presented.holds(chunk)).collect();
             let changed = since.is_some_and(|since| {
-                !follows && presented.changed(&chunks, since, &entries, &self.presented)
+                !follows && presented.changed(&chunks, since, &entries, &mut self.presented)
             });
-            if full || follows || changed {
-                let snapshot = writer.buffer(full);
-                let keys = presented.fill(snapshot, &chunks, tick, full);
-                self.presented = keys;
+            let write = full || follows || changed;
+            if write {
+                let settled = self.presented.settle(&chunks);
+                presented.fill(writer.buffer(full), &settled, tick, full);
             }
+            #[cfg(test)]
+            self.test.observe(&presented, &chunks, since, &entries, full, follows, tick, {
+                write.then(|| writer.pending()).flatten()
+            });
         }
 
         self.settle = if full {
@@ -571,15 +578,15 @@ impl Presented {
     }
 
     /// Whether an idle pass writes a snapshot: a presented row was stamped in a column the
-    /// snapshot copies since `since`, or a row entered or left the presented rows (their
-    /// keys are not `previous`, those of the snapshot last written), or a presented row lost
-    /// a component the snapshot copies.
+    /// snapshot copies since `since`, or a row entered or left the presented rows (`order`,
+    /// settled on `chunks` here when the log holds an entry, held the keys of the snapshot last
+    /// written), or a presented row lost a component the snapshot copies.
     fn changed(
         &self,
         chunks: &[ChunkRef<'_>],
         since: ChangeMark,
         entries: &[LogEntry],
-        previous: &[StableKey],
+        order: &mut Order,
     ) -> bool {
         let stamped = chunks.iter().any(|chunk| {
             chunk
@@ -593,54 +600,38 @@ impl Presented {
         if entries.is_empty() {
             return false;
         }
-        let keys = keys_of(chunks);
-        keys != previous
+        let settled = order.settle(chunks);
+        settled.changed()
             || entries.iter().any(|entry| match entry.change {
                 StructuralChange::Removed { key, component } => {
-                    self.copies(component) && keys.binary_search(&key).is_ok()
+                    self.copies(component) && settled.holds(key)
                 }
                 _ => false,
             })
     }
 
-    /// Writes the presented rows of `chunks` into `snapshot`, and returns their keys,
-    /// ascending. A full pass in a world that is not a prediction world makes it a cut.
+    /// Writes the presented rows `settled` holds into `snapshot` in their key order: for each
+    /// component the snapshot copies, every row whose chunk has it, read from that chunk now.
+    /// A full pass in a world that is not a prediction world makes it a cut.
     fn fill(
         &self,
         snapshot: &mut crate::PresentSnapshot,
-        chunks: &[ChunkRef<'_>],
+        settled: &Settled<'_, '_>,
         tick: Tick,
         full: bool,
-    ) -> Vec<StableKey> {
-        let columns: Vec<ErasedColumn<'_>> = chunks
+    ) {
+        let mut components: Vec<ComponentKey> = settled
+            .chunks()
             .iter()
-            .flat_map(|chunk| {
-                chunk
-                    .components()
-                    .filter(|&component| self.copies(component))
-                    .filter_map(|component| chunk.column(component))
-            })
+            .flat_map(|chunk| chunk.components().filter(|&component| self.copies(component)))
             .collect();
-        let mut rows: BTreeMap<ComponentKey, Vec<(StableKey, &[u8])>> = BTreeMap::new();
-        for column in &columns {
-            let size = column.element_size();
-            let values = rows.entry(column.component()).or_default();
-            for (row, &key) in column.keys().iter().enumerate() {
-                values.push((key, &column.bytes()[row * size..(row + 1) * size]));
-            }
-        }
+        components.sort_unstable();
+        components.dedup();
         let cut = full && self.kind != WorldKind::Prediction;
-        snapshot.fill(self.kind, tick, cut, rows);
-        keys_of(chunks)
+        snapshot.fill(self.kind, tick, cut, &components, |component, rows| {
+            settled.copy(component, |key, bytes| rows.push(key, bytes));
+        });
     }
-}
-
-/// The keys of `chunks`' rows, ascending.
-fn keys_of(chunks: &[ChunkRef<'_>]) -> Vec<StableKey> {
-    let mut keys: Vec<StableKey> =
-        chunks.iter().flat_map(|chunk| chunk.keys().iter().copied()).collect();
-    keys.sort_unstable();
-    keys
 }
 
 /// The service resource [`setup`](crate::setup) inserts: the world's [`ExtractState`] under
@@ -657,3 +648,7 @@ pub(crate) fn extract(world: &mut World, job: Job, state: ResMut<ExtractService>
     let world: &World = world;
     state.0.extract(world, &mut job);
 }
+
+mod order;
+#[cfg(test)]
+mod tests;
