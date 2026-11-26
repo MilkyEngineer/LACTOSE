@@ -181,9 +181,21 @@ struct Park {
 struct Gate {
     /// Each opening's start and end, the end `None` until the gate has returned.
     openings: Vec<(Instant, Option<Instant>)>,
+    /// The waits an opening began within, the rest dropped as they end: the workers park
+    /// between records far more often than the gate opens, and a callback that grew a long
+    /// vector would stall the worker it runs on.
     parks: Vec<Park>,
-    /// The index in `parks` of each frame worker's wait in progress.
-    waiting: Vec<Option<usize>>,
+    /// Each frame worker's wait in progress.
+    waiting: Vec<Option<Park>>,
+    /// Every wait begun, kept or not.
+    began: usize,
+}
+
+impl Gate {
+    /// Whether an opening began after `park` did, and so within it while it waits.
+    fn spans_an_opening(&self, park: &Park) -> bool {
+        self.openings.last().is_some_and(|&(start, _)| start > park.began)
+    }
 }
 
 /// The first entry into a physics system's span and the last exit since the last take: the
@@ -195,8 +207,9 @@ struct Gate {
 /// It also sees `lactose-task`'s `open_gate` and `park` spans and keeps the frame workers'
 /// ([`Gate`]). A `park` callback runs on a worker that is going to sleep or has just been
 /// woken, where it must not block or call the executor (`lactose-task`'s README,
-/// "Tracing"): it reads the clock, takes a lock that only these callbacks take and the test
-/// thread between ticks, and pushes.
+/// "Tracing"): it reads the clock, allocates nothing past the first wait of each worker and
+/// the few hundred waits an opening wakes, and takes a lock that only these callbacks take
+/// and the test thread between ticks.
 #[derive(Default)]
 struct PhysicsPhase {
     phase: Mutex<Phase>,
@@ -214,10 +227,18 @@ impl PhysicsPhase {
         lock(&self.gate).openings.len()
     }
 
-    /// The gate's spans since the last take. A wait in progress is dropped with the rest: it
-    /// began before any opening the next take holds.
+    /// The gate's spans since the last take, a wait in progress kept with `ended` `None`
+    /// where an opening began within it. Taken before a reservation, it drops every wait in
+    /// progress: each began before any opening the next take holds.
     fn take_gate(&self) -> Gate {
-        std::mem::take(&mut *lock(&self.gate))
+        let mut gate = std::mem::take(&mut *lock(&self.gate));
+        let waiting: Vec<Park> = gate.waiting.drain(..).flatten().collect();
+        for park in waiting {
+            if gate.spans_an_opening(&park) {
+                gate.parks.push(park);
+            }
+        }
+        gate
     }
 
     fn gate_entered(&self, id: u64, worker: usize, now: Instant) {
@@ -226,13 +247,12 @@ impl PhysicsPhase {
             gate.openings.push((now, None));
             return;
         }
-        let park = Park { worker, latch: id == PARK_LATCH, began: now, ended: None };
-        gate.parks.push(park);
-        let at = gate.parks.len() - 1;
+        gate.began += 1;
         if gate.waiting.len() <= worker {
             gate.waiting.resize(worker + 1, None);
         }
-        gate.waiting[worker] = Some(at);
+        gate.waiting[worker] =
+            Some(Park { worker, latch: id == PARK_LATCH, began: now, ended: None });
     }
 
     fn gate_exited(&self, id: u64, worker: usize, now: Instant) {
@@ -243,8 +263,10 @@ impl PhysicsPhase {
             }
             return;
         }
-        if let Some(at) = gate.waiting.get_mut(worker).and_then(Option::take) {
-            gate.parks[at].ended = Some(now);
+        let Some(mut park) = gate.waiting.get_mut(worker).and_then(Option::take) else { return };
+        if gate.spans_an_opening(&park) {
+            park.ended = Some(now);
+            gate.parks.push(park);
         }
     }
 }
@@ -268,21 +290,24 @@ fn frame_worker() -> Option<usize> {
     })
 }
 
-/// Reads a `park` span's `wait` field.
+/// Reads a `park` span's `wait` field as the span's id, with no allocation: it runs on the
+/// worker that parks.
 #[derive(Default)]
-struct Wait(Option<String>);
+struct Wait(Option<u64>);
 
 impl tracing::field::Visit for Wait {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "wait" {
-            self.0 = Some(value.to_owned());
+            self.0 = Some(match value {
+                "idle" => PARK_IDLE,
+                "latch" => PARK_LATCH,
+                other => panic!("a `park` span whose wait is {other:?}"),
+            });
         }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "wait" {
-            self.0 = Some(format!("{value:?}").trim_matches('"').to_owned());
-        }
+        assert!(field.name() != "wait", "a `park` span whose wait is not a string: {value:?}");
     }
 }
 
@@ -336,11 +361,7 @@ impl Subscriber for &'static PhysicsPhase {
                 "park" => {
                     let mut wait = Wait::default();
                     attributes.record(&mut wait);
-                    match wait.0.as_deref() {
-                        Some("idle") => Id::from_u64(PARK_IDLE),
-                        Some("latch") => Id::from_u64(PARK_LATCH),
-                        other => panic!("a `park` span whose wait is {other:?}"),
-                    }
+                    Id::from_u64(wait.0.expect("a `park` span has a `wait` field"))
                 }
                 name => physics_id(name),
             };
@@ -610,7 +631,7 @@ fn beside(executor: &Executor, recorder: &mut Recorder, workers: u32, reserved: 
     records(&format!("{prefix}.beside_physics"), &by_physics);
     records(&format!("{prefix}.beside_tick"), &by_tick);
     let gate = phase.take_gate();
-    assert!(!gate.parks.is_empty(), "the reservation of {reserved} saw no `park` span");
+    assert!(gate.began > 0, "the reservation of {reserved} saw no `park` span");
     gate_figures(&prefix, &gate, &gated);
 }
 
