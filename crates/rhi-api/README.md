@@ -1358,10 +1358,14 @@ column, one or more for each of its clauses, 69 in all: `unreported_capability_i
 - `dispatch_beyond_the_group_limit_is_refused` and `viewport_outside_its_rules_is_refused`
   go one past the limits the device reports: the dispatch in each dimension whose limit is
   below `u32::MAX`, since no count exceeds that one (AMD's Windows driver reports it in x),
-  printing that it skipped the others and skipped whole where all three are. Null runs them
-  under `Capabilities::LEAST`, and under AMD's limits in its own test of the skip; a device
-  under `LEAST` would need to report below its driver's limits, which no device backend does,
-  so a device runs them against its own.
+  printing that it skipped the others and skipped whole where all three are. The dispatch's
+  accepted counts run at each limit up to 2^22 groups, 3.3 ms of empty groups on the M1, and
+  at 2^22 above it, printed as run in part: at its limit MoltenVK's 2^30 took 850 ms, and
+  AMD's 4,294,967,295 would take about 3.4 s against Windows' 2 s GPU timeout. A count at a
+  limit above the budget is held by each backend's own test of its comparison, null's through
+  a device at AMD's limits. Null runs the cases under `Capabilities::LEAST`, and under AMD's
+  limits in its own test of the skip; a device under `LEAST` would need to report below its
+  driver's limits, which no device backend does, so a device runs them against its own.
   `empty_draws_and_dispatches_record_nothing` runs with Metal API validation on.
 - `cooked_shader_forged_under_a_valid_checksum_is_refused` writes each breach of the
   version 2 fields into a valid encoding and makes its checksum again, as a writer that

@@ -185,8 +185,11 @@ impl<'a> Ctx<'a> {
         Self { harness, case, set, sink: Arc::default() }
     }
 
-    /// Says that a part of the case, `what`, does not apply under the set, in the words a
-    /// device backend's test gives a case skipped whole ([`Outcome::Skipped`](super::Outcome)).
+    /// Says that a part of the case, `what`, does not apply under the set, or is run in part:
+    /// `<case>: skipped in part, <what>`. The words differ on purpose from a device backend's
+    /// test's for a case skipped whole (`<case>: skipped, <why>`, from
+    /// [`Outcome::Skipped`](super::Outcome)), which a run's record takes as the case's word,
+    /// so a case that prints this and passes is recorded as passed.
     pub(super) fn skip_part(&self, what: &str) {
         eprintln!("{}: skipped in part, {what}", self.case.name);
     }

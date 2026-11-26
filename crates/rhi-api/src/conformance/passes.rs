@@ -402,6 +402,13 @@ fn indirect_arguments_outside_or_unaligned_are_refused(ctx: &Ctx<'_>) -> Applies
     Ok(())
 }
 
+/// The most groups the case dispatches in a dimension at its limit: 2^22, 3.3 ms of GPU at
+/// the 0.79 ns an empty group took on the M1 under MoltenVK. At the limits themselves
+/// MoltenVK's 2^30 took 850 ms, and AMD's 4,294,967,295 in x would take about 3.4 s at that
+/// rate, past Windows' 2 s GPU timeout. A dispatch at a limit above it is held by each
+/// backend's own test of its comparison.
+const GROUPS_RUN_MOST: u32 = 1 << 22;
+
 fn dispatch_beyond_the_group_limit_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let pipeline = ctx.compute(&*device);
@@ -427,13 +434,19 @@ fn dispatch_beyond_the_group_limit_is_refused(ctx: &Ctx<'_>) -> Applies {
         encoder.end_pass();
         ctx.refused(submit(&*device, &mut [encoder]), "a dispatch one group past the limit");
     }
-    // At the limit on one axis at a time: on all three at once a device would run the
-    // product, 2^90 groups where MoltenVK reports 2^30.
+    // At the limit on one axis at a time, up to the budget: on all three at once a device
+    // would run the product, 2^90 groups where MoltenVK reports 2^30.
+    if limit.iter().any(|&most| most > GROUPS_RUN_MOST) {
+        ctx.skip_part(&format!(
+            "a dispatch at the limit of {limit:?} in the dimensions above {GROUPS_RUN_MOST} \
+             groups, which are dispatched at {GROUPS_RUN_MOST}"
+        ));
+    }
     let mut encoder = ctx.encoder(&*device, G);
     compute_pass(&mut *encoder, pipeline, PassReach::NOTHING);
     for axis in 0..3 {
         let mut groups = [1; 3];
-        groups[axis] = limit[axis];
+        groups[axis] = limit[axis].min(GROUPS_RUN_MOST);
         encoder.dispatch(groups);
     }
     encoder.end_pass();

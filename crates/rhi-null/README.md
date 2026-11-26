@@ -124,7 +124,9 @@ walk refuse it `destroyed`, with nothing submitted.
   pending and of the device's last handle; a drop that is not the last, which returns at
   once; and the drops made while a thread unwinds, none of which waits. Beside them, the
   shapes null accepts where a device refuses ("Queues by role" in `lactose-rhi-api`'s
-  README): a signal 2^31 above a value null has run and the caller has not seen.
+  README): a signal 2^31 above a value null has run and the caller has not seen. And a
+  dispatch at each of AMD's group limits, `u32::MAX` in x, taken, and one a group past a
+  limit below it refused, which the conformance case dispatches only up to its budget.
 
 ## Proof
 

@@ -11,12 +11,12 @@ use std::time::Duration;
 use lactose_core::{ErrorKind, Result};
 use lactose_rhi_api::{
     Acquired, BufferCopy, BufferDesc, BufferHandle, BufferImageCopy, BufferState, BufferTransition,
-    BufferUsage, Capabilities, ColourAttachment, ComputePass, ComputePipelineDesc, CookedShader,
-    Device, DeviceRequest, Encoder, Extent, HeapSlot, ImageDesc, ImageHandle, ImageMemory,
-    ImageRange, ImageState, ImageTransition, ImageUsage, Load, MemoryClass, Message, MessageSink,
-    PassReach, Presented, QueueLayout, QueuePath, QueueRole, Rect, RenderPass, Rule, ShaderStage,
-    ShaderTarget, Sharing, StageDesc, StateOn, Store, Submit, Swapchain, SwapchainDesc, Target,
-    TimelineHandle, TimelinePoint,
+    BufferUsage, Capabilities, ColourAttachment, ComputePass, ComputePipelineDesc,
+    ComputePipelineHandle, CookedShader, Device, DeviceRequest, Encoder, Extent, HeapSlot,
+    ImageDesc, ImageHandle, ImageMemory, ImageRange, ImageState, ImageTransition, ImageUsage, Load,
+    MemoryClass, Message, MessageSink, PassReach, Presented, QueueLayout, QueuePath, QueueRole,
+    Rect, RenderPass, Rule, ShaderStage, ShaderTarget, Sharing, StageDesc, StateOn, Store, Submit,
+    Swapchain, SwapchainDesc, Target, TimelineHandle, TimelinePoint,
 };
 
 use crate::device::Between;
@@ -201,25 +201,7 @@ fn a_pass_that_begins_during_a_heap_write_is_refused() {
     let (first, second) = (sampled(&device), sampled(&device));
     let slot = HeapSlot(3);
     device.write_heap_slot(slot, first).expect("a write");
-    let shader = CookedShader {
-        stage: ShaderStage::Compute,
-        target: ShaderTarget::SpirV,
-        entry: "main".to_owned(),
-        code: [0x0723_0203_u32, 0x0001_0000, 0, 1, 0]
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect(),
-        heap: None,
-        constants: Vec::new(),
-        push_bytes: 0,
-        inputs: 0,
-        outputs: 0,
-        workgroup: Some([1, 1, 1]),
-        varyings: Vec::new(),
-    };
-    let desc =
-        ComputePipelineDesc { label: "unit", stage: StageDesc { shader: &shader, constants: &[] } };
-    let pipeline = device.create_compute_pipeline(&desc).expect("a pipeline");
+    let pipeline = compute(&device);
     let record = move |device: &NullDevice| {
         let mut encoder = device.create_encoder(G, "unit").expect("an encoder");
         encoder.begin_compute_pass(&ComputePass {
@@ -240,6 +222,64 @@ fn a_pass_that_begins_during_a_heap_write_is_refused() {
     let refused = taken(&device, &out);
     assert_eq!(rule(&refused), Some(Rule::HeapWrite), "{refused:?}");
     run(&device, record(&device));
+}
+
+/// An empty compute pipeline of one invocation a group.
+fn compute(device: &NullDevice) -> ComputePipelineHandle {
+    let shader = CookedShader {
+        stage: ShaderStage::Compute,
+        target: ShaderTarget::SpirV,
+        entry: "main".to_owned(),
+        code: [0x0723_0203_u32, 0x0001_0000, 0, 1, 0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect(),
+        heap: None,
+        constants: Vec::new(),
+        push_bytes: 0,
+        inputs: 0,
+        outputs: 0,
+        workgroup: Some([1, 1, 1]),
+        varyings: Vec::new(),
+    };
+    let desc =
+        ComputePipelineDesc { label: "unit", stage: StageDesc { shader: &shader, constants: &[] } };
+    device.create_compute_pipeline(&desc).expect("a pipeline")
+}
+
+/// The dispatch's refusal at the limits AMD's Windows driver 26.11.2 reports: a dispatch at
+/// each dimension's limit, `u32::MAX` in x among them, is taken, and one a group past a limit
+/// below `u32::MAX` refused. Null runs no group, so it holds at the full limit what the
+/// conformance case dispatches on a device only up to its budget.
+#[test]
+fn a_dispatch_at_each_group_limit_is_taken_and_one_past_it_refused() {
+    let set = Capabilities { compute_groups: [u32::MAX, 65535, 65535], ..Capabilities::LEAST };
+    let request = DeviceRequest {
+        adapter: None,
+        surface: None,
+        heap_slots: set.heap_slots,
+        samplers: set.samplers,
+        pipeline_cache: Vec::new(),
+        messages: Arc::new(Silent),
+    };
+    let device = NullDevice::new(request, set).expect("a null device");
+    let pipeline = compute(&device);
+    let encoder = |groups: [u32; 3]| {
+        let mut encoder = device.create_encoder(G, "unit").expect("an encoder");
+        encoder.begin_compute_pass(&ComputePass { label: "unit", reach: PassReach::NOTHING });
+        encoder.bind_compute_pipeline(pipeline);
+        encoder.dispatch(groups);
+        encoder.end_pass();
+        encoder
+    };
+    for groups in [[u32::MAX, 1, 1], [1, 65535, 1], [1, 1, 65535], [u32::MAX, 65535, 65535]] {
+        run(&device, encoder(groups));
+    }
+    for groups in [[1, 65536, 1], [1, 1, 65536], [u32::MAX, 65536, 65535]] {
+        let refused =
+            device.submit(G, Submit { encoders: &mut [encoder(groups)], waits: &[], signals: &[] });
+        assert_eq!(rule(&refused), Some(Rule::Bounds), "{groups:?}: {refused:?}");
+    }
 }
 
 fn upload(device: &NullDevice) -> BufferHandle {

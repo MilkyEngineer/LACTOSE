@@ -77,7 +77,7 @@ env:
 # GitHub's 10 GB, but GitHub evicts the least recently used entries first, and most of it was
 # entries of older keys: the newest entry of each job came to about 2.6 GB. The first run after
 # the split restores nothing (no earlier key has the group in it) and builds cold, and no job
-# restores a `v0-rust-check-<os>-...` entry again. check and windows-lint-release set
+# restores a `v0-rust-check-<os>-...` entry again. check, windows-lint-release and shaders set
 # cache-on-failure, so a cold run that times out late in its build still saves its dependencies.
 # But rust-cache saves only when its key missed, so a run on a new key that fails or is
 # cancelled before its build finishes leaves a partial entry that later runs restore and never
@@ -267,7 +267,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
+      # The Windows leg's first run builds cold, and a failure of one of its cook tests,
+      # which have not run there before, would otherwise save nothing and leave every later
+      # run cold.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.151
@@ -379,6 +384,12 @@ jobs:
         run: |
           failed=false
           for os in macOS Windows; do
+            # A leg that timed out wrote no hashes, which is not a difference.
+            if [ ! -f "shaders-$os/hashes.txt" ]; then
+              echo "::error::the $os leg left no hashes: see its job"
+              failed=true
+              continue
+            fi
             if ! diff shaders-Linux/hashes.txt "shaders-$os/hashes.txt"; then
               echo "::error::the SPIR-V or MSL cooked on Linux and on $os differ (lines above)"
               failed=true

@@ -1,14 +1,46 @@
 //! Timed driver waits held to the host's clock. A driver may return `VK_TIMEOUT` before the
-//! time it was given has passed by `Instant`: AMD's Windows driver 26.11.2 did so from
-//! `vkWaitSemaphores` on a point only the host signals, in 11 of 50 waits of 30 ms, the
-//! earliest by 2.97 ms. The contract's timed waits end unreached only once their time has
-//! passed, so each is made again for what is left.
+//! time it was given has passed by `Instant`, which the spec allows (the timeout "is adjusted
+//! to the closest value allowed by the implementation-dependent timeout accuracy"): AMD's
+//! Windows driver 26.11.2 did so from `vkWaitSemaphores` on a point only the host signals, in
+//! 11 of 50 waits of 30 ms, the earliest by 2.97 ms. The contract's timed waits end unreached
+//! only once their time has passed, so each is made again for what is left.
+//!
+//! A driver whose call returned `VK_TIMEOUT` in less than a tenth of the time it was given,
+//! as one may for a time below its accuracy, is not called again at once: the host first
+//! sleeps for what is left, at most [`PAUSE`], so such a driver costs a call a millisecond
+//! rather than a core for the rest of the wait.
 
 use core::time::Duration;
 use std::time::Instant;
 
 use ash::prelude::VkResult;
 use ash::vk;
+
+/// The most the host sleeps between two calls of a driver that returned at once.
+const PAUSE: Duration = Duration::from_millis(1);
+
+#[cfg(test)]
+thread_local! {
+    /// How many of this thread's next driver waits are given half the time left: a driver
+    /// that returns `VK_TIMEOUT` early, for the device tests ([`return_early`]).
+    static EARLY: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Plays a driver that returns `VK_TIMEOUT` early on this thread: each of its next `calls`
+/// driver waits made through [`until`] is given half the time left, and so ends at half its
+/// time. A device test sets it before a timed wait and asserts [`early_left`] is 0 after, so
+/// a call site that waits without [`until`] fails it, as one that waits once does by the
+/// time it took.
+#[cfg(test)]
+pub(crate) fn return_early(calls: u32) {
+    EARLY.set(calls);
+}
+
+/// How many of the early returns [`return_early`] asked for are yet to be played.
+#[cfg(test)]
+pub(crate) fn early_left() -> u32 {
+    EARLY.get()
+}
 
 /// When a wait of `timeout` begun now ends: `None` for one too long to have an end the clock
 /// can hold, which waits with no timeout.
@@ -25,16 +57,39 @@ pub(crate) fn until<T>(
     mut wait: impl FnMut(u64) -> VkResult<T>,
 ) -> VkResult<T> {
     loop {
-        let nanos = deadline.map_or(u64::MAX, |deadline| {
-            let left = deadline.saturating_duration_since(Instant::now());
-            u64::try_from(left.as_nanos()).unwrap_or(u64::MAX)
-        });
+        let nanos = given(deadline);
+        let called = Instant::now();
         match wait(nanos) {
             Err(vk::Result::TIMEOUT)
-                if deadline.is_none_or(|deadline| Instant::now() < deadline) => {}
+                if deadline.is_none_or(|deadline| Instant::now() < deadline) =>
+            {
+                if called.elapsed() < Duration::from_nanos(nanos / 10) {
+                    let left = deadline.map_or(PAUSE, |deadline| {
+                        deadline.saturating_duration_since(Instant::now())
+                    });
+                    std::thread::sleep(left.min(PAUSE));
+                }
+            }
             other => return other,
         }
     }
+}
+
+/// The nanoseconds left until `deadline`, `u64::MAX` for none.
+fn given(deadline: Option<Instant>) -> u64 {
+    let nanos = deadline.map_or(u64::MAX, |deadline| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        u64::try_from(left.as_nanos()).unwrap_or(u64::MAX)
+    });
+    #[cfg(test)]
+    let nanos = match EARLY.get() {
+        0 => nanos,
+        early => {
+            EARLY.set(early - 1);
+            nanos / 2
+        }
+    };
+    nanos
 }
 
 #[cfg(test)]
@@ -79,6 +134,30 @@ mod tests {
         });
         assert_eq!(result, Err(vk::Result::TIMEOUT));
         assert!(start.elapsed() >= timeout, "returned after {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn a_driver_that_returns_at_once_is_called_again_after_a_pause() {
+        // A driver whose wait never blocks: without the pause it is called hundreds of
+        // thousands of times in 30 ms. A loaded host only lengthens the sleeps.
+        let timeout = Duration::from_millis(30);
+        let start = Instant::now();
+        let (given, result) = driver(deadline(timeout), usize::MAX, Ok(0));
+        assert_eq!(result, Err(vk::Result::TIMEOUT));
+        assert!(start.elapsed() >= timeout, "returned after {:?}", start.elapsed());
+        // A call a millisecond at most, besides the first and the poll at the deadline.
+        assert!((2..=32).contains(&given.len()), "{} calls", given.len());
+    }
+
+    #[test]
+    fn an_early_return_played_halves_the_time_given_and_is_used_up() {
+        return_early(2);
+        let timeout = Duration::from_secs(60);
+        let (given, result) = driver(deadline(timeout), 3, Ok(1));
+        assert_eq!((given.len(), result, early_left()), (4, Ok(1), 0));
+        let most = u64::try_from(timeout.as_nanos()).unwrap();
+        assert!(given[0] <= most / 2 && given[1] <= most / 2, "{given:?}");
+        assert!(given[2] > most / 2, "{given:?}");
     }
 
     #[test]
