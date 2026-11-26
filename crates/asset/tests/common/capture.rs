@@ -138,8 +138,8 @@ impl Capture {
 
 impl Subscriber for Capture {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        // The executor's debug spans run on parking workers, where a callback must not block
-        // (`lactose-task`'s README, "Tracing"); they are not the store's either.
+        // The executor's debug spans run on parking workers, where a callback must return
+        // promptly (`lactose-task`'s README, "Tracing"); they are not the store's either.
         metadata.target() != "whisk" || *metadata.level() <= Level::INFO
     }
 

@@ -28,12 +28,16 @@
 //! scope's latch. A worker is *parked across* an opening when its `park` began before the
 //! opening's start and ended after it. At each reservation the file gives the time from
 //! each opening's start to the `park` exit of each worker parked across it, with the count of
-//! each kind of wait; the opening's own length, which bounds it on the opener's side; for the
-//! openings after which a worker parked across it took the record's next job, the first to
-//! start after the opening's start, that job's start from the opening's start and its start
-//! wait; and the count of the openings after which a worker that was awake took it, the
-//! opener among them. A figure of fewer than 100 samples gives its median and its worst and
-//! no 99th percentile. On Windows these are what the `SetEvent` for each frame worker that
+//! each kind of wait; the opening's own length, on the opener's side, which bounds no wake;
+//! for the openings after which a worker parked across it took the record's
+//! next job, the first to start after the opening's start, that job's start from the
+//! opening's start and its start wait; and the count of the openings after which a worker
+//! that was awake took it, the opener among them. The time from the opening to that job's
+//! start is mostly the test thread's own: records run back to back, each a `run_job` call,
+//! the bound's keeping thread and the submit, so the next call comes when the record in
+//! progress at the opening ends. The gate's figures are the wake and the start wait. A
+//! figure of fewer than 100 samples gives its median and its worst and no 99th percentile.
+//! On Windows the wake and the start wait show what the `SetEvent` for each frame worker that
 //! `Pool::open_gate` makes costs (row 164's unmeasured list). Every tick asserts that it saw
 //! an `open_gate` span, and each reservation that it saw `park` spans, so a build that
 //! compiles debug spans out fails.
@@ -206,10 +210,11 @@ impl Gate {
 ///
 /// It also sees `lactose-task`'s `open_gate` and `park` spans and keeps the frame workers'
 /// ([`Gate`]). A `park` callback runs on a worker that is going to sleep or has just been
-/// woken, where it must not block or call the executor (`lactose-task`'s README,
-/// "Tracing"): it reads the clock, allocates nothing past the first wait of each worker and
-/// the few hundred waits an opening wakes, and takes a lock that only these callbacks take
-/// and the test thread between ticks.
+/// woken, where it must return promptly and never call into the executor (`lactose-task`'s
+/// README, "Tracing"), and an `open_gate` one on the opener while the gate is still closed:
+/// each reads the clock, takes a lock that only these callbacks take and the test thread
+/// between ticks, and allocates nothing, since [`PhysicsPhase::take_gate`] leaves room for
+/// every opening and wait of a reservation.
 #[derive(Default)]
 struct PhysicsPhase {
     phase: Mutex<Phase>,
@@ -230,8 +235,19 @@ impl PhysicsPhase {
     /// The gate's spans since the last take, a wait in progress kept with `ended` `None`
     /// where an opening began within it. Taken before a reservation, it drops every wait in
     /// progress: each began before any opening the next take holds.
-    fn take_gate(&self) -> Gate {
-        let mut gate = std::mem::take(&mut *lock(&self.gate));
+    ///
+    /// Leaves room for `openings` openings on `workers` frame workers, made here on the test
+    /// thread so that no callback grows a vector: a worker's waits do not overlap, and each
+    /// one kept spans an opening's start, so no more than `workers` are kept per opening.
+    fn take_gate(&self, workers: u32, openings: u32) -> Gate {
+        let (workers, openings) = (workers as usize, openings as usize);
+        let room = Gate {
+            openings: Vec::with_capacity(openings),
+            parks: Vec::with_capacity(openings * workers),
+            waiting: vec![None; workers],
+            began: 0,
+        };
+        let mut gate = std::mem::replace(&mut *lock(&self.gate), room);
         let waiting: Vec<Park> = gate.waiting.drain(..).flatten().collect();
         for park in waiting {
             if gate.spans_an_opening(&park) {
@@ -561,7 +577,7 @@ fn gate_figures(prefix: &str, gate: &Gate, ticks: &[(Range<usize>, Vec<Timed>)])
     }
     let prefix = format!("{prefix}.gate");
     figure(&format!("{prefix}.openings"), lengths.len());
-    spread(&format!("{prefix}.opening"), lengths);
+    spread_of_enough(&format!("{prefix}.opening"), lengths);
     figure(&format!("{prefix}.wakes_idle"), idle);
     figure(&format!("{prefix}.wakes_latch"), latch);
     spread_of_enough(&format!("{prefix}.wake"), wakes);
@@ -578,7 +594,7 @@ fn beside(executor: &Executor, recorder: &mut Recorder, workers: u32, reserved: 
     let (mut physics, mut steps) = (Vec::new(), Vec::new());
     let (mut by_physics, mut by_tick) = (Vec::new(), Vec::new());
     let mut gated = Vec::new();
-    phase.take_gate();
+    phase.take_gate(workers, WARM_UP + ticks);
     for tick in 0..WARM_UP + ticks {
         phase.take();
         let opened = phase.openings();
@@ -630,7 +646,7 @@ fn beside(executor: &Executor, recorder: &mut Recorder, workers: u32, reserved: 
     figure(&format!("{prefix}.step_us"), micros(median(steps)));
     records(&format!("{prefix}.beside_physics"), &by_physics);
     records(&format!("{prefix}.beside_tick"), &by_tick);
-    let gate = phase.take_gate();
+    let gate = phase.take_gate(workers, WARM_UP + ticks);
     assert!(gate.began > 0, "the reservation of {reserved} saw no `park` span");
     gate_figures(&prefix, &gate, &gated);
 }
