@@ -242,7 +242,7 @@ pub const MEASUREMENTS: [Measurement; 18] = [
     },
     Measurement {
         name: "extract-50k",
-        what: "Milestone 2's criterion 4: extract's pass over 100k rows with 50,000 moved, writing the device's ring and a snapshot of 10,000 presented rows, each alone, on one worker, and again on null",
+        what: "Milestone 2's criterion 4: extract's pass over 100k rows with 50,000 moved, writing the device's ring and a snapshot of 5,000 presented rows, each alone, on one worker, and again on null, with two null arms beside (10,000 presented rows, and a pass that sorts)",
         threshold: "1 ms for the median on the device (milestone 2 plan, section 4, criterion 4; verification row 16)",
         run: device(
             "lactose-app-client",

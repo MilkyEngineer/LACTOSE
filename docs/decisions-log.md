@@ -7168,6 +7168,27 @@ process state; the nightly Miri filters name modules that Miri compiles** (§20,
   Miri run covers it; architecture section 3 names the lock. A reader that stops acquiring costs
   memory, one batch per publication with an event; what it receives when it returns is
   `frame-design`'s decision.
+- Addendum (lane `snapshot-order`, 2026-11-26; D164; review round 1): *the fill keeps its
+  places as a hint.* `ExtractState` keeps the presented rows' places from the pass that last
+  sorted them, in ascending key order, each a key, the index of its chunk among that pass's
+  presented chunks and its row in the chunk. A pass that writes a snapshot, and an idle pass
+  whose log holds an entry, checks every place against the key its chunk holds there and the
+  places' count against the presented rows, and sorts the places again from the chunks when
+  either check fails. The places are one sort of distinct positions, so as many as there are
+  rows, each holding its key, are every row once and in key order. A place says where a row
+  is and never what it holds: each copied column is read from the row's chunk at every pass,
+  since a row can keep its chunk and its row while its archetype changes, and no byte of the
+  snapshot depends on a place (architecture section 8.2). An archetype change that keeps a
+  row's chunk and row, and a move to another region, the region being a column of the chunk,
+  keep the place. Under SOUR's layout modes, which permute rows at every sync point, a pass
+  sorts wherever a permutation moved a presented row: 1,409 to 1,551 sorts over 1,682 passes,
+  1,553 of which wrote, in the lane's unit tests. The fill reads the places only through the
+  order `settle` returns for the pass's chunks, so a fill from places not settled on them does
+  not compile, and `PresentSnapshot::fill`, crate-private, takes each row's key with its bytes
+  in one call, so the two cannot part. The copy walks the presented rows once for each copied
+  component, so it grows with the rows times the components: twelve more `extracted`
+  components, each on one row, took the half from 107 to 139 µs at 5,000 rows in the review's
+  probe. The buffers stay whole as D157 chose, and no public signature changed.
 
 **D158. `lactose-rhi-api`'s facade: a refused call is a value that names its rule, null checks every rule and a device backend every rule whose breach would be undefined behaviour, a GPU fault or an abort, with two stated residuals; a device backend's records are guarded by one short lock that recording does not take; states are the caller's, on queues named by role; a pass declares what it reaches; the present role is reached through the swapchain alone; and the facade takes a side on each of the native Metal spike's three conflicts until the freeze** (§3, §5.1, §12.1, §12.2, §19, §20, §21, `lactose-rhi-api`, `lactose-rhi-null`, `lactose-rhi-vulkan`, `lactose-rhi-metal`, `lactose-render-graph`, `lactose-renderer`, `lactose-platform`, `lactose-app`, `tools/cook`)
 - Why: section 12.1 lists what the interface holds and not its shape. The RHI spike's fourteen
