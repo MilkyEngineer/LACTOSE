@@ -32,6 +32,7 @@ use crate::lock;
 use crate::raw::{Presents, Raw, driver, unsupported};
 use crate::records::{ImageRec, QUEUES, Stamps};
 use crate::submit::{self, Binary, Staged, Staging};
+use crate::wait;
 
 /// The bound of an acquire, of a present's wait for its submit's release, and of a
 /// `resize`'s wait for the swapchain's presents.
@@ -678,10 +679,10 @@ impl VulkanSwapchain {
         if fences.is_empty() {
             return Ok(true);
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        let nanos = u64::try_from(left.as_nanos()).unwrap_or(u64::MAX);
-        // SAFETY: the fences are this swapchain's; a wait is bounded by `deadline`.
-        let waited = unsafe { self.device().wait_for_fences(&fences, true, nanos) };
+        let waited = wait::until(Some(deadline), |nanos| {
+            // SAFETY: the fences are this swapchain's; a wait is bounded by `deadline`.
+            unsafe { self.device().wait_for_fences(&fences, true, nanos) }
+        });
         match waited {
             Ok(()) | Err(vk::Result::TIMEOUT) => {}
             Err(error) => return Err(self.failed(error, "vkWaitForFences")),
@@ -726,11 +727,12 @@ impl VulkanSwapchain {
         let semaphores = [self.shared.queue(self.queue).timeline];
         let values = [seq];
         let info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values);
-        let left = deadline.saturating_duration_since(Instant::now());
-        let nanos = u64::try_from(left.as_nanos()).unwrap_or(u64::MAX);
-        // SAFETY: the queue's semaphore lives as long as the device, which the swapchain
-        // holds; the wait is bounded.
-        match unsafe { self.device().wait_semaphores(&info, nanos) } {
+        let waited = wait::until(Some(deadline), |nanos| {
+            // SAFETY: the queue's semaphore lives as long as the device, which the swapchain
+            // holds; the wait is bounded.
+            unsafe { self.device().wait_semaphores(&info, nanos) }
+        });
+        match waited {
             Ok(()) => Ok(true),
             Err(vk::Result::TIMEOUT) => Ok(false),
             Err(error) => Err(self.failed(error, "vkWaitSemaphores")),
@@ -1046,18 +1048,20 @@ impl Swapchain for VulkanSwapchain {
             return Ok(Acquired::Stale);
         }
         let at = self.acquire_semaphore()?;
-        let nanos = u64::try_from(BOUND.as_nanos()).unwrap_or(u64::MAX);
-        // SAFETY: the swapchain is this one's, not retired (`stale` is set wherever it may
-        // be), and reached by this thread alone (`Swapchain` is not `Sync`); the semaphore
-        // is unsignalled with no operation pending (`Use::Free`).
-        let acquired = unsafe {
-            self.presents().swapchain.acquire_next_image(
-                self.chain.swapchain(),
-                nanos,
-                self.pool[at].0,
-                vk::Fence::null(),
-            )
-        };
+        let acquired = wait::until(wait::deadline(BOUND), |nanos| {
+            // SAFETY: the swapchain is this one's, not retired (`stale` is set wherever it
+            // may be), and reached by this thread alone (`Swapchain` is not `Sync`); the
+            // semaphore is unsignalled with no operation pending (`Use::Free`), which an
+            // acquire that timed out leaves it.
+            unsafe {
+                self.presents().swapchain.acquire_next_image(
+                    self.chain.swapchain(),
+                    nanos,
+                    self.pool[at].0,
+                    vk::Fence::null(),
+                )
+            }
+        });
         match acquired {
             // `VK_SUBOPTIMAL_KHR` is an image, never stale.
             Ok((index, _)) => {

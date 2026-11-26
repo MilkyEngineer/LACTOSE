@@ -58,9 +58,9 @@ impl Slang {
                 ),
             )
         })?;
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stderr = String::from_utf8_lossy(&lf(output.stderr)).trim().to_owned();
         let found = if stderr.is_empty() {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            String::from_utf8_lossy(&lf(output.stdout)).trim().to_owned()
         } else {
             stderr
         };
@@ -154,13 +154,10 @@ pub(crate) fn cook(slang: &Slang, sources: &Path, source: &Source) -> Result<Vec
         let json = scratch.path.join(format!("{entry}.json"));
         let code = compile(SPIRV, Some(&json))?;
         let reflection = spirv::reflect(&code).map_err(at(format!("{what} (SPIR-V)")))?;
-        let semantics = fs::read(&json).map_err(io_error(&json))?;
+        let semantics = lf(fs::read(&json).map_err(io_error(&json))?);
         let semantics = semantics::read(&semantics, &entry).map_err(at(&what))?;
-        let msl = compile(MSL, None)?;
-        let text = String::from_utf8(msl.clone()).map_err(|_| {
-            Error::new(ErrorKind::InvalidData, format!("{what} (MSL): text that is not UTF-8"))
-        })?;
-        let interface = msl::read(&text, reflection.stage, &reflection.entry)
+        let msl = msl_text(compile(MSL, None)?).map_err(at(format!("{what} (MSL)")))?;
+        let interface = msl::read(&msl, reflection.stage, &reflection.entry)
             .map_err(at(format!("{what} (MSL)")))?;
         agree(&reflection, semantics, &interface).map_err(at(&what))?;
         let shader = |target, code| CookedShader {
@@ -179,12 +176,13 @@ pub(crate) fn cook(slang: &Slang, sources: &Path, source: &Source) -> Result<Vec
         let name = |ending: &str| format!("{stem}.{entry}.{ending}");
         if cfg!(target_os = "macos") {
             let file = format!("{}.{entry}", stem.rsplit('/').next().expect("a stem"));
-            let library = metal(&scratch.path, &file, &msl).map_err(at(&what))?;
+            let library = metal(&scratch.path, &file, msl.as_bytes()).map_err(at(&what))?;
             cooked.push(Cooked {
                 name: name("metallib"),
                 shader: shader(ShaderTarget::MetalLibrary, library),
             });
         }
+        let msl = msl.into_bytes();
         cooked.push(Cooked { name: name("msl"), shader: shader(ShaderTarget::Msl, msl) });
         cooked.push(Cooked { name: name("spirv"), shader: shader(ShaderTarget::SpirV, code) });
     }
@@ -318,10 +316,38 @@ fn bits(bits: u32) -> String {
     if set.is_empty() { "none".to_owned() } else { set.join(", ") }
 }
 
-/// Runs a toolchain command and returns its standard output; `what` names the source in
-/// the error.
+/// The MSL `slangc` wrote, as the cook reads and stores it: with LF line endings ([`lf`]),
+/// and UTF-8.
+fn msl_text(msl: Vec<u8>) -> Result<String> {
+    String::from_utf8(lf(msl))
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "text that is not UTF-8"))
+}
+
+/// `text` with each CRLF made LF. The Windows `slangc` writes its text with CRLF line
+/// endings, the MSL on its standard output, Slang's reflection and its diagnostics among it,
+/// where the other hosts' write LF. Every text the cook reads back from the toolchain passes
+/// through this before it is parsed, stored or shown, so a cooked shader and its version are
+/// the same bytes on every host, and so is a refusal's message. A lone CR is kept. Never
+/// applied to the SPIR-V or a metallib, binary code in which the two bytes may stand side by
+/// side.
+fn lf(text: Vec<u8>) -> Vec<u8> {
+    if !text.contains(&b'\r') {
+        return text;
+    }
+    let mut kept = Vec::with_capacity(text.len());
+    for (at, &byte) in text.iter().enumerate() {
+        if byte != b'\r' || text.get(at + 1) != Some(&b'\n') {
+            kept.push(byte);
+        }
+    }
+    kept
+}
+
+/// Runs a toolchain command and returns its standard output as it was written; `what`
+/// names the source in the error, and the program is named by its file stem, `slangc` on
+/// Windows too.
 fn run(command: &mut Command, what: &str) -> Result<Vec<u8>> {
-    let program = Path::new(command.get_program()).file_name().unwrap_or_default();
+    let program = Path::new(command.get_program()).file_stem().unwrap_or_default();
     let program = program.to_string_lossy().into_owned();
     let output = command.stdin(Stdio::null()).output().map_err(|error| {
         Error::new(ErrorKind::NotFound, format!("{what}: cannot run {program}: {error}"))
@@ -331,7 +357,7 @@ fn run(command: &mut Command, what: &str) -> Result<Vec<u8>> {
             ErrorKind::InvalidData,
             format!(
                 "{what}: {program} failed:\n{}",
-                String::from_utf8_lossy(&output.stderr).trim_end()
+                String::from_utf8_lossy(&lf(output.stderr)).trim_end()
             ),
         ));
     }
@@ -426,6 +452,39 @@ mod tests {
             heap: true,
         };
         (reflection, semantics, interface)
+    }
+
+    #[test]
+    fn crlf_is_made_lf_and_a_lone_cr_is_kept() {
+        assert_eq!(lf(b"a\r\nb\r\n\r\nc\rd\r".to_vec()), b"a\nb\n\nc\rd\r");
+        assert_eq!(lf(b"\r\r\n\n".to_vec()), b"\r\n\n");
+        assert_eq!(lf(Vec::new()), b"");
+    }
+
+    #[test]
+    fn msl_the_windows_slangc_wrote_with_crlf_is_read_and_stored_with_lf() {
+        // The Windows `slangc`'s `-target metal` of `client/present.slang`'s `fs_main`, in
+        // short: every line ends in CRLF, and the struct's header is not found as written.
+        let msl = "struct pixelOutput_0\n{\n    float4 output_0 [[color(0)]];\n};\n\n\
+                   [[fragment]] pixelOutput_0 fs_main(float4 position_0 [[position]])\n{\n";
+        let windows = msl.replace('\n', "\r\n");
+        let error = msl::read(&windows, ShaderStage::Fragment, "fs_main").unwrap_err();
+        assert!(error.message().contains("a struct the MSL does not declare"), "{error}");
+        let text = msl_text(windows.into_bytes()).unwrap();
+        assert_eq!(text, msl, "the bytes stored");
+        let interface = msl::read(&text, ShaderStage::Fragment, "fs_main").unwrap();
+        assert_eq!(interface.outputs, 0b1);
+        let error = msl_text(vec![b'a', 0xff, b'\r', b'\n']).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_diagnostic_with_crlf_is_shown_with_lf() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'error[E1]: a\\r\\n  b\\r\\n' >&2; exit 1"]);
+        let error = run(&mut command, "x.slang").unwrap_err();
+        assert_eq!(error.message(), "x.slang: sh failed:\nerror[E1]: a\n  b");
     }
 
     #[test]

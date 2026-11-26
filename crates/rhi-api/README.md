@@ -939,7 +939,11 @@ is a supertrait of `Encoder` so a backend recovers its own type in a submit.
   timeline has already met holds nothing back, and a promise outlives its submit's
   completion until the timeline reaches it: on Metal the backend's own event, encoded before
   the caller's signals, completes a submit before its promise lands.
-- `wait_timeline` blocks for at most its timeout and returns whether the point was reached.
+- `wait_timeline` blocks until the point is reached or its timeout has passed, and returns
+  whether the point was reached; it returns `false` only once the timeout has passed by
+  `std::time::Instant`, measured from the call. A device backend whose driver's wait returns
+  its timeout early, as AMD's Windows driver 26.11.2 did by up to 3 ms of 30, waits again for
+  what is left.
   A wait may be made before the signal that satisfies it is submitted; a present behind one
   holds, and is refused past its bound ("The swapchain").
 - A fence is a timeline point a submit signals. The facade has no other fence; Metal's
@@ -1352,9 +1356,12 @@ column, one or more for each of its clauses, 69 in all: `unreported_capability_i
 - `destroy_at_once_after_the_wait_is_accepted` holds a device to "Queues by role": a lagging
   submit, a wait for its point, then at once a destroy and a reset, repeated, each accepted.
 - `dispatch_beyond_the_group_limit_is_refused` and `viewport_outside_its_rules_is_refused`
-  go one past the limits the device reports; null runs them under `Capabilities::LEAST`, and
-  a device under `LEAST` would need to report below its driver's limits, which no device
-  backend does, so a device runs them against its own.
+  go one past the limits the device reports: the dispatch in each dimension whose limit is
+  below `u32::MAX`, since no count exceeds that one (AMD's Windows driver reports it in x),
+  printing that it skipped the others and skipped whole where all three are. Null runs them
+  under `Capabilities::LEAST`, and under AMD's limits in its own test of the skip; a device
+  under `LEAST` would need to report below its driver's limits, which no device backend does,
+  so a device runs them against its own.
   `empty_draws_and_dispatches_record_nothing` runs with Metal API validation on.
 - `cooked_shader_forged_under_a_valid_checksum_is_refused` writes each breach of the
   version 2 fields into a valid encoding and makes its checksum again, as a writer that

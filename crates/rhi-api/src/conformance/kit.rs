@@ -185,6 +185,12 @@ impl<'a> Ctx<'a> {
         Self { harness, case, set, sink: Arc::default() }
     }
 
+    /// Says that a part of the case, `what`, does not apply under the set, in the words a
+    /// device backend's test gives a case skipped whole ([`Outcome::Skipped`](super::Outcome)).
+    pub(super) fn skip_part(&self, what: &str) {
+        eprintln!("{}: skipped in part, {what}", self.case.name);
+    }
+
     /// The messages the sink of every device of this context has been sent that the case
     /// did not provoke ([`provoking`](Self::provoking)).
     pub(super) fn messages(&self) -> usize {

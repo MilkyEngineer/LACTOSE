@@ -136,6 +136,18 @@ images are colour attachments and nothing else, and nothing that ships turns it 
 - **The submit** takes its queue's lock and the records', makes every check a submit can be
   refused by, stamps the submit, gives the records' lock up and calls `vkQueueSubmit2` with
   the caller's waits and signals and the queue's own timeline signal last.
+- **Timed waits** are held to the host's clock (`src/wait.rs`). A driver may return
+  `VK_TIMEOUT` before the time it was given has passed by `Instant`: AMD's Windows driver
+  26.11.2 returned it from `vkWaitSemaphores` on a point only the host signals after 27.0 ms
+  of 30 in 11 of 50 waits. Each timed wait whose caller rests on its length takes its
+  deadline from `Instant` and, on `VK_TIMEOUT` before it, waits again for what is left:
+  `wait_timeline` from the call's start; an acquire's `vkAcquireNextImageKHR`, `None` only
+  once its second has passed; and a present's and a `resize`'s wait for present fences and
+  for the present queue's own timeline, against their bound, and the drop's against its three
+  seconds. A present's wait for an undecided point walks again after any return and is held
+  to its bound by that walk. A wait of no time (the device's reads of a timeline) and one of
+  `u64::MAX` (an encoder's drop behind its submit, the heap's wait for its placeholder
+  image's transition) need neither.
 
 ## The swapchain
 
@@ -383,6 +395,12 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   with no lock on one thread under a lagging dispatch while another submits to it, made only
   while the dispatch is pending (its lag doubled up to four times where it ended first), with
   a watchdog that aborts the process after 30 seconds should the driver hang.
+- `src/wait.rs`, unit tests with a driver's wait played by a closure, needing no device: a
+  `VK_TIMEOUT` returned early, twice, waited again with what is left and the third call's
+  result returned; a wait returning at half its time each call, timed out only once its
+  30 ms have passed; a zero timeout one poll; a timeout too long for the clock waited with
+  `u64::MAX`; and any other result returned at once. With the re-wait removed the first and
+  second fail.
 - `tests/swapchain.rs`, on a headless surface: 48 frames, two in flight, presented across a resize,
   each clearing a target on the graphics queue that crosses to the present queue, exclusively by a
   release and an acquire where present has its own queue and concurrently, and is read back there

@@ -260,9 +260,12 @@ pub trait Device: Send + Sync {
     fn signal_timeline(&self, point: TimelinePoint) -> Result<()>;
 
     /// Blocks until the point is reached or `timeout` has passed, and returns whether it
-    /// was reached. A zero timeout polls. A device backend that returns `true` records the
-    /// point as reached before it returns, so no later call is refused as `pending` for a
-    /// submit that signals it (`README.md`, "Queues by role").
+    /// was reached. It returns `false` only once `timeout` has passed by
+    /// [`Instant`](std::time::Instant), measured from the call: a device backend whose
+    /// driver's wait returns early waits again for what is left. A zero timeout polls. A
+    /// device backend that returns `true` records the point as reached before it returns, so
+    /// no later call is refused as `pending` for a submit that signals it (`README.md`,
+    /// "Queues by role").
     ///
     /// # Errors
     ///

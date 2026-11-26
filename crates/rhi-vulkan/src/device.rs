@@ -32,7 +32,7 @@ use crate::surface::Target;
 use crate::swapchain::{Left, SwapchainObj, VulkanSwapchain};
 use crate::table::Table;
 use crate::timestamps::QueryObj;
-use crate::{lock, submit};
+use crate::{lock, submit, wait};
 
 /// Host memory a buffer's allocation is mapped to for as long as the buffer lives.
 struct Mapping {
@@ -1587,6 +1587,7 @@ impl Device for VulkanDevice {
     }
 
     fn wait_timeline(&self, point: TimelinePoint, timeout: Duration) -> Result<bool> {
+        let deadline = wait::deadline(timeout);
         let object = {
             let records = self.records();
             records.timeline(point.timeline)?;
@@ -1596,9 +1597,11 @@ impl Device for VulkanDevice {
         let semaphores = [object.semaphore];
         let values = [point.value];
         let info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values);
-        let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
-        // SAFETY: the count keeps the semaphore alive through the wait.
-        match unsafe { self.shared.raw.device.wait_semaphores(&info, nanos) } {
+        let waited = wait::until(deadline, |nanos| {
+            // SAFETY: the count keeps the semaphore alive through the wait.
+            unsafe { self.shared.raw.device.wait_semaphores(&info, nanos) }
+        });
+        match waited {
             Ok(()) => {
                 let mut records = self.records();
                 if self

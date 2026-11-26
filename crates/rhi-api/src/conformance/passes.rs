@@ -406,7 +406,19 @@ fn dispatch_beyond_the_group_limit_is_refused(ctx: &Ctx<'_>) -> Applies {
     let device = ctx.device();
     let pipeline = ctx.compute(&*device);
     let limit = ctx.set.compute_groups;
-    for axis in 0..3 {
+    // A dimension whose limit is `u32::MAX`, as AMD's Windows driver reports in x, cannot be
+    // exceeded: the case checks the others, and does not apply where there are none.
+    let exceeded: Vec<usize> = (0..3).filter(|&axis| limit[axis] < u32::MAX).collect();
+    if exceeded.is_empty() {
+        return Err("each dimension's group limit is u32::MAX, which no dispatch exceeds");
+    }
+    if exceeded.len() < 3 {
+        ctx.skip_part(&format!(
+            "a dispatch past the limit of {limit:?} in the dimensions whose limit is u32::MAX, \
+             which no dispatch exceeds"
+        ));
+    }
+    for axis in exceeded {
         let mut groups = [1; 3];
         groups[axis] = limit[axis] + 1;
         let mut encoder = ctx.encoder(&*device, G);
