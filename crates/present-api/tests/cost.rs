@@ -1,8 +1,12 @@
 //! What extract's pass costs (`README.md`, "Proof for milestone 2", Cost): a server world of
-//! instances, half of which move every tick, a stated share of them presented rows the
-//! snapshot holds, extracted to a null sink that only counts. Asserted on what does not
-//! depend on the machine (how many rows each pass writes, and the snapshot's rows); the
-//! times are measured by an ignored test, run by hand in release, and reported, never
+//! instances in four archetypes and sixteen regions, half of which move every tick, a stated
+//! count of them presented rows the snapshot holds, extracted to a null sink that only counts.
+//! The presented rows' keys follow no chunk order: they are interleaved across the chunks of
+//! both presented archetypes and across the regions, a column of each chunk, as
+//! `extract-50k`'s scene lays them out (D164), so the snapshot's fill is measured where an
+//! order is work to find. Asserted on what
+//! does not depend on the machine (how many rows each pass writes, and the snapshot's rows);
+//! the times are measured by an ignored test, run by hand in release, and reported, never
 //! asserted:
 //!
 //! `cargo nextest run -p lactose-present-api --run-ignored only --cargo-profile release
@@ -23,11 +27,14 @@ use std::time::{Duration, Instant};
 
 use crate::common;
 
-use common::{REGION, Rig, Shown, Walker, at, key, mesh, scalar, simulation};
+use common::{Rig, Shown, Walker, at, key, mesh, simulation};
 use lactose_core::{StableKey, Tick};
-use lactose_ecs::{LayoutConfig, WorldKind};
+use lactose_ecs::{LayoutConfig, RegionConfig, RegionId, RegionMode, WorldKind};
 use lactose_math::Scalar;
 use lactose_present_api::{ExtractPass, InstanceRow, InstanceSink, extract_state};
+
+/// The scene's regions: `common`'s two and fourteen more.
+const REGIONS: u64 = 16;
 
 /// A sink that keeps nothing: it counts the rows written, which a relaxed add per batch does
 /// at no measurable cost.
@@ -46,10 +53,20 @@ impl InstanceSink for NullSink {
     fn end(&mut self) {}
 }
 
-/// A server world of `rows` instances, the first `moving` of which walk one unit a tick and
-/// the first `presented` of which carry `Shown`, with a null sink and, if `snapshot`, a
-/// snapshot channel. Returns the rig, the sink's count and the rows each pass writes.
-fn scene(rows: u64, moving: u64, presented: u64, snapshot: bool, workers: u32) -> (Rig, NullSink) {
+/// The region of row `n`.
+fn region(n: u64) -> RegionId {
+    RegionId(1 + n % REGIONS)
+}
+
+/// A server world of `rows` instances in sixteen regions, row `n` in region `1 + n % 16`, the
+/// even rows walking one unit a tick, and `presented` of them carrying `Shown`: those at 1 and
+/// 2 modulo `2 * rows / presented`, so half the presented rows walk, and each presented
+/// archetype's chunks interleave their keys with the other's. Each presented archetype's rows
+/// sit in `16 / gcd(2 * rows / presented, 16)` of the regions: two at 5,000 of 100,000, four
+/// at 10,000. A null sink and, if `snapshot`, a snapshot channel are installed.
+fn scene(rows: u64, presented: u64, snapshot: bool, workers: u32) -> (Rig, NullSink) {
+    let period = 2 * rows / presented;
+    assert!(period >= 3 && period * presented == 2 * rows, "{presented} of {rows} rows");
     let mut rig = Rig::new(
         simulation(WorldKind::Server, LayoutConfig::default(), Tick(1)),
         common::executor(workers),
@@ -61,12 +78,24 @@ fn scene(rows: u64, moving: u64, presented: u64, snapshot: bool, workers: u32) -
         drop(state.set_snapshot(None));
     }
     let world = rig.world_mut();
+    for id in 3..=REGIONS {
+        let config = RegionConfig { id: RegionId(id), seed: 10 + id, mode: RegionMode::Simulated };
+        world.create_region(config).expect("a region");
+    }
     for n in 1..=rows {
-        let walker = Walker(if n <= moving { Scalar::ONE } else { scalar(0.0) });
-        world.spawn(key(n), REGION, (at(0.0), mesh(n), walker)).unwrap();
-        if n <= presented {
-            world.insert(key(n), Shown(1)).unwrap();
-        }
+        let walks = n % 2 == 0;
+        let shown = matches!(n % period, 1 | 2);
+        let spawned = match (walks, shown) {
+            (false, false) => world.spawn(key(n), region(n), (at(0.0), mesh(n))),
+            (false, true) => world.spawn(key(n), region(n), (at(0.0), mesh(n), Shown(1))),
+            (true, false) => {
+                world.spawn(key(n), region(n), (at(0.0), mesh(n), Walker(Scalar::ONE)))
+            }
+            (true, true) => {
+                world.spawn(key(n), region(n), (at(0.0), mesh(n), Walker(Scalar::ONE), Shown(1)))
+            }
+        };
+        spawned.unwrap();
     }
     (rig, sink)
 }
@@ -81,52 +110,132 @@ fn frame(rig: &mut Rig, sink: &NullSink) -> usize {
 
 #[test]
 fn a_pass_writes_the_moved_rows_and_the_snapshot_holds_the_presented_ones() {
-    let (mut rig, sink) = scene(2_000, 1_000, 200, true, 2);
+    let (mut rig, sink) = scene(2_000, 200, true, 2);
     assert_eq!(frame(&mut rig, &sink), 2_000, "the first pass is full");
     for _ in 0..3 {
         assert_eq!(frame(&mut rig, &sink), 1_000, "the rows that moved");
     }
     let frame = rig.reader.acquire().unwrap();
-    assert_eq!(frame.newer().rows::<Shown>().len(), 200);
+    let shown: Vec<StableKey> = frame.newer().rows::<Shown>().map(|(key, _)| key).collect();
+    assert_eq!(shown.len(), 200);
+    let walking = shown.iter().filter(|&&key| rig.world().get::<Walker>(key).is_some()).count();
+    assert_eq!(walking, 100, "half the presented rows walk");
+    assert_eq!(interleaved(&rig), (1, 1), "each presented archetype one chunk");
 }
 
-/// The times, at 50,000 rows moved among 100,000 with 10,000 presented rows, and with no
-/// snapshot installed so the snapshot's part shows: the median and the least of the pass's
-/// time over many frames, under one worker and four.
+/// The timed scene's layout, at both counts of presented rows: the plan's (milestone 2, row
+/// `extract-50k`), the presented archetypes' chunks interleaved, so no chunk order is key order.
+#[test]
+fn the_timed_scene_interleaves_its_presented_archetypes() {
+    for presented in [5_000, 10_000] {
+        let (rig, _sink) = scene(100_000, presented, true, 1);
+        let (walking, still) = interleaved(&rig);
+        println!("{presented} presented rows: {walking} chunks walking, {still} not");
+        assert!(walking > 1 && still > 1, "the timed scene's archetypes span several chunks");
+    }
+}
+
+/// Asserts that no order of the presented chunks is key order: every chunk of a presented
+/// archetype that holds two rows or more holds keys on both sides of a key of the other
+/// presented archetype, which no concatenation of chunks can put in order. Within an
+/// archetype the chunks may run in key order; across the two they cannot. A row's region is a
+/// column of its chunk, so the regions interleave within each chunk. Returns how many chunks
+/// each presented archetype has, the walking one's first.
+fn interleaved(rig: &Rig) -> (usize, usize) {
+    let shown = <Shown as lactose_reflect::Reflect>::KEY;
+    let walker = <Walker as lactose_reflect::Reflect>::KEY;
+    let (walking, still): (Vec<_>, Vec<_>) = rig
+        .world()
+        .chunks()
+        .filter(|chunk| chunk.column(shown).is_some())
+        .partition(|chunk| chunk.column(walker).is_some());
+    for (these, others) in [(&walking, &still), (&still, &walking)] {
+        for chunk in these.iter().filter(|chunk| chunk.keys().len() > 1) {
+            let low = chunk.keys().iter().min().expect("two rows");
+            let high = chunk.keys().iter().max().expect("two rows");
+            let split =
+                others.iter().flat_map(|other| other.keys()).any(|key| low < key && key < high);
+            assert!(split, "a presented chunk whose keys no key of the other archetype splits");
+        }
+    }
+    (walking.len(), still.len())
+}
+
+/// The arm of the ignored test that runs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Arm {
+    /// No snapshot installed: the ring's part alone.
+    Ring,
+    /// The snapshot installed, the presented rows staying where they are.
+    Snapshot,
+    /// The snapshot installed, and before every tick one presented row despawned and another
+    /// spawned in its archetype and region: a pass whose kept places no longer hold, which
+    /// sorts.
+    Sorting,
+}
+
+/// The times, at 50,000 rows moved among 100,000, with 5,000 presented rows, the count
+/// criterion 4 is judged at, and 10,000 printed beside it (D164): for each, the median and the
+/// least of the pass's time over sixty frames with no snapshot installed, with one, and with
+/// one whose order is broken at every tick, under one worker and four. The snapshot's part is
+/// the median with it less the median without.
 #[test]
 #[ignore = "a measurement, run by hand: timings are reported, not asserted"]
 #[expect(clippy::disallowed_types, reason = "a measurement, run by hand: timings are reported")]
 fn extract_at_fifty_thousand_moved_among_a_hundred_thousand() {
     const ROWS: u64 = 100_000;
-    const MOVING: u64 = 50_000;
-    const PRESENTED: u64 = 10_000;
+    const MOVING: usize = 50_000;
     // Decision 5.2 of the milestone 2 plan measures over 60 passes.
     const FRAMES: usize = 60;
-    for workers in [1, 4] {
-        for snapshot in [true, false] {
-            let (mut rig, sink) = scene(ROWS, MOVING, PRESENTED, snapshot, workers);
-            frame(&mut rig, &sink);
-            let mut times: Vec<Duration> = Vec::with_capacity(FRAMES);
-            for _ in 0..FRAMES {
-                rig.step();
-                let start = Instant::now();
-                rig.passes();
-                times.push(start.elapsed());
-                rig.publish();
-                assert_eq!(sink.0.swap(0, Ordering::Relaxed), 50_000);
-                if snapshot {
-                    let frame = rig.reader.acquire().unwrap();
-                    assert_eq!(frame.newer().rows::<Shown>().len(), 10_000);
+    for presented in [5_000, 10_000] {
+        let period = 2 * ROWS / presented;
+        for workers in [1, 4] {
+            let mut ring = Duration::ZERO;
+            for arm in [Arm::Ring, Arm::Snapshot, Arm::Sorting] {
+                let (mut rig, sink) = scene(ROWS, presented, arm != Arm::Ring, workers);
+                frame(&mut rig, &sink);
+                // The despawned row of the sorting arm: a presented row that does not walk.
+                let mut gone = 1;
+                let mut times: Vec<Duration> = Vec::with_capacity(FRAMES);
+                for spawned in 1..=FRAMES {
+                    if arm == Arm::Sorting {
+                        let world = rig.world_mut();
+                        let region = world.region_of(key(gone)).expect("a live row");
+                        world.despawn(key(gone)).unwrap();
+                        let fresh = key(ROWS + u64::try_from(spawned).unwrap());
+                        world.spawn(fresh, region, (at(0.0), mesh(1), Shown(1))).unwrap();
+                        gone += period;
+                    }
+                    rig.step();
+                    let start = Instant::now();
+                    rig.passes();
+                    times.push(start.elapsed());
+                    rig.publish();
+                    let written = sink.0.swap(0, Ordering::Relaxed);
+                    // The sorting arm also writes the row it spawned, and once more, at the
+                    // settling write, the row it spawned the frame before.
+                    let spawned =
+                        if arm == Arm::Sorting { 1 + usize::from(spawned > 1) } else { 0 };
+                    assert_eq!(written, MOVING + spawned, "the moved rows and the spawned ones");
+                    if arm != Arm::Ring {
+                        let frame = rig.reader.acquire().unwrap();
+                        let held = frame.newer().rows::<Shown>().len();
+                        assert_eq!(held, usize::try_from(presented).unwrap());
+                    }
                 }
+                times.sort_unstable();
+                let median = times[FRAMES / 2];
+                if arm == Arm::Ring {
+                    ring = median;
+                }
+                println!(
+                    "extract, {MOVING} moved among {ROWS}, {presented} presented rows, {arm:?}, \
+                     {workers} worker(s): median {median:?}, least {:?} over {FRAMES} passes; \
+                     the snapshot's part {:?}",
+                    times[0],
+                    median.saturating_sub(ring),
+                );
             }
-            times.sort_unstable();
-            println!(
-                "extract, {MOVING} moved among {ROWS}, {} presented rows in the snapshot, \
-                 {workers} worker(s): median {:?}, least {:?} over {FRAMES} passes",
-                if snapshot { PRESENTED } else { 0 },
-                times[FRAMES / 2],
-                times[0],
-            );
         }
     }
 }

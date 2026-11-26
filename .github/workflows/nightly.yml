@@ -127,7 +127,7 @@ jobs:
             args: -p lactose-platform --lib --test integration
             miriflags: -Zmiri-many-seeds=0..4
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Miri is the one sanctioned use of a nightly toolchain (architecture section 8.3).
       - run: rustup toolchain install $MIRI_TOOLCHAIN --profile minimal --component miri,rust-src
       # Every entry is the same job, so each takes its own cache key.
@@ -153,7 +153,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p lactose-task --features loom --release --locked
@@ -185,7 +185,7 @@ jobs:
           - os: macos-latest
             platform: macos-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -237,7 +237,7 @@ jobs:
       # a timeout in them cannot cost the dev baseline its upload.
       - name: Keep the baseline hashes
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: sour-hashes-${{ matrix.platform }}
           path: sour-hashes-${{ matrix.platform }}.tsv
@@ -255,7 +255,7 @@ jobs:
       # the failure replays exactly.
       - name: Keep SOUR output
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: sour-output-${{ matrix.platform }}
           path: |
@@ -273,10 +273,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: sour-hashes-*
           merge-multiple: true
@@ -338,20 +338,20 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install lavapipe
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends mesa-vulkan-drivers
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: target/vulkan-sdk/download
           key: vulkan-sdk-${{ hashFiles('tools/xtask/vulkan-layer.toml') }}
       - name: The device tests under GPU-assisted validation
         run: cargo xtask gpu --driver lavapipe --only vulkan --gpu-assisted
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: success() || failure()
         with:
           name: gpu-lavapipe-gpu-assisted
@@ -415,7 +415,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep vulkaninfo's output
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: gpu-probe-lavapipe
           path: |

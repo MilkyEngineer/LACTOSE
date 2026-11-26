@@ -25,6 +25,7 @@ mod job;
 mod job_run;
 mod lane;
 mod latch;
+mod measure;
 #[cfg(all(test, feature = "loom"))]
 mod models;
 mod parking;
@@ -45,8 +46,9 @@ pub use graph::{Graph, GraphBuilder, GraphError, GraphNode, GraphRun, NodeId};
 pub use job::{ChildContext, JobContext, Scope};
 pub use job_run::JobRun;
 pub use lane::{Lane, LaneCall, LanePump, lane};
+pub use measure::{TaskRole, current_core_class, take_foreground_task_role};
 pub use parking::{ParkingPump, parking_lane};
-pub use platform::{CoreTopology, Platform, StdPlatform, ThreadHandle, ThreadSpec};
+pub use platform::{CoreClass, CoreTopology, Platform, StdPlatform, ThreadHandle, ThreadSpec};
 pub use task::{Task, YieldNow, yield_now};
 pub use time::{Sleep, TickBudget, TickPacer};
 
