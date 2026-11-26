@@ -30,7 +30,7 @@ jobs:
           - os: windows-latest
             platform: windows-x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -45,7 +45,7 @@ jobs:
       # Whatever the run got to, so a failure elsewhere still keeps a figure written.
       - name: Keep edit-to-playing
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: edit-to-playing-${{ matrix.platform }}
           path: target/measure/results/edit-to-playing-*
