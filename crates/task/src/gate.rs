@@ -366,12 +366,13 @@ pub(crate) fn wait_for_children(
             if proceed.is_none() {
                 // A listener's callbacks run between the re-check and the park, and one that
                 // waits through this thread's parker takes the token an unpark sent meanwhile
-                // left: the set latch, freed permit or shutdown it came with would be missed,
-                // and the opener would sleep beside it for good. So the re-check runs again
-                // once they have.
+                // left: the set latch, freed permit, shutdown or child queued for this opener
+                // it came with would be missed, and the opener would sleep beside it. So once
+                // they have run, the re-check runs again, and an opener with no children here
+                // looks where its children are queued, as it does after a wake.
                 let _park = tracing::debug_span!(target: TARGET, "park", wait = "latch").entered();
                 proceed = recheck(latch, gate, children_here, opener);
-                if proceed.is_none() {
+                if proceed.is_none() && (children_here || !opener.look()) {
                     opener.park(latch);
                 }
             }
@@ -412,7 +413,7 @@ pub(crate) fn wait_for_children(
 }
 
 /// The opener's wait against a tracing listener that takes the thread's park token: each of
-/// the three reasons that end the wait with an unpark, landing between the re-check and the
+/// the four reasons that end the wait with an unpark, landing between the re-check and the
 /// park, where the latch `park` span's callbacks run.
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
@@ -436,16 +437,29 @@ mod tests {
         }
     }
 
-    /// An opener with one child: on its own deque, where the gate stops it and which it
-    /// runs once it may go on, or with another worker, which counts it down. It never parks:
-    /// in each test the wait has a reason to end before it would, and the listener has taken
-    /// the token that reason's unpark left, so a park would sleep through it.
+    /// Where the scope's one child is.
+    #[derive(Clone, Copy)]
+    enum Child<'a> {
+        /// With another worker, which counts it down.
+        Elsewhere,
+        /// On the opener's own deque, where the gate stops it the first time.
+        OnDeque,
+        /// Queued for the opener of a `run_job` scope once the flag is set, as another worker
+        /// that splits a half off or puts one back queues it.
+        Queued(&'a AtomicBool),
+        /// Run by the opener.
+        Ran,
+    }
+
+    /// An opener with one child, which it runs once it may go on. It never parks: in each
+    /// test the wait has a reason to end before it would, and the listener has taken the
+    /// token that reason's unpark left, so a park would sleep through it.
     struct OneChild<'a> {
         latch: &'a Latch,
         shutdown: &'a AtomicBool,
         /// Set by the listener once the latch `park` span is made.
         heard: &'a AtomicBool,
-        on_deque: bool,
+        child: Child<'a>,
         stopped: bool,
         /// What the opener would park beside.
         beside: &'static str,
@@ -453,13 +467,13 @@ mod tests {
 
     impl Opener for OneChild<'_> {
         fn run_children(&mut self) -> bool {
-            if !self.on_deque {
-                return false;
+            match self.child {
+                Child::OnDeque if !core::mem::replace(&mut self.stopped, true) => return true,
+                Child::OnDeque => {}
+                Child::Queued(queued) if queued.swap(false, Ordering::SeqCst) => {}
+                Child::Elsewhere | Child::Queued(_) | Child::Ran => return false,
             }
-            if !core::mem::replace(&mut self.stopped, true) {
-                return true;
-            }
-            self.on_deque = false;
+            self.child = Child::Ran;
             assert!(self.latch.count_down(1), "the scope's one child");
             false
         }
@@ -473,7 +487,7 @@ mod tests {
         }
 
         fn look(&mut self) -> bool {
-            false
+            matches!(self.child, Child::Queued(queued) if queued.load(Ordering::SeqCst))
         }
 
         fn park(&mut self, _latch: &Latch) {
@@ -519,14 +533,13 @@ mod tests {
         gate: &Gate,
         latch: &Latch,
         shutdown: &AtomicBool,
-        on_deque: bool,
+        child: Child<'_>,
         beside: &'static str,
         event: impl FnOnce() + Send + 'static,
     ) {
         let wake = Opened(std::thread::current());
         let heard = Arc::new(AtomicBool::new(false));
-        let mut opener =
-            OneChild { latch, shutdown, heard: &heard, on_deque, stopped: false, beside };
+        let mut opener = OneChild { latch, shutdown, heard: &heard, child, stopped: false, beside };
         let event = std::sync::Mutex::new(Some(event));
         let listener = TakesTheToken { event, heard: heard.clone() };
         tracing::subscriber::with_default(listener, || {
@@ -548,7 +561,8 @@ mod tests {
                 opener.unpark(0);
             }
         };
-        wait_through(&gate, &latch, &AtomicBool::new(false), false, "on a set latch", event);
+        let shutdown = AtomicBool::new(false);
+        wait_through(&gate, &latch, &shutdown, Child::Elsewhere, "on a set latch", event);
         assert_eq!(gate.permits(), (1, None), "the opener holds its permit again");
     }
 
@@ -567,7 +581,7 @@ mod tests {
             move || gate.release(&opener)
         };
         let beside = "beside its child and a free permit";
-        wait_through(&gate, &latch, &AtomicBool::new(false), true, beside, event);
+        wait_through(&gate, &latch, &AtomicBool::new(false), Child::OnDeque, beside, event);
         assert_eq!(gate.permits(), (1, Some(1)), "the opener holds the reserved permit");
     }
 
@@ -588,7 +602,26 @@ mod tests {
                 opener.unpark(0);
             }
         };
-        wait_through(&gate, &latch, &shutdown, true, "beside its child after shutdown", event);
+        let beside = "beside its child after shutdown";
+        wait_through(&gate, &latch, &shutdown, Child::OnDeque, beside, event);
         assert_eq!(gate.permits(), (1, Some(0)), "the opener took a permit back past the limit");
+    }
+
+    #[test]
+    fn a_listener_that_takes_a_queued_childs_unpark_costs_no_wake_up() {
+        let (gate, latch, queued) = (Gate::new(1), Latch::new(), Arc::new(AtomicBool::new(false)));
+        latch.add(1);
+        assert!(gate.try_acquire(), "the opener's permit");
+        let event = {
+            let (queued, opener) = (queued.clone(), Opened(std::thread::current()));
+            // As `Width::queued` does for a child another worker splits off or puts back.
+            move || {
+                queued.store(true, Ordering::SeqCst);
+                opener.unpark(0);
+            }
+        };
+        let (shutdown, child) = (AtomicBool::new(false), Child::Queued(&queued));
+        wait_through(&gate, &latch, &shutdown, child, "with its child queued", event);
+        assert_eq!(gate.permits(), (1, None), "the opener holds its permit again");
     }
 }

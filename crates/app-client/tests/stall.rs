@@ -26,7 +26,11 @@
 //! from the end of the step's `block_in_place` closure to the gate's return, and `park`,
 //! around each wait a frame worker makes without a permit, in the idle protocol or on a
 //! scope's latch. A worker is *parked across* an opening when its `park` began before the
-//! opening's start and ended after it. At each reservation the file gives the time from
+//! opening's start and ended after it, whether or not it slept: the idle wait returns without
+//! sleeping when a waker has already claimed the worker, and the latch's when its re-check
+//! after the span's callbacks finds a reason to go on. Either way the worker was waiting
+//! without a permit when the opening began, and its exit may have another cause than the
+//! opening, such as a latch set meanwhile. At each reservation the file gives the time from
 //! each opening's start to the `park` exit of each worker parked across it, with the count of
 //! each kind of wait; the opening's own length, on the opener's side, which bounds no wake;
 //! for the openings after which a worker parked across it took the record's

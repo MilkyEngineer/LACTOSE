@@ -302,7 +302,9 @@ and list what changed, because `lactose-ecs` is written against this surface.
   - `open_gate`, around `Pool::open_gate` in `JobContext::block_in_place`: from the closure's
     return to the gate's return.
   - `park`, around each of the two waits a worker makes without a permit, entered before the
-    wait and exited when it returns. Its field `wait` says which: `"idle"` for `sleep.park` in
+    wait and exited when it returns, or with no sleep in it when the wait finds it need not
+    sleep after all: the idle wait when a waker has already claimed the worker, the latch's when
+    its re-check after the callbacks finds a reason to go on. Its field `wait` says which: `"idle"` for `sleep.park` in
     `gate::idle_park`, whenever a worker parks in the idle protocol, whatever its last look saw,
     nothing or work with no permit to take it; `"latch"` for `opener.park(latch)` in
     `gate::wait_for_children`, a scope's opener on its latch, which `Pool::open_gate` wakes with
@@ -323,7 +325,9 @@ and list what changed, because `lactose-ecs` is written against this surface.
   `sync_channel` hand-off) takes the token an unpark left, but the idle wait parks only while
   its sleeper bit says nobody has claimed the worker, and the latch wait checks its latch, its
   permit and shutdown again once the `park` span is entered, after the callbacks, before it
-  parks. The repository's own listeners at debug, `record-stall` and this crate's span tests,
+  parks, and a `run_job` scope's opener looks again where its children are queued: between
+  them, every reason the latch wait ends, an opening of the gate among them as a permit. The
+  repository's own listeners at debug, `record-stall` and this crate's span tests,
   take a `Mutex` there, held by any thread for a few pushes and reads at most: a wait that
   short is what the rule allows, and a wake `record-stall` times includes it.
 
