@@ -62,11 +62,11 @@ and device ids, the driver's name, information and version, the device's and the
 API versions, the loader (the pinned SDK's, or the system's with its instance version), the
 validation (off), the presentation (none: the run makes no surface, so it has no present mode
 or refresh rate), the memory type the ring's `MemoryClass::Upload` gets by
-`lactose-rhi-vulkan`'s rule, and the variables set, paths written from the SDK's root or cut
-to a file name. A test that hears a message from the device fails. `--no-device` leaves these out of `--all`; `cargo xtask gpu`
-runs them short under its validators, figures discarded. With no `--driver`, `gpu-cost` runs
-once under each of the host's drivers, MoltenVK and then KosmicKrisp on macOS, each driver's
-files named and headed for it (`gpu-cost-moltenvk-<machine>-<date>`).
+`lactose-rhi-vulkan`'s rule, and the variables set, paths written from the SDK's root or cut to
+a file name. A test that hears a message from the device fails. `--no-device` leaves these out
+of `--all`; `cargo xtask gpu` runs them short under its validators, figures discarded. With no
+`--driver`, `gpu-cost` runs once under each of the host's drivers, MoltenVK and then KosmicKrisp
+on macOS, each driver's files named and headed for it (`gpu-cost-moltenvk-<machine>-<date>`).
 
 `triangle` is criterion 1's proof, not a measurement of time: it runs the client binary under
 the validators `cargo xtask gpu` turns on, with the pinned layer, on the host's drivers as
@@ -86,8 +86,8 @@ step, `cargo xtask gpu --only vulkan`, on the host's drivers as `gpu-cost` does,
 GPU-assisted validation on each driver that takes it (not MoltenVK), and writes each run's report
 from the target directory as `rhi-conformance-<driver>[-gpu-assisted]-<machine>-<date>.md`, under a
 header of its own, and a file of the same name an earlier run left is removed first. It fails where
-the gate does, after its file is written, or with none where the gate wrote no report. `--short` cuts nothing
-of it, and `--all` runs it last.
+the gate does, after its file is written, or with none where the gate wrote no report. `--short`
+cuts nothing of it, and `--all` runs it last.
 
 | Measurement | What | Run | Threshold |
 |---|---|---|---|

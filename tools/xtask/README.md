@@ -577,8 +577,8 @@ standard error as it comes.
   and the driver's manifest is pinned as `gpu` pins it. No loader settings file is in reach,
   as for a `gpu` run (the XDG directories and the refusal described under "GPU runs").
   `vulkaninfo` (the SDK's on macOS, the one on the path elsewhere) runs once under
-  the same environment before the first of them, and the run is refused where it is not
-  found, runs past its deadline, exits with a failure, lists an instance layer or prints no
+  the same environment before the first of them, and the run is refused where it does not
+  start, runs past its deadline, exits with a failure, lists an instance layer or prints no
   list this tool reads; each file's header adds the rows of the device its test named in
   `device.adapter`: its name and vendor and device ids, the driver's name, information and
   version, the device's and the instance's API versions, the loader (the pinned SDK's by its
@@ -804,7 +804,8 @@ compute encoder hides under MoltenVK. KosmicKrisp runs without Metal's validatio
 its queue aborts under API validation and its heap's textures are not resident under shader
 validation, defects of that driver. `gpu --gpu-assisted` with no `--driver` runs KosmicKrisp
 alone, since the layer's instrumented shaders fail in MoltenVK's SPIRV-Cross. On another host
-a run names its driver, and on Windows it is `system` alone. `--driver <name>` runs one driver, for development, and `--adapter`
+a run names its driver, and on Windows it is `system` alone. `--driver <name>` runs one driver, for
+development, and `--adapter`
 goes with `--driver system` alone. Every step runs before a failure fails the run, so each
 writes its report.
 
@@ -1018,7 +1019,8 @@ writes its report.
    KosmicKrisp, where 45 of 217 did and 100 passes left 2 of 301; plain, 0 of 301 did under
    KosmicKrisp and, in the merger's run at `1c62676`, 1 of 301 under MoltenVK, so the plain run
    reaches a pending encoder seldom, and the gate holds it to no figure of them: a refused reset
-   fails either run, and a pending figure of zero fails the lagged one alone. KosmicKrisp's figure at 200 is wide,
+   fails either run, and a pending figure of zero fails the lagged one alone. KosmicKrisp's figure
+   at 200 is wide,
    17 to 81 of 209 to 247 calls over six runs, below a tenth of the calls in one, and more passes
    do not raise it: at 300, in three runs at load averages from 6.81 to 13.61, 2 of 165 to 170
    calls, and at 400, in three at 3.85 to 4.97, 2 of 110 to 121, the frame finding the GPU busy for
@@ -1089,7 +1091,8 @@ scatter-to-vertex barrier and the barrier across frames: each run copies the che
 fresh directory under `<out dir>`, patches one barrier out of `lactose-rhi-vulkan`'s encoder
 and the lag it needs into the scatter shader, and runs `cargo xtask gpu --only vulkan` there.
 The verdict is read from the gate's report under `<out dir>/target/gpu/`, never from its
-console, which prints no passing test: `caught` on the named test's `FAILED` line alone, where its control passed under that driver,
+console, which prints no passing test: `caught` on the named test's `FAILED` line alone, where its
+control passed under that driver,
 `MISSED` on its `passed` line, `KILLED` where it ran past its deadline, `NOT JUDGED` where
 its control failed, and `NOT RUN` on neither line. Each mutant's control runs before it, `--run`
 of a mutant included: its lag alone, or the checkout unpatched where it adds no lag, which must
