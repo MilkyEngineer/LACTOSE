@@ -844,15 +844,15 @@ changes one, the measurement commit's bullet in the plan, which gains the senten
 only session C's driver shows. The eleventh changes two, that bullet and the commit's row: each has
 the laptop stand for the pin, as ruled, only where the laptop's session finds the defect, and each
 has the one question left to the owner where session C's driver shows it. The twelfth changes none:
-the blocks and the decision entry are the eleventh's, byte for byte. Every block was applied in
-memory to the two files of `1c62676`: each OLD was found once, at the lines its head states. If a
-merge before the decision is applied moves a line, the blocks are built again from the merged files.
-`present-encoder`'s merge at `1c62676` inserted an addendum of D162 into the decisions log and
-replaced verification row 229, one line by one. It did not touch the plan, it moved no line of the
-verification file, and no block here names row 229, so the third version's blocks kept their lines
-and the next decision number is the one after D164. The plan's own record of the text it once
-appended to row 150, in its section "Verification rows", still reads "probed on the laptop's
-devices": it records an edit that was made, and it stays.
+the blocks are the eleventh's, byte for byte. Every block was applied in memory to the two files of
+`1c62676`: each OLD was found once, at the lines its head states. If a merge before the decision is
+applied moves a line, the blocks are built again from the merged files. `present-encoder`'s merge at
+`1c62676` inserted an addendum of D162 into the decisions log and replaced verification row 229, one
+line by one. It did not touch the plan, it moved no line of the verification file, and no block here
+names row 229, so the third version's blocks kept their lines and the next decision number is the
+one after D164. The plan's own record of the text it once appended to row 150, in its section
+"Verification rows", still reads "probed on the laptop's devices": it records an edit that was made,
+and it stays.
 
 The text is written for the owner's rulings.
 
@@ -1300,7 +1300,7 @@ gate's wake is read from two debug spans** (§5.1, §20, §21, §22, `lactose-ta
     it; a probe program written for row 150's four questions; a lane for the client's fault probe
     before the exit; a window measurement run on a system `lactose-platform` has not been run on.
 - Driven by: the exit pass's audit at `ad1a99d`; `docs/proposals/milestone-2-sittings.md`, its probe
-  of LunarG's installer and its nine reviews; `reviewer-gpu`'s reading for row 34; lane
+  of LunarG's installer and its ten reviews; `reviewer-gpu`'s reading for row 34; lane
   `park-stamp`'s reviews, for the opening's length and for a listener; the owner's rulings on its
   five questions, on the sittings' order, on 26 November 2026 on the order of the three runs and on
   the rehearsal, and on 28 November 2026 on a commit the laptop's session moves and on the
@@ -1670,8 +1670,8 @@ to the owner.
 the decision entry, the rows and the two commands files that changed against their last versions,
 and ran the checker again. It found M2 and the nit closed, and two nits and nothing more. The
 coordinator decided both, and kept the round to this text's body and the quiet window's commands.
-The decision entry and the twenty-one blocks stand as the eleventh version has them, byte for byte,
-so the entry's "its nine reviews" does not count this one.
+The twenty-one blocks stand as the eleventh version has them, byte for byte, and so does the
+decision entry, but for one word: its "Driven by" counts ten reviews, this one among them.
 
 | Finding | Answer |
 |---|---|
