@@ -602,6 +602,8 @@ fn run_vulkan(
         args.validators,
         args.adapter,
     )?;
+    // The device tests run in the repository's root, the working directory.
+    run.refuse_overrides(&context.root)?;
     let form = match args.validators {
         vulkan::Validators::Plain => "",
         vulkan::Validators::GpuAssisted => "-gpu-assisted",
@@ -679,6 +681,7 @@ fn run_vulkan(
     if let Some(binary) = client {
         let dir = context.root.join(out).join("client");
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        run.refuse_overrides(&dir)?;
         for passes in [0, client_lag(driver)] {
             let arm = client_arm(passes);
             if screen_locked()? {

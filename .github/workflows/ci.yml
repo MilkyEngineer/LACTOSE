@@ -343,10 +343,18 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends mesa-vulkan-drivers
+      # The download is the Linux archive alone: its url and digest key it, and another
+      # host's pin does not.
+      - name: The cache key of the Linux archive
+        id: archive
+        run: |
+          pin=$(awk '/^\[/ { linux = ($0 == "[host.linux-x86_64]") } linux && /^(url|sha256) = /' tools/xtask/vulkan-layer.toml)
+          test "$(printf '%s\n' "$pin" | wc -l)" -eq 2
+          echo "key=vulkan-sdk-$(printf '%s\n' "$pin" | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v5
         with:
           path: target/vulkan-sdk/download
-          key: vulkan-sdk-${{ hashFiles('tools/xtask/vulkan-layer.toml') }}
+          key: ${{ steps.archive.outputs.key }}
       - name: The device tests under lavapipe
         run: cargo xtask gpu --driver lavapipe --only vulkan
       - uses: actions/upload-artifact@v6

@@ -723,6 +723,36 @@ fn vulkaninfo(text: &str) -> VulkanInfo {
     info
 }
 
+/// The instance layers `vulkaninfo`'s text output lists, by name, or `None` where it has no
+/// list this reads: the section `Layers: count = <n>` of the full output or `Instance Layers:
+/// count = <n>` of `--summary`, either with no count where it lists none, each layer an
+/// unindented line that starts with its name (its extensions and devices indented below it),
+/// and the section ended by the next unindented line that is no layer's and no rule.
+fn instance_layers(text: &str) -> Option<Vec<String>> {
+    let mut lines = text.lines().map(str::trim_end);
+    let count = lines.find_map(|line| {
+        let rest =
+            line.strip_prefix("Layers:").or_else(|| line.strip_prefix("Instance Layers:"))?;
+        match rest.trim().strip_prefix("count = ") {
+            Some(count) => count.trim().parse::<usize>().ok().map(Some),
+            None if rest.trim().is_empty() => Some(None),
+            None => None,
+        }
+    })?;
+    let rule = |line: &str| !line.is_empty() && line.chars().all(|c| c == '=' || c == '-');
+    let mut layers = Vec::new();
+    for line in lines {
+        if line.is_empty() || line.starts_with(char::is_whitespace) || rule(line) {
+            continue;
+        }
+        if !line.starts_with("VK_LAYER_") {
+            break;
+        }
+        layers.push(line.split([' ', '(', ':']).next().unwrap_or(line).to_owned());
+    }
+    (layers.len() == count.unwrap_or(0)).then_some(layers)
+}
+
 /// `VkMemoryPropertyFlagBits` by bit, as the header names them.
 const MEMORY_FLAGS: [(u32, &str); 9] = [
     (0x1, "DEVICE_LOCAL"),
@@ -835,12 +865,19 @@ fn device_notes(setting: &DeviceSetting, adapter: Option<&str>) -> Vec<(String, 
         .as_ref()
         .map_or_else(|| "the system's".to_owned(), |version| format!("the Vulkan SDK {version}'s"));
     note("Loader", loader);
+    // A run whose `vulkaninfo` lists a layer is refused (`on_device`).
+    let listed = if setting.info.is_ok() {
+        ", as `vulkaninfo` under the same environment lists none"
+    } else {
+        ""
+    };
     note(
         "Validation",
-        "off: no layer loaded, the loader's implicit and explicit layer paths an empty \
-         directory (`VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_PATH`), and no Metal API or shader \
-         validation"
-            .to_owned(),
+        format!(
+            "off: no layer loaded{listed}; the loader's implicit and explicit layer paths an \
+             empty directory (`VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_PATH`) and no loader \
+             settings file in reach; no Metal API or shader validation"
+        ),
     );
     note(
         "Presentation",
@@ -1041,6 +1078,9 @@ struct GateEntry {
     /// The messages and the lines of the driver's or Metal's log the entry records; not a
     /// retry's line, nor how a failed test ended and its output's tail.
     heard: Vec<String>,
+    /// Each part of itself the case says it skipped, its `skipped in part, <what>` lines'
+    /// `<what>`; none of them is a message.
+    parts: Vec<String>,
 }
 
 impl GateReport {
@@ -1094,9 +1134,15 @@ fn gate_report(text: &str) -> Result<GateReport, String> {
                     "the gate's report has a line before its first entry: `{line}`"
                 ));
             };
+            // Every line before it is one the verdict heard, a driver's that the driver
+            // indented among them; the output's tail, indented further, comes after it.
             ended |= heard.starts_with("ended with ");
-            if !ended && !heard.starts_with(' ') && !heard.ends_with("retrying") {
-                entry.heard.push(heard.to_owned());
+            if ended || heard.ends_with("retrying") {
+                continue;
+            }
+            match heard.strip_prefix(vulkan::PART) {
+                Some(part) => entry.parts.push(part.to_owned()),
+                None => entry.heard.push(heard.to_owned()),
             }
         } else if let Some((name, word)) = line.split_once(": ") {
             let (package, test) = match name.split_once(' ') {
@@ -1108,6 +1154,7 @@ fn gate_report(text: &str) -> Result<GateReport, String> {
                 test: test.to_owned(),
                 word: word.to_owned(),
                 heard: Vec::new(),
+                parts: Vec::new(),
             });
             ended = false;
         } else if !line.is_empty() {
@@ -1174,12 +1221,35 @@ impl Cut {
             [(self.sdk.as_deref(), "<sdk>"), (Some(&*self.root), "."), (self.home.as_deref(), "~")];
         for (dir, name) in named {
             let Some(dir) = dir.map(|dir| dir.to_string_lossy().into_owned()) else { continue };
-            if !dir.is_empty() {
-                text = text.replace(&dir, name);
-            }
+            text = replace_dir(&text, &dir, name);
         }
         text
     }
+}
+
+/// `text` with the directory `dir` written as `name` wherever it starts a path: not where it
+/// is the end of another path or the start of a longer name, and never for a directory of no
+/// name, such as `/` or a drive's root, which would cut every path.
+fn replace_dir(text: &str, dir: &str, name: &str) -> String {
+    if Path::new(dir).file_name().is_none() {
+        return text.to_owned();
+    }
+    let in_name = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.');
+    let (mut cut, mut from) = (String::with_capacity(text.len()), 0);
+    for (at, _) in text.match_indices(dir) {
+        let before = text[..at].chars().next_back();
+        let after = text[at + dir.len()..].chars().next();
+        if before.is_some_and(|c| in_name(c) || matches!(c, '/' | '\\'))
+            || after.is_some_and(in_name)
+        {
+            continue;
+        }
+        cut.push_str(&text[from..at]);
+        cut.push_str(name);
+        from = at + dir.len();
+    }
+    cut.push_str(&text[from..]);
+    cut
 }
 
 /// What a file of `rhi-conformance` says of its run, beside the gate's report.
@@ -1197,6 +1267,20 @@ struct ConformanceHeader {
     load: Load,
     /// `--adapter`, where one was given.
     adapter: Option<String>,
+    /// The rows of [`device_notes`] named in [`DEVICE_ROWS`], for the device the gate's
+    /// report names.
+    device: Vec<(String, String)>,
+}
+
+/// The rows of a device file's header an `rhi-conformance` file's takes: the device's identity,
+/// its driver, the API versions and the loader. The rest are the measured environment's.
+const DEVICE_ROWS: [&str; 4] = ["Device", "Driver", "Vulkan", "Loader"];
+
+/// The adapter the gate's report names in its `DeviceInfo` line.
+fn reported_adapter(report: &GateReport) -> Option<String> {
+    let fields = report.device.as_deref().and_then(debug_fields)?;
+    let (_, value) = fields.into_iter().find(|(name, _)| name == "adapter")?;
+    Some(value.trim_matches('"').to_owned())
 }
 
 /// A cell of a Markdown table: no `|` in it ends the cell, and no line break the row.
@@ -1226,11 +1310,7 @@ fn conformance_markdown(
     let _ = writeln!(text, "{}. Threshold: {}.\n", m.what, m.threshold);
     let (load_name, load) = load_text(&header.load);
     let device = report.device.as_deref();
-    let named = device.and_then(debug_fields).and_then(|fields| {
-        let (_, value) = fields.into_iter().find(|(name, _)| name == "adapter")?;
-        Some(value.trim_matches('"').to_owned())
-    });
-    let adapter = match (named, &header.adapter) {
+    let adapter = match (reported_adapter(report), &header.adapter) {
         (Some(name), Some(given)) => format!("{name}, chosen by `--adapter {given}`"),
         (Some(name), None) => format!("{name}, the loader's first device (no `--adapter`)"),
         (None, _) => "unreported: no case printed the device".to_owned(),
@@ -1246,25 +1326,32 @@ fn conformance_markdown(
         report.environment.iter().filter(|(name, _)| validating(name)).map(shown).collect();
     let others: Vec<String> =
         report.environment.iter().filter(|(name, _)| !validating(name)).map(shown).collect();
-    let rows = [
+    let mut rows = vec![
         ("CPU", format!("{} ({}, {})", header.cpu, header.os, header.arch)),
         ("Commit", format!("`{}`", header.commit)),
         ("Command", format!("`{}`, which ran `{}`", header.command, header.ran)),
         (load_name, load),
         ("Adapter", adapter),
-        ("Device", device.map_or_else(|| "unreported".to_owned(), code)),
-        ("Driver", format!("`--driver {}`", field("driver"))),
+    ];
+    // `vulkaninfo`'s rows, or the gate's flag alone where there are none.
+    rows.extend(header.device.iter().map(|(name, value)| (name.as_str(), value.clone())));
+    if header.device.is_empty() {
+        rows.push(("Driver", format!("`--driver {}`", field("driver"))));
+    }
+    rows.extend([
+        ("Device info", device.map_or_else(|| "unreported".to_owned(), code)),
         ("Shaders", cut.text(field("shaders"))),
         (
             "Validation",
             format!(
-                "{layer}{library}, loaded from the implicit layer path alone: {}",
+                "{layer}{library}, loaded from the implicit layer path alone, no loader or \
+                 layer settings file in reach: {}",
                 settings.join(", ")
             ),
         ),
         ("Environment", others.join(", ")),
         ("Inherited and cleared", field("inherited and cleared").to_owned()),
-    ];
+    ]);
     let _ = writeln!(text, "| | |\n|---|---|");
     for (name, value) in rows {
         let _ = writeln!(text, "| {name} | {} |", cell(&value));
@@ -1291,12 +1378,12 @@ fn conformance_markdown(
     let _ = writeln!(text, "| Package | Case | Verdict |\n|---|---|---|");
     for entry in &report.entries {
         let package = entry.package.as_deref().map_or_else(|| "none".to_owned(), code);
-        let _ = writeln!(
-            text,
-            "| {package} | {} | {} |",
-            code(&entry.test),
-            cell(&cut.text(&entry.word))
-        );
+        let mut verdict = entry.word.clone();
+        for part in &entry.parts {
+            verdict.push_str(&format!("; skipped in part, {part}"));
+        }
+        let _ =
+            writeln!(text, "| {package} | {} | {} |", code(&entry.test), cell(&cut.text(&verdict)));
     }
     let _ = writeln!(text, "\n## Capabilities reported\n");
     match report.capabilities.as_deref() {
@@ -1582,7 +1669,9 @@ pub fn run(workspace: &Workspace, options: &Options) -> Result<Vec<PathBuf>, Str
             Run::TaskBench => run_task_bench(workspace, options, &machine, &out),
             Run::Headless => run_headless(workspace, options, &machine, m, &out),
             Run::EditToPlaying => run_edit_to_playing(workspace, options, &machine, m, &out),
-            Run::Conformance => run_conformance(workspace, options, &machine, m, &out),
+            Run::Conformance => {
+                run_conformance(workspace, options, &machine, m, &out, &mut devices)
+            }
         };
         match result {
             Ok(files) => {
@@ -1961,8 +2050,9 @@ impl Devices {
 }
 
 /// The environment of `driver`, the pinned SDK's loader where the driver is the SDK's or the
-/// host has no loader of its own (macOS), and `vulkaninfo`'s report under it: the SDK's copy,
-/// or the one on the path with the system's loader.
+/// host has no loader of its own (macOS), and `vulkaninfo`'s report under it: the SDK's copy
+/// on the Mac, elsewhere the one on the path. It refuses a run that [`vulkan::Run::refuse_overrides`]
+/// refuses, and one in which `vulkaninfo` lists any layer, which the run's paths keep out.
 fn on_device(
     workspace: &Workspace,
     options: &Options,
@@ -1984,9 +2074,14 @@ fn on_device(
         &no_layers,
         options.adapter.as_deref(),
     )?;
+    run.refuse_overrides(&workspace.root)?;
     let root = sdk.as_ref().map(|(_, sdk)| sdk.root.as_path());
-    let program =
-        root.map_or_else(|| PathBuf::from("vulkaninfo"), |root| root.join("bin/vulkaninfo"));
+    // The tool unpacks no `vulkaninfo` from the Linux archive: there the system's runs, and
+    // loads the SDK's loader by the run's library path.
+    let program = match root {
+        Some(root) if cfg!(target_os = "macos") => root.join("bin/vulkaninfo"),
+        _ => PathBuf::from("vulkaninfo"),
+    };
     let mut command = Command::new(&program);
     run.apply(&mut command).stdin(Stdio::null());
     let info = match vulkan::run_bounded(&mut command, VULKANINFO_DEADLINE) {
@@ -1995,7 +2090,26 @@ fn on_device(
             Err(format!("`vulkaninfo` ran past {VULKANINFO_DEADLINE:?}"))
         }
         Ok(ended) if !ended.succeeded => Err(format!("`vulkaninfo` ended with {}", ended.status)),
-        Ok(ended) => Ok(vulkaninfo(&ended.stdout)),
+        Ok(ended) => {
+            // The layer paths keep every layer out: one listed came by another way, a
+            // settings file or the registry, which the measurement's sink would not hear.
+            match instance_layers(&ended.stdout) {
+                Some(layers) if layers.is_empty() => {}
+                Some(layers) => {
+                    return Err(format!(
+                        "`vulkaninfo` lists the layer(s) {} under the measured environment, \
+                         which loads none: a run would measure them",
+                        layers.join(", ")
+                    ));
+                }
+                None => {
+                    return Err("`vulkaninfo` printed no list of instance layers this tool \
+                                reads, so no layer is shown kept out"
+                        .to_owned());
+                }
+            }
+            Ok(vulkaninfo(&ended.stdout))
+        }
     };
     if let Err(why) = &info {
         eprintln!("measure: the device's identity is {why}");
@@ -2374,6 +2488,8 @@ fn run_triangle(
             vulkan::Validators::Plain,
             options.adapter.as_deref(),
         )?;
+        // The canaries run in the repository's root, the client in a directory of its own.
+        run.refuse_overrides(&workspace.root)?;
         let mut found = Vec::new();
         let mut output = String::new();
         let mut failures = Vec::new();
@@ -2427,6 +2543,7 @@ fn run_triangle(
         let run_dir = dir.join(driver.name());
         let _ = fs::remove_dir_all(&run_dir);
         fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
+        run.refuse_overrides(&run_dir)?;
         let (cache, dump) = (run_dir.join("pipeline-cache.bin"), run_dir.join("dump"));
         let run_args: Vec<String> = [
             "--shaders".to_owned(),
@@ -3246,6 +3363,7 @@ fn run_conformance(
     machine: &Machine,
     m: &'static Measurement,
     out: &Path,
+    devices: &mut Devices,
 ) -> Result<Vec<PathBuf>, String> {
     let host = vulkan::Host::this()?;
     let file = workspace.root.join(vulkan::PIN_FILE);
@@ -3270,6 +3388,9 @@ fn run_conformance(
                 driver.name()
             ));
         }
+        // The device's identity and the loader, `vulkaninfo`'s under the measured environment,
+        // as a device file's header gives them.
+        let device = devices.get(workspace, options, driver)?;
         let mut forms = vec![vulkan::Validators::Plain];
         if driver.takes_gpu_assisted() {
             forms.push(vulkan::Validators::GpuAssisted);
@@ -3289,16 +3410,22 @@ fn run_conformance(
             }
             let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
             let ran = shell_line(&[], "cargo xtask", &args);
-            // An earlier run's report would be read as this one's.
+            let stem =
+                file_stem(&format!("{}-{variant}", m.name), &machine.name, &machine.date, false);
+            let md = out.join(format!("{stem}.md"));
+            // An earlier run's report would be read as this one's, and an earlier file of the
+            // same day would stand beside a run that writes none.
             let report_file = workspace
                 .target_dir
                 .join("gpu")
                 .join(format!("{}-vulkan{suffix}.txt", driver.name()));
-            match fs::remove_file(&report_file) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(format!("{}: {e}", report_file.display()));
+            for stale in [&report_file, &md] {
+                match fs::remove_file(stale) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(format!("{}: {e}", stale.display()));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
             eprintln!("measure: rhi-conformance under {variant}: {ran}");
             let sampler = Sampler::start();
@@ -3333,10 +3460,15 @@ fn run_conformance(
                 ran,
                 load,
                 adapter: options.adapter.clone(),
+                device: device_notes(&device.setting, reported_adapter(&report).as_deref())
+                    .into_iter()
+                    .filter(|(name, _)| DEVICE_ROWS.contains(&name.as_str()))
+                    .map(|(name, value)| {
+                        let named = "; the gate's `DeviceInfo` line names it";
+                        (name, value.replace("; the test's `device.*` figures name it", named))
+                    })
+                    .collect(),
             };
-            let stem =
-                file_stem(&format!("{}-{variant}", m.name), &machine.name, &machine.date, false);
-            let md = out.join(format!("{stem}.md"));
             fs::write(&md, conformance_markdown(m, &header, &report, &cut))
                 .map_err(|e| format!("{}: {e}", md.display()))?;
             if !status.success() {
@@ -4039,9 +4171,10 @@ mod tests {
             "| Loader | the Vulkan SDK 1.4.363.1's |",
             "| Ring memory | type 1 of 3, DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT + HOST_CACHED (0x000f):",
             "| Environment | `VK_DRIVER_FILES=<sdk>/share/vulkan/icd.d/MoltenVK_icd.json` |",
-            "| Validation | off: no layer loaded, the loader's implicit and explicit layer \
-             paths an empty directory (`VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_PATH`), and no Metal \
-             API or shader validation |",
+            "| Validation | off: no layer loaded, as `vulkaninfo` under the same environment \
+             lists none; the loader's implicit and explicit layer paths an empty directory \
+             (`VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_PATH`) and no loader settings file in reach; \
+             no Metal API or shader validation |",
             "| Presentation | none:",
         ] {
             assert!(text.contains(expected), "{expected} in\n{text}");
@@ -4103,6 +4236,7 @@ mod tests {
              \x20 message: Message {{ source: Validation, severity: Error, id: \
              \"VUID-vkCmdDraw-None-09600\", text: \"expects VkImage 0x14 in {sdk}/x\" }}\n\
              lactose-rhi-vulkan conformance::address_is_read_in_a_shader: passed\n\
+             \x20 skipped in part, a read past 4 GiB\n\
              \x20 conformance::address_is_read_in_a_shader: Lag at 2 rounds: retrying\n\
              DeviceInfo {{ backend: \"vulkan\", adapter: \"Apple M1\", driver: \"MoltenVK 1.4.2\" }}\n\
              Capabilities {{ multi_draw_indirect: true, queues: QueueLayout {{ compute: Own, \
@@ -4138,6 +4272,7 @@ mod tests {
         let tests: Vec<&str> = report.entries.iter().map(|entry| entry.test.as_str()).collect();
         assert_eq!(tests.len(), 6, "{tests:?}");
         assert_eq!(report.entries[1].heard, Vec::<String>::new());
+        assert_eq!(report.entries[1].parts, ["a read past 4 GiB"]);
         let failed = &report.entries[4];
         assert_eq!(failed.package.as_deref(), Some("lactose-renderer"));
         assert_eq!(failed.word, "FAILED, 2 message(s)");
@@ -4177,22 +4312,37 @@ mod tests {
             ran: "cargo xtask gpu --driver moltenvk --only vulkan".into(),
             load: Load::Averages { before: "1.0".into(), after: "2.0".into() },
             adapter: None,
+            device: vec![
+                ("Device".into(), "Apple M1, vendor 0x106b, device 0x1b020207".into()),
+                (
+                    "Driver".into(),
+                    "MoltenVK 1.4.2, driver version 0.2.2210, `--driver moltenvk`".into(),
+                ),
+                ("Vulkan".into(), "the device's API 1.4.357, the instance's 1.4.363".into()),
+                ("Loader".into(), "the Vulkan SDK 1.4.363.1's".into()),
+            ],
         };
         let m = find("rhi-conformance").unwrap();
         let text = conformance_markdown(m, &header, &report, &cut);
         assert!(text.starts_with("# rhi-conformance under moltenvk, apple-m1, 2026-11-26\n"));
         for expected in [
             "| Adapter | Apple M1, the loader's first device (no `--adapter`) |",
-            "| Device | `DeviceInfo { backend: \"vulkan\", adapter: \"Apple M1\", driver: \"MoltenVK 1.4.2\" }` |",
+            "| Device | Apple M1, vendor 0x106b, device 0x1b020207 |",
+            "| Driver | MoltenVK 1.4.2, driver version 0.2.2210, `--driver moltenvk` |",
+            "| Vulkan | the device's API 1.4.357, the instance's 1.4.363 |",
+            "| Loader | the Vulkan SDK 1.4.363.1's |",
+            "| Device info | `DeviceInfo { backend: \"vulkan\", adapter: \"Apple M1\", driver: \"MoltenVK 1.4.2\" }` |",
             "| Validation | VK_LAYER_KHRONOS_validation 1.4.363 of the Vulkan SDK 1.4.363.1, library \
              `<sdk>/lib/libVkLayer_khronos_validation.dylib`, loaded from the implicit layer path \
-             alone: `VK_KHRONOS_VALIDATION_VALIDATE_CORE=true`, `MTL_DEBUG_LAYER=1` |",
+             alone, no loader or layer settings file in reach: \
+             `VK_KHRONOS_VALIDATION_VALIDATE_CORE=true`, `MTL_DEBUG_LAYER=1` |",
             "`VK_IMPLICIT_LAYER_PATH=target/gpu/layers`",
             "`VK_DRIVER_FILES=<sdk>/share/vulkan/icd.d/MoltenVK_icd.json`",
             "| Load average | 1.0 before, 2.0 after |",
             "## Cases run\n\n6 entries, the gate's `failed: 2`: 3 passed; 1 skipped, a case of a \
              check the null backend alone makes; 2 FAILED.",
             "| `lactose-renderer` | `device::a_case` | FAILED, 2 message(s) |",
+            "| `lactose-rhi-vulkan` | `conformance::address_is_read_in_a_shader` | passed; skipped in part, a read past 4 GiB |",
             "| `queues` | `QueueLayout { compute: Own, present: Shared }` |",
             "- `device::canary_core_validation_reports_a_wrong_layout`: passed\n  - `message: \
              Message { source: Validation, severity: Error, id: \"VUID-vkCmdDraw-None-09600\", \
@@ -4206,9 +4356,13 @@ mod tests {
         }
         assert!(!text.contains(&*home.to_string_lossy()), "{text}");
         assert!(!text.contains("retrying") && !text.contains("ended with"), "{text}");
+        assert!(!text.contains("| Driver | `--driver"), "{text}");
         let given = ConformanceHeader { adapter: Some("Apple M1".into()), ..header };
         let text = conformance_markdown(m, &given, &report, &cut);
         assert!(text.contains("| Adapter | Apple M1, chosen by `--adapter Apple M1` |"));
+        let bare = ConformanceHeader { device: Vec::new(), ..given };
+        let text = conformance_markdown(m, &bare, &report, &cut);
+        assert!(text.contains("| Driver | `--driver moltenvk` |"), "{text}");
         // Outside every named directory, an absolute path in a message is left as the layer
         // wrote it: the message is the record. A value is cut to its file name.
         let other = std::env::temp_dir().join("elsewhere").join("icd.json");
@@ -4289,5 +4443,95 @@ mod tests {
             shell_line(&[(SHORT_VAR, "1".to_owned())], "cargo", &args),
             "LACTOSE_MEASURE_SHORT=1 cargo nextest -E 'test(=a::b)'"
         );
+    }
+
+    /// Review r1 of layer-windows, N3: a home of `/` cut every slash of a message, and a
+    /// directory that begins a sibling's name cut that name in two.
+    #[test]
+    fn a_directory_is_cut_where_it_starts_a_path_alone() {
+        let cut = Cut { root: PathBuf::from("/r"), sdk: None, home: Some(PathBuf::from("/")) };
+        assert_eq!(cut.text("expects VkImage in a/b/c"), "expects VkImage in a/b/c");
+        let cut = Cut {
+            root: PathBuf::from("/h/repo"),
+            sdk: Some(PathBuf::from("/h/sdk")),
+            home: Some(PathBuf::from("/h")),
+        };
+        assert_eq!(
+            cut.text("`/h/repo/target`, `/h/repository`, `/h/sdk/lib`, /h, /x/h/repo, (/h/a)"),
+            "`./target`, `~/repository`, `<sdk>/lib`, ~, /x/h/repo, (~/a)"
+        );
+    }
+
+    /// Review r1 of layer-windows, N4: a driver's line it wrote indented failed the case and
+    /// was left out of the file's count of other messages by source.
+    #[test]
+    fn an_indented_driver_line_is_counted_under_the_driver_s_log() {
+        let ended = vulkan::Ended {
+            succeeded: true,
+            status: "exit status: 0".into(),
+            stdout: "running 1 test\ntest conformance::a_case ... a_case: passed\nok\n".into(),
+            stderr: "  [mvk-warn] an indented warning\n".into(),
+            killed_at: None,
+        };
+        let verdict = vulkan::judge_ended("conformance::a_case", &ended, None, false);
+        let entry = vulkan::entry("lactose-rhi-vulkan", "conformance::a_case", &verdict, &ended);
+        let text = format!(
+            "driver: moltenvk\nshaders: s\nlayer: l\ninherited and cleared: none\n\
+             environment:\ncanaries: none heard\nfailed: 1\n{entry}"
+        );
+        let report = gate_report(&text).unwrap();
+        assert!(report.entries[0].word.starts_with("FAILED, 1 line(s)"), "{entry}");
+        assert_eq!(report.entries[0].heard, ["  [mvk-warn] an indented warning"]);
+        assert_eq!(source_of(&report.entries[0].heard[0]), "log");
+    }
+
+    /// A device file says that `vulkaninfo` listed no layer only where it ran: `on_device`
+    /// refuses a run in which it lists one.
+    #[test]
+    fn a_device_file_claims_no_listed_layer_only_where_vulkaninfo_ran() {
+        let mut setting = DeviceSetting {
+            driver: "moltenvk",
+            sdk_version: None,
+            environment: Vec::new(),
+            info: Ok(VulkanInfo::default()),
+        };
+        let validation = |setting: &DeviceSetting| {
+            let notes = device_notes(setting, None);
+            notes.into_iter().find(|(name, _)| name == "Validation").unwrap().1
+        };
+        assert!(validation(&setting).contains("`vulkaninfo` under the same environment lists"));
+        setting.info = Err("`vulkaninfo` did not run: not found".into());
+        assert!(!validation(&setting).contains("vulkaninfo"), "{}", validation(&setting));
+        assert!(validation(&setting).contains("no loader settings file in reach"));
+    }
+
+    /// The instance layers of `vulkaninfo`'s full output and of `--summary`, cut from the
+    /// SDK 1.4.363.1's `vulkaninfo` under MoltenVK on the M1: none under the measured
+    /// environment, and the SDK's explicit layers with `VK_LAYER_PATH` at them.
+    #[test]
+    fn vulkaninfo_s_instance_layers_read_from_either_output() {
+        let none = "\tVK_MVK_macos_surface                   : extension revision 3\n\n\
+                    Layers:\n=======\nPresentable Surfaces:\n=====================\n\
+                    GPU id : 0 (Apple M1) [VK_EXT_metal_surface]:\n";
+        assert_eq!(instance_layers(none), Some(Vec::new()));
+        let some = "Layers: count = 2\n=================\n\
+                    VK_LAYER_KHRONOS_profiles (Khronos Profiles layer) Vulkan version 1.4.363, \
+                    layer version 1:\n\tLayer Extensions: count = 1\n\
+                    \t\tVK_EXT_layer_settings : extension revision 2\n\tDevices: count = 1\n\
+                    \t\tGPU id = 0 (Apple M1)\n\n\
+                    VK_LAYER_KHRONOS_validation (Khronos Validation Layer) Vulkan version \
+                    1.4.363, layer version 1:\n\tLayer Extensions: count = 0\n\n\
+                    Presentable Surfaces:\n=====================\n";
+        let names = ["VK_LAYER_KHRONOS_profiles", "VK_LAYER_KHRONOS_validation"];
+        assert_eq!(instance_layers(some), Some(names.map(str::to_owned).to_vec()));
+        let summary = "Instance Layers: count = 1\n--------------------------\n\
+                       VK_LAYER_KHRONOS_validation Khronos Validation Layer 1.4.363  version 1\n\n\
+                       Devices:\n========\n";
+        assert_eq!(instance_layers(summary), Some(vec![names[1].to_owned()]));
+        let empty = "Instance Layers:\n----------------\n\nDevices:\n========\n";
+        assert_eq!(instance_layers(empty), Some(Vec::new()));
+        // A count the lines do not hold, or no section, is no list this reads.
+        assert_eq!(instance_layers(&some.replace("count = 2", "count = 3")), None);
+        assert_eq!(instance_layers("Devices:\n========\n"), None);
     }
 }

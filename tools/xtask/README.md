@@ -574,8 +574,11 @@ standard error as it comes.
   set. A loader made to skip a layer by `VK_LOADER_LAYERS_DISABLE` warns of each, which a
   measured run hears as a message and fails on, so no run sets it. The loader is the pinned
   SDK's (`vulkan-layer.toml`) on macOS and for a driver the SDK ships, the system's otherwise,
-  and the driver's manifest is pinned as `gpu` pins it. `vulkaninfo` (the SDK's, or the one on the path) runs once under
-  the same environment before the first of them, and each file's header adds the rows of the
+  and the driver's manifest is pinned as `gpu` pins it. No loader settings file is in reach,
+  as for a `gpu` run (the XDG directories and the refusal described under "GPU runs").
+  `vulkaninfo` (the SDK's on macOS, the one on the path elsewhere) runs once under
+  the same environment before the first of them, and the run is refused where it lists an
+  instance layer, or prints no list this tool reads; each file's header adds the rows of the
   device its test named in `device.adapter`: its name and vendor and device ids, the driver's
   name, information and version, the device's and the instance's API versions, the loader,
   the validation (off), the presentation (none: no surface, so no present mode or refresh
@@ -880,9 +883,27 @@ writes its report.
      measured run. `VK_ADD_IMPLICIT_LAYER_PATH` would add the directory beside
      the machine's layers, and no run sets it. A layer forced through `VK_INSTANCE_LAYERS` or
      `VK_LOADER_LAYERS_ENABLE`, or found twice, makes the loader warn, and the warning reaches
-     the debug messenger, which counts it. The loader ignores all of these variables in an
-     elevated process, so a run on Windows is made from a shell that is not elevated. Before
-     the run sets its own, it removes these
+     the debug messenger, which counts it. In an elevated process the loader ignores the
+     layer and driver path variables, `VK_LOADER_LAYERS_DISABLE` and the filters
+     (`VK_LOADER_LAYERS_ENABLE` and the like), which it reads through `loader_secure_getenv`,
+     though it still reads `VK_INSTANCE_LAYERS` (loader 1.4.363, `loader.c` and
+     `loader_environment.c`): on Windows a run is refused where `whoami /groups` lists an
+     integrity level of high (`S-1-16-12288`) or above. A loader settings file, which Vulkan
+     Configurator writes, names the layers the loader loads, and the loader reads it before
+     these variables: off Windows every run sets `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
+     `XDG_CONFIG_DIRS` and, but under `system`, whose drivers are in the system's data
+     directories, `XDG_DATA_DIRS` to the empty directory, and a run is refused, naming the
+     file, where `vulkan/loader_settings.d/vk_loader_settings.json` is under any directory the
+     loader would still look in (those variables, `/etc` and `/usr/local/etc`, in the
+     loader's order); on Windows where the registry's `SOFTWARE\Khronos\Vulkan\LoaderSettings`
+     key holds a value under `HKEY_CURRENT_USER` or `HKEY_LOCAL_MACHINE`. A validated run is
+     refused too where the layer's own settings file is in reach, which would set what the run
+     does not: under `Software\Khronos\Vulkan\Settings` of either hive on Windows, at
+     `vulkan/settings.d/vk_layer_settings.txt` under `XDG_DATA_HOME` (else
+     `~/.local/share`) elsewhere, and as `vk_layer_settings.txt` in the test's working
+     directory on every host. The refusal is checked where each process starts, the gate's
+     tests from the repository's root and the client and the triangle from their own
+     directories. Before the run sets its own, it removes these
      inherited variables (`CLEARED` and `CLEARED_PREFIXES` in `src/vulkan.rs`): the
      families `VK_KHRONOS_VALIDATION_*` and `VK_LAYER_*` (the layer's settings under both
      the names its manifest gives, and the layer paths), `VK_LOADER_*`, MoltenVK's `MVK_*`,
@@ -961,7 +982,10 @@ writes its report.
    driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
    cleared:`, or `none`), every variable it set, the canaries heard or skipped, the
    device's `DeviceInfo` and `Capabilities`, and each test with `passed`, the suite's
-   `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed, then
+   `skipped, <why>` or `FAILED, <why>`, under it each part of itself a case says it ran
+   only in part (`skipped in part, <what>`, the conformance kit's `Ctx::skip_part`, kept
+   beside a `passed` and never read as a skip of the case or as a message), and the
+   messages and driver lines it printed, then
    each line of its output that ends in `retrying`, so that a test that passed only on a
    retry says so (the renderer's device tests print one where a held frame was reached
    before its release, `crates/renderer/README.md`, "Proof"). Under a
@@ -1049,18 +1073,26 @@ there. The library's digest was read on the Mac out of that installer, which was
    `library_sha256`, and the manifest names `VK_LAYER_KHRONOS_validation`, API version
    `1.4.363`, library `.\VkLayer_khronos_validation.dll`, as the check reads it.
 
-A run on Windows is from a shell that is not elevated (the loader ignores its variables in an
-elevated process), under `--driver system`, the SDK installed as administrator once.
+A run on Windows is from a shell that is not elevated (the loader ignores its layer path
+variables in an elevated process, and the tool refuses one), under `--driver system`, the SDK
+installed as administrator once. The loader is the system's, whose version the run's
+`vulkaninfo` rows record (`Loader`), not the SDK's.
 
 ### Barrier mutations
 
-`python3 tools/xtask/barrier-mutations.py <out dir> [--run <name>]... [-- <gpu args>...]`
-(`py -3` on Windows) runs the renderer's barrier mutations its docstring describes, the
+`python3 -B tools/xtask/barrier-mutations.py <out dir> [--run <name>]... [-- <gpu args>...]`
+(`py -3 -B` on Windows; `-B` writes no `__pycache__` into the checkout) runs the renderer's barrier mutations its docstring describes, the
 records of `docs/verification.md`'s rows of the barrier between dispatches, the
 scatter-to-vertex barrier and the barrier across frames: each run copies the checkout into a
 fresh directory under `<out dir>`, patches one barrier out of `lactose-rhi-vulkan`'s encoder
 and the lag it needs into the scatter shader, and runs `cargo xtask gpu --only vulkan` there.
 The verdict is read from the gate's report under `<out dir>/target/gpu/`, never from its
-console, which prints no passing test: `caught` on the named test's `FAILED` line alone,
-`MISSED` on its `passed` line, `NOT RUN` on neither. Each lag runs alone first as its mutant's
-control, which must pass every test. Its files are read and written as UTF-8.
+console, which prints no passing test: `caught` on the named test's `FAILED` line alone, where its control passed under that driver,
+`MISSED` on its `passed` line, `KILLED` where it ran past its deadline, `NOT JUDGED` where
+its control failed, and `NOT RUN` on neither line. Each mutant's control runs before it, `--run`
+of a mutant included: its lag alone, or the checkout unpatched where it adds no lag, which must
+pass every test. Each copy's encoder is touched after the copy, which keeps every other file's
+time, so the copy's build recompiles `lactose-rhi-vulkan` and what depends on it even where the
+same `<out dir>` held a mutant before. A patch that does not apply removes its copy and exits
+2; a failed control or a mutant killed, not judged or not run exits 1. Under `--gpu-assisted`
+on macOS the driver must be named. Its files are read and written as UTF-8.
