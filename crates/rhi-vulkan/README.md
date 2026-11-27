@@ -403,7 +403,10 @@ drivers: MoltenVK under Metal API and shader validation as well, and KosmicKrisp
   30 ms have passed; a driver that returns at once called at most once a millisecond; the
   test-only early return halving the next calls' time and used up; a zero timeout one poll;
   a timeout too long for the clock waited with `u64::MAX`; and any other result returned at
-  once. With the re-wait removed three fail, and with the pause removed its own test.
+  once. With the re-wait removed five fail, and with the pause removed its own test. That
+  the pause follows only a call that returned in less than a tenth of its time is held by
+  reading: a pause after every early return passes them, and would sleep up to a millisecond
+  of a wait otherwise spent in the driver, seeing a signal in it that much late.
 - `src/swapchain.rs`, on a driver, the timed waits against one that returns early, played by
   `wait::return_early`, which gives a call made through `wait::until` half the time left:
   `wait_timeline` on a point no one signals, on a device with no surface, and the swapchain's

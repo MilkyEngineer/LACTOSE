@@ -382,9 +382,13 @@ jobs:
       - name: The three hosts' SPIR-V and MSL are equal
         shell: bash
         run: |
+          # A leg that timed out wrote no hashes, which is not a difference.
+          if [ ! -f shaders-Linux/hashes.txt ]; then
+            echo "::error::the Linux leg left no hashes: see its job"
+            exit 1
+          fi
           failed=false
           for os in macOS Windows; do
-            # A leg that timed out wrote no hashes, which is not a difference.
             if [ ! -f "shaders-$os/hashes.txt" ]; then
               echo "::error::the $os leg left no hashes: see its job"
               failed=true
