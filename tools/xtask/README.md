@@ -577,14 +577,16 @@ standard error as it comes.
   and the driver's manifest is pinned as `gpu` pins it. No loader settings file is in reach,
   as for a `gpu` run (the XDG directories and the refusal described under "GPU runs").
   `vulkaninfo` (the SDK's on macOS, the one on the path elsewhere) runs once under
-  the same environment before the first of them, and the run is refused where it lists an
-  instance layer, or prints no list this tool reads; each file's header adds the rows of the
-  device its test named in `device.adapter`: its name and vendor and device ids, the driver's
-  name, information and version, the device's and the instance's API versions, the loader,
-  the validation (off), the presentation (none: no surface, so no present mode or refresh
+  the same environment before the first of them, and the run is refused where it is not
+  found, runs past its deadline, exits with a failure, lists an instance layer or prints no
+  list this tool reads; each file's header adds the rows of the device its test named in
+  `device.adapter`: its name and vendor and device ids, the driver's name, information and
+  version, the device's and the instance's API versions, the loader (the pinned SDK's by its
+  version, or the system's with the instance version `vulkaninfo` reports), the validation
+  (off), the presentation (none: no surface, so no present mode or refresh
   rate), the memory type `lactose-rhi-vulkan` chooses for `MemoryClass::Upload`, the ring's,
   and the environment set, a path inside the SDK written from `<sdk>`, one inside the
-  repository relative to its root, and any other cut to its file name. Where `vulkaninfo` fails the rows say why and the run goes on. A test that
+  repository relative to its root, and any other cut to its file name. A test that
   hears a message from the device fails. `--no-device` leaves them out of `--all` and refuses
   one named; the `measure` workflow passes it, since its runners have no device. `cargo xtask
   gpu` runs them too, short, under its validators. With no `--driver`, `gpu-cost` runs once
@@ -1075,14 +1077,14 @@ there. The library's digest was read on the Mac out of that installer, which was
 
 A run on Windows is from a shell that is not elevated (the loader ignores its layer path
 variables in an elevated process, and the tool refuses one), under `--driver system`, the SDK
-installed as administrator once. The loader is the system's, whose version the run's
-`vulkaninfo` rows record (`Loader`), not the SDK's.
+installed as administrator once. The loader is the system's, not the SDK's: a measured
+run's `Loader` row names it with the instance version `vulkaninfo` reports.
 
 ### Barrier mutations
 
 `python3 -B tools/xtask/barrier-mutations.py <out dir> [--run <name>]... [-- <gpu args>...]`
-(`py -3 -B` on Windows; `-B` writes no `__pycache__` into the checkout) runs the renderer's
-barrier mutations its docstring describes, the records of `docs/verification.md`'s rows of the barrier between dispatches, the
+(`py -3 -B` on Windows) runs the renderer's barrier mutations its docstring describes, the
+records of `docs/verification.md`'s rows of the barrier between dispatches, the
 scatter-to-vertex barrier and the barrier across frames: each run copies the checkout into a
 fresh directory under `<out dir>`, patches one barrier out of `lactose-rhi-vulkan`'s encoder
 and the lag it needs into the scatter shader, and runs `cargo xtask gpu --only vulkan` there.
@@ -1097,5 +1099,8 @@ same `<out dir>` held a mutant before. A patch that does not apply removes its c
 2; a failed control or a mutant killed, not judged or not run exits 1. An `<out dir>` whose
 `target` is the checkout's own target directory, through a link or `CARGO_TARGET_DIR`, is
 refused: cargo names a workspace's crates by their paths within it and judges them by their
-sources' times, so the checkout's next build would run the last mutant unrebuilt. Under `--gpu-assisted`
-on macOS the driver must be named. Its files are read and written as UTF-8.
+sources' times, so the checkout's next build would run the last mutant unrebuilt. An
+`<out dir>` inside the checkout is refused too, since each copy would take it in, unless it is
+under the checkout's `target`, `.scratchpad` or `.claude`. Both refusals ask the file system
+whether two paths are one, so neither a link nor a spelling in another case passes them. Under
+`--gpu-assisted` on macOS the driver must be named. Its files are read and written as UTF-8.

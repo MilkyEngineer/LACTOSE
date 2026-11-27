@@ -149,20 +149,67 @@ def write(path, text):
         out.write(text)
 
 
-def inside(path, root):
-    """Whether `path` is `root` or under it, each with its links resolved; never where the two
-    are on different drives."""
-    path, root = os.path.normcase(os.path.realpath(path)), os.path.normcase(os.path.realpath(root))
+# Whether a name that does not exist yet is the same name in another case: as the default
+# file systems of macOS and Windows take it.
+FOLDS_CASE = sys.platform in ("darwin", "win32")
+
+
+def same_file(path, other):
+    """Whether two existing paths are one file, asked of the file system, which on macOS
+    and Windows takes a name in any case; never by their spelling."""
     try:
-        return os.path.commonpath([path, root]) == root
-    except ValueError:
+        return os.path.samefile(path, other)
+    except OSError:
         return False
 
 
+def existing(path):
+    """`path` with its links resolved, as its nearest part that exists and the names below
+    that part that do not."""
+    path, tail = os.path.realpath(os.path.abspath(path)), []
+    while not os.path.exists(path):
+        parent, name = os.path.split(path)
+        if parent == path:
+            break
+        path, tail = parent, [name, *tail]
+    return path, tail
+
+
+def same_name(name, other):
+    return name.casefold() == other.casefold() if FOLDS_CASE else name == other
+
+
 def same(path, other):
-    """Whether two paths name one directory, each with its links resolved."""
-    return (os.path.normcase(os.path.realpath(path))
-            == os.path.normcase(os.path.realpath(os.path.abspath(other))))
+    """Whether two paths name one directory: their existing parts one file and the names
+    below them the same."""
+    (path, tail), (other, other_tail) = existing(path), existing(other)
+    return (same_file(path, other) and len(tail) == len(other_tail)
+            and all(map(same_name, tail, other_tail)))
+
+
+def below(path, root):
+    """The name of the entry of `root` that `path` is in, `""` for `root` itself, or `None`
+    where `path` is not inside `root`; asked of the file system at each existing parent, so
+    that neither a link nor another case or spelling hides the checkout."""
+    path, tail = existing(path)
+    child = tail[0] if tail else ""
+    while True:
+        if same_file(path, root):
+            return child
+        parent, name = os.path.split(path)
+        if parent == path:
+            return None
+        path, child = parent, name
+
+
+def left_out(name):
+    """Whether the checkout's entry `name` is one the copies leave out: `target`,
+    `.scratchpad` or `.claude`. The copy's ignore reads the name an entry has on disk, so one
+    that exists is asked of the file system and one that does not yet is taken as spelt."""
+    path = os.path.join(CHECKOUT, name)
+    if os.path.exists(path):
+        return any(same_file(path, os.path.join(CHECKOUT, kept)) for kept in LEFT_OUT[:3])
+    return name in LEFT_OUT[:3]
 
 
 def copy(out, name):
@@ -255,12 +302,11 @@ def parse(argv):
         else:
             sys.exit(f"barrier-mutations: unrecognised argument `{first}`\n\n{__doc__}")
     out = os.path.abspath(out)
-    if inside(out, CHECKOUT):
-        under = os.path.relpath(out, CHECKOUT).split(os.sep)[0]
-        if under not in LEFT_OUT[:3]:
-            sys.exit("barrier-mutations: the output directory is inside the checkout, which "
-                     "each copy would take in: give one outside it, or under its `target`, "
-                     "`.scratchpad` or `.claude`")
+    under = below(out, CHECKOUT)
+    if under is not None and not (under and left_out(under)):
+        sys.exit("barrier-mutations: the output directory is inside the checkout, which "
+                 "each copy would take in: give one outside it, or under its `target`, "
+                 "`.scratchpad` or `.claude`")
     # Cargo names a workspace's crates by their paths within it and judges them fresh by
     # their sources' times, so a mutant built into the checkout's own target directory is
     # what the checkout's next build runs, unrebuilt.

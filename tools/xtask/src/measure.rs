@@ -821,24 +821,24 @@ struct DeviceSetting {
     sdk_version: Option<String>,
     /// Every variable the run sets, paths redacted.
     environment: Vec<(String, String)>,
-    /// What `vulkaninfo` reported under the same environment, or why it reported nothing.
-    info: Result<VulkanInfo, String>,
+    /// What `vulkaninfo` reported under the same environment.
+    info: VulkanInfo,
 }
 
 /// The header's rows for a test on a device that named its adapter `adapter`.
 fn device_notes(setting: &DeviceSetting, adapter: Option<&str>) -> Vec<(String, String)> {
     let mut notes = Vec::new();
     let mut note = |name: &str, value: String| notes.push((name.to_owned(), value));
-    let gpu = match (&setting.info, adapter) {
-        (Err(why), _) => Err(format!("unreported: {why}")),
-        (Ok(_), None) => Err("unreported: the test printed no `device.adapter`".to_owned()),
-        (Ok(info), Some(adapter)) => {
-            info.gpus.iter().find(|gpu| gpu.get("deviceName") == Some(adapter)).ok_or_else(|| {
-                format!("unreported: `vulkaninfo` lists no device named `{adapter}`")
-            })
+    let gpu = match adapter {
+        None => Err("unreported: the test printed no `device.adapter`".to_owned()),
+        Some(adapter) => {
+            setting.info.gpus.iter().find(|gpu| gpu.get("deviceName") == Some(adapter)).ok_or_else(
+                || format!("unreported: `vulkaninfo` lists no device named `{adapter}`"),
+            )
         }
     };
     let field = |gpu: &Gpu, key: &str| gpu.get(key).unwrap_or("unreported").to_owned();
+    let instance = setting.info.instance.as_deref();
     match &gpu {
         Ok(gpu) => {
             let (name, vendor, id) =
@@ -848,7 +848,6 @@ fn device_notes(setting: &DeviceSetting, adapter: Option<&str>) -> Vec<(String, 
             let version = field(gpu, "driverVersion");
             let flag = setting.driver;
             note("Driver", format!("{driver} {info}, driver version {version}, `--driver {flag}`"));
-            let instance = setting.info.as_ref().ok().and_then(|info| info.instance.as_deref());
             note(
                 "Vulkan",
                 format!(
@@ -860,24 +859,20 @@ fn device_notes(setting: &DeviceSetting, adapter: Option<&str>) -> Vec<(String, 
         }
         Err(why) => note("Device", format!("{why}; the test's `device.*` figures name it")),
     }
-    let loader = setting
-        .sdk_version
-        .as_ref()
-        .map_or_else(|| "the system's".to_owned(), |version| format!("the Vulkan SDK {version}'s"));
+    // The system's loader is the instance `vulkaninfo` reports; the SDK's is the pin's.
+    let loader = setting.sdk_version.as_ref().map_or_else(
+        || format!("the system's, instance version {}", instance.unwrap_or("unreported")),
+        |version| format!("the Vulkan SDK {version}'s"),
+    );
     note("Loader", loader);
-    // A run whose `vulkaninfo` lists a layer is refused (`on_device`).
-    let listed = if setting.info.is_ok() {
-        ", as `vulkaninfo` under the same environment lists none"
-    } else {
-        ""
-    };
+    // A run whose `vulkaninfo` does not run, or lists a layer, is refused (`on_device`).
     note(
         "Validation",
-        format!(
-            "off: no layer loaded{listed}; the loader's implicit and explicit layer paths an \
-             empty directory (`VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_PATH`) and no loader \
-             settings file in reach; no Metal API or shader validation"
-        ),
+        "off: no layer loaded, as `vulkaninfo` under the same environment lists none; the \
+         loader's implicit and explicit layer paths an empty directory \
+         (`VK_IMPLICIT_LAYER_PATH`, `VK_LAYER_PATH`) and no loader settings file in reach; no \
+         Metal API or shader validation"
+            .to_owned(),
     );
     note(
         "Presentation",
@@ -2052,7 +2047,7 @@ impl Devices {
 /// The environment of `driver`, the pinned SDK's loader where the driver is the SDK's or the
 /// host has no loader of its own (macOS), and `vulkaninfo`'s report under it: the SDK's copy
 /// on the Mac, elsewhere the one on the path. It refuses a run that [`vulkan::Run::refuse_overrides`]
-/// refuses, and one in which `vulkaninfo` lists any layer, which the run's paths keep out.
+/// refuses, and one whose `vulkaninfo` [`listed_info`] refuses.
 fn on_device(
     workspace: &Workspace,
     options: &Options,
@@ -2084,36 +2079,7 @@ fn on_device(
     };
     let mut command = Command::new(&program);
     run.apply(&mut command).stdin(Stdio::null());
-    let info = match vulkan::run_bounded(&mut command, VULKANINFO_DEADLINE) {
-        Err(e) => Err(format!("`vulkaninfo` did not run: {e}")),
-        Ok(ended) if ended.killed_at.is_some() => {
-            Err(format!("`vulkaninfo` ran past {VULKANINFO_DEADLINE:?}"))
-        }
-        Ok(ended) if !ended.succeeded => Err(format!("`vulkaninfo` ended with {}", ended.status)),
-        Ok(ended) => {
-            // The layer paths keep every layer out: one listed came by another way, a
-            // settings file or the registry, which the measurement's sink would not hear.
-            match instance_layers(&ended.stdout) {
-                Some(layers) if layers.is_empty() => {}
-                Some(layers) => {
-                    return Err(format!(
-                        "`vulkaninfo` lists the layer(s) {} under the measured environment, \
-                         which loads none: a run would measure them",
-                        layers.join(", ")
-                    ));
-                }
-                None => {
-                    return Err("`vulkaninfo` printed no list of instance layers this tool \
-                                reads, so no layer is shown kept out"
-                        .to_owned());
-                }
-            }
-            Ok(vulkaninfo(&ended.stdout))
-        }
-    };
-    if let Err(why) = &info {
-        eprintln!("measure: the device's identity is {why}");
-    }
+    let info = listed_info(vulkan::run_bounded(&mut command, VULKANINFO_DEADLINE))?;
     let environment = run
         .set
         .iter()
@@ -2126,6 +2092,33 @@ fn on_device(
         info,
     };
     Ok(OnDevice { run, setting })
+}
+
+/// What `vulkaninfo` reported, where it ran, ended with success and listed no instance
+/// layer. Its list is the run's one check that no layer reaches it by a way
+/// [`vulkan::Run::refuse_overrides`] does not read, so a `vulkaninfo` that did not run, ran
+/// past its deadline or failed refuses the run, as one that lists a layer does.
+fn listed_info(ended: std::io::Result<vulkan::Ended>) -> Result<VulkanInfo, String> {
+    let ended = ended.map_err(|e| format!("`vulkaninfo` did not run: {e}"))?;
+    if ended.killed_at.is_some() {
+        return Err(format!("`vulkaninfo` ran past {VULKANINFO_DEADLINE:?}"));
+    }
+    if !ended.succeeded {
+        return Err(format!("`vulkaninfo` ended with {}", ended.status));
+    }
+    // The layer paths keep every layer out: one listed came by another way, a settings file
+    // or the registry, which the measurement's sink would not hear.
+    match instance_layers(&ended.stdout) {
+        Some(layers) if layers.is_empty() => Ok(vulkaninfo(&ended.stdout)),
+        Some(layers) => Err(format!(
+            "`vulkaninfo` lists the layer(s) {} under the measured environment, which loads \
+             none: a run would measure them",
+            layers.join(", ")
+        )),
+        None => Err("`vulkaninfo` printed no list of instance layers this tool reads, so no \
+                     layer is shown kept out"
+            .to_owned()),
+    }
 }
 
 fn run_test(
@@ -4155,11 +4148,11 @@ mod tests {
             cut_path(inside.to_str().unwrap(), &root, Some(&unpacked)),
             "<sdk>/lib/VulkanLoader"
         );
-        let mut setting = DeviceSetting {
+        let setting = DeviceSetting {
             driver: "moltenvk",
             sdk_version: Some("1.4.363.1".into()),
             environment: vec![("VK_DRIVER_FILES".into(), redacted(icd, Some(&sdk)))],
-            info: Ok(vulkaninfo(VULKANINFO)),
+            info: vulkaninfo(VULKANINFO),
         };
         let notes = device_notes(&setting, Some("Apple M1"));
         let text: String =
@@ -4179,12 +4172,19 @@ mod tests {
         ] {
             assert!(text.contains(expected), "{expected} in\n{text}");
         }
+        let row = |setting: &DeviceSetting| {
+            let notes = device_notes(setting, Some("Apple M1"));
+            notes.into_iter().find(|(name, _)| name == "Loader").unwrap().1
+        };
+        // Review fix1, m2: the system's loader, as on Windows, is named with the instance
+        // version `vulkaninfo` reports under the run's environment.
+        let mut system = DeviceSetting { sdk_version: None, ..setting.clone() };
+        assert_eq!(row(&system), "the system's, instance version 1.4.363");
+        system.info = VulkanInfo::default();
+        assert_eq!(row(&system), "the system's, instance version unreported");
         let unnamed = device_notes(&setting, Some("Apple M2"));
         assert!(unnamed[0].1.contains("lists no device named `Apple M2`"), "{unnamed:?}");
         assert!(!unnamed.iter().any(|(name, _)| name == "Ring memory"));
-        setting.info = Err("`vulkaninfo` did not run: not found".into());
-        let failed = device_notes(&setting, Some("Apple M1"));
-        assert!(failed[0].1.starts_with("unreported: `vulkaninfo` did not run"), "{failed:?}");
     }
 
     /// Review r1, M7: an absolute `--out` was written into the Command row as given, a
@@ -4485,24 +4485,44 @@ mod tests {
         assert_eq!(source_of(&report.entries[0].heard[0]), "log");
     }
 
-    /// A device file says that `vulkaninfo` listed no layer only where it ran: `on_device`
-    /// refuses a run in which it lists one.
+    /// Review fix1, n2: a `vulkaninfo` that did not run, ran past its deadline or failed
+    /// refuses the run, as one that lists a layer or prints no list does; only a clean list
+    /// is read.
     #[test]
-    fn a_device_file_claims_no_listed_layer_only_where_vulkaninfo_ran() {
-        let mut setting = DeviceSetting {
-            driver: "moltenvk",
-            sdk_version: None,
-            environment: Vec::new(),
-            info: Ok(VulkanInfo::default()),
+    fn a_run_is_refused_where_vulkaninfo_does_not_show_its_layers() {
+        let ended = |succeeded: bool, stdout: &str, killed: bool| {
+            Ok(vulkan::Ended {
+                succeeded,
+                status: if succeeded { "exit status: 0" } else { "exit status: 1" }.to_owned(),
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+                killed_at: killed.then_some(VULKANINFO_DEADLINE),
+            })
         };
-        let validation = |setting: &DeviceSetting| {
-            let notes = device_notes(setting, None);
-            notes.into_iter().find(|(name, _)| name == "Validation").unwrap().1
-        };
-        assert!(validation(&setting).contains("`vulkaninfo` under the same environment lists"));
-        setting.info = Err("`vulkaninfo` did not run: not found".into());
-        assert!(!validation(&setting).contains("vulkaninfo"), "{}", validation(&setting));
-        assert!(validation(&setting).contains("no loader settings file in reach"));
+        // No layer listed, then the device the fixture reports.
+        let clean = format!("Layers:\n=======\n{VULKANINFO}");
+        let clean = clean.as_str();
+        let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let refused = |result: Result<VulkanInfo, String>| result.unwrap_err();
+        assert!(refused(listed_info(Err(missing))).starts_with("`vulkaninfo` did not run"));
+        assert!(refused(listed_info(ended(true, clean, true))).contains("ran past"));
+        assert_eq!(
+            refused(listed_info(ended(false, clean, false))),
+            "`vulkaninfo` ended with exit status: 1"
+        );
+        let listed = "Layers: count = 1\n=================\nVK_LAYER_KHRONOS_validation \
+                      (Khronos Validation Layer) Vulkan version 1.4.363, layer version 1:\n";
+        assert!(refused(listed_info(ended(true, listed, false))).contains("VK_LAYER_KHRONOS"));
+        assert!(refused(listed_info(ended(true, "no list", false))).contains("no list"));
+        let info = listed_info(ended(true, clean, false)).unwrap();
+        assert_eq!(info, vulkaninfo(VULKANINFO));
+        let notes =
+            DeviceSetting { driver: "moltenvk", sdk_version: None, environment: Vec::new(), info };
+        let validation =
+            device_notes(&notes, None).into_iter().find(|(name, _)| name == "Validation");
+        let validation = validation.unwrap().1;
+        assert!(validation.contains("`vulkaninfo` under the same environment lists none"));
+        assert!(validation.contains("no loader settings file in reach"));
     }
 
     /// The instance layers of `vulkaninfo`'s full output and of `--summary`, cut from the
