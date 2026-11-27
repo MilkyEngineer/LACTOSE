@@ -2,31 +2,34 @@
 
 Status: decided. The owner ruled on its five questions, on the order of the sittings, on 26 November
 2026 on the order of the three runs before the commit and on the work desktop's rehearsal, and on 28
-November 2026 on a commit that moves and on who dispatches the workflows at the commit, and this is
-the proposal as ruled, for the coordinator to apply as D165. It is the tenth version. The fifth
-answered the fourth's diff review, which found one serious defect, in a commands file and not in
-this text, five minor ones and five nits. The sixth narrowed one rule of the fifth's, when the pin
-runs again after a fix round, and took back a claim about `record-stall`'s rows that a lane's review
-showed false. The seventh answered the diff review of those two, which found one serious defect,
-three minor ones and two nits: the sixth's rule contradicted itself, and the coordinator replaced it
-with a simpler one, that the pin passes at the commit's code. The eighth answered the seventh's diff
-review, which found one serious defect, two minor ones and two nits: the seventh's commit was "the
-first commit of main that holds" the lanes, which left a state with no next step once the pass had
-to be at the commit's code, and the commit became the head of main at which the three runs are last.
-The ninth answered the eighth's diff review, which found no serious defect, five minor ones and two
-nits: the pin passes at the commit itself, a push made against the hold moves the commit, the head
-is chosen after the early runs' last report, and at a moved commit the laptop's record follows the
-M1's hour there. The tenth answers the ninth's diff review, which found one minor defect and two
-nits: a moved commit's states now cover a defect that the laptop's record shows and one that only
-session C's driver shows, and the rehearsal's complement says when it can arise. The answers to each
-review are near the end. It answers the exit pass's audit of main at `ad1a99d` (26 November 2026):
-what stands between main and milestone 2's exit (`docs/plans/milestone-2.md`, section 7), and in
-what order it is done. It settles four things: the measurement commit, the order of the sittings and
-what each asks of the owner, the Khronos layer's pin on Windows, and the stamp verification row 21's
-Windows item waits for. The rulings are near the end, where the questions were, and after them what
-the reviews changed. It amends no sentence of `docs/architecture.md`. It is applied as one decision
-entry, the plan's and the verification rows' text below, and two lanes, of which `park-stamp` is
-running.
+November 2026 on a commit that the laptop's session moves and on who dispatches the workflows at the
+commit, and this is the proposal as ruled, for the coordinator to apply as D165. It is the eleventh
+version. The fifth answered the fourth's diff review, which found one serious defect, in a commands
+file and not in this text, five minor ones and five nits. The sixth narrowed one rule of the
+fifth's, when the pin runs again after a fix round, and took back a claim about `record-stall`'s
+rows that a lane's review showed false. The seventh answered the diff review of those two, which
+found one serious defect, three minor ones and two nits: the sixth's rule contradicted itself, and
+the coordinator replaced it with a simpler one, that the pin passes at the commit's code. The eighth
+answered the seventh's diff review, which found one serious defect, two minor ones and two nits: the
+seventh's commit was "the first commit of main that holds" the lanes, which left a state with no
+next step once the pass had to be at the commit's code, and the commit became the head of main at
+which the three runs are last. The ninth answered the eighth's diff review, which found no serious
+defect, five minor ones and two nits: the pin passes at the commit itself, a push made against the
+hold moves the commit, the head is chosen after the early runs' last report, and at a moved commit
+the laptop's record follows the M1's hour there. The tenth answered the ninth's diff review, which
+found one minor defect and two nits: a moved commit's states cover a defect that the laptop's record
+shows and one that only session C's driver shows, and the rehearsal's complement says when it can
+arise. The eleventh answers the tenth's diff review, which found one minor defect and one nit: the
+ruling of 28 November is recorded as it was asked, of a defect the laptop's session finds, and what
+stands for the pin at a commit that session C's defect moves joins the question left to the owner.
+The answers to each review are near the end. It answers the exit pass's audit of main at `ad1a99d`
+(26 November 2026): what stands between main and milestone 2's exit (`docs/plans/milestone-2.md`,
+section 7), and in what order it is done. It settles four things: the measurement commit, the order
+of the sittings and what each asks of the owner, the Khronos layer's pin on Windows, and the stamp
+verification row 21's Windows item waits for. The rulings are near the end, where the questions
+were, and after them what the reviews changed. It amends no sentence of `docs/architecture.md`. It
+is applied as one decision entry, the plan's and the verification rows' text below, and two lanes,
+of which `park-stamp` is running.
 
 This proposal ran no measurement and no device. It read the tree, the audit, `reviewer-gpu`'s
 reading for row 34, the two reviews with their probes and the diff review of the second version. It
@@ -40,10 +43,11 @@ run, the list of measurements in `tools/xtask/src/measure.rs` for which of them 
 the lane's README at its branch's head `35c2120` for a listener's rule. For the ninth it read that
 README again at the lane's commit `19f1b1b`, and the laptop's commands for where its record falls at
 a moved commit. For the tenth it read the laptop's commands again for the parts that follow its
-short run, and the work desktop's for when the pin run's first message goes out. The work desktop's
-facts are its own agent session's inventory, as the coordinator relayed it, and this proposal
-checked none of them. The rows below are built against main at `1c62676`, which is `b0c5f44` with
-lane `present-encoder` merged.
+short run, and the work desktop's for when the pin run's first message goes out. For the eleventh it
+read no file again: the question of 28 November is here as the coordinator relayed its wording. The
+work desktop's facts are its own agent session's inventory, as the coordinator relayed it, and this
+proposal checked none of them. The rows below are built against main at `1c62676`, which is
+`b0c5f44` with lane `present-encoder` merged.
 
 ## What stands between main and the exit
 
@@ -156,10 +160,11 @@ coordinator's rule, as the diff reviews of the seventh and eighth versions corre
    that case: the coordinator relays that the owner's ruling of 26 November was framed beside it.
    Found after, it is a defect found after the commit, and the rule for a file of a later commit
    holds.
-5. *A commit that moves after 7 December is recorded with the laptop standing for the pin.* This is
-   the owner's ruling of 28 November 2026. A commit that a defect only NVIDIA's or Intel's driver
-   shows has moved is recorded once `check`, `measure` and the laptop's own gate and short run have
-   passed at the moved head. Only documents merge from `check` there until it is recorded. No
+5. *A commit that the laptop's session moves is recorded with the laptop standing for the pin.* This
+   is the owner's ruling of 28 November 2026, and the question it answered named the laptop's
+   session. A commit moved by a defect that the laptop's session finds, and that only NVIDIA's or
+   Intel's driver shows, is recorded once `check`, `measure` and the laptop's own gate and short run
+   have passed at the moved head. Only documents merge from `check` there until it is recorded. No
    further remote session of the work desktop's is needed: it may no longer be lent by then. The
    rest of this rule is the coordinator's. The first four rules hold at the moved head with the
    laptop's gate and short run in the pin's place: the hold covers pushes, and a failure of one of
@@ -167,10 +172,15 @@ coordinator's rule, as the diff reviews of the seventh and eighth versions corre
    again there, or after the owner has ruled that the M1's files stand, which is the order's ruling
    read for a moved commit. Where the laptop's record had begun when the defect showed, its files so
    far are steering, since they are not at the commit, and its sitting at the moved head runs the
-   record whole. A defect that only session C's driver shows moves the commit as the laptop's does.
-   Whether session C then sits again at the moved head or its files stand is the owner's to rule
-   when it arises, and it is not ruled: the owner's desk time comes last and once, and no rule here
-   spends it twice.
+   record whole. A defect that only session C's driver shows moves the commit as the laptop's does,
+   and the laptop sits again there, since its record must be at the measurement commit. The ruling
+   does not reach that case. Whether the laptop's gate and short run stand for the pin there is not
+   ruled, and neither is whether session C sits again at the moved head or its files stand. The two
+   are one question, which the coordinator asks the owner when the case arises, and the moved
+   commit's hash waits for the answer. The question carries its cost: the laptop's gate cannot show
+   the fix of a defect that only session C's driver shows, so if session C's files stand, nothing at
+   the moved commit exercises the fix on the driver that showed it. The owner's desk time comes last
+   and once, and no rule here spends it twice.
 
 **Why documents may merge, and why none is pushed.** The coordinator's own work between the pass and
 the recording is documents: this decision's rows, a review's answers, a result file. They merge into
@@ -191,8 +201,8 @@ on that search now.
 
 **Every state has a next step.** The seventh version's diff review reached a state its texts gave no
 way out of, and the eighth's found one state with two next steps and one with none. The ninth's
-named two the table lacked. These are the states between the lanes' merges and the last sitting,
-each with the one thing that is done next.
+named two the table lacked, and the tenth's one that gave as ruled what was not. These are the
+states between the lanes' merges and the last sitting, each with the one thing that is done next.
 
 | State | Next step |
 |---|---|
@@ -211,10 +221,10 @@ each with the one thing that is done next.
 | The rehearsal finds a defect that fails none of the four | The commit does not wait. Its fix round merges once no hold stands: after the hash is recorded, or before the head is next chosen where the hold ended without a hash. The part that found it then runs again, as steering |
 | The rehearsal finds a defect that fails one of the four, before the hash is recorded. The coordinator records on the first message of the pin run's report, which goes out before the rehearsal starts, so this is only a defect reported before that recording is made | The pin has failed, as where it fails on a defect of the engine's |
 | The same, after the hash is recorded | A defect found after the commit. The commit stands, and the rule for a file of a later commit holds |
-| A sitting from 7 December shows a defect of a measured input that only NVIDIA's or Intel's driver shows | The commit moves to its fix. Where the laptop's record has not begun, its session leaves it out. Once the fix round has merged the coordinator chooses the head that holds it and holds main, `check` and `measure` run there, and a second sitting of the laptop runs its gate and short run there, which stand for the pin, as the owner ruled on 28 November 2026 |
+| A sitting from 7 December shows a defect of a measured input that only NVIDIA's or Intel's driver shows | The commit moves to its fix. Where the laptop's record has not begun, its session leaves it out. Once the fix round has merged the coordinator chooses the head that holds it and holds main, `check` and `measure` run there, and a second sitting of the laptop runs its gate and short run there. Where the laptop's own session showed the defect they stand for the pin, as the owner ruled on 28 November 2026 |
 | The same, where the laptop's record has begun | The commit moves as above. The laptop's files so far are steering, and its second sitting runs the record whole, which is part F of its commands, after its gate, its short run and its wait |
-| The same, where the sitting that shows the defect is session C and only its driver shows it | The commit moves as at a defect the laptop shows, and the laptop sits again as the two states above have it. The coordinator asks the owner whether session C sits again at the moved head or its files stand. That is not ruled: the owner's desk time comes last and once, and no text has session C sit twice of its own accord |
-| At a moved head, `check`, `measure` and the laptop's gate and short run have passed | The coordinator records the moved commit's hash, and the hold ends. The laptop's session waits. The M1's hour runs again there unless the owner rules that its files stand, and the coordinator then tells the laptop's session to take its record |
+| The same, where the sitting that shows the defect is session C and only its driver shows it | The commit moves as at a defect the laptop shows. The laptop sits again there as the state above has it, since its record must be at the measurement commit: that step is the coordinator's. Whether its gate and short run stand for the pin there is not ruled, since the ruling of 28 November was asked of a defect the laptop's session finds. The coordinator asks the owner one question: whether session C sits again at the moved head or its files stand, and what stands for the pin there. The question carries its cost: the laptop's gate cannot show the fix of a defect that only session C's driver shows, so if session C's files stand, nothing at the moved commit exercises the fix on the driver that showed it. Nothing of it is ruled: the owner's desk time comes last and once, and no text has session C sit twice of its own accord |
+| At a moved head, `check`, `measure` and what stands for the pin there have passed: the laptop's gate and short run where its own session showed the defect, and what the owner's answer names where session C did | The coordinator records the moved commit's hash, and the hold ends. The laptop's session waits. The M1's hour runs again there unless the owner rules that its files stand, and the coordinator then tells the laptop's session to take its record |
 | At a moved head, `check`, `measure` or the laptop's gate or short run fails | As at the first commit: the hold ends, a fix round merges, and the head is chosen again |
 
 **How the rule came to this.** The fourth version wrote "has run the Windows pin" and sent a failure
@@ -285,27 +295,32 @@ finding says which file is the record (section 7, step 7).
 **A defect a later sitting finds.** The work desktop shows AMD's driver and no other. A defect of a
 measured input that only NVIDIA's or Intel's driver shows is found from 7 December, after the M1's
 hour: on the laptop, in its gate, its short run or its record, or in session C. It moves the commit
-to its fix: the M1's hour runs again there, or the owner rules that its files stand. The fifth rule
-says how the moved commit is recorded, and it is the owner's ruling of 28 November 2026: on `check`,
-`measure` and the laptop's own gate and short run at the moved head, with no further remote session
-of the work desktop's. The machine may no longer be lent by then, and its driver is not the one that
-showed the defect. The laptop's commands gain one rule for it. Its gate and its short run already
-come before its record, and a second sitting of the laptop, which the owner starts, runs them at the
-moved head and sends its first four messages. The coordinator records the hash on those. The sitting
-then waits for the coordinator's word before its record: the M1's hour runs again at the moved
-commit first, or the owner rules that its files stand. The eighth version let the sitting go on to
-its record at once. Its diff review showed that this is a sitting at the commit before the M1's
-files there are read, which the decision rules out. The ninth version's states covered a defect that
-the laptop's gate or short run shows, and no other. Its diff review named two more. Where the defect
-shows once the laptop's record has begun, in a measurement of the record, in the client's run or in
-the mutations, the files written so far are steering and the second sitting runs the record whole.
-Where only session C's driver shows it, the commit moves as it does for the laptop's, and whether
-session C then sits again at the moved head or its files stand is the owner's to rule when it
-arises. The desktop's GPU is not known before its first sitting, and the owner's desk time comes
-last and once, so this text does not have session C sit twice of its own accord. A case of the pin's
-that the owner ruled the work desktop's own and that then fails in the laptop's gate is such a
-defect. The owner's ruling takes that cost for the days before 7 December it saves, and the fourth
-option below names it.
+to its fix: the M1's hour runs again there, or the owner rules that its files stand. Where the
+laptop's session finds the defect, the fifth rule says how the moved commit is recorded, and it is
+the owner's ruling of 28 November 2026: on `check`, `measure` and the laptop's own gate and short
+run at the moved head, with no further remote session of the work desktop's. The machine may no
+longer be lent by then, and its driver is not the one that showed the defect. The laptop's commands
+gain one rule for it. Its gate and its short run already come before its record, and a second
+sitting of the laptop, which the owner starts, runs them at the moved head and sends its first four
+messages. The coordinator records the hash on those. The sitting then waits for the coordinator's
+word before its record: the M1's hour runs again at the moved commit first, or the owner rules that
+its files stand. The eighth version let the sitting go on to its record at once. Its diff review
+showed that this is a sitting at the commit before the M1's files there are read, which the decision
+rules out. The ninth version's states covered a defect that the laptop's gate or short run shows,
+and no other. Its diff review named two more. Where the defect shows once the laptop's record has
+begun, in a measurement of the record, in the client's run or in the mutations, the files written so
+far are steering and the second sitting runs the record whole. Where only session C's driver shows
+it, the commit moves as it does for the laptop's, and the laptop sits again there, since its record
+must be at the measurement commit. The ruling was asked of the laptop's session, as the tenth
+version's diff review showed, and it does not reach this case. So one question goes to the owner
+when the case arises: whether session C sits again at the moved head or its files stand, and what
+stands for the pin there. Its cost goes with it: the laptop's gate cannot show the fix of a defect
+that only session C's driver shows, so if session C's files stand, nothing at the moved commit
+exercises the fix on the driver that showed it. The desktop's GPU is not known before its first
+sitting, and the owner's desk time comes last and once, so this text does not have session C sit
+twice of its own accord. A case of the pin's that the owner ruled the work desktop's own and that
+then fails in the laptop's gate is such a defect. The owner's ruling takes that cost for the days
+before 7 December it saves, and the fourth option below names it.
 
 **The nightly.** Exit step 3's nightly is the first at or after the measurement commit whose four
 `sour` jobs pass: `sour (linux-x64)`, `sour (windows-x64)`, `sour (macos-arm64)`, and `sour
@@ -400,10 +415,10 @@ runs at their own commits; the window cases (rows 208, 210, 234 and 236), fiftee
 the three mutations on the RTX 4070. `frame-impl`'s by-hand form of criterion 1 is dropped: `cargo
 xtask measure triangle` is that run once the pin exists (row 243). A session cut short, or stopped
 before the record, runs what is left in a second sitting of the laptop, which needs the owner only
-to start it. Where the commit has moved, that sitting's gate and short run at the moved head are
-what the moved commit is recorded on, as the owner ruled. Its record there waits for the
-coordinator's word: the M1's hour runs again at the moved commit first, or the owner rules that its
-files stand.
+to start it. Where a defect of the laptop's session has moved the commit, that sitting's gate and
+short run at the moved head are what the moved commit is recorded on, as the owner ruled. Its record
+there waits for the coordinator's word: the M1's hour runs again at the moved commit first, or the
+owner rules that its files stand.
 
 **The work desktop.** It is the owner's desktop at work, lent for early runs and reached through its
 own agent session over a remote desktop session. Its inventory, as that session gave it: an AMD
@@ -815,15 +830,17 @@ rows, of which the commit's row alone changes. They take the pass at the commit 
 choice after the early runs' last report, a push made against the hold, what ends the hold, and a
 moved commit as the owner ruled it with the laptop's record after the M1's hour there. The tenth
 changes one, the measurement commit's bullet in the plan, which gains the sentence on a defect that
-only session C's driver shows. Every block was applied in memory to the two files of `1c62676`: each
-OLD was found once, at the lines its head states. If a merge before the decision is applied moves a
-line, the blocks are built again from the merged files. `present-encoder`'s merge at `1c62676`
-inserted an addendum of D162 into the decisions log and replaced verification row 229, one line by
-one. It did not touch the plan, it moved no line of the verification file, and no block here names
-row 229, so the third version's blocks kept their lines and the next decision number is the one
-after D164. The plan's own record of the text it once appended to row 150, in its section
-"Verification rows", still reads "probed on the laptop's devices": it records an edit that was made,
-and it stays.
+only session C's driver shows. The eleventh changes two, that bullet and the commit's row: each has
+the laptop stand for the pin, as ruled, only where the laptop's session finds the defect, and each
+has the one question left to the owner where session C's driver shows it. Every block was applied in
+memory to the two files of `1c62676`: each OLD was found once, at the lines its head states. If a
+merge before the decision is applied moves a line, the blocks are built again from the merged files.
+`present-encoder`'s merge at `1c62676` inserted an addendum of D162 into the decisions log and
+replaced verification row 229, one line by one. It did not touch the plan, it moved no line of the
+verification file, and no block here names row 229, so the third version's blocks kept their lines
+and the next decision number is the one after D164. The plan's own record of the text it once
+appended to row 150, in its section "Verification rows", still reads "probed on the laptop's
+devices": it records an edit that was made, and it stays.
 
 The text is written for the owner's rulings.
 
@@ -884,21 +901,25 @@ NEW:
   commit out as soon as it is recorded, and the laptop's session and session C from 7 December 2026
   (section 4). A defect of a measured input that only NVIDIA's or Intel's driver shows, neither of
   which the work desktop has, moves the commit to its fix: the quiet window runs again there, or the
-  owner rules that its files stand. A commit moved so is recorded as the first is, with the laptop's
-  own gate and short run at the moved head standing for the pin: the owner ruled so, the work
-  desktop is not needed, and the hold runs from `check` at that head to the hash's recording. The
-  laptop's record at the moved commit follows the quiet window's run there, or the owner's ruling
-  that the quiet window's files stand. A defect that only session C's driver shows moves the commit
-  as the laptop's does, and whether session C then sits again at the moved head or its files stand
-  is the owner's to rule when it arises. A file is the record at the commit. A file of a later
-  commit is the record as `-at-<commit>` only where the diff from the measurement commit changes no
-  measured input the file's measurement reads, and its row gives the diff; otherwise the owner's
-  ruling says which file is the record (section 7). A figure one of section 4's measurements gave
-  before it is steering: it stays in its row, proves no criterion and stands for no file of record.
-  A run on the work desktop is steering at any commit: it closes no row, and none of its files is
-  checked in. A row that asks a machine for a run and names no commit is closed by that machine's
-  run and records the commit it ran at. A lane that merges after it and changes a measured input
-  runs the measurements it touches and reports them as steering.
+  owner rules that its files stand. Where the laptop's session finds the defect, the moved commit is
+  recorded as the first is, with the laptop's own gate and short run at the moved head standing for
+  the pin: the owner ruled so, the work desktop is not needed, and the hold runs from `check` at
+  that head to the hash's recording. The laptop's record at the moved commit follows the quiet
+  window's run there, or the owner's ruling that the quiet window's files stand. A defect that only
+  session C's driver shows moves the commit as the laptop's does, and the laptop sits again there
+  for its record. Whether session C then sits again at the moved head or its files stand, and what
+  stands for the pin there, is one question, the owner's to rule when it arises: the laptop's gate
+  cannot show the fix of a defect that only session C's driver shows, and if session C's files
+  stand, nothing at the moved commit exercises the fix on the driver that showed it. A file is the
+  record at the commit. A file of a later commit is the record as `-at-<commit>` only where the diff
+  from the measurement commit changes no measured input the file's measurement reads, and its row
+  gives the diff; otherwise the owner's ruling says which file is the record (section 7). A figure
+  one of section 4's measurements gave before it is steering: it stays in its row, proves no
+  criterion and stands for no file of record. A run on the work desktop is steering at any commit:
+  it closes no row, and none of its files is checked in. A row that asks a machine for a run and
+  names no commit is closed by that machine's run and records the commit it ran at. A lane that
+  merges after it and changes a measured input runs the measurements it touches and reports them as
+  steering.
 
 === docs/plans/milestone-2.md line 297: section 4's table of machines: the work desktop, after the desktop's row
 OLD:
@@ -1104,7 +1125,7 @@ NEW:
 
 === docs/verification.md: five rows appended at the end of the file, after the table's last row
 NEW:
-| The measurement commit of milestone 2 (D165): the head of main at which `check`, the `measure` workflow and the Windows pin run last, once main holds `present-encoder`, `park-stamp` and `layer-windows`, the three lanes that change a measured input after `measure-role`, of which `present-encoder` merged at `1c62676`, and the fix round of each defect the commit waits for. It is recorded once `check` and the `measure` workflow are green at it and the work desktop's run of the Windows pin on its RX 9060 XT has passed at it. The pass is at the commit itself: the commit the pin's report names is the commit recorded, and a pass at another commit does not count. The order is the owner's ruling: the lanes the commit holds merge first, `check` and `measure` run at that head, and the pin runs there last. The coordinator chooses that head once the work desktop's early runs have sent their last report, and holds main from the start of `check` there until the hash is recorded: while the hold stands nothing merges to main but documents, which are the files under `docs/` and the `*.md` files, and nothing is pushed to it, a document neither. A push made against the hold moves the commit to the new head: `check`, `measure` and the pin run there, each again where it had run. The commit waits for a defect that an early run of the work desktop's finds, or that `check`, `measure` or the pin fails on: it is a fix round of the lane whose code it is, whichever crate that is. A run that fails ends the hold, and so does such a defect reported while it stands: once the fix round has merged the head is chosen again, and the three run there in the same order. The commit does not wait for a defect that only the work desktop's rehearsal finds and that fails none of the pin's four conditions, which D165 names: the owner ruled so. Its fix round merges outside the hold: before the head is chosen, or after the hash is recorded, as a lane that merges after the commit does. One that fails one of the four, found before the hash is recorded, is the pin's failure. A measured input is anything a measurement builds, runs or computes a figure with, among them the crates under `crates/` and `game/`, `tools/cook` and `tools/xtask`, the Slang and layer pins, `shaders/`, `vendor/`, the manifests and `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, `.config/nextest.toml` and `.gitattributes`; where the list is short the definition holds. The quiet window on the M1 checks it out as soon as it is recorded, and from 7 December 2026 the laptop's session and session C on the desktop, in that order, each read before the next. A defect of a measured input that only NVIDIA's or Intel's driver shows, neither of which the work desktop has, moves the commit to its fix: the quiet window runs again there, or the owner rules that its files stand. A commit moved so is recorded as the first is, with the laptop's own gate and short run at the moved head standing for the pin: the owner ruled so, the work desktop is not needed, and the hold runs from `check` at that head to the hash's recording. The laptop's record at the moved commit follows the quiet window's run there, or the owner's ruling that the quiet window's files stand. A file is the record at it. A file of a later commit is the record as `-at-<commit>` only where the diff from it changes no measured input the file's measurement reads, and the row that cites the file gives the diff; otherwise the owner's ruling at the plan's exit step 7 names the record. A figure a measurement gave before it is steering and stands for no file of record, and a run on the work desktop is steering at any commit. A row that asks a machine for a run and names no commit is closed by that machine's run and records the commit it ran at. Two sittings keep commits of their own: the desktop's first at `a539d60` (D151), and `eco-qos`'s runs at `a75596b` and its first parent. To record here: the commit's hash; the date of the work desktop's pin run that passed, and the commit its report names, which is that hash; each fix round before the commit; each defect the rehearsal found that the commit did not wait for, with its fix round's merge; where the commit moved, the laptop's gate and short run that stood for the pin, and the quiet window's run there or the owner's ruling that its files stand; for each sitting its date, its load and the files it wrote; the ids of the `measure` workflow's run and of the first nightly at or after the commit whose four `sour` jobs pass | 2. **Owed**: no such commit exists at `1c62676` |
+| The measurement commit of milestone 2 (D165): the head of main at which `check`, the `measure` workflow and the Windows pin run last, once main holds `present-encoder`, `park-stamp` and `layer-windows`, the three lanes that change a measured input after `measure-role`, of which `present-encoder` merged at `1c62676`, and the fix round of each defect the commit waits for. It is recorded once `check` and the `measure` workflow are green at it and the work desktop's run of the Windows pin on its RX 9060 XT has passed at it. The pass is at the commit itself: the commit the pin's report names is the commit recorded, and a pass at another commit does not count. The order is the owner's ruling: the lanes the commit holds merge first, `check` and `measure` run at that head, and the pin runs there last. The coordinator chooses that head once the work desktop's early runs have sent their last report, and holds main from the start of `check` there until the hash is recorded: while the hold stands nothing merges to main but documents, which are the files under `docs/` and the `*.md` files, and nothing is pushed to it, a document neither. A push made against the hold moves the commit to the new head: `check`, `measure` and the pin run there, each again where it had run. The commit waits for a defect that an early run of the work desktop's finds, or that `check`, `measure` or the pin fails on: it is a fix round of the lane whose code it is, whichever crate that is. A run that fails ends the hold, and so does such a defect reported while it stands: once the fix round has merged the head is chosen again, and the three run there in the same order. The commit does not wait for a defect that only the work desktop's rehearsal finds and that fails none of the pin's four conditions, which D165 names: the owner ruled so. Its fix round merges outside the hold: before the head is chosen, or after the hash is recorded, as a lane that merges after the commit does. One that fails one of the four, found before the hash is recorded, is the pin's failure. A measured input is anything a measurement builds, runs or computes a figure with, among them the crates under `crates/` and `game/`, `tools/cook` and `tools/xtask`, the Slang and layer pins, `shaders/`, `vendor/`, the manifests and `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`, `.config/nextest.toml` and `.gitattributes`; where the list is short the definition holds. The quiet window on the M1 checks it out as soon as it is recorded, and from 7 December 2026 the laptop's session and session C on the desktop, in that order, each read before the next. A defect of a measured input that only NVIDIA's or Intel's driver shows, neither of which the work desktop has, moves the commit to its fix: the quiet window runs again there, or the owner rules that its files stand. Where the laptop's session finds the defect, the moved commit is recorded as the first is, with the laptop's own gate and short run at the moved head standing for the pin: the owner ruled so, the work desktop is not needed, and the hold runs from `check` at that head to the hash's recording. The laptop's record at the moved commit follows the quiet window's run there, or the owner's ruling that the quiet window's files stand. A defect that only session C's driver shows moves the commit as the laptop's does, and the laptop sits again there for its record. Whether session C then sits again at the moved head or its files stand, and what stands for the pin there, is one question, the owner's to rule when it arises: the laptop's gate cannot show the fix of a defect that only session C's driver shows, and if session C's files stand, nothing at the moved commit exercises the fix on the driver that showed it. A file is the record at it. A file of a later commit is the record as `-at-<commit>` only where the diff from it changes no measured input the file's measurement reads, and the row that cites the file gives the diff; otherwise the owner's ruling at the plan's exit step 7 names the record. A figure a measurement gave before it is steering and stands for no file of record, and a run on the work desktop is steering at any commit. A row that asks a machine for a run and names no commit is closed by that machine's run and records the commit it ran at. Two sittings keep commits of their own: the desktop's first at `a539d60` (D151), and `eco-qos`'s runs at `a75596b` and its first parent. To record here: the commit's hash; the date of the work desktop's pin run that passed, and the commit its report names, which is that hash; each fix round before the commit; each defect the rehearsal found that the commit did not wait for, with its fix round's merge; where the commit moved, what stood for the pin there, which is the laptop's gate and short run or what the owner's answer named, and the quiet window's run there or the owner's ruling that its files stand; for each sitting its date, its load and the files it wrote; the ids of the `measure` workflow's run and of the first nightly at or after the commit whose four `sour` jobs pass | 2. **Owed**: no such commit exists at `1c62676` |
 | The Khronos layer on Windows is pinned as installed (D165, D153; lane `layer-windows`): `library_sha256` is the SHA-256 of `Bin/VkLayer_khronos_validation.dll` as read on the development Mac, by the proposal and again by its GPU review, out of LunarG's installer `vulkansdk-windows-X64-1.4.363.1.exe`, which was fetched by the SHA-256 LunarG publishes for it and never run. No Windows host has checked it. The work desktop's pin run is the first to, on AMD's driver and as steering, and the measurement commit's row waits for its pass; the laptop's session, from 7 December 2026, is the check on NVIDIA's driver and Intel's, and the desktop's Windows is the third host. What a host's first run shows, and nothing before it: that the installed manifest names the layer at `1.4.363` and the installed file is the archived one, which the tool checks in that order; that the system's loader, whose version the run records, takes the layer's manifest from the exclusive `VK_IMPLICIT_LAYER_PATH` in a shell that is not elevated and loads no layer of the registry's with it, the loader ignoring every such variable in an elevated process; that each canary is heard on each of the host's GPUs, seven under the plain validators and two under GPU-assisted validation; that a measured run under the empty path hears no message; and which implicit layers the registry holds, read from the loader's own log (`VK_LOADER_DEBUG=layer`), each with its enable and disable variables. The work desktop's registry holds one for the whole machine, `VK_LAYER_OBS_HOOK`, so its runs show the exclusive path against a layer that would otherwise join. A digest that differs is a finding, and no run re-pins: a second pin is proposed only for a file whose version is 1.4.363.x and whose signature is LunarG's, and it is the owner's to approve | 2 |
 | The work desktop's runs (D165): steering alone, under the machine name `work-desktop-windows`, and `work-desktop-windows-igpu` on its integrated Radeon, on a machine that is not the owner's own and is reached over a remote session: an AMD Ryzen 9 9950X and a Radeon RX 9060 XT, with endpoint scanning in every figure. None of its files is checked in, no run of its closes a row, and its reports name no host, user or domain. Owed, in two parts. Before lane `layer-windows` merges, at main's head and with no validation layer on the machine: the device tests `cargo xtask gpu` lists, without their canaries, by hand on the RX 9060 XT, which is the first run of `lactose-rhi-vulkan` on a Windows driver; `lactose-platform`'s window cases; and `cargo xtask measure --all --no-device`. Once the lanes the measurement commit holds have merged and `check` and `measure` are green at that head, with the pinned SDK installed: the Windows pin there, whose pass the measurement commit's row waits for; then `cargo xtask measure --all`, `cargo xtask gpu --client` and the barrier mutations, as rehearsal of the laptop's session and of session C. The measurement commit does not wait for a defect that only the rehearsal finds and that fails none of the pin's four conditions. The owner may rule a failed case of the pin's the machine's only where the case presents into the remote session, never the layer's check, a canary or a message, and the laptop's gate runs that case first. The rehearsals are owed while the machine is lent: the exit's read re-gates what is left of them if it no longer is. To record here: each run's date and commit; each failure and whose it was, the engine's, AMD's driver's, the remote session's or one of the machine's controls'; the lane each defect's fix round went to, whether the measurement commit waited for it, and the pin's run after it where it did; and each case the owner ruled the machine's, with what the laptop's gate then gave for it. A figure of its is quoted in the row it steers, labelled as the work desktop's | 2 |
 | `lactose-task`'s two debug spans (D165; lane `park-stamp`): `open_gate` and `park`, target `whisk`, which `record-stall` reads. `park` is around both waits a worker makes without a permit, the idle protocol's and a scope opener's on its latch, which an opening of the gate wakes too. Both are in every build: section 5.1's compile-out of finer levels is not built, and a span costs about 1 ns where nothing listens at debug. `park`'s callbacks run on a worker that is going to sleep or has just been woken, in the idle protocol after it has announced it is asleep. A scope's opener checks its latch, its permit and shutdown again once it has entered the span, after the callbacks and before it parks, so a listener that blocks there delays a wake and cannot lose it. A listener's callbacks must return promptly and never call the executor, and `open_gate`'s enter callback runs with the gate still closed. Owed by the lane, on the M1 as steering: the record phase's figures and the time from an opening to the record's next job with nothing listening at debug, with `open_gate` listened to and with both, interleaved; `cargo xtask measure whisk` before and after; the loom models, Miri and the cross-target clippy runs, with the span at the latch's wait, which no probe has run; a test in which a listener's callback takes the opener's unpark token and the opener still wakes. Owed by the quiet window: the WHISK file at the measurement commit, read against D156 as the plan has it. `record-stall` fails where a build compiles debug spans out, so when section 5.1's compile-out is built it is set where `record-stall`'s build does not inherit it | 2 |
@@ -1191,16 +1212,19 @@ gate's wake is read from two debug spans** (§5.1, §20, §21, §22, `lactose-ta
     opened once, and session C. A criterion that misses on the M1 needs an engine lane, and a
     sitting taken before that lane is steering. A defect of a measured input that only NVIDIA's or
     Intel's driver shows is found after the M1's hour: it moves the commit to its fix, and the hour
-    runs again there or the owner rules that its files stand. A commit moved so is recorded as the
-    first is, with the laptop's own gate and short run at the moved head standing for the pin: the
-    owner ruled so, the work desktop is not needed, and the hold runs from `check` at that head to
-    the hash's recording. The laptop's record at the moved commit follows the M1's hour there, or
-    the owner's ruling that the M1's files stand. A defect that only session C's driver shows moves
-    the commit as the laptop's does, and whether session C then sits again at the moved head or its
-    files stand is the owner's to rule when it arises. The owner's desk time comes last and once.
-    The desktop's first sitting waits for the machine alone. The nightly of the exit is the first at
-    or after the measurement commit whose four `sour` jobs pass; another job's failure in that run
-    is a finding in its own row.
+    runs again there or the owner rules that its files stand. Where the laptop's session finds the
+    defect, the moved commit is recorded as the first is, with the laptop's own gate and short run
+    at the moved head standing for the pin: the owner ruled so, the work desktop is not needed, and
+    the hold runs from `check` at that head to the hash's recording. The laptop's record at the
+    moved commit follows the M1's hour there, or the owner's ruling that the M1's files stand. A
+    defect that only session C's driver shows moves the commit as the laptop's does, and the laptop
+    sits again there for its record. Whether session C then sits again at the moved head or its
+    files stand, and what stands for the pin there, is one question, the owner's to rule when it
+    arises: the laptop's gate cannot show the fix of a defect that only session C's driver shows,
+    and if session C's files stand, nothing at the moved commit exercises the fix on the driver that
+    showed it. The owner's desk time comes last and once. The desktop's first sitting waits for the
+    machine alone. The nightly of the exit is the first at or after the measurement commit whose
+    four `sour` jobs pass; another job's failure in that run is a finding in its own row.
   - *Windows takes the layer as installed.* `vulkan-layer.toml` pins the SHA-256 of the SDK's
     `VkLayer_khronos_validation.dll`, read on the development Mac out of LunarG's installer, which
     is fetched by the digest LunarG publishes and never run. The owner installs the SDK on each
@@ -1250,25 +1274,26 @@ gate's wake is read from two debug spans** (§5.1, §20, §21, §22, `lactose-ta
     the work desktop's early runs have sent their last report; the Windows pin counted as passed at
     a commit other than the one recorded, or on a ruling that the layer's check, a canary or a
     message was the machine's; the commit made to wait for a defect that only the work desktop's
-    rehearsal found and that fails none of the pin's four conditions; a commit moved after 7
-    December 2026 made to wait for the work desktop, and the laptop's record taken there before the
-    M1's hour has run there or the owner has ruled that its files stand; a command that overrides a
-    control of the work desktop's; a file of the work desktop's as the record, checked in, or
-    closing a row; a sitting of the laptop or the desktop before 7 December 2026; a file at another
-    commit cited as the record where the diff changes what its measurement reads; a sitting at the
-    measurement commit on the laptop or the desktop before the M1's files are read, the parts B, C
-    and E that record a moved commit apart; a layer on Windows taken unchecked from whatever the
-    machine has, and a pin changed by the session that found it wrong; a download the tool unpacks
-    out of an installer; an implicit layer of the machine's in a validated or a measured run; a
-    public hook in `lactose-task` for row 21's stamp, and a cargo feature for it; a probe program
-    written for row 150's four questions; a lane for the client's fault probe before the exit; a
-    window measurement run on a system `lactose-platform` has not been run on.
+    rehearsal found and that fails none of the pin's four conditions; a commit that a defect of the
+    laptop's session moved made to wait for the work desktop, and the laptop's record taken at a
+    moved commit before the M1's hour has run there or the owner has ruled that its files stand; a
+    command that overrides a control of the work desktop's; a file of the work desktop's as the
+    record, checked in, or closing a row; a sitting of the laptop or the desktop before 7 December
+    2026; a file at another commit cited as the record where the diff changes what its measurement
+    reads; a sitting at the measurement commit on the laptop or the desktop before the M1's files
+    are read, the parts B, C and E that record a moved commit apart; a layer on Windows taken
+    unchecked from whatever the machine has, and a pin changed by the session that found it wrong; a
+    download the tool unpacks out of an installer; an implicit layer of the machine's in a validated
+    or a measured run; a public hook in `lactose-task` for row 21's stamp, and a cargo feature for
+    it; a probe program written for row 150's four questions; a lane for the client's fault probe
+    before the exit; a window measurement run on a system `lactose-platform` has not been run on.
 - Driven by: the exit pass's audit at `ad1a99d`; `docs/proposals/milestone-2-sittings.md`, its probe
-  of LunarG's installer and its eight reviews; `reviewer-gpu`'s reading for row 34; lane
+  of LunarG's installer and its nine reviews; `reviewer-gpu`'s reading for row 34; lane
   `park-stamp`'s reviews, for the opening's length and for a listener; the owner's rulings on its
   five questions, on the sittings' order, on 26 November 2026 on the order of the three runs and on
-  the rehearsal, and on 28 November 2026 on a moved commit and on the coordinator's dispatch of
-  `measure` and the nightly; the work desktop's inventory, from its own agent session.
+  the rehearsal, and on 28 November 2026 on a commit the laptop's session moves and on the
+  coordinator's dispatch of `measure` and the nightly; the work desktop's inventory, from its own
+  agent session.
 - Replaced: in the plan's section 2, row 150's four hardware questions as "probed on the laptop's
   devices"; in its section 3, the measurement commit as "the first commit of main that holds
   `frame-impl` and `measure-m2`", "a measured crate", and two of the spike's open questions as
@@ -1319,16 +1344,20 @@ That narrows the ruling in its own direction and takes nothing it grants: a merg
 
 **The rulings on a moved commit and on dispatch.** On 28 November 2026 the owner ruled twice again,
 through `AskUserQuestion`, each time for the recommended option, and the coordinator relayed both.
-The first is on a commit that a defect only NVIDIA's or Intel's driver shows has moved: the laptop
-stands in for the pin. The moved commit is recorded once the Mac's checks and measurements and the
-laptop's gate and short run pass at that head, only documents merge from the Mac's checks until it
-is recorded, and there is no further remote session on the work desktop, which may not be lent by
-then. This text reads "the Mac's checks and measurements" as `check` and the `measure` workflow, as
-the diff review of the eighth version does. The eighth version had this rule as the coordinator's
-and asked for the ruling. The second is on who dispatches `measure` and the nightly at the
-measurement commit: the coordinator may run `gh workflow run measure.yml` and `gh workflow run
-nightly.yml` on main, for the measurement commit and a moved one alone. Nothing else of the
-coordinator's rule for `gh` changes.
+The first is on a commit moved by a defect that the laptop's session finds. As the coordinator
+relayed the question, it asked whether, if the laptop's session from 7 December finds a defect that
+only NVIDIA's or Intel's driver shows, the laptop's own gate and short measured run stand in for the
+Windows pin at the moved commit. The owner ruled that they do. The question named no other sitting,
+so the ruling does not reach a commit that a defect of session C's moves: the tenth version recorded
+it more widely than it was asked, and its diff review showed so. The moved commit is recorded once
+the Mac's checks and measurements and the laptop's gate and short run pass at that head, only
+documents merge from the Mac's checks until it is recorded, and there is no further remote session
+on the work desktop, which may not be lent by then. This text reads "the Mac's checks and
+measurements" as `check` and the `measure` workflow, as the diff review of the eighth version does.
+The eighth version had this rule as the coordinator's and asked for the ruling. The second is on who
+dispatches `measure` and the nightly at the measurement commit: the coordinator may run `gh workflow
+run measure.yml` and `gh workflow run nightly.yml` on main, for the measurement commit and a moved
+one alone. Nothing else of the coordinator's rule for `gh` changes.
 
 **What this text adds to the rulings.** Eight things the rulings do not say and this text decides,
 each the smallest reading of them.
@@ -1346,21 +1375,24 @@ each the smallest reading of them.
   message, and the laptop's gate runs that case first.
 - *Where the commit is, and the hold.* The rulings give the order of the three runs, that only
   documents merge from the pin's run to the recording, that the commit does not wait for the
-  rehearsal, and how a moved commit is recorded. The rest of "The decision" is the coordinator's
-  rule, as the diff reviews of the seventh and eighth versions corrected it, and the owner has not
-  ruled on it. The commit is the head of main at which the three run last, and not the first commit
-  that holds the lanes. The pass is at the commit itself, by the hash the pin's report names. The
-  head is chosen after the early runs' last report. The hold starts with `check` at that head,
-  sooner than the ruling's span, and covers every push, a document's too. It ends at the recording,
-  at a failed run, or at a defect the commit waits for that is reported while it stands. A push made
-  against it moves the commit to the new head. A rehearsal's fix merges before the head is chosen or
-  after the hash is recorded, and the part that found the defect then runs again as steering. A
-  rehearsal's defect that fails one of the four, found before the recording, is the pin's failure.
-  At a moved commit the hold covers pushes as at the first, and the laptop's record waits for the
-  M1's hour there or for the owner's ruling that its files stand, which is the order's ruling read
-  for a moved commit. Where that record had begun, its files so far are steering. A defect that only
-  session C's driver shows moves the commit as the laptop's does. Whether session C then sits again
-  at the moved head or its files stand is left to the owner, and nothing here rules it.
+  rehearsal, and how a commit that the laptop's session moves is recorded. The rest of "The
+  decision" is the coordinator's rule, as the diff reviews of the seventh and eighth versions
+  corrected it, and the owner has not ruled on it. The commit is the head of main at which the three
+  run last, and not the first commit that holds the lanes. The pass is at the commit itself, by the
+  hash the pin's report names. The head is chosen after the early runs' last report. The hold starts
+  with `check` at that head, sooner than the ruling's span, and covers every push, a document's too.
+  It ends at the recording, at a failed run, or at a defect the commit waits for that is reported
+  while it stands. A push made against it moves the commit to the new head. A rehearsal's fix merges
+  before the head is chosen or after the hash is recorded, and the part that found the defect then
+  runs again as steering. A rehearsal's defect that fails one of the four, found before the
+  recording, is the pin's failure. At a moved commit the hold covers pushes as at the first, and the
+  laptop's record waits for the M1's hour there or for the owner's ruling that its files stand,
+  which is the order's ruling read for a moved commit. Where that record had begun, its files so far
+  are steering. A defect that only session C's driver shows moves the commit as the laptop's does,
+  and the laptop sits again there for its record: both steps are the coordinator's. The ruling of 28
+  November was asked of the laptop's session and does not reach that case, so what stands for the
+  pin there is not ruled. It is one question with whether session C sits again at the moved head or
+  its files stand. That question is left to the owner with its cost, and nothing here rules it.
 - *The work desktop's controls stand.* No command asks for an exception to one or overrides one,
   PowerShell's execution policy among them.
 - *A second machine name*, `work-desktop-windows-igpu`, for the rehearsal on the work desktop's
@@ -1389,7 +1421,7 @@ as soon as the desktop is in reach, and its install of the SDK comes after its m
 | The quiet window | The coordinator, with every agent stopped | None |
 | The desktop's first sitting, from 7 December 2026 | The owner | None |
 | The laptop's session, from 7 December 2026 | The laptop's own agent session | 1 |
-| A commit moved after 7 December, as the owner ruled: `check`, `measure`, and the laptop's gate and short run at the moved head; then the M1's hour again there, or the owner's ruling that its files stand; then the laptop's record | The coordinator, and the laptop's own agent session in a second sitting the owner starts, which waits between its short run and its record | 1 for each move, beside its fix round |
+| A commit moved after 7 December: `check`, `measure`, and the laptop's gate and short run at the moved head, which stand for the pin where the laptop's session found the defect, as the owner ruled; then the M1's hour again there, or the owner's ruling that its files stand; then the laptop's record | The coordinator, and the laptop's own agent session in a second sitting the owner starts, which waits between its short run and its record | 1 for each move, beside its fix round |
 | Session C | The owner | None |
 | The files checked in and the rows written | The coordinator's pass, or a lane as `exit-pass-rows` was | 2 |
 | The freeze decision, the exit's read and the milestone 3 plan | As section 7 has them | Already counted |
@@ -1562,7 +1594,7 @@ the review's first fix for the serious one.
 | Finding | Answer |
 |---|---|
 | R1. "The first commit of main that holds" cannot be squared with a pass "at its code" once anything but a fix the commit waits for merges after the last such fix, and the fourth rule allowed such a merge | Accepted, with the review's first fix. The commit is the head of main at which `check`, `measure` and the pin run last. The hold starts with `check` at that head, covers pushes with merges, and ends at the recording or at a failed run. A rehearsal's fix merges before the head is chosen or after the hash is recorded, and no longer "before a run of the pin where it is ready". "Every state has a next step" lists the states, the review's three among them. It is in the decision entry, the plan's bullet, the commit's row and the quiet window's commands |
-| R2. A commit moved by a defect that only NVIDIA's or Intel's driver shows is under none of the five rules, and the work desktop may no longer be lent | Accepted, with the coordinator's rule, which the owner then ruled on 28 November 2026: the laptop's own gate and short run at the moved head stand for the pin, the work desktop is not needed, and the hold runs from `check` there to the recording. One sentence in the decision entry, the plan's bullet and the commit's row, and "A defect a later sitting finds" gives its cost |
+| R2. A commit moved by a defect that only NVIDIA's or Intel's driver shows is under none of the five rules, and the work desktop may no longer be lent | Accepted, with the coordinator's rule, which the owner then ruled on 28 November 2026 for a defect the laptop's session finds: the laptop's own gate and short run at the moved head stand for the pin, the work desktop is not needed, and the hold runs from `check` there to the recording. One sentence in the decision entry, the plan's bullet and the commit's row, and "A defect a later sitting finds" gives its cost |
 | R3. "One of the four conditions" has two meanings: the fourth is the short run's, and the examples named a measured run of the full set | Accepted. Each example names the short run's four measurements, and so does the condition, in the decision entry, the plan's section 4, the section on the pin's pass and the two commands files that changed. The seventh version's name for them, "the four device measurements", is dropped there: six measurements need a device, and the short run takes four. The laptop's and session C's commands kept the name beside the command that lists the four until the ninth version, which names the four there too |
 | n1. The reason a listener that blocks loses no wake covered the latch's wait alone | Accepted, in the decision entry and the section on the stamp: the sleeper bit at the idle wait, the opener's second check at the latch. With it, from the lane's fix round, `open_gate`'s two callbacks. The lane table's row and the spans' row are left for the lane's merge |
 | n2. The brief for a second pin run sends part A again, which ends in the owner's install | Accepted, in the work desktop's commands: where the pinned SDK is installed already, part A reads the loader and goes on to part B |
@@ -1604,10 +1636,21 @@ session C set another text than the review's.
 | n1. "Rules out" excepts the gate and the short run, where the sitting that records a moved commit also runs parts B and C before the M1's files are read | Accepted: "the parts B, C and E that record a moved commit apart" |
 | n2. The complement for a rehearsal's defect that fails one of the four cannot arise, since the coordinator records on the pin run's first message | Kept, with its bound said. The coordinator records on that message, so the complement covers only a defect reported before the recording is made: in the fourth rule, its state, the decision entry and the work desktop's commands. It is not dropped: the coordinator relays that the owner's ruling of 26 November was framed beside it |
 
-The coordinator also ruled on three readings of the ninth version's report. The quiet window's two
+The coordinator also decided on three readings of the ninth version's report. The quiet window's two
 commands that show no push was made against the hold stay. The line that names message 7 the early
 runs' last is the coordinator's to send to that session. And lane `park-stamp`'s merge writes the
 lane table's row and the spans' row again.
+
+**The diff review of the tenth version.** `reviewer-diff` read the tenth version's commit, and the
+decision entry, the rows and the two commands files that changed against their ninth versions, and
+ran the checker again. It found M1, n1 and n2 closed, and no blocking or serious defect, one minor
+one and one nit. The coordinator decided both, and relayed the question of 28 November as it was put
+to the owner.
+
+| Finding | Answer |
+|---|---|
+| M2. The laptop standing for the pin at a commit that session C's defect moved is given as the owner's ruling, where the question the owner answered named a defect the laptop's session finds | Accepted, as the coordinator decided it. The rulings' section records the ruling as it was asked. It is the owner's for a commit that a defect of the laptop's session moves, and for no other: in the fifth rule, the table's states, "A defect a later sitting finds", the laptop's second sitting, the decision entry, the plan's bullet, the commit's row, the cost table and R2's answer. At a commit that a defect of session C's moves the laptop still sits again, since its record must be at the measurement commit, and that step is the coordinator's. Whether its gate and short run stand for the pin there is not ruled. It joins the owner's question, which is one: whether session C sits again at the moved head or its files stand, and what stands for the pin there. The question carries its cost: the laptop's gate cannot show the fix of a defect that only session C's driver shows, so if session C's files stand, nothing at the moved commit exercises the fix on the driver that showed it. "The owner ruled so" still stands in the rehearsal's sentence and in the laptop's moved commit's, and in no other |
+| n1. The answers to the ninth's review have the coordinator "ruled" on three readings, where this text keeps the word for the owner | Accepted: "decided" |
 
 ## What this proposal could not verify
 
@@ -1683,10 +1726,11 @@ lane table's row and the spans' row again.
   lane's review, whose finding it answers, was not read here, and neither was anything the lane's
   worktree held beyond that commit.
 - The owner's four rulings of 26 and 28 November 2026. They are here as the coordinator relayed
-  them, and this proposal saw none of the questions. The second ruling's span, "from the pin's run",
-  is quoted as the coordinator and the diff review of the eighth version give it. That "the Mac's
-  checks and measurements" in the moved commit's ruling are `check` and the `measure` workflow is
-  this text's reading.
+  them, and this proposal saw none of the questions: the wording of the one on a moved commit is the
+  coordinator's relay too. The second ruling's span, "from the pin's run", is quoted as the
+  coordinator and the diff review of the eighth version give it. That "the Mac's checks and
+  measurements" in the moved commit's ruling are `check` and the `measure` workflow is this text's
+  reading.
 - What a push and a dispatch do to a run. That a push cancels a `check` in progress on main, that a
   cancelled run comes back only where it is run again, and that a dispatch of `measure` runs at the
   branch's head are read from the two workflow files at `1c62676` and from GitHub's behaviour as
