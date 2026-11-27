@@ -3,7 +3,7 @@
 Status: decided. The owner ruled on its five questions, on the order of the sittings, on 26 November
 2026 on the order of the three runs before the commit and on the work desktop's rehearsal, and on 28
 November 2026 on a commit that the laptop's session moves and on who dispatches the workflows at the
-commit, and this is the proposal as ruled, for the coordinator to apply as D165. It is the eleventh
+commit, and this is the proposal as ruled, for the coordinator to apply as D165. It is the twelfth
 version. The fifth answered the fourth's diff review, which found one serious defect, in a commands
 file and not in this text, five minor ones and five nits. The sixth narrowed one rule of the
 fifth's, when the pin runs again after a fix round, and took back a claim about `record-stall`'s
@@ -19,17 +19,19 @@ hold moves the commit, the head is chosen after the early runs' last report, and
 the laptop's record follows the M1's hour there. The tenth answered the ninth's diff review, which
 found one minor defect and two nits: a moved commit's states cover a defect that the laptop's record
 shows and one that only session C's driver shows, and the rehearsal's complement says when it can
-arise. The eleventh answers the tenth's diff review, which found one minor defect and one nit: the
+arise. The eleventh answered the tenth's diff review, which found one minor defect and one nit: the
 ruling of 28 November is recorded as it was asked, of a defect the laptop's session finds, and what
 stands for the pin at a commit that session C's defect moves joins the question left to the owner.
-The answers to each review are near the end. It answers the exit pass's audit of main at `ad1a99d`
-(26 November 2026): what stands between main and milestone 2's exit (`docs/plans/milestone-2.md`,
-section 7), and in what order it is done. It settles four things: the measurement commit, the order
-of the sittings and what each asks of the owner, the Khronos layer's pin on Windows, and the stamp
-verification row 21's Windows item waits for. The rulings are near the end, where the questions
-were, and after them what the reviews changed. It amends no sentence of `docs/architecture.md`. It
-is applied as one decision entry, the plan's and the verification rows' text below, and two lanes,
-of which `park-stamp` is running.
+The twelfth answers the eleventh's diff review, which found two nits: that question is asked once
+the defect is read, before the head is chosen, and a failure of what stands for the pin at a moved
+head has its state. The answers to each review are near the end. It answers the exit pass's audit of
+main at `ad1a99d` (26 November 2026): what stands between main and milestone 2's exit
+(`docs/plans/milestone-2.md`, section 7), and in what order it is done. It settles four things: the
+measurement commit, the order of the sittings and what each asks of the owner, the Khronos layer's
+pin on Windows, and the stamp verification row 21's Windows item waits for. The rulings are near the
+end, where the questions were, and after them what the reviews changed. It amends no sentence of
+`docs/architecture.md`. It is applied as one decision entry, the plan's and the verification rows'
+text below, and two lanes, of which `park-stamp` is running.
 
 This proposal ran no measurement and no device. It read the tree, the audit, `reviewer-gpu`'s
 reading for row 34, the two reviews with their probes and the diff review of the second version. It
@@ -44,10 +46,11 @@ the lane's README at its branch's head `35c2120` for a listener's rule. For the 
 README again at the lane's commit `19f1b1b`, and the laptop's commands for where its record falls at
 a moved commit. For the tenth it read the laptop's commands again for the parts that follow its
 short run, and the work desktop's for when the pin run's first message goes out. For the eleventh it
-read no file again: the question of 28 November is here as the coordinator relayed its wording. The
-work desktop's facts are its own agent session's inventory, as the coordinator relayed it, and this
-proposal checked none of them. The rows below are built against main at `1c62676`, which is
-`b0c5f44` with lane `present-encoder` merged.
+read no file again: the question of 28 November is here as the coordinator relayed its wording. For
+the twelfth it read the quiet window's commands again for where the question on session C's case
+fell among their steps. The work desktop's facts are its own agent session's inventory, as the
+coordinator relayed it, and this proposal checked none of them. The rows below are built against
+main at `1c62676`, which is `b0c5f44` with lane `present-encoder` merged.
 
 ## What stands between main and the exit
 
@@ -176,11 +179,17 @@ coordinator's rule, as the diff reviews of the seventh and eighth versions corre
    and the laptop sits again there, since its record must be at the measurement commit. The ruling
    does not reach that case. Whether the laptop's gate and short run stand for the pin there is not
    ruled, and neither is whether session C sits again at the moved head or its files stand. The two
-   are one question, which the coordinator asks the owner when the case arises, and the moved
-   commit's hash waits for the answer. The question carries its cost: the laptop's gate cannot show
-   the fix of a defect that only session C's driver shows, so if session C's files stand, nothing at
-   the moved commit exercises the fix on the driver that showed it. The owner's desk time comes last
-   and once, and no rule here spends it twice.
+   are one question. The coordinator asks it once the defect is read, before the head is chosen and
+   the hold starts, so that main is not held while the owner considers it. The head is chosen once
+   the fix round has merged and the owner has answered, and the moved commit's hash is recorded as
+   the answer has it. The question carries its cost: the laptop's gate cannot show the fix of a
+   defect that only session C's driver shows, so if session C's files stand, nothing at the moved
+   commit exercises the fix on the driver that showed it. It carries the answer's consequence for
+   the order too: if session C's second sitting is to stand for the pin, that sitting comes before
+   the hash, and so before the M1's hour at the moved head. The decision otherwise has no sitting at
+   the commit before the M1's files are read, so an answer that names that sitting would be the
+   owner's ruling on the order as well. The owner's desk time comes last and once, and no rule here
+   spends it twice.
 
 **Why documents may merge, and why none is pushed.** The coordinator's own work between the pass and
 the recording is documents: this decision's rows, a review's answers, a result file. They merge into
@@ -223,9 +232,9 @@ states between the lanes' merges and the last sitting, each with the one thing t
 | The same, after the hash is recorded | A defect found after the commit. The commit stands, and the rule for a file of a later commit holds |
 | A sitting from 7 December shows a defect of a measured input that only NVIDIA's or Intel's driver shows | The commit moves to its fix. Where the laptop's record has not begun, its session leaves it out. Once the fix round has merged the coordinator chooses the head that holds it and holds main, `check` and `measure` run there, and a second sitting of the laptop runs its gate and short run there. Where the laptop's own session showed the defect they stand for the pin, as the owner ruled on 28 November 2026 |
 | The same, where the laptop's record has begun | The commit moves as above. The laptop's files so far are steering, and its second sitting runs the record whole, which is part F of its commands, after its gate, its short run and its wait |
-| The same, where the sitting that shows the defect is session C and only its driver shows it | The commit moves as at a defect the laptop shows. The laptop sits again there as the state above has it, since its record must be at the measurement commit: that step is the coordinator's. Whether its gate and short run stand for the pin there is not ruled, since the ruling of 28 November was asked of a defect the laptop's session finds. The coordinator asks the owner one question: whether session C sits again at the moved head or its files stand, and what stands for the pin there. The question carries its cost: the laptop's gate cannot show the fix of a defect that only session C's driver shows, so if session C's files stand, nothing at the moved commit exercises the fix on the driver that showed it. Nothing of it is ruled: the owner's desk time comes last and once, and no text has session C sit twice of its own accord |
+| The same, where the sitting that shows the defect is session C and only its driver shows it | The commit moves as at a defect the laptop shows. Once the defect is read, before the head is chosen and the hold starts, the coordinator asks the owner one question: whether session C sits again at the moved head or its files stand, and what stands for the pin there. The question carries its cost: the laptop's gate cannot show the fix of a defect that only session C's driver shows, so if session C's files stand, nothing at the moved commit exercises the fix on the driver that showed it. It carries the answer's consequence for the order too: if session C's second sitting is to stand for the pin, that sitting comes before the hash, and so before the M1's hour at the moved head. Whether the laptop's gate and short run stand for the pin there is not ruled, since the ruling of 28 November was asked of a defect the laptop's session finds. The head is chosen once the fix round has merged and the owner has answered. The laptop sits again there as the state above has it, since its record must be at the measurement commit: that step is the coordinator's. Nothing of the question is ruled: the owner's desk time comes last and once, and no text has session C sit twice of its own accord |
 | At a moved head, `check`, `measure` and what stands for the pin there have passed: the laptop's gate and short run where its own session showed the defect, and what the owner's answer names where session C did | The coordinator records the moved commit's hash, and the hold ends. The laptop's session waits. The M1's hour runs again there unless the owner rules that its files stand, and the coordinator then tells the laptop's session to take its record |
-| At a moved head, `check`, `measure` or the laptop's gate or short run fails | As at the first commit: the hold ends, a fix round merges, and the head is chosen again |
+| At a moved head, `check`, `measure` or the laptop's gate or short run fails, or what stands for the pin there fails | As at the first commit: the hold ends, a fix round merges, and the head is chosen again |
 
 **How the rule came to this.** The fourth version wrote "has run the Windows pin" and sent a failure
 to "the lane it names". A pin run that failed met those words, a defect of the engine's that the pin
@@ -313,14 +322,16 @@ far are steering and the second sitting runs the record whole. Where only sessio
 it, the commit moves as it does for the laptop's, and the laptop sits again there, since its record
 must be at the measurement commit. The ruling was asked of the laptop's session, as the tenth
 version's diff review showed, and it does not reach this case. So one question goes to the owner
-when the case arises: whether session C sits again at the moved head or its files stand, and what
-stands for the pin there. Its cost goes with it: the laptop's gate cannot show the fix of a defect
-that only session C's driver shows, so if session C's files stand, nothing at the moved commit
-exercises the fix on the driver that showed it. The desktop's GPU is not known before its first
-sitting, and the owner's desk time comes last and once, so this text does not have session C sit
-twice of its own accord. A case of the pin's that the owner ruled the work desktop's own and that
-then fails in the laptop's gate is such a defect. The owner's ruling takes that cost for the days
-before 7 December it saves, and the fourth option below names it.
+once the defect is read, before the head is chosen and the hold starts: whether session C sits again
+at the moved head or its files stand, and what stands for the pin there. Its cost goes with it: the
+laptop's gate cannot show the fix of a defect that only session C's driver shows, so if session C's
+files stand, nothing at the moved commit exercises the fix on the driver that showed it. So does the
+answer's consequence for the order: if session C's second sitting is to stand for the pin, that
+sitting comes before the hash, and so before the M1's hour at the moved head. The desktop's GPU is
+not known before its first sitting, and the owner's desk time comes last and once, so this text does
+not have session C sit twice of its own accord. A case of the pin's that the owner ruled the work
+desktop's own and that then fails in the laptop's gate is such a defect. The owner's ruling takes
+that cost for the days before 7 December it saves, and the fourth option below names it.
 
 **The nightly.** Exit step 3's nightly is the first at or after the measurement commit whose four
 `sour` jobs pass: `sour (linux-x64)`, `sour (windows-x64)`, `sour (macos-arm64)`, and `sour
@@ -832,7 +843,8 @@ moved commit as the owner ruled it with the laptop's record after the M1's hour 
 changes one, the measurement commit's bullet in the plan, which gains the sentence on a defect that
 only session C's driver shows. The eleventh changes two, that bullet and the commit's row: each has
 the laptop stand for the pin, as ruled, only where the laptop's session finds the defect, and each
-has the one question left to the owner where session C's driver shows it. Every block was applied in
+has the one question left to the owner where session C's driver shows it. The twelfth changes none:
+the blocks and the decision entry are the eleventh's, byte for byte. Every block was applied in
 memory to the two files of `1c62676`: each OLD was found once, at the lines its head states. If a
 merge before the decision is applied moves a line, the blocks are built again from the merged files.
 `present-encoder`'s merge at `1c62676` inserted an addendum of D162 into the decisions log and
@@ -1392,7 +1404,9 @@ each the smallest reading of them.
   and the laptop sits again there for its record: both steps are the coordinator's. The ruling of 28
   November was asked of the laptop's session and does not reach that case, so what stands for the
   pin there is not ruled. It is one question with whether session C sits again at the moved head or
-  its files stand. That question is left to the owner with its cost, and nothing here rules it.
+  its files stand. That question is left to the owner with its cost and with its answer's
+  consequence for the order. The coordinator asks it once the defect is read, before the head is
+  chosen, and nothing here rules it.
 - *The work desktop's controls stand.* No command asks for an exception to one or overrides one,
   PowerShell's execution policy among them.
 - *A second machine name*, `work-desktop-windows-igpu`, for the rehearsal on the work desktop's
@@ -1651,6 +1665,18 @@ to the owner.
 |---|---|
 | M2. The laptop standing for the pin at a commit that session C's defect moved is given as the owner's ruling, where the question the owner answered named a defect the laptop's session finds | Accepted, as the coordinator decided it. The rulings' section records the ruling as it was asked. It is the owner's for a commit that a defect of the laptop's session moves, and for no other: in the fifth rule, the table's states, "A defect a later sitting finds", the laptop's second sitting, the decision entry, the plan's bullet, the commit's row, the cost table and R2's answer. At a commit that a defect of session C's moves the laptop still sits again, since its record must be at the measurement commit, and that step is the coordinator's. Whether its gate and short run stand for the pin there is not ruled. It joins the owner's question, which is one: whether session C sits again at the moved head or its files stand, and what stands for the pin there. The question carries its cost: the laptop's gate cannot show the fix of a defect that only session C's driver shows, so if session C's files stand, nothing at the moved commit exercises the fix on the driver that showed it. "The owner ruled so" still stands in the rehearsal's sentence and in the laptop's moved commit's, and in no other |
 | n1. The answers to the ninth's review have the coordinator "ruled" on three readings, where this text keeps the word for the owner | Accepted: "decided" |
+
+**The diff review of the eleventh version.** `reviewer-diff` read the eleventh version's commit, and
+the decision entry, the rows and the two commands files that changed against their last versions,
+and ran the checker again. It found M2 and the nit closed, and two nits and nothing more. The
+coordinator decided both, and kept the round to this text's body and the quiet window's commands.
+The decision entry and the twenty-one blocks stand as the eleventh version has them, byte for byte,
+so the entry's "its nine reviews" does not count this one.
+
+| Finding | Answer |
+|---|---|
+| n1. The question on session C's case is asked after the head is chosen, so main is held while the owner considers it, and one answer has session C sit before the hash, which "Rules out" does not except | Accepted, as the coordinator decided it. The question is asked once the defect is read, before the head is chosen and the hold starts: in the fifth rule, session C's state, "A defect a later sitting finds", the bullet on where the commit is and the quiet window's commands. Beside its cost it carries the answer's consequence for the order: if session C's second sitting is to stand for the pin, that sitting comes before the hash, and so before the M1's hour at the moved head. The entry is not changed: an answer that names that sitting would be the owner's ruling on the order as well, and the fifth rule says so |
+| n2. The state for a failure at a moved head names the laptop's gate and short run alone, where the state for a pass names what stands for the pin there | Accepted: "or what stands for the pin there fails" |
 
 ## What this proposal could not verify
 
