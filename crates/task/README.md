@@ -304,12 +304,12 @@ and list what changed, because `lactose-ecs` is written against this surface.
   - `park`, around each of the two waits a worker makes without a permit, entered before the
     wait and exited when it returns, or with no sleep in it when the wait finds it need not
     sleep after all: the idle wait when a waker has already claimed the worker, the latch's when
-    its re-check after the callbacks finds a reason to go on. Its field `wait` says which: `"idle"` for `sleep.park` in
-    `gate::idle_park`, whenever a worker parks in the idle protocol, whatever its last look saw,
-    nothing or work with no permit to take it; `"latch"` for `opener.park(latch)` in
-    `gate::wait_for_children`, a scope's opener on its latch, which `Pool::open_gate` wakes with
-    every other worker. A replay's wait on a latch is not spanned: under a replay the log
-    decides when each worker runs.
+    its re-check after the callbacks finds a reason to go on. Its field `wait` says which: `"idle"`
+    for `sleep.park` in `gate::idle_park`, whenever a worker parks in the idle protocol, whatever
+    its last look saw, nothing or work with no permit to take it; `"latch"` for `opener.park(latch)`
+    in `gate::wait_for_children`, a scope's opener on its latch, which `Pool::open_gate` wakes with
+    every other worker. A replay's wait on a latch is not spanned: under a replay the log decides
+    when each worker runs.
 - Both debug spans are in every build until architecture section 5.1's compile-out of finer
   levels is built: the workspace's `tracing` sets no static maximum level. Where nothing
   listens at debug, each costs what a span nobody wants costs (see the end of this file).
