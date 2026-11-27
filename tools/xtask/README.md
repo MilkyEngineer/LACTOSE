@@ -1081,8 +1081,8 @@ installed as administrator once. The loader is the system's, whose version the r
 ### Barrier mutations
 
 `python3 -B tools/xtask/barrier-mutations.py <out dir> [--run <name>]... [-- <gpu args>...]`
-(`py -3 -B` on Windows; `-B` writes no `__pycache__` into the checkout) runs the renderer's barrier mutations its docstring describes, the
-records of `docs/verification.md`'s rows of the barrier between dispatches, the
+(`py -3 -B` on Windows; `-B` writes no `__pycache__` into the checkout) runs the renderer's
+barrier mutations its docstring describes, the records of `docs/verification.md`'s rows of the barrier between dispatches, the
 scatter-to-vertex barrier and the barrier across frames: each run copies the checkout into a
 fresh directory under `<out dir>`, patches one barrier out of `lactose-rhi-vulkan`'s encoder
 and the lag it needs into the scatter shader, and runs `cargo xtask gpu --only vulkan` there.
@@ -1094,5 +1094,8 @@ of a mutant included: its lag alone, or the checkout unpatched where it adds no 
 pass every test. Each copy's encoder is touched after the copy, which keeps every other file's
 time, so the copy's build recompiles `lactose-rhi-vulkan` and what depends on it even where the
 same `<out dir>` held a mutant before. A patch that does not apply removes its copy and exits
-2; a failed control or a mutant killed, not judged or not run exits 1. Under `--gpu-assisted`
+2; a failed control or a mutant killed, not judged or not run exits 1. An `<out dir>` whose
+`target` is the checkout's own target directory, through a link or `CARGO_TARGET_DIR`, is
+refused: cargo names a workspace's crates by their paths within it and judges them by their
+sources' times, so the checkout's next build would run the last mutant unrebuilt. Under `--gpu-assisted`
 on macOS the driver must be named. Its files are read and written as UTF-8.

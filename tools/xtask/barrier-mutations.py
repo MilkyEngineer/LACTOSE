@@ -159,6 +159,12 @@ def inside(path, root):
         return False
 
 
+def same(path, other):
+    """Whether two paths name one directory, each with its links resolved."""
+    return (os.path.normcase(os.path.realpath(path))
+            == os.path.normcase(os.path.realpath(os.path.abspath(other))))
+
+
 def copy(out, name):
     """A copy of the checkout in a directory made fresh for it, which no earlier run's files,
     nor a handle Windows still holds on one, can reach."""
@@ -255,6 +261,15 @@ def parse(argv):
             sys.exit("barrier-mutations: the output directory is inside the checkout, which "
                      "each copy would take in: give one outside it, or under its `target`, "
                      "`.scratchpad` or `.claude`")
+    # Cargo names a workspace's crates by their paths within it and judges them fresh by
+    # their sources' times, so a mutant built into the checkout's own target directory is
+    # what the checkout's next build runs, unrebuilt.
+    target = os.path.join(out, "target")
+    owns = [os.path.join(CHECKOUT, "target"), os.environ.get("CARGO_TARGET_DIR")]
+    if any(own and same(target, own) for own in owns):
+        sys.exit("barrier-mutations: `<out dir>/target` is the checkout's own target "
+                 "directory, which a mutant's build would leave its crates in: give an "
+                 "output directory whose `target` is its own")
     # A mutant's verdict stands on its control's pass, so a chosen mutant brings its control.
     controls = [run[3] for run in RUNS if run[0] in chosen and run[3]]
     runs = [run for run in RUNS if not chosen or run[0] in chosen or run[0] in controls]
