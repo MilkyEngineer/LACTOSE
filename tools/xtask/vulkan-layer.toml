@@ -16,3 +16,12 @@ library_sha256 = "eed43e28b9360aba05d34ff2f6c2b2c16834fa6097f73982182b50e2957ccd
 # `~/VulkanSDK/<version>/macOS` where the installer puts it. Nothing is fetched.
 [host.macos-aarch64]
 library_sha256 = "c4d93ad34b5e164fb6d5c6b7fbcf19aefbcbc73ea25fee0582937ddc36b086fe"
+
+# LunarG's installer, which an owner runs as administrator: the SDK at `VULKAN_SDK`, or at
+# `C:\VulkanSDK\<version>` where the installer puts it. Nothing is fetched. `url` and `sha256`
+# name the installer, for the error that says the SDK is not there. `library_sha256` was read
+# on the Mac out of that installer, never run (tools/xtask/README.md, "GPU runs").
+[host.windows-x86_64]
+url = "https://sdk.lunarg.com/sdk/download/1.4.363.1/windows/vulkansdk-windows-X64-1.4.363.1.exe"
+sha256 = "c02932bd9a968b22d404536108adaacac908c081cd6b0113f5bfefc523dd0a6a"
+library_sha256 = "451ed11cbc799f858cbc0e843766d2990527c03f93f7a85f03bc1e67b605a435"

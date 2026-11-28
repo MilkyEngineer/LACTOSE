@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -40,48 +41,102 @@ pub struct Pin {
 #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct HostPin {
-    /// The SDK archive fetched on this host, or `None` where an installer put the SDK.
+    /// LunarG's file of the SDK: on Linux the archive the tool fetches, on Windows the
+    /// installer an owner runs, which the tool names and never fetches; `None` on the Mac.
     pub url: Option<String>,
-    /// The archive's SHA-256, with `url`.
+    /// That file's SHA-256, the digest LunarG publishes for it, with `url`.
     pub sha256: Option<String>,
     /// The SHA-256 of the layer's library.
     pub library_sha256: String,
 }
 
-/// The hosts the pin must name: the CI runner of the `gpu (lavapipe)` job and the M1.
-pub const HOSTS: [&str; 2] = ["linux-x86_64", "macos-aarch64"];
+/// The hosts the pin must name: the CI runner of the `gpu (lavapipe)` job, the M1, and
+/// Windows on x86-64, the laptop's and the desktop's.
+pub const HOSTS: [&str; 3] = ["linux-x86_64", "macos-aarch64", "windows-x86_64"];
+
+/// A host the pin names, by the SDK's form there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Host {
+    /// The archive fetched by digest and unpacked under the target directory; the SDK's loader
+    /// and the system's lavapipe.
+    Linux,
+    /// The installed SDK; its loader and its drivers, or the system's.
+    MacOs,
+    /// The installed SDK; the system's loader and the system's drivers alone.
+    Windows,
+}
+
+impl Host {
+    /// The host this tool runs on.
+    ///
+    /// # Errors
+    /// On a host the pin names no layer for.
+    pub fn this() -> Result<Self, String> {
+        match (env::consts::OS, env::consts::ARCH) {
+            ("linux", "x86_64") => Ok(Self::Linux),
+            ("macos", "aarch64") => Ok(Self::MacOs),
+            ("windows", "x86_64") => Ok(Self::Windows),
+            (os, arch) => Err(format!("{PIN_FILE} pins no validation layer for {os} on {arch}")),
+        }
+    }
+
+    /// Its name in the pin, one of [`HOSTS`].
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Linux => HOSTS[0],
+            Self::MacOs => HOSTS[1],
+            Self::Windows => HOSTS[2],
+        }
+    }
+
+    /// The end of the url of LunarG's file the pin names for this host, of the SDK `version`:
+    /// the archive on Linux, the installer on Windows; none on the Mac.
+    fn named_file(self, version: &str) -> Option<String> {
+        match self {
+            Self::Linux => {
+                Some(format!("/{version}/linux/vulkansdk-linux-x86_64-{version}.tar.xz"))
+            }
+            Self::MacOs => None,
+            Self::Windows => {
+                Some(format!("/{version}/windows/vulkansdk-windows-X64-{version}.exe"))
+            }
+        }
+    }
+}
 
 impl Pin {
     /// Reads the pin file's text.
     ///
     /// # Errors
     /// For text that is not the pin's form, a host missing or another named, a digest that
-    /// is not 64 lowercase hexadecimal digits, or an archive on one host and not the other's
-    /// form: Linux's is fetched, with its digest, and the Mac's installed.
+    /// is not 64 lowercase hexadecimal digits, or a host not of its form: Linux names the
+    /// archive it fetches and Windows the installer an owner runs, each with its url and
+    /// digest, and the Mac names neither.
     pub fn parse(text: &str) -> Result<Self, String> {
         let pin: Self = toml::from_str(text).map_err(|e| format!("{PIN_FILE}: {e}"))?;
         let names: Vec<&str> = pin.host.keys().map(String::as_str).collect();
         if names != HOSTS {
             return Err(format!("{PIN_FILE}: the hosts are {names:?}, where {HOSTS:?} are pinned"));
         }
-        for (name, host) in &pin.host {
-            let digests = [Some(&host.library_sha256), host.sha256.as_ref()];
+        for (host, (name, pinned)) in
+            [Host::Linux, Host::MacOs, Host::Windows].into_iter().zip(&pin.host)
+        {
+            let digests = [Some(&pinned.library_sha256), pinned.sha256.as_ref()];
             if digests.into_iter().flatten().any(|digest| !hex64(digest)) {
                 return Err(format!("{PIN_FILE}: {name}'s sha256 is not 64 lowercase hex digits"));
             }
-            let fetched = name == "linux-x86_64";
-            match (&host.url, &host.sha256) {
-                (Some(url), Some(_)) if fetched => {
-                    let file = format!("/{0}/linux/vulkansdk-linux-x86_64-{0}.tar.xz", pin.version);
+            match (host.named_file(&pin.version), &pinned.url, &pinned.sha256) {
+                (Some(file), Some(url), Some(_)) => {
                     if !url.starts_with("https://") || !url.ends_with(&file) {
                         return Err(format!("{PIN_FILE}: {name}'s url does not end in `{file}`"));
                     }
                 }
-                (None, None) if !fetched => {}
-                _ => {
+                (None, None, None) => {}
+                (named, _, _) => {
                     return Err(format!(
-                        "{PIN_FILE}: {name} {} an archive's url and sha256",
-                        if fetched { "needs" } else { "takes no" }
+                        "{PIN_FILE}: {name} {} a url and sha256",
+                        if named.is_some() { "needs" } else { "takes no" }
                     ));
                 }
             }
@@ -138,6 +193,13 @@ impl Driver {
     pub fn metal_validation(self) -> bool {
         self == Self::MoltenVk
     }
+
+    /// Whether the gate's GPU-assisted form runs under it: not under MoltenVK, whose
+    /// SPIRV-Cross fails on the layer's instrumented shaders.
+    #[must_use]
+    pub fn takes_gpu_assisted(self) -> bool {
+        self != Self::MoltenVk
+    }
 }
 
 /// The drivers `gpu` gates on with no `--driver`, on macOS, one after the other: each
@@ -178,7 +240,10 @@ pub enum Validators {
 }
 
 impl Validators {
-    /// The layer's settings, as the environment variables that set them.
+    /// The layer's settings, as the environment variables that set them. Object lifetime and
+    /// stateless parameter validation are on by the layer's default, and set here all the
+    /// same: no canary sends their messages, so a settings file that turned them off would
+    /// pass the gate unseen.
     #[must_use]
     pub fn settings(self) -> &'static [(&'static str, &'static str)] {
         match self {
@@ -187,6 +252,8 @@ impl Validators {
                 ("VK_KHRONOS_VALIDATION_VALIDATE_SYNC", "true"),
                 ("VK_KHRONOS_VALIDATION_SYNCVAL_LOAD_OP_AFTER_STORE_OP_VALIDATION", "true"),
                 ("VK_KHRONOS_VALIDATION_THREAD_SAFETY", "true"),
+                ("VK_KHRONOS_VALIDATION_OBJECT_LIFETIME", "true"),
+                ("VK_KHRONOS_VALIDATION_STATELESS_PARAM", "true"),
                 ("VK_KHRONOS_VALIDATION_GPUAV_ENABLE", "false"),
             ],
             // The filter drops the layer's own note, on every device, of the features it
@@ -200,6 +267,8 @@ impl Validators {
                 ("VK_KHRONOS_VALIDATION_VALIDATE_CORE", "false"),
                 ("VK_KHRONOS_VALIDATION_VALIDATE_SYNC", "false"),
                 ("VK_KHRONOS_VALIDATION_THREAD_SAFETY", "true"),
+                ("VK_KHRONOS_VALIDATION_OBJECT_LIFETIME", "true"),
+                ("VK_KHRONOS_VALIDATION_STATELESS_PARAM", "true"),
                 ("VK_KHRONOS_VALIDATION_GPUAV_ENABLE", "true"),
                 ("VK_KHRONOS_VALIDATION_GPUAV_SAFE_MODE", "true"),
                 ("VK_KHRONOS_VALIDATION_GPUAV_SHADER_SANITIZER", "false"),
@@ -263,97 +332,159 @@ pub fn is_canary(test: &str) -> bool {
 /// The SDK's files a run loads.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Sdk {
-    /// The directory the loader is loaded from.
-    pub loader: PathBuf,
+    /// The SDK's directory, which a result file writes as `<sdk>`.
+    pub root: PathBuf,
+    /// The directory the loader is loaded from, or `None` where a run takes the system's
+    /// (Windows).
+    pub loader: Option<PathBuf>,
     /// The layer's library, its digest the pin's.
     pub library: PathBuf,
     /// The layer's manifest as the SDK ships it.
     pub manifest: PathBuf,
-    /// The SDK's drivers' manifests, on the Mac.
-    pub icds: PathBuf,
+    /// The directory of the manifests of the drivers a run names: the SDK's on the Mac, the
+    /// system's (lavapipe's) on Linux; `None` where a run takes the system's drivers alone
+    /// (Windows).
+    pub icds: Option<PathBuf>,
 }
 
-/// This host's name in the pin, or why it has none.
+impl Sdk {
+    /// The files of the SDK at `root` on `host`, as that host's SDK lays them out.
+    #[must_use]
+    pub fn at(host: Host, root: PathBuf) -> Self {
+        let manifest = "share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json";
+        match host {
+            Host::Linux => Self {
+                loader: Some(root.join("lib/VulkanLoader/lib")),
+                library: root.join("lib/libVkLayer_khronos_validation.so"),
+                manifest: root.join(manifest),
+                icds: Some(PathBuf::from("/usr/share/vulkan/icd.d")),
+                root,
+            },
+            Host::MacOs => Self {
+                loader: Some(root.join("lib")),
+                library: root.join("lib").join("libVkLayer_khronos_validation.dylib"),
+                manifest: root.join(manifest),
+                icds: Some(root.join("share/vulkan/icd.d")),
+                root,
+            },
+            // The manifest is beside the library, naming it by a relative path; the installer
+            // registers it as an explicit layer, which a run's empty `VK_LAYER_PATH` hides.
+            Host::Windows => Self {
+                loader: None,
+                library: root.join("Bin").join("VkLayer_khronos_validation.dll"),
+                manifest: root.join("Bin").join("VkLayer_khronos_validation.json"),
+                icds: None,
+                root,
+            },
+        }
+    }
+}
+
+/// Where the pinned SDK is on `host`, given the values of `VULKAN_SDK` and `HOME`: on Linux
+/// under `target_dir`, where the tool unpacks it; on the Mac and on Windows at `VULKAN_SDK`,
+/// which the installer sets, where it is not empty, or where the installer puts it, `~/VulkanSDK/<version>/macOS`
+/// and `C:\VulkanSDK\<version>`.
 ///
 /// # Errors
-/// On a host the pin names no layer for.
-pub fn host() -> Result<&'static str, String> {
-    match (env::consts::OS, env::consts::ARCH) {
-        ("linux", "x86_64") => Ok("linux-x86_64"),
-        ("macos", "aarch64") => Ok("macos-aarch64"),
-        (os, arch) => Err(format!("{PIN_FILE} pins no validation layer for {os} on {arch}")),
+/// On the Mac, where neither variable is set.
+pub fn sdk_root(
+    host: Host,
+    pin: &Pin,
+    target_dir: &Path,
+    vulkan_sdk: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, String> {
+    let version = &pin.version;
+    // An empty `VULKAN_SDK` names no directory.
+    match (host, vulkan_sdk.filter(|root| !root.is_empty())) {
+        (Host::Linux, _) => {
+            Ok(target_dir.join("vulkan-sdk").join(version).join(version).join("x86_64"))
+        }
+        (_, Some(root)) => Ok(PathBuf::from(root)),
+        (Host::MacOs, None) => home
+            .map(|home| PathBuf::from(home).join("VulkanSDK").join(version).join("macOS"))
+            .ok_or_else(|| "neither VULKAN_SDK nor HOME is set".to_owned()),
+        (Host::Windows, None) => Ok(PathBuf::from(format!(r"C:\VulkanSDK\{version}"))),
     }
 }
 
 /// The pinned SDK on this host: on Linux fetched and unpacked under `target_dir` unless it is
-/// there, on the Mac the installed one. Progress goes to standard error.
+/// there, on the Mac and on Windows the installed one ([`sdk_root`]), held to the pin by
+/// [`check`]. Progress goes to standard error.
 ///
 /// # Errors
-/// On a host with no pin, an SDK that is not there, a download or unpack that fails, an
-/// archive or a layer library whose digest is not the pin's, or a manifest that is not the
-/// pinned layer's.
+/// On a host with no pin, a download or unpack that fails, an archive whose digest is not the
+/// pin's, or an SDK that [`check`] refuses.
 pub fn sdk(pin: &Pin, target_dir: &Path) -> Result<Sdk, String> {
-    let host = host()?;
-    let pinned = &pin.host[host];
-    let sdk = if host == "linux-x86_64" {
-        let root = target_dir.join("vulkan-sdk").join(&pin.version);
-        let sdk = linux_sdk(&root.join(&pin.version).join("x86_64"));
-        if digest_of(&sdk.library).ok().as_deref() != Some(pinned.library_sha256.as_str()) {
-            fetch_linux(pin, pinned, target_dir, &root)?;
+    let host = Host::this()?;
+    let pinned = &pin.host[host.name()];
+    let root = sdk_root(host, pin, target_dir, env::var_os("VULKAN_SDK"), env::var_os("HOME"))?;
+    let sdk = Sdk::at(host, root);
+    if host == Host::Linux
+        && digest_of(&sdk.library).ok().as_deref() != Some(pinned.library_sha256.as_str())
+    {
+        let unpacked = target_dir.join("vulkan-sdk").join(&pin.version);
+        fetch_linux(pin, pinned, target_dir, &unpacked)?;
+    }
+    check(pin, host, &sdk)?;
+    Ok(sdk)
+}
+
+/// Holds the SDK at `sdk` to the pin for `host`: first its layer's manifest, which must name
+/// the pinned layer at the pinned version, so that another SDK, which the installer's
+/// `VULKAN_SDK` names once a later one is installed, is refused as that version; then the
+/// layer's library, whose SHA-256 must be the pin's.
+///
+/// # Errors
+/// An SDK that is not there, which names the installer on Windows; a manifest of another
+/// layer or version; a library of another digest.
+pub fn check(pin: &Pin, host: Host, sdk: &Sdk) -> Result<(), String> {
+    let pinned = &pin.host[host.name()];
+    let installer = match (host, &pinned.url, &pinned.sha256) {
+        (Host::Windows, Some(url), Some(sha256)) => {
+            Some(format!("LunarG's installer {url} (SHA-256 {sha256})"))
         }
-        sdk
-    } else {
-        let root = match env::var_os("VULKAN_SDK") {
-            Some(root) => PathBuf::from(root),
-            None => home()?.join("VulkanSDK").join(&pin.version).join("macOS"),
-        };
-        Sdk {
-            loader: root.join("lib"),
-            library: root.join("lib").join("libVkLayer_khronos_validation.dylib"),
-            manifest: root.join("share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json"),
-            icds: root.join("share/vulkan/icd.d"),
-        }
+        _ => None,
     };
-    let digest = digest_of(&sdk.library).map_err(|e| {
+    let manifest = fs::read_to_string(&sdk.manifest).map_err(|e| {
+        let install = installer.as_ref().map_or_else(String::new, |installer| {
+            format!(
+                ": install it with {installer} as administrator, which this tool does not fetch"
+            )
+        });
         format!(
-            "{}: {e}; the Vulkan SDK {} is not installed there",
-            sdk.library.display(),
-            pin.version
+            "{}: {e}; the Vulkan SDK {} is not installed at {}{install}",
+            sdk.manifest.display(),
+            pin.version,
+            sdk.root.display()
         )
     })?;
-    if digest != pinned.library_sha256 {
+    let (name, api) = layer_of(&manifest)?;
+    if name != LAYER || api != pin.api_version {
         return Err(format!(
-            "{} has SHA-256 {digest}, where {PIN_FILE} pins {}",
+            "{} is {name} {api}: another SDK than the Vulkan SDK {}, whose {LAYER} is {}, which \
+             {PIN_FILE} pins",
+            sdk.manifest.display(),
+            pin.version,
+            pin.api_version
+        ));
+    }
+    let digest = digest_of(&sdk.library).map_err(|e| format!("{}: {e}", sdk.library.display()))?;
+    if digest != pinned.library_sha256 {
+        // A digest that differs on Windows is a finding, and no session re-pins (D165).
+        let installed = installer.map_or_else(String::new, |installer| {
+            format!(
+                ": the pinned layer is the one {installer} installs; report the digest, and \
+                 do not change the pin"
+            )
+        });
+        return Err(format!(
+            "{} has SHA-256 {digest}, where {PIN_FILE} pins {}{installed}",
             sdk.library.display(),
             pinned.library_sha256
         ));
     }
-    let manifest = fs::read_to_string(&sdk.manifest)
-        .map_err(|e| format!("{}: {e}", sdk.manifest.display()))?;
-    let (name, api) = layer_of(&manifest)?;
-    if name != LAYER || api != pin.api_version {
-        return Err(format!(
-            "{} is {name} {api}, where {PIN_FILE} pins {LAYER} {}",
-            sdk.manifest.display(),
-            pin.api_version
-        ));
-    }
-    Ok(sdk)
-}
-
-fn linux_sdk(root: &Path) -> Sdk {
-    Sdk {
-        loader: root.join("lib/VulkanLoader/lib"),
-        library: root.join("lib/libVkLayer_khronos_validation.so"),
-        manifest: root.join("share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json"),
-        icds: PathBuf::from("/usr/share/vulkan/icd.d"),
-    }
-}
-
-fn home() -> Result<PathBuf, String> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "neither VULKAN_SDK nor HOME is set".to_owned())
+    Ok(())
 }
 
 /// Fetches the Linux archive unless a download of the pinned digest is there, and unpacks
@@ -406,10 +537,11 @@ fn layer_of(manifest: &str) -> Result<(String, String), String> {
 }
 
 /// The SDK's manifest made an implicit layer's: its library by its absolute path, and the
-/// `disable_environment` an implicit layer must name. Loaded from a directory of its own
-/// with the explicit layer path emptied, the layer is on in every process of the run, and the
-/// loader warns of no duplicate and no layer forced by the environment: warnings it sends to
-/// the debug messenger, which counts them.
+/// `disable_environment` an implicit layer must name. Loaded from a directory of its own,
+/// the run's whole implicit layer path, with the explicit layer path emptied, the layer is on
+/// in every process of the run and is the only layer loaded, and the loader warns of no
+/// duplicate and no layer forced by the environment: warnings it sends to the debug
+/// messenger, which counts them.
 ///
 /// # Errors
 /// On a manifest that is not JSON with a `layer` object.
@@ -441,8 +573,8 @@ pub struct Run {
     pub canaries: Vec<(&'static str, &'static [&'static str])>,
 }
 
-/// The variables that load `sdk`'s loader and, but under `system`, pin `driver`'s manifest
-/// as the SDK ships it.
+/// The variables that load `sdk`'s loader, where the host takes the SDK's, and, but under
+/// `system`, pin `driver`'s manifest as the SDK, or on Linux the system, ships it.
 fn loader_and_driver(driver: Driver, sdk: &Sdk) -> Result<Vec<(String, String)>, String> {
     let path = |path: &Path| path.to_string_lossy().into_owned();
     // On macOS the fallback path: `DYLD_LIBRARY_PATH` would also redirect a driver the
@@ -450,12 +582,20 @@ fn loader_and_driver(driver: Driver, sdk: &Sdk) -> Result<Vec<(String, String)>,
     // loader reports as a message under `system`, where the drivers are the system's.
     let library_path =
         if cfg!(target_os = "macos") { "DYLD_FALLBACK_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
-    let mut set = vec![(library_path.to_owned(), path(&sdk.loader))];
-    let icd = match driver {
-        Driver::Lavapipe => Some(lavapipe_icd(&sdk.icds)?),
-        Driver::MoltenVk => Some(sdk.icds.join("MoltenVK_icd.json")),
-        Driver::KosmicKrisp => Some(sdk.icds.join("libkosmickrisp_icd.json")),
-        Driver::System => None,
+    let mut set: Vec<(String, String)> =
+        sdk.loader.iter().map(|loader| (library_path.to_owned(), path(loader))).collect();
+    let icd = match (driver, &sdk.icds) {
+        (Driver::System, _) => None,
+        (_, None) => {
+            return Err(format!(
+                "the driver {} is not this host's: a run here takes the system's drivers, \
+                 `--driver system`",
+                driver.name()
+            ));
+        }
+        (Driver::Lavapipe, Some(icds)) => Some(lavapipe_icd(icds)?),
+        (Driver::MoltenVk, Some(icds)) => Some(icds.join("MoltenVK_icd.json")),
+        (Driver::KosmicKrisp, Some(icds)) => Some(icds.join("libkosmickrisp_icd.json")),
     };
     if let Some(icd) = icd {
         if !icd.is_file() {
@@ -466,11 +606,148 @@ fn loader_and_driver(driver: Driver, sdk: &Sdk) -> Result<Vec<(String, String)>,
     Ok(set)
 }
 
+/// The variables that give the loader its layers: the implicit ones from `implicit` alone,
+/// which the loader then reads in place of every other place it looks for them, the Windows
+/// registry's keys among them, and the explicit ones from the empty `no_layers`, which hides
+/// the SDK's, the installer's registry entries among them. Both are needed on Windows: with
+/// the implicit path alone the loader still reads the registry's `ExplicitLayers` key, and
+/// where the key is absent it warns through the debug messenger that the lookup failed, which
+/// fails a device test and a measured run. A layer the loader is made to skip
+/// by `VK_LOADER_LAYERS_DISABLE` it warns of instead, and the debug messenger counts the
+/// warning; one added beside the registry's by `VK_ADD_IMPLICIT_LAYER_PATH` joins every
+/// layer the machine registers.
+fn layer_paths(implicit: &Path, no_layers: &Path) -> [(String, String); 2] {
+    let path = |path: &Path| path.to_string_lossy().into_owned();
+    [
+        ("VK_IMPLICIT_LAYER_PATH".to_owned(), path(implicit)),
+        ("VK_LAYER_PATH".to_owned(), path(no_layers)),
+    ]
+}
+
+/// The XDG variables a run off Windows points at the empty `no_layers`. The loader looks in
+/// each for its settings file, Vulkan Configurator's `vk_loader_settings.json`, whose layers it
+/// loads in place of every layer path's, and the layer in the second for its own settings
+/// file. Under `system` the data directories stay the system's, which hold its drivers'
+/// manifests, and [`Run::refuse_overrides`] reads them instead. The system's configuration
+/// directories, which no variable moves, it reads too.
+const XDG: [&str; 4] = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS"];
+
+fn settings_dirs(driver: Driver, no_layers: &Path) -> Vec<(String, String)> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    let kept = |name: &str| driver == Driver::System && name == "XDG_DATA_DIRS";
+    XDG.iter()
+        .filter(|name| !kept(name))
+        .map(|name| ((*name).to_owned(), no_layers.to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// The configuration directories the loader reads off Windows that no variable moves: its
+/// `SYSCONFDIR`, `/etc` in the SDK's loader on the Mac, and the `/usr/local/etc` a loader built
+/// for `/usr/local` takes in its place.
+const SYSCONFDIRS: [&str; 2] = ["/etc", "/usr/local/etc"];
+
+/// Every file off Windows the loader would take as its settings file, in the order it looks
+/// (`get_unix_settings_path`, loader 1.4.363), given each variable's value in the run: a
+/// variable unset or empty is passed over, `HOME` stands in for an XDG home that is, and each
+/// list of directories is split at `:`.
+fn loader_settings_files(var: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    let set = |name: &str| var(name).filter(|value| !value.is_empty());
+    let (config_home, data_home) = (set("XDG_CONFIG_HOME"), set("XDG_DATA_HOME"));
+    let mut dirs: Vec<String> = Vec::new();
+    let mut add =
+        |list: &str| dirs.extend(list.split(':').filter(|d| !d.is_empty()).map(str::to_owned));
+    config_home.iter().chain(&data_home).for_each(|list| add(list));
+    if let Some(home) = set("HOME") {
+        if config_home.is_none() {
+            add(&format!("{home}/.config"));
+        }
+        if data_home.is_none() {
+            add(&format!("{home}/.local/share"));
+        }
+    }
+    add(&set("XDG_CONFIG_DIRS").unwrap_or_else(|| "/etc/xdg".to_owned()));
+    SYSCONFDIRS.iter().for_each(|dir| add(dir));
+    add(&set("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".to_owned()));
+    dirs.iter()
+        .map(|dir| Path::new(dir).join("vulkan/loader_settings.d/vk_loader_settings.json"))
+        .collect()
+}
+
+/// Every file off Windows the layer would take its settings from where the run sets no
+/// `VK_LAYER_SETTINGS_PATH`, which it clears: under the XDG data home, else `HOME`'s, and in
+/// the process's directory `cwd` (Vulkan-Utility-Libraries' `FindSettingsFile`).
+fn layer_settings_files(var: &dyn Fn(&str) -> Option<String>, cwd: &Path) -> Vec<PathBuf> {
+    let set = |name: &str| var(name).filter(|value| !value.is_empty());
+    let home =
+        set("XDG_DATA_HOME").or_else(|| set("HOME").map(|home| format!("{home}/.local/share")));
+    home.map(|home| Path::new(&home).join("vulkan/settings.d/vk_layer_settings.txt"))
+        .into_iter()
+        .chain([cwd.join(LAYER_SETTINGS_FILE)])
+        .collect()
+}
+
+/// The layer's settings file by name, which it reads from the process's directory last.
+const LAYER_SETTINGS_FILE: &str = "vk_layer_settings.txt";
+
+/// The registry keys on Windows whose values name the loader's settings file, read in this
+/// order; the current user's is passed over in an elevated process, which is refused.
+const LOADER_SETTINGS_KEYS: [&str; 2] = [
+    r"HKCU\SOFTWARE\Khronos\Vulkan\LoaderSettings",
+    r"HKLM\SOFTWARE\Khronos\Vulkan\LoaderSettings",
+];
+
+/// The registry keys on Windows whose values name the layer's settings file.
+const LAYER_SETTINGS_KEYS: [&str; 2] =
+    [r"HKLM\SOFTWARE\Khronos\Vulkan\Settings", r"HKCU\SOFTWARE\Khronos\Vulkan\Settings"];
+
+/// The names of the values `reg query <key>` printed: each line of a value is its name, four
+/// spaces, its type (`REG_*`), four spaces and its data, indented by four spaces. A subkey's
+/// line is its full name, unindented.
+fn registry_values(query: &str) -> Vec<String> {
+    query
+        .lines()
+        .filter_map(|line| line.strip_prefix("    "))
+        .filter_map(|value| value.find("    REG_").map(|at| value[..at].trim().to_owned()))
+        .collect()
+}
+
+/// Whether the process whose groups `whoami /groups` printed runs at the high mandatory level
+/// or above (`S-1-16-12288`), where the loader ignores every layer path a run sets.
+fn elevated(groups: &str) -> Result<bool, String> {
+    let levels: Vec<u32> = groups
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '"')
+        .filter_map(|token| token.strip_prefix("S-1-16-"))
+        .filter_map(|rid| rid.parse().ok())
+        .collect();
+    if levels.is_empty() {
+        return Err("`whoami /groups` lists no integrity level".to_owned());
+    }
+    Ok(levels.iter().any(|&level| level >= 12288))
+}
+
+/// What `program` printed to standard output, where it succeeded or ended with an exit code
+/// in `absent`, which is then `None`.
+fn printed(program: &str, args: &[&str], absent: Option<i32>) -> Result<Option<String>, String> {
+    let output = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run {program}: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    match output.status.code() {
+        Some(0) => Ok(Some(stdout)),
+        code if code.is_some() && code == absent && stdout.trim().is_empty() => Ok(None),
+        _ => Err(format!("`{program} {}` ended with {}", args.join(" "), output.status)),
+    }
+}
+
 /// Variables a run removes from the environment it inherits, before it sets its own: each
 /// would change which layers or drivers load, Metal's validation, or the tests' device.
 /// `METAL_DEVICE_WRAPPER_TYPE`, which Xcode sets, turns Metal's API validation on as
 /// `MTL_DEBUG_LAYER` does.
-const CLEARED: [&str; 11] = [
+const CLEARED: [&str; 12] = [
     "DYLD_LIBRARY_PATH",
     "VK_INSTANCE_LAYERS",
     "VK_ICD_FILENAMES",
@@ -478,6 +755,7 @@ const CLEARED: [&str; 11] = [
     "VK_ADD_DRIVER_FILES",
     "VK_ADD_LAYER_PATH",
     "VK_IMPLICIT_LAYER_PATH",
+    "VK_ADD_IMPLICIT_LAYER_PATH",
     "METAL_DEVICE_WRAPPER_TYPE",
     "LACTOSE_VALIDATION_OFF",
     "LACTOSE_GPU_ADAPTER",
@@ -509,7 +787,8 @@ pub fn cleared(inherited: impl IntoIterator<Item = String>) -> Vec<String> {
 
 impl Run {
     /// The environment of a run of `driver` on `sdk`, with the layer's implicit manifest in
-    /// `layers`, an empty directory at `no_layers`, `validators` on, Metal's validation
+    /// `layers`, the loader's only implicit layer path, an empty directory at `no_layers`, its
+    /// explicit layer path, `validators` on, Metal's validation
     /// where the driver runs under it, the suite's shaders in `shaders` and, under `system`,
     /// the device `adapter` names.
     ///
@@ -526,8 +805,8 @@ impl Run {
         let path = |path: &Path| path.to_string_lossy().into_owned();
         let mut set: Vec<(String, String)> = Vec::new();
         set.extend(loader_and_driver(driver, sdk)?);
-        set.push(("VK_ADD_IMPLICIT_LAYER_PATH".to_owned(), path(layers)));
-        set.push(("VK_LAYER_PATH".to_owned(), path(no_layers)));
+        set.extend(layer_paths(layers, no_layers));
+        set.extend(settings_dirs(driver, no_layers));
         for (name, value) in validators.settings() {
             set.push(((*name).to_owned(), (*value).to_owned()));
         }
@@ -552,12 +831,13 @@ impl Run {
     }
 
     /// The environment of a measurement on `driver` (`cargo xtask measure`): no layer at
-    /// all, every implicit one disabled through the loader, and no Metal validation, so the
-    /// figures are the driver's alone. The loader is `sdk`'s where one is given, and the
-    /// driver's manifest is the SDK's, as [`environment`](Self::environment) pins it;
-    /// under `system` with no SDK the system's loader finds the system's drivers (Windows,
-    /// where no layer is pinned). MoltenVK's warnings and errors still reach standard
-    /// error, where the measurement's own sink fails on any message the device sends.
+    /// all, the loader's implicit and explicit layer paths both the empty `no_layers`, and no
+    /// Metal validation, so the figures are the driver's alone. The loader is `sdk`'s where one
+    /// is given, and the driver's manifest is the SDK's, as
+    /// [`environment`](Self::environment) pins it; under `system` with no SDK the system's
+    /// loader finds the system's drivers (Windows, where a measurement needs no layer).
+    /// MoltenVK's warnings and errors still reach standard error, where the measurement's own
+    /// sink fails on any message the device sends.
     ///
     /// # Errors
     /// When the driver's manifest is not where this host keeps it, or a driver other than
@@ -565,6 +845,7 @@ impl Run {
     pub fn measured(
         driver: Driver,
         sdk: Option<&Sdk>,
+        no_layers: &Path,
         adapter: Option<&str>,
     ) -> Result<Self, String> {
         let mut set = match sdk {
@@ -572,7 +853,8 @@ impl Run {
             None if driver == Driver::System => Vec::new(),
             None => return Err(format!("the driver {} is the pinned SDK's", driver.name())),
         };
-        set.push(("VK_LOADER_LAYERS_DISABLE".to_owned(), "~implicit~".to_owned()));
+        set.extend(layer_paths(no_layers, no_layers));
+        set.extend(settings_dirs(driver, no_layers));
         set.push(("MVK_CONFIG_LOG_LEVEL".to_owned(), "2".to_owned()));
         set.push(("MESA_VK_IGNORE_CONFORMANCE_WARNING".to_owned(), "1".to_owned()));
         if let Some(adapter) = adapter {
@@ -589,6 +871,80 @@ impl Run {
             command.env_remove(name);
         }
         command.envs(self.set.iter().map(|(name, value)| (name, value)))
+    }
+
+    /// The value of `name` in a process the run starts: its own, none where it clears the
+    /// name, or the inherited one.
+    fn var(&self, name: &str) -> Option<String> {
+        match self.set.iter().find(|(set, _)| set == name) {
+            Some((_, value)) => Some(value.clone()),
+            None if self.cleared.iter().any(|cleared| cleared == name) => None,
+            None => env::var(name).ok(),
+        }
+    }
+
+    /// Refuses the run, naming what it found, where something outside its environment would
+    /// change the layers it loads or their settings, which the debug messenger would not hear:
+    /// a loader settings file (Vulkan Configurator's), whose layers the loader loads in place
+    /// of the run's layer paths, and, where the run validates, a settings file of the layer's,
+    /// in the process's directory `cwd` among other places. On Windows the registry names
+    /// both, and a process at the high integrity level is refused too: there the loader
+    /// ignores every layer path.
+    ///
+    /// # Errors
+    /// On each of those, or where `whoami` or `reg` cannot be run on Windows.
+    pub fn refuse_overrides(&self, cwd: &Path) -> Result<(), String> {
+        let validates = self.set.iter().any(|(name, _)| name.starts_with("VK_KHRONOS_VALIDATION_"));
+        let mut found = Vec::new();
+        if cfg!(windows) {
+            let groups = printed("whoami", &["/groups"], None)?.unwrap_or_default();
+            if elevated(&groups)? {
+                return Err("this process is elevated, at the high integrity level or above \
+                            (`whoami /groups`), where the loader ignores the run's layer \
+                            paths: run from a shell that is not elevated"
+                    .to_owned());
+            }
+            let keys = LOADER_SETTINGS_KEYS.iter().map(|key| (key, "the loader's settings file"));
+            let layer = LAYER_SETTINGS_KEYS.iter().map(|key| (key, "the layer's settings file"));
+            for (key, what) in keys.chain(layer.filter(|_| validates)) {
+                // `reg` ends with 1, printing nothing, for a key that is not there.
+                let query = printed("reg", &["query", key], Some(1))?.unwrap_or_default();
+                found.extend(
+                    registry_values(&query)
+                        .into_iter()
+                        .map(|value| format!("{what}, by the registry's `{key}`: `{value}`")),
+                );
+            }
+        } else {
+            let files = loader_settings_files(&|name| self.var(name));
+            found.extend(
+                files
+                    .iter()
+                    .filter(|file| file.is_file())
+                    .map(|file| format!("the loader's settings file `{}`", file.display())),
+            );
+        }
+        if validates {
+            let files = if cfg!(windows) {
+                vec![cwd.join(LAYER_SETTINGS_FILE)]
+            } else {
+                layer_settings_files(&|name| self.var(name), cwd)
+            };
+            found.extend(
+                files
+                    .iter()
+                    .filter(|file| file.is_file())
+                    .map(|file| format!("the layer's settings file `{}`", file.display())),
+            );
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{}: each would change the run's layers or their settings unheard. Vulkan \
+             Configurator writes them; quit it, or remove them, and run again",
+            found.join("; ")
+        ))
     }
 }
 
@@ -735,16 +1091,17 @@ pub fn metal_step(root: &Path, args: &[&str]) -> Result<StepOutput, String> {
 }
 
 /// Under `out`, the directory `layers`, holding the pinned layer's implicit manifest for
-/// `sdk`, and the empty directory `no-layers`, as [`Run::environment`] takes them.
+/// `sdk` and nothing else, and the empty directory `no-layers` ([`no_layer_dir`]), as
+/// [`Run::environment`] takes them. Each is emptied first: the loader loads every manifest
+/// in the implicit layer path.
 ///
 /// # Errors
 /// If a directory or the manifest cannot be written, or the SDK's manifest read.
 pub fn layer_dirs(sdk: &Sdk, out: &Path) -> Result<[PathBuf; 2], String> {
     let layers = out.join("layers");
-    let no_layers = out.join("no-layers");
-    for dir in [&layers, &no_layers] {
-        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
+    remove(&layers)?;
+    fs::create_dir_all(&layers).map_err(|e| format!("{}: {e}", layers.display()))?;
+    let no_layers = no_layer_dir(out)?;
     let manifest = fs::read_to_string(&sdk.manifest)
         .map_err(|e| format!("{}: {e}", sdk.manifest.display()))?;
     let implicit = layers.join("VkLayer_khronos_validation.json");
@@ -753,11 +1110,27 @@ pub fn layer_dirs(sdk: &Sdk, out: &Path) -> Result<[PathBuf; 2], String> {
     Ok([layers, no_layers])
 }
 
+/// The empty directory `no-layers` under `out`, as [`Run::measured`] takes it, emptied of
+/// anything an earlier hand put there: a manifest in it would load as an implicit layer.
+///
+/// # Errors
+/// If the directory cannot be emptied or made.
+pub fn no_layer_dir(out: &Path) -> Result<PathBuf, String> {
+    let dir = out.join("no-layers");
+    remove(&dir)?;
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
 /// What one device test's process came to.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Verdict {
     /// The suite's own word for the case, `passed` or `skipped, <why>`, where it printed one.
     pub said: Option<String>,
+    /// What the case says it ran only in part, or not at all, of itself: each `<what>` of a
+    /// `<case>: skipped in part, <what>` line, in order. A case that prints them and passes
+    /// passed, and the report keeps them beside its word.
+    pub parts: Vec<String>,
     /// Every message the test's sinks printed, each a line.
     pub messages: Vec<String>,
     /// Every line in which the driver, or Metal's validation under it, reported an error or
@@ -829,6 +1202,13 @@ pub fn judge(
         let word = &line[at + name.len() + 2..];
         (word == "passed" || word.starts_with("skipped, ")).then(|| word.to_owned())
     });
+    let parts: Vec<String> = output
+        .lines()
+        .filter_map(|line| {
+            let at = line.find(&format!("{name}: {PART}"))?;
+            Some(line[at + name.len() + 2 + PART.len()..].trim_end().to_owned())
+        })
+        .collect();
     let skipped = said.as_deref().is_some_and(|word| word.starts_with("skipped, "));
     let unloaded = METAL_BANNERS.iter().find(|banner| {
         metal && !skipped && !output.lines().any(|line| logged(line) && line.ends_with(*banner))
@@ -864,8 +1244,12 @@ pub fn judge(
             }
         }
     };
-    Verdict { said, messages, driver, reports, failure }
+    Verdict { said, parts, messages, driver, reports, failure }
 }
+
+/// The words, after `<case>: `, of a part of a case it did not run. They differ from a whole
+/// skip's `skipped, `, which is the case's word.
+pub const PART: &str = "skipped in part, ";
 
 /// How long one device test's process may run before the run kills it and records it
 /// failed. The longest device test on the M1 takes under three seconds under either
@@ -958,7 +1342,8 @@ pub fn judge_ended(test: &str, ended: &Ended, expected: Option<&[&str]>, metal: 
 pub const TAIL_LINES: usize = 40;
 
 /// The entry of the device test `test` of `package` in its run's report: its name and word,
-/// then each message, report and driver line it printed, then each line of its output that
+/// then each part of itself it says it skipped ([`PART`]), each message, report and driver
+/// line it printed, then each line of its output that
 /// ends in `retrying`, which a device test prints where it ran a step again and still
 /// passed (`crates/renderer/tests/device.rs`, `held`); for a failed test, how its process
 /// ended and the last lines of its standard output and of its standard error, [`TAIL_LINES`]
@@ -967,6 +1352,9 @@ pub const TAIL_LINES: usize = 40;
 #[must_use]
 pub fn entry(package: &str, test: &str, verdict: &Verdict, ended: &Ended) -> String {
     let mut entry = format!("{package} {test}: {}\n", verdict.word());
+    for part in &verdict.parts {
+        entry.push_str(&format!("  {PART}{part}\n"));
+    }
     for line in verdict.messages.iter().chain(&verdict.reports).chain(&verdict.driver) {
         entry.push_str(&format!("  {line}\n"));
     }
@@ -1059,64 +1447,414 @@ mod tests {
 
     const PIN: &str = include_str!("../vulkan-layer.toml");
 
+    fn value(run: &Run, name: &str) -> Option<String> {
+        run.set.iter().find(|(set, _)| set == name).map(|(_, value)| value.clone())
+    }
+
+    /// A fresh directory under the system's temporary one, named for the test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xtask-vulkan-{name}-{}", std::process::id()));
+        remove(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// A measurement's environment loads no layer and sets no validation, and pins the
     /// driver's manifest as `gpu` does.
     #[test]
     fn a_measurement_runs_with_no_layer_on_the_pinned_driver() {
-        let value = |run: &Run, name: &str| {
-            run.set.iter().find(|(set, _)| set == name).map(|(_, value)| value.clone())
-        };
-        let system = Run::measured(Driver::System, None, Some("Apple M1")).unwrap();
-        assert_eq!(value(&system, "VK_LOADER_LAYERS_DISABLE").as_deref(), Some("~implicit~"));
+        let root = scratch("measure-sdk");
+        let no_layers = no_layer_dir(&root).unwrap();
+        let system = Run::measured(Driver::System, None, &no_layers, Some("Apple M1")).unwrap();
+        let empty = Some(no_layers.to_string_lossy().into_owned());
+        assert_eq!(value(&system, "VK_IMPLICIT_LAYER_PATH"), empty);
+        assert_eq!(value(&system, "VK_LAYER_PATH"), empty);
         assert_eq!(value(&system, "LACTOSE_GPU_ADAPTER").as_deref(), Some("Apple M1"));
         assert_eq!(value(&system, "VK_DRIVER_FILES"), None);
         assert!(!system.metal && system.canaries.is_empty());
         for (name, _) in &system.set {
-            assert!(
-                !name.starts_with("VK_KHRONOS_VALIDATION_")
-                    && !name.starts_with("MTL_")
-                    && !name.contains("LAYER_PATH"),
-                "{name}"
-            );
+            assert!(!name.starts_with("VK_KHRONOS_VALIDATION_") && !name.starts_with("MTL_"));
         }
-        let error = Run::measured(Driver::MoltenVk, None, None).err().expect("no SDK");
+        let error = Run::measured(Driver::MoltenVk, None, &no_layers, None).err().expect("no SDK");
         assert!(error.contains("SDK"), "{error}");
-        let root = std::env::temp_dir().join(format!("measure-sdk-{}", std::process::id()));
         let icds = root.join("icd.d");
         fs::create_dir_all(&icds).unwrap();
         let sdk = Sdk {
-            loader: root.join("lib"),
+            root: root.clone(),
+            loader: Some(root.join("lib")),
             library: root.join("lib").join("layer"),
             manifest: root.join("manifest.json"),
-            icds: icds.clone(),
+            icds: Some(icds.clone()),
         };
-        let missing = Run::measured(Driver::KosmicKrisp, Some(&sdk), None);
+        let missing = Run::measured(Driver::KosmicKrisp, Some(&sdk), &no_layers, None);
         let error = missing.err().expect("no manifest");
         assert!(error.contains("no such driver manifest"), "{error}");
         fs::write(icds.join("libkosmickrisp_icd.json"), "{}").unwrap();
-        let krisp = Run::measured(Driver::KosmicKrisp, Some(&sdk), None).unwrap();
+        let krisp = Run::measured(Driver::KosmicKrisp, Some(&sdk), &no_layers, None).unwrap();
         let manifest = icds.join("libkosmickrisp_icd.json");
         assert_eq!(value(&krisp, "VK_DRIVER_FILES"), Some(manifest.to_string_lossy().into()));
-        assert!(krisp.set.iter().any(|(_, value)| *value == sdk.loader.to_string_lossy()));
+        let loader = root.join("lib").to_string_lossy().into_owned();
+        assert!(krisp.set.iter().any(|(_, value)| *value == loader));
         assert_eq!(value(&krisp, "LACTOSE_GPU_ADAPTER"), None);
+        // What an earlier hand left in the empty directory is gone: it would load as a layer.
+        fs::write(no_layers.join("a-layer.json"), "{}").unwrap();
+        assert_eq!(fs::read_dir(no_layer_dir(&root).unwrap()).unwrap().count(), 0);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// D165: the loader reads a layer the registry or a system directory holds beside one
+    /// `VK_ADD_IMPLICIT_LAYER_PATH` adds, and warns of each layer `VK_LOADER_LAYERS_DISABLE`
+    /// skips. No run, gated or measured, on any driver or host, sets either; each sets the
+    /// exclusive implicit path, and both are cleared from what it inherits.
+    #[test]
+    fn no_run_adds_to_the_machines_layers_or_disables_them() {
+        let root = scratch("exclusive");
+        let [layers, no_layers] = [root.join("layers"), no_layer_dir(&root).unwrap()];
+        let icds = root.join("icd.d");
+        fs::create_dir_all(&icds).unwrap();
+        for icd in ["MoltenVK_icd.json", "libkosmickrisp_icd.json", "lvp_icd.x86_64.json"] {
+            fs::write(icds.join(icd), "{}").unwrap();
+        }
+        let sdk = |host| Sdk { icds: Some(icds.clone()), ..Sdk::at(host, root.clone()) };
+        let windows = Sdk::at(Host::Windows, root.clone());
+        let gated = |driver, sdk: &Sdk, validators| {
+            Run::environment(driver, sdk, [&layers, &no_layers, &root], validators, None).unwrap()
+        };
+        let mut runs = Vec::new();
+        for driver in [Driver::Lavapipe, Driver::MoltenVk, Driver::KosmicKrisp, Driver::System] {
+            for validators in [Validators::Plain, Validators::GpuAssisted] {
+                runs.push((gated(driver, &sdk(Host::MacOs), validators), &layers));
+                runs.push((gated(driver, &sdk(Host::Linux), validators), &layers));
+            }
+            let measured = Run::measured(driver, Some(&sdk(Host::Linux)), &no_layers, None);
+            runs.push((measured.unwrap(), &no_layers));
+        }
+        runs.push((gated(Driver::System, &windows, Validators::Plain), &layers));
+        let measured = Run::measured(Driver::System, Some(&windows), &no_layers, None);
+        runs.push((measured.unwrap(), &no_layers));
+        runs.push((Run::measured(Driver::System, None, &no_layers, None).unwrap(), &no_layers));
+        for (run, implicit) in &runs {
+            for name in ["VK_ADD_IMPLICIT_LAYER_PATH", "VK_LOADER_LAYERS_DISABLE"] {
+                assert_eq!(value(run, name), None, "{name} in {:?}", run.set);
+            }
+            let implicit = Some(implicit.to_string_lossy().into_owned());
+            assert_eq!(value(run, "VK_IMPLICIT_LAYER_PATH"), implicit, "{:?}", run.set);
+            assert_eq!(value(run, "VK_LAYER_PATH"), Some(no_layers.to_string_lossy().into()));
+        }
+        let inherited = ["VK_ADD_IMPLICIT_LAYER_PATH", "VK_LOADER_LAYERS_DISABLE"];
+        assert_eq!(cleared(inherited.map(str::to_owned)), inherited);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// On Windows a run loads the system's loader, which the GPU's driver installs, and the
+    /// system's drivers: it sets no library path, which would make Windows look for DLLs where
+    /// the SDK is, and names no driver manifest. A driver the SDK ships elsewhere is refused.
+    /// Every run there, validated or measured, empties the explicit layer path as well as
+    /// naming the implicit one: on a Windows desktop, loader 1.4.357, the implicit path alone
+    /// left the loader reading the registry's absent `ExplicitLayers` key, and its warning
+    /// ("Registry lookup failed to get layer manifest files") failed a clean device test.
+    #[test]
+    fn on_windows_a_run_takes_the_systems_loader_and_drivers() {
+        let root = PathBuf::from(r"C:\VulkanSDK\1.4.363.1");
+        let sdk = Sdk::at(Host::Windows, root.clone());
+        assert_eq!((sdk.loader.as_ref(), sdk.icds.as_ref()), (None, None));
+        assert_eq!(sdk.library, root.join("Bin").join("VkLayer_khronos_validation.dll"));
+        assert_eq!(sdk.manifest, root.join("Bin").join("VkLayer_khronos_validation.json"));
+        let dirs = [Path::new("layers"), Path::new("no-layers"), Path::new("shaders")];
+        let run =
+            Run::environment(Driver::System, &sdk, dirs, Validators::GpuAssisted, Some("AMD"));
+        let run = run.unwrap();
+        let names: Vec<&str> = run.set.iter().map(|(name, _)| name.as_str()).collect();
+        for name in ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "PATH", "VK_DRIVER_FILES"] {
+            assert!(!names.contains(&name), "{name} in {names:?}");
+        }
+        assert_eq!(value(&run, "VK_IMPLICIT_LAYER_PATH").as_deref(), Some("layers"));
+        assert_eq!(value(&run, "LACTOSE_GPU_ADAPTER").as_deref(), Some("AMD"));
+        let plain = Run::environment(Driver::System, &sdk, dirs, Validators::Plain, None);
+        // `measure` takes no SDK under `system` off the Mac, and one where it is given.
+        let measured = [None, Some(&sdk)]
+            .map(|sdk| Run::measured(Driver::System, sdk, dirs[1], Some("AMD")).unwrap());
+        for run in [&run, &plain.unwrap(), &measured[0], &measured[1]] {
+            assert_eq!(value(run, "VK_LAYER_PATH").as_deref(), Some("no-layers"), "{:?}", run.set);
+        }
+        for run in &measured {
+            assert_eq!(value(run, "VK_IMPLICIT_LAYER_PATH").as_deref(), Some("no-layers"));
+        }
+        for driver in [Driver::Lavapipe, Driver::MoltenVk, Driver::KosmicKrisp] {
+            let error =
+                Run::environment(driver, &sdk, dirs, Validators::Plain, None).err().unwrap();
+            assert!(error.contains("`--driver system`"), "{error}");
+            let measured = Run::measured(driver, Some(&sdk), dirs[1], None).err().unwrap();
+            assert!(measured.contains("`--driver system`"), "{measured}");
+        }
+    }
+
+    /// Where each host's SDK is: `VULKAN_SDK` first on the hosts an installer serves, the
+    /// installer's own place without it; on Linux the unpacked archive whatever is set.
+    #[test]
+    fn the_sdk_is_where_its_host_keeps_it() {
+        let pin = Pin::parse(PIN).unwrap();
+        let target = Path::new("target");
+        let set = || Some(OsString::from("elsewhere"));
+        let home = || Some(OsString::from("home"));
+        let root = |host, vulkan_sdk, home| sdk_root(host, &pin, target, vulkan_sdk, home);
+        let unpacked = target.join("vulkan-sdk/1.4.363.1/1.4.363.1/x86_64");
+        assert_eq!(root(Host::Linux, set(), None).unwrap(), unpacked);
+        assert_eq!(root(Host::MacOs, set(), home()).unwrap(), PathBuf::from("elsewhere"));
+        let installed = Path::new("home/VulkanSDK/1.4.363.1/macOS");
+        assert_eq!(root(Host::MacOs, None, home()).unwrap(), installed);
+        assert!(root(Host::MacOs, None, None).unwrap_err().contains("HOME"));
+        assert_eq!(root(Host::Windows, set(), None).unwrap(), PathBuf::from("elsewhere"));
+        let installed = PathBuf::from(r"C:\VulkanSDK\1.4.363.1");
+        assert_eq!(root(Host::Windows, None, home()).unwrap(), installed);
+        // Review r1 of layer-windows, N2: an empty `VULKAN_SDK` names no directory.
+        assert_eq!(root(Host::Windows, Some(OsString::new()), home()).unwrap(), installed);
+        let mac = Path::new("home/VulkanSDK/1.4.363.1/macOS");
+        assert_eq!(root(Host::MacOs, Some(OsString::new()), home()).unwrap(), mac);
+        let names = [Host::Linux, Host::MacOs, Host::Windows].map(Host::name);
+        assert_eq!(names, HOSTS);
+    }
+
+    /// An SDK is held to the pin by its manifest before its library: the installer's
+    /// `VULKAN_SDK` names the latest SDK installed, whose library would only fail a digest,
+    /// where its manifest says which SDK it is. An SDK that is not there names the installer
+    /// on Windows, and the tool fetches nothing.
+    #[test]
+    fn an_sdk_is_held_to_the_pin_by_its_manifest_then_its_library() {
+        let pin = Pin::parse(PIN).unwrap();
+        let root = scratch("check");
+        let sdk = Sdk::at(Host::Windows, root.clone());
+        let absent = check(&pin, Host::Windows, &sdk).unwrap_err();
+        let installer = &pin.host["windows-x86_64"];
+        for expected in [installer.url.as_deref().unwrap(), installer.sha256.as_deref().unwrap()] {
+            assert!(absent.contains(expected), "{absent}");
+        }
+        assert!(absent.contains("not installed at") && absent.contains("does not fetch"));
+        let mac = check(&pin, Host::MacOs, &Sdk::at(Host::MacOs, root.clone())).unwrap_err();
+        assert!(mac.contains("not installed at") && !mac.contains("https://"), "{mac}");
+        fs::create_dir_all(root.join("Bin")).unwrap();
+        let manifest = |api: &str| {
+            format!(
+                r#"{{"file_format_version": "1.2.0", "layer": {{"name": "{LAYER}", "api_version": "{api}", "library_path": ".\\VkLayer_khronos_validation.dll"}}}}"#
+            )
+        };
+        // Another SDK's manifest, no library beside it: refused by the version it names.
+        fs::write(&sdk.manifest, manifest("1.4.370")).unwrap();
+        let other = check(&pin, Host::Windows, &sdk).unwrap_err();
+        assert!(other.contains("1.4.370") && other.contains("another SDK"), "{other}");
+        fs::write(&sdk.manifest, manifest(&pin.api_version)).unwrap();
+        let no_library = check(&pin, Host::Windows, &sdk).unwrap_err();
+        assert!(no_library.starts_with(&sdk.library.display().to_string()), "{no_library}");
+        fs::write(&sdk.library, "not the layer").unwrap();
+        let wrong = check(&pin, Host::Windows, &sdk).unwrap_err();
+        assert!(wrong.contains(&format!("pins {}", installer.library_sha256)), "{wrong}");
+        // Review r1 of layer-windows, N5: the digest names the installer, and the pin stays.
+        assert!(wrong.contains(installer.url.as_deref().unwrap()), "{wrong}");
+        assert!(wrong.contains("do not change the pin"), "{wrong}");
+        // The pin's digest held by a stand-in: the check passes on the digest alone.
+        let mut stand_in = pin.clone();
+        let digest = digest_of(&sdk.library).unwrap();
+        stand_in.host.get_mut("windows-x86_64").unwrap().library_sha256 = digest;
+        assert_eq!(check(&stand_in, Host::Windows, &sdk), Ok(()));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The Windows manifest names its library relative to itself; the implicit copy names
+    /// it absolutely, as the loader reads it from another directory.
+    #[test]
+    fn the_windows_manifest_is_made_implicit_with_its_library_absolute() {
+        let manifest = r#"{"file_format_version": "1.2.0", "layer": {"name": "VK_LAYER_KHRONOS_validation", "api_version": "1.4.363", "library_path": ".\\VkLayer_khronos_validation.dll"}}"#;
+        let library = r"C:\VulkanSDK\1.4.363.1\Bin\VkLayer_khronos_validation.dll";
+        let made = implicit_manifest(manifest, Path::new(library)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&made).unwrap();
+        assert_eq!(value["layer"]["library_path"], library);
+    }
+
+    /// Review r1 of layer-windows, S2 and reviewer-gpu's G1 and G2: a loader settings file
+    /// loads its layers in place of the run's paths, and the layer's settings file sets what
+    /// the run does not. Off Windows every run points the XDG directories at its empty one,
+    /// but under `system` the data directories, which hold the system's drivers.
+    #[test]
+    fn off_windows_a_run_reads_no_settings_file_of_the_users() {
+        let root = scratch("xdg");
+        let [layers, no_layers] = [root.join("layers"), no_layer_dir(&root).unwrap()];
+        let sdk = Sdk::at(Host::Windows, root.clone());
+        let empty = Some(no_layers.to_string_lossy().into_owned());
+        let plain = Run::environment(
+            Driver::System,
+            &sdk,
+            [&layers, &no_layers, &root],
+            Validators::Plain,
+            None,
+        )
+        .unwrap();
+        let measured = Run::measured(Driver::System, None, &no_layers, None).unwrap();
+        for run in [&plain, &measured] {
+            for name in XDG {
+                let expected =
+                    if cfg!(windows) || name == "XDG_DATA_DIRS" { None } else { empty.clone() };
+                assert_eq!(value(run, name), expected, "{name} in {:?}", run.set);
+            }
+        }
+        if !cfg!(windows) {
+            let icds = root.join("icd.d");
+            fs::create_dir_all(&icds).unwrap();
+            fs::write(icds.join("MoltenVK_icd.json"), "{}").unwrap();
+            let sdk = Sdk { icds: Some(icds), ..Sdk::at(Host::MacOs, root.clone()) };
+            let pinned = Run::measured(Driver::MoltenVk, Some(&sdk), &no_layers, None).unwrap();
+            assert_eq!(value(&pinned, "XDG_DATA_DIRS"), empty);
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The loader's places for its settings file off Windows, in its order, and the layer's
+    /// for its own.
+    #[test]
+    fn the_settings_files_are_looked_for_where_the_loader_and_the_layer_look() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs.iter().find(|(set, _)| *set == name).map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let file = "vulkan/loader_settings.d/vk_loader_settings.json";
+        let under = |dirs: &[&str]| -> Vec<PathBuf> {
+            dirs.iter().map(|dir| Path::new(dir).join(file)).collect()
+        };
+        let unset = vars(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "")]);
+        assert_eq!(
+            loader_settings_files(&unset),
+            under(&[
+                "/h/.config",
+                "/h/.local/share",
+                "/etc/xdg",
+                "/etc",
+                "/usr/local/etc",
+                "/usr/local/share",
+                "/usr/share"
+            ])
+        );
+        let moved = vars(&[
+            ("HOME", "/h"),
+            ("XDG_CONFIG_HOME", "/e"),
+            ("XDG_DATA_HOME", "/e"),
+            ("XDG_CONFIG_DIRS", "/e"),
+            ("XDG_DATA_DIRS", "/d1:/d2"),
+        ]);
+        let expected = under(&["/e", "/e", "/e", "/etc", "/usr/local/etc", "/d1", "/d2"]);
+        assert_eq!(loader_settings_files(&moved), expected);
+        let cwd = Path::new("/w");
+        let settings = "vulkan/settings.d/vk_layer_settings.txt";
+        assert_eq!(
+            layer_settings_files(&unset, cwd),
+            [Path::new("/h/.local/share").join(settings), cwd.join("vk_layer_settings.txt")]
+        );
+        assert_eq!(layer_settings_files(&moved, cwd)[0], Path::new("/e").join(settings));
+    }
+
+    /// Off Windows a run is refused, naming the file, where a loader settings file is in one
+    /// of its places, and a validated run where the layer's is in its directory.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_run_is_refused_where_a_settings_file_is_in_reach() {
+        let root = scratch("refused");
+        let [layers, no_layers] = [root.join("layers"), no_layer_dir(&root).unwrap()];
+        let icds = root.join("icd.d");
+        fs::create_dir_all(&icds).unwrap();
+        fs::write(icds.join("MoltenVK_icd.json"), "{}").unwrap();
+        let sdk = Sdk { icds: Some(icds), ..Sdk::at(Host::MacOs, root.clone()) };
+        let dirs = [&*layers, &*no_layers, &*root];
+        let plain = Run::environment(Driver::MoltenVk, &sdk, dirs, Validators::Plain, None);
+        let plain = plain.unwrap();
+        let measured = Run::measured(Driver::MoltenVk, Some(&sdk), &no_layers, None).unwrap();
+        let cwd = root.join("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        // The machine's own places are read as they are; this test needs them clean.
+        let machine: Vec<PathBuf> = loader_settings_files(&|name| plain.var(name))
+            .into_iter()
+            .filter(|file| file.is_file())
+            .collect();
+        if !machine.is_empty() {
+            eprintln!("skipped: this machine holds a loader settings file, {machine:?}");
+            return;
+        }
+        assert_eq!(plain.refuse_overrides(&cwd), Ok(()));
+        let file = no_layers.join("vulkan/loader_settings.d/vk_loader_settings.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "{}").unwrap();
+        for run in [&plain, &measured] {
+            let error = run.refuse_overrides(&cwd).unwrap_err();
+            assert!(error.contains(&file.display().to_string()), "{error}");
+            assert!(error.contains("the loader's settings file"), "{error}");
+        }
+        fs::remove_file(&file).unwrap();
+        fs::write(cwd.join("vk_layer_settings.txt"), "").unwrap();
+        let error = plain.refuse_overrides(&cwd).unwrap_err();
+        assert!(error.contains("the layer's settings file"), "{error}");
+        // A measured run loads no layer, so the layer's file changes nothing of it.
+        assert_eq!(measured.refuse_overrides(&cwd), Ok(()));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Review r1 of layer-windows, S2 and reviewer-gpu's G1 to G3: what `reg query` prints of
+    /// a key's values, and the integrity level `whoami /groups` lists.
+    #[test]
+    fn the_registry_s_values_and_the_integrity_level_read() {
+        let query = "\r\nHKEY_CURRENT_USER\\SOFTWARE\\Khronos\\Vulkan\\LoaderSettings\r\n    \
+                     C:\\Users\\u\\AppData\\Local\\LunarG\\vkconfig\\override\\vk_loader_settings.json    \
+                     REG_DWORD    0x0\r\n\r\nHKEY_CURRENT_USER\\SOFTWARE\\Khronos\\Vulkan\\LoaderSettings\\Sub\r\n";
+        assert_eq!(
+            registry_values(query),
+            [r"C:\Users\u\AppData\Local\LunarG\vkconfig\override\vk_loader_settings.json"]
+        );
+        assert!(
+            registry_values("\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Khronos\\Vulkan\\Settings\r\n")
+                .is_empty()
+        );
+        let groups = |level: &str| {
+            format!(
+                "GROUP INFORMATION\r\n-----------------\r\n\r\nGroup Name    Type    SID    \
+                 Attributes\r\n===\r\nEveryone    Well-known group S-1-1-0    Mandatory group\r\n\
+                 BUILTIN\\Users    Alias    S-1-5-32-545    Mandatory group\r\n\
+                 Mandatory Label\\{level} Mandatory Level Label {}\r\n",
+                match level {
+                    "Medium" => "S-1-16-8192",
+                    "High" => "S-1-16-12288",
+                    _ => "S-1-16-16384",
+                }
+            )
+        };
+        assert_eq!(elevated(&groups("Medium")), Ok(false));
+        assert_eq!(elevated(&groups("High")), Ok(true));
+        assert_eq!(elevated(&groups("System")), Ok(true));
+        let csv = "\"Mandatory Label\\High Mandatory Level\",\"Label\",\"S-1-16-12288\",\"\"";
+        assert_eq!(elevated(csv), Ok(true));
+        assert!(elevated("Everyone S-1-1-0").unwrap_err().contains("no integrity level"));
     }
 
     #[test]
     fn the_tracked_pin_reads() {
         let pin = Pin::parse(PIN).unwrap();
         assert_eq!(pin.host.len(), HOSTS.len());
+        let windows = &pin.host["windows-x86_64"];
+        assert!(windows.url.as_deref().unwrap().ends_with("vulkansdk-windows-X64-1.4.363.1.exe"));
     }
 
     #[test]
-    fn a_pin_missing_a_host_or_with_an_archive_on_the_mac_is_refused() {
-        let missing = PIN.replace("[host.macos-aarch64]", "[host.windows-x86_64]");
+    fn a_pin_missing_a_host_or_not_of_its_hosts_form_is_refused() {
+        let missing = PIN.replace("[host.macos-aarch64]", "[host.macos-x86_64]");
         assert!(Pin::parse(&missing).unwrap_err().contains("the hosts are"));
         let fetched = PIN.replace(
             "[host.macos-aarch64]\n",
             "[host.macos-aarch64]\nurl = \"https://example.invalid/a\"\n",
         );
         assert!(Pin::parse(&fetched).unwrap_err().contains("takes no"), "{fetched}");
+        // Windows names its installer, the url with the digest.
+        let pin = Pin::parse(PIN).unwrap();
+        let installer = pin.host["windows-x86_64"].sha256.clone().unwrap();
+        let unnamed = PIN.replace(&format!("sha256 = \"{installer}\"\n"), "");
+        assert!(Pin::parse(&unnamed).unwrap_err().contains("windows-x86_64 needs"), "{unnamed}");
+        let archive = PIN.replace("/windows/vulkansdk-windows-X64-", "/windows/vulkansdk-linux-");
+        assert!(Pin::parse(&archive).unwrap_err().contains("url does not end in"));
     }
 
     #[test]
@@ -1198,6 +1936,44 @@ mod tests {
         // An identifier that merely begins with the canary's is another message.
         let longer = format!("{both}{}", message("A-and-more"));
         assert!(judge("device::canary", true, &longer, Some(ids), false).failure.is_some());
+    }
+
+    /// A case of the conformance kit that ran only part of itself prints `<case>: skipped in
+    /// part, <what>` before its `passed` (`Ctx::skip_part`, lane `windows-fixes`): it passed,
+    /// and its entry keeps each part, distinct from a whole skip's word.
+    #[test]
+    fn a_case_run_in_part_passes_and_its_entry_says_what_it_left_out() {
+        let name = "conformance::dispatch_beyond_the_group_limit_is_refused";
+        let output = "running 1 test\n\
+                      dispatch_beyond_the_group_limit_is_refused: skipped in part, a dispatch \
+                      past the limit in x\n\
+                      dispatch_beyond_the_group_limit_is_refused: skipped in part, x at 4194304\n\
+                      dispatch_beyond_the_group_limit_is_refused: passed\n\
+                      test conformance::dispatch_beyond_the_group_limit_is_refused ... ok\n";
+        let verdict = judge(name, true, output, None, false);
+        assert_eq!(verdict.said.as_deref(), Some("passed"));
+        assert_eq!(verdict.parts, ["a dispatch past the limit in x", "x at 4194304"]);
+        assert_eq!((verdict.failure.as_deref(), verdict.word().as_str()), (None, "passed"));
+        let ended = Ended {
+            succeeded: true,
+            status: "exit status: 0".into(),
+            stdout: String::new(),
+            stderr: output.into(),
+            killed_at: None,
+        };
+        assert_eq!(
+            entry("lactose-rhi-vulkan", name, &verdict, &ended),
+            "lactose-rhi-vulkan conformance::dispatch_beyond_the_group_limit_is_refused: passed\n  \
+             skipped in part, a dispatch past the limit in x\n  skipped in part, x at 4194304\n"
+        );
+        // A whole skip is the case's word, and no part of it.
+        let whole = "dispatch_beyond_the_group_limit_is_refused: skipped, no limit to pass\n";
+        let verdict = judge(name, true, whole, None, false);
+        assert_eq!(verdict.said.as_deref(), Some("skipped, no limit to pass"));
+        assert!(verdict.parts.is_empty());
+        // Another case's part is not this one's.
+        let other = "dispatch_indirect_reads_its_counts: skipped in part, x\n";
+        assert!(judge(name, true, other, None, false).parts.is_empty());
     }
 
     #[test]

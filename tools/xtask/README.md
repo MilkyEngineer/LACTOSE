@@ -568,17 +568,25 @@ standard error as it comes.
 - A measurement on a Vulkan device (`extract-50k`, `remote-upload-5k`, `gpu-cost`) runs under the
   driver `--driver` names, `moltenvk` by default on macOS and `system` elsewhere, on the adapter
   `--adapter` names or the loader's first, with no layer: the inherited variables `gpu`
-  clears are cleared, every implicit layer is disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~`)
-  and no Metal validation is set. The loader is the pinned SDK's (`vulkan-layer.toml`) on
-  macOS and for a driver the SDK ships, the system's otherwise, and the driver's manifest is
-  pinned as `gpu` pins it. `vulkaninfo` (the SDK's, or the one on the path) runs once under
-  the same environment before the first of them, and each file's header adds the rows of the
-  device its test named in `device.adapter`: its name and vendor and device ids, the driver's
-  name, information and version, the device's and the instance's API versions, the loader,
-  the validation (off), the presentation (none: no surface, so no present mode or refresh
+  clears are cleared, the loader's implicit and explicit layer paths are both the empty
+  `target/measure/no-layers` (`VK_IMPLICIT_LAYER_PATH` and `VK_LAYER_PATH`), so that it looks
+  in no other place for a layer, the Windows registry's among them, and no Metal validation is
+  set. A loader made to skip a layer by `VK_LOADER_LAYERS_DISABLE` warns of each, which a
+  measured run hears as a message and fails on, so no run sets it. The loader is the pinned
+  SDK's (`vulkan-layer.toml`) on macOS and for a driver the SDK ships, the system's otherwise,
+  and the driver's manifest is pinned as `gpu` pins it. No loader settings file is in reach,
+  as for a `gpu` run (the XDG directories and the refusal described under "GPU runs").
+  `vulkaninfo` (the SDK's on macOS, the one on the path elsewhere) runs once under
+  the same environment before the first of them, and the run is refused where it does not
+  start, runs past its deadline, exits with a failure, lists an instance layer or prints no
+  list this tool reads; each file's header adds the rows of the device its test named in
+  `device.adapter`: its name and vendor and device ids, the driver's name, information and
+  version, the device's and the instance's API versions, the loader (the pinned SDK's by its
+  version, or the system's with the instance version `vulkaninfo` reports), the validation
+  (off), the presentation (none: no surface, so no present mode or refresh
   rate), the memory type `lactose-rhi-vulkan` chooses for `MemoryClass::Upload`, the ring's,
-  and the environment set, a path inside the SDK written from `<sdk>` and any other cut to
-  its file name. Where `vulkaninfo` fails the rows say why and the run goes on. A test that
+  and the environment set, a path inside the SDK written from `<sdk>`, one inside the
+  repository relative to its root, and any other cut to its file name. A test that
   hears a message from the device fails. `--no-device` leaves them out of `--all` and refuses
   one named; the `measure` workflow passes it, since its runners have no device. `cargo xtask
   gpu` runs them too, short, under its validators. With no `--driver`, `gpu-cost` runs once
@@ -594,9 +602,28 @@ standard error as it comes.
   `Outcome` line, without the comparison, with a slot of no pixel surely its colour, or with
   a line logged at warn or above. The file records each canary's word, the `Outcome`'s
   figures and the criterion, and the measurement fails after writing it where the criterion
-  is not met. It presents: the screen must be unlocked and the display awake. A host the
-  layer's pin names nothing for (Windows) cannot run it.
+  is not met. It presents: the screen must be unlocked and the display awake. On Windows it
+  runs under `--driver system`, with the SDK the pin names installed.
 - `frame-pace` is not a test either (section "frame-pace" below).
+- `rhi-conformance` is criterion 2's file, not a test: it runs this binary's own `gpu --driver
+  <name> --only vulkan` (section "GPU runs" below) under each of the host's drivers, as
+  `gpu-cost` does, and again with `--gpu-assisted` under each that takes it (not MoltenVK,
+  whose SPIRV-Cross fails on the layer's instrumented shaders), `--adapter` passed on with
+  `--driver system` alone. Each run's report, `target/gpu/<driver>-vulkan[-gpu-assisted].txt`,
+  removed before the run so that no earlier one is read, is written out as
+  `rhi-conformance-<driver>[-gpu-assisted]-<machine>-<date>.md`, under a header of its own,
+  since the run is validated and no timed one: the CPU, the commit, the command and what it
+  ran, the load, the adapter (`DeviceInfo`'s, and whether `--adapter` chose it), the device as
+  `DeviceInfo` reports it, the driver, the shaders, and the Validation row, the layer's version
+  and its library with the validators' and Metal's settings, then the rest of the environment
+  and the inherited variables cleared. Then the plan's four contents: the cases run, counted by
+  verdict and each with its own; the capabilities the device reports, from `Capabilities`; each
+  canary's verdict and every message it heard; and the count of every other message by source,
+  `Validation` and `Driver` through the debug messenger and the lines of the driver's or
+  Metal's own log. Every path is cut as a device file's is, and in a message's text the SDK's
+  directory is `<sdk>`, the repository's `.` and the home directory `~`. A run whose gate
+  fails writes its file and fails the measurement. `--short` cuts nothing of it, and `--all`
+  runs it last.
 - `spike-net` runs the netcode spike's ten-minute replays one `cargo nextest run` at a time;
   each prints its report as one JSON object, whose values the files carry under
   `<scene>.<clock>.` (nested keys joined by dots, an array as its JSON text), with the
@@ -777,7 +804,8 @@ compute encoder hides under MoltenVK. KosmicKrisp runs without Metal's validatio
 its queue aborts under API validation and its heap's textures are not resident under shader
 validation, defects of that driver. `gpu --gpu-assisted` with no `--driver` runs KosmicKrisp
 alone, since the layer's instrumented shaders fail in MoltenVK's SPIRV-Cross. On another host
-a run names its driver. `--driver <name>` runs one driver, for development, and `--adapter`
+a run names its driver, and on Windows it is `system` alone. `--driver <name>` runs one driver, for
+development, and `--adapter`
 goes with `--driver system` alone. Every step runs before a failure fails the run, so each
 writes its report.
 
@@ -828,32 +856,72 @@ writes its report.
    which only they read), each in a
    process of its own, built with `cargo test --no-run` and run by its exact name. Under each driver it sets the loader's environment for its children:
    - the layer is the Khronos validation layer of the Vulkan SDK that
-     `tools/xtask/vulkan-layer.toml` pins, refused unless its library's SHA-256 and its
-     manifest's version are the pin's. On Linux the SDK's archive is fetched into
+     `tools/xtask/vulkan-layer.toml` pins, refused unless its manifest names the pinned layer at
+     the pinned version and then unless its library's SHA-256 is the pin's: the manifest first,
+     so that another SDK, which the installer's `VULKAN_SDK` names once a later one is installed,
+     is refused as that SDK and not as a digest. On Linux the SDK's archive is fetched into
      `target/vulkan-sdk/`, refused unless its SHA-256 is the pin's (LunarG's published
      digest), and its loader, layer and manifest unpacked; on the Mac the SDK is the one the
-     installer put at `VULKAN_SDK`, or at `~/VulkanSDK/<version>/macOS`. The loader is the
-     SDK's (`LD_LIBRARY_PATH`, or on macOS `DYLD_FALLBACK_LIBRARY_PATH`, since
-     `DYLD_LIBRARY_PATH` would also load the SDK's copy of a driver the loader opens by its
-     absolute path, and the loader reports the difference);
+     installer put at `VULKAN_SDK`, or at `~/VulkanSDK/<version>/macOS`; on Windows the one
+     LunarG's installer, run as administrator, put at `VULKAN_SDK`, or at
+     `C:\VulkanSDK\<version>`, its layer `Bin\VkLayer_khronos_validation.dll` and its manifest
+     `Bin\VkLayer_khronos_validation.json`, and an SDK that is not there is an error that names
+     the installer's url and SHA-256, which the tool never fetches (section "The Windows pin"
+     below). The loader is the SDK's (`LD_LIBRARY_PATH`, or on macOS
+     `DYLD_FALLBACK_LIBRARY_PATH`, since `DYLD_LIBRARY_PATH` would also load the SDK's copy of a
+     driver the loader opens by its absolute path, and the loader reports the difference); on
+     Windows the system's, which the GPU's driver installs, with no library path set;
    - the layer is loaded as an implicit layer, from a copy of its manifest under
-     `target/gpu/layers/` that names its library by its absolute path, with `VK_LAYER_PATH`
-     set to an empty directory: a layer forced through `VK_INSTANCE_LAYERS` or
+     `target/gpu/layers/` that names its library by its absolute path. `VK_IMPLICIT_LAYER_PATH`
+     is that directory, which the loader then reads in place of every other place it looks for
+     an implicit layer: no layer the machine registers joins the run, the Windows registry's
+     `ImplicitLayers` (a capture tool's hook and the GPU driver's own layer, on a Windows
+     desktop) and Linux's `/usr/share/vulkan/implicit_layer.d` (Mesa's device-select layer, on
+     the CI runner) among them. `VK_LAYER_PATH` is an empty directory, which hides the explicit
+     layers, the SDK's own registry entry among them; a measured run sets both paths to it. On
+     Windows the second is needed even where no explicit layer is installed: with the implicit
+     path alone the loader still reads the registry's `ExplicitLayers` key, and where the key is
+     absent it sends "Registry lookup failed to get layer manifest files" as a warning through
+     the debug messenger, which failed a clean device test on loader 1.4.357 and would fail a
+     measured run. `VK_ADD_IMPLICIT_LAYER_PATH` would add the directory beside
+     the machine's layers, and no run sets it. A layer forced through `VK_INSTANCE_LAYERS` or
      `VK_LOADER_LAYERS_ENABLE`, or found twice, makes the loader warn, and the warning reaches
-     the debug messenger, which counts it. Before the run sets its own, it removes these
+     the debug messenger, which counts it. In an elevated process the loader ignores the
+     layer and driver path variables, `VK_LOADER_LAYERS_DISABLE` and the filters
+     (`VK_LOADER_LAYERS_ENABLE` and the like), which it reads through `loader_secure_getenv`,
+     though it still reads `VK_INSTANCE_LAYERS` (loader 1.4.363, `loader.c` and
+     `loader_environment.c`): on Windows a run is refused where `whoami /groups` lists an
+     integrity level of high (`S-1-16-12288`) or above. A loader settings file, which Vulkan
+     Configurator writes, names the layers the loader loads, and the loader reads it before
+     these variables: off Windows every run sets `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
+     `XDG_CONFIG_DIRS` and, but under `system`, whose drivers are in the system's data
+     directories, `XDG_DATA_DIRS` to the empty directory, and a run is refused, naming the
+     file, where `vulkan/loader_settings.d/vk_loader_settings.json` is under any directory the
+     loader would still look in (those variables, `/etc` and `/usr/local/etc`, in the
+     loader's order); on Windows where the registry's `SOFTWARE\Khronos\Vulkan\LoaderSettings`
+     key holds a value under `HKEY_CURRENT_USER` or `HKEY_LOCAL_MACHINE`. A validated run is
+     refused too where the layer's own settings file is in reach, which would set what the run
+     does not: under `Software\Khronos\Vulkan\Settings` of either hive on Windows, at
+     `vulkan/settings.d/vk_layer_settings.txt` under `XDG_DATA_HOME` (else
+     `~/.local/share`) elsewhere, and as `vk_layer_settings.txt` in the test's working
+     directory on every host. The refusal is checked where each process starts, the gate's
+     tests from the repository's root and the client and the triangle from their own
+     directories. Before the run sets its own, it removes these
      inherited variables (`CLEARED` and `CLEARED_PREFIXES` in `src/vulkan.rs`): the
      families `VK_KHRONOS_VALIDATION_*` and `VK_LAYER_*` (the layer's settings under both
      the names its manifest gives, and the layer paths), `VK_LOADER_*`, MoltenVK's `MVK_*`,
      Mesa's `MESA_*` (KosmicKrisp's and lavapipe's) and Metal's `MTL_*`, and by name
      `VK_INSTANCE_LAYERS`, `VK_ICD_FILENAMES`, `VK_DRIVER_FILES`, `VK_ADD_DRIVER_FILES`,
-     `VK_ADD_LAYER_PATH`, `VK_IMPLICIT_LAYER_PATH`, `DYLD_LIBRARY_PATH`,
+     `VK_ADD_LAYER_PATH`, `VK_IMPLICIT_LAYER_PATH`, `VK_ADD_IMPLICIT_LAYER_PATH`,
+     `DYLD_LIBRARY_PATH`,
      `METAL_DEVICE_WRAPPER_TYPE` (which turns Metal's API validation on, as `MTL_DEBUG_LAYER`
      does), `LACTOSE_VALIDATION_OFF`, `LACTOSE_GPU_ADAPTER` and `LACTOSE_GPU_SHADERS`. It
      names each it removed in its file. A driver's other variables are not cleared. What a
      run needs of them it takes as an argument, or sets itself after the removal;
    - the driver is `VK_DRIVER_FILES`: lavapipe's manifest in `/usr/share/vulkan/icd.d/`,
-     MoltenVK's or KosmicKrisp's in the SDK's `share/vulkan/icd.d/`; under `system` the
-     loader's own search, and `--adapter <name>` selects the device by a part of its name
+     MoltenVK's or KosmicKrisp's in the SDK's `share/vulkan/icd.d/`; under `system`, on Windows
+     the only driver a run takes, the loader's own search, and `--adapter <name>` selects the
+     device by a part of its name
      (`LACTOSE_GPU_ADAPTER`, which the tests' request reads);
    - the validators are core, synchronisation (with its check of a load after a store) and
      thread-safety validation; with `--gpu-assisted`, GPU-assisted validation and
@@ -917,7 +985,10 @@ writes its report.
    driver, the shaders' Slang, the layer, the inherited variables it cleared (`inherited and
    cleared:`, or `none`), every variable it set, the canaries heard or skipped, the
    device's `DeviceInfo` and `Capabilities`, and each test with `passed`, the suite's
-   `skipped, <why>` or `FAILED, <why>` and the messages and driver lines it printed, then
+   `skipped, <why>` or `FAILED, <why>`, under it each part of itself a case says it ran
+   only in part (`skipped in part, <what>`, the conformance kit's `Ctx::skip_part`, kept
+   beside a `passed` and never read as a skip of the case or as a message), and the
+   messages and driver lines it printed, then
    each line of its output that ends in `retrying`, so that a test that passed only on a
    retry says so (the renderer's device tests print one where a held frame was reached
    before its release, `crates/renderer/README.md`, "Proof"). Under a
@@ -945,8 +1016,11 @@ writes its report.
    fails where the pending figure is zero, since its lag then reached nothing it is for. The lag
    was set on the M1 under each driver's validators (26 November 2026, load averages near 9): 100
    passes under MoltenVK, where 31 of 136 calls found their oldest read unreached, and 200 under
-   KosmicKrisp, where 45 of 217 did and 100 passes left 2 of 301; plain, none of 301 did under
-   either, so the plain run alone reaches no pending encoder. KosmicKrisp's figure at 200 is wide,
+   KosmicKrisp, where 45 of 217 did and 100 passes left 2 of 301; plain, 0 of 301 did under
+   KosmicKrisp and, in the merger's run at `1c62676`, 1 of 301 under MoltenVK, so the plain run
+   reaches a pending encoder seldom, and the gate holds it to no figure of them: a refused reset
+   fails either run, and a pending figure of zero fails the lagged one alone. KosmicKrisp's figure
+   at 200 is wide,
    17 to 81 of 209 to 247 calls over six runs, below a tenth of the calls in one, and more passes
    do not raise it: at 300, in three runs at load averages from 6.81 to 13.61, 2 of 165 to 170
    calls, and at 400, in three at 3.85 to 4.97, 2 of 110 to 121, the frame finding the GPU busy for
@@ -978,3 +1052,58 @@ SDK, its `metal`, its `swift` and its Metal device's facts, as
 `swift tools/xtask/metal/pipelines.swift --device` prints them. Each is recorded before any is
 judged, and a missing one fails the step, naming it. `--metal-optional`, for a runner that
 compiles no metallib, records a missing `metal` and does not fail on it.
+
+### The Windows pin
+
+On Windows the pin names the installer an owner runs, `[host.windows-x86_64]`'s `url` and
+`sha256`, and the layer's library it installs, `library_sha256`; the tool fetches nothing
+there. The library's digest was read on the Mac out of that installer, which was never run
+(26 November 2026):
+
+1. LunarG's list of files, `https://vulkan.lunarg.com/sdk/files.json`, fetched into a new,
+   empty directory, gives under `windows`, `1.4.363.1`, the file
+   `vulkansdk-windows-X64-1.4.363.1.exe`, 303,066,832 bytes, SHA-256
+   `c02932bd9a968b22d404536108adaacac908c081cd6b0113f5bfefc523dd0a6a`, the pin's `sha256`.
+2. The installer, fetched from the pin's `url` into another new, empty directory with `curl`,
+   has that SHA-256 (`shasum -a 256`).
+3. It is a Qt Installer Framework binary, whose payload is 7z archives. Each is cut out by its
+   signature, `7z\xbc\xaf\x27\x1c`, and kept only where the CRC-32 of its start header and of
+   its next header hold and it ends inside the file, by a script that reads the installer as
+   bytes, run with `python3 -I`, into a third new directory: ten archives, of which the one at
+   offset 34,765,651, 169,636,880 bytes, alone holds `Bin/VkLayer_khronos_validation.dll` and
+   `Bin/VkLayer_khronos_validation.json`.
+4. That archive is read by the system's `bsdtar` into a fourth new directory. The library's
+   SHA-256 is `451ed11cbc799f858cbc0e843766d2990527c03f93f7a85f03bc1e67b605a435`, the pin's
+   `library_sha256`, and the manifest names `VK_LAYER_KHRONOS_validation`, API version
+   `1.4.363`, library `.\VkLayer_khronos_validation.dll`, as the check reads it.
+
+A run on Windows is from a shell that is not elevated (the loader ignores its layer path
+variables in an elevated process, and the tool refuses one), under `--driver system`, the SDK
+installed as administrator once. The loader is the system's, not the SDK's: a measured
+run's `Loader` row names it with the instance version `vulkaninfo` reports.
+
+### Barrier mutations
+
+`python3 -B tools/xtask/barrier-mutations.py <out dir> [--run <name>]... [-- <gpu args>...]`
+(`py -3 -B` on Windows) runs the renderer's barrier mutations its docstring describes, the
+records of `docs/verification.md`'s rows of the barrier between dispatches, the
+scatter-to-vertex barrier and the barrier across frames: each run copies the checkout into a
+fresh directory under `<out dir>`, patches one barrier out of `lactose-rhi-vulkan`'s encoder
+and the lag it needs into the scatter shader, and runs `cargo xtask gpu --only vulkan` there.
+The verdict is read from the gate's report under `<out dir>/target/gpu/`, never from its
+console, which prints no passing test: `caught` on the named test's `FAILED` line alone, where its
+control passed under that driver,
+`MISSED` on its `passed` line, `KILLED` where it ran past its deadline, `NOT JUDGED` where
+its control failed, and `NOT RUN` on neither line. Each mutant's control runs before it, `--run`
+of a mutant included: its lag alone, or the checkout unpatched where it adds no lag, which must
+pass every test. Each copy's encoder is touched after the copy, which keeps every other file's
+time, so the copy's build recompiles `lactose-rhi-vulkan` and what depends on it even where the
+same `<out dir>` held a mutant before. A patch that does not apply removes its copy and exits
+2; a failed control or a mutant killed, not judged or not run exits 1. An `<out dir>` whose
+`target` is the checkout's own target directory, through a link or `CARGO_TARGET_DIR`, is
+refused: cargo names a workspace's crates by their paths within it and judges them by their
+sources' times, so the checkout's next build would run the last mutant unrebuilt. An
+`<out dir>` inside the checkout is refused too, since each copy would take it in, unless it is
+under the checkout's `target`, `.scratchpad` or `.claude`. Both refusals ask the file system
+whether two paths are one, so neither a link nor a spelling in another case passes them. Under
+`--gpu-assisted` on macOS the driver must be named. Its files are read and written as UTF-8.
