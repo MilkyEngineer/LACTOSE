@@ -15,6 +15,7 @@ use crate::gate::Opener;
 use crate::guard::abort_on_unwind;
 use crate::latch::Latch;
 use crate::pool::{Arenas, Entry, LATCH_SPIN, Rest, WorkerLocal, drain_range, spin_until};
+use crate::span::TARGET;
 
 /// Handed to every job.
 pub struct JobContext<'job> {
@@ -131,7 +132,11 @@ impl<'job> JobContext<'job> {
         let pool = self.local.pool();
         pool.close_gate(reserved_workers);
         let result = f();
+        // `record-stall` times each parked worker's wake from this span's entry (README,
+        // "Tracing").
+        let opening = tracing::debug_span!(target: TARGET, "open_gate").entered();
         pool.open_gate(reserved_workers);
+        drop(opening);
         result
     }
 }

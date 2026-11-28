@@ -12,6 +12,7 @@
 
 use crate::latch::Latch;
 use crate::sleep::Sleep;
+use crate::span::TARGET;
 use std::time::Instant;
 
 use crate::sync::{AtomicUsize, Mutex, Ordering};
@@ -271,7 +272,32 @@ pub(crate) fn idle_park(
         if let Some(hook) = gate.before_park.get() {
             hook(worker, seen);
         }
+        // After the announcement: a listener's callbacks run on a worker that a waker may
+        // already have claimed, and one that waits through the thread's parker may take the
+        // waker's unpark. `Sleep::park` parks only while its bit says nobody has claimed the
+        // worker, so that delays the wake and loses nothing.
+        let _park = tracing::debug_span!(target: TARGET, "park", wait = "idle").entered();
         sleep.park(worker, deadline);
+    }
+}
+
+/// The re-check of [`wait_for_children`] before the opener parks: `Some(false)` if the latch
+/// is set, `Some(true)` holding a permit if the opener should run its children, `None` if it
+/// should park.
+fn recheck(latch: &Latch, gate: &Gate, children_here: bool, opener: &impl Opener) -> Option<bool> {
+    if latch.is_set() {
+        Some(false)
+    } else if children_here && opener.shutting_down() {
+        // Nobody else will run what is on this deque, and the gate no longer applies. With
+        // nothing on the deque shutdown is no reason to stay up: the children are with
+        // workers that run them before they exit, and the last one's count-down unparks this
+        // worker.
+        gate.retake();
+        Some(true)
+    } else if children_here && gate.try_acquire() {
+        Some(true)
+    } else {
+        None
     }
 }
 
@@ -336,21 +362,20 @@ pub(crate) fn wait_for_children(
             }
             // The re-check. A latch that is set, a permit, or shutdown each end the park
             // before it starts; whichever of them happens later comes with an unpark.
-            let proceed = if latch.is_set() {
-                Some(false)
-            } else if children_here && opener.shutting_down() {
-                // Nobody else will run what is on this deque, and the gate no longer
-                // applies. With nothing on the deque shutdown is no reason to stay up:
-                // the children are with workers that run them before they exit, and the
-                // last one's count-down unparks this worker.
-                gate.retake();
-                Some(true)
-            } else if children_here && gate.try_acquire() {
-                Some(true)
-            } else {
-                opener.park(latch);
-                None
-            };
+            let mut proceed = recheck(latch, gate, children_here, opener);
+            if proceed.is_none() {
+                // A listener's callbacks run between the re-check and the park, and one that
+                // waits through this thread's parker takes the token an unpark sent meanwhile
+                // left: the set latch, freed permit, shutdown or child queued for this opener
+                // it came with would be missed, and the opener would sleep beside it. So once
+                // they have run, the re-check runs again, and an opener with no children here
+                // looks where its children are queued, as it does after a wake.
+                let _park = tracing::debug_span!(target: TARGET, "park", wait = "latch").entered();
+                proceed = recheck(latch, gate, children_here, opener);
+                if proceed.is_none() && (children_here || !opener.look()) {
+                    opener.park(latch);
+                }
+            }
             if children_here {
                 gate.openers.cancel(worker);
             }
@@ -384,5 +409,219 @@ pub(crate) fn wait_for_children(
                 break;
             }
         }
+    }
+}
+
+/// The opener's wait against a tracing listener that takes the thread's park token: each of
+/// the four reasons that end the wait with an unpark, landing between the re-check and the
+/// park, where the latch `park` span's callbacks run.
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+    use core::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::thread::Thread;
+    use std::time::Duration;
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// The pool as the gate sees it: the opener, worker 0, on the test's thread.
+    struct Opened(Thread);
+
+    impl Wake for Opened {
+        fn idle_one(&self) {}
+
+        fn unpark(&self, worker: usize) {
+            assert_eq!(worker, 0, "the opener is the only worker");
+            self.0.unpark();
+        }
+    }
+
+    /// Where the scope's one child is.
+    #[derive(Clone, Copy)]
+    enum Child<'a> {
+        /// With another worker, which counts it down.
+        Elsewhere,
+        /// On the opener's own deque, where the gate stops it the first time.
+        OnDeque,
+        /// Queued for the opener of a `run_job` scope once the flag is set, as another worker
+        /// that splits a half off or puts one back queues it.
+        Queued(&'a AtomicBool),
+        /// Run by the opener.
+        Ran,
+    }
+
+    /// An opener with one child, which it runs once it may go on. It never parks: in each
+    /// test the wait has a reason to end before it would, and the listener has taken the
+    /// token that reason's unpark left, so a park would sleep through it.
+    struct OneChild<'a> {
+        latch: &'a Latch,
+        shutdown: &'a AtomicBool,
+        /// Set by the listener once the latch `park` span is made.
+        heard: &'a AtomicBool,
+        child: Child<'a>,
+        stopped: bool,
+        /// What the opener would park beside.
+        beside: &'static str,
+    }
+
+    impl Opener for OneChild<'_> {
+        fn run_children(&mut self) -> bool {
+            match self.child {
+                Child::OnDeque if !core::mem::replace(&mut self.stopped, true) => return true,
+                Child::OnDeque => {}
+                Child::Queued(queued) if queued.swap(false, Ordering::SeqCst) => {}
+                Child::Elsewhere | Child::Queued(_) | Child::Ran => return false,
+            }
+            self.child = Child::Ran;
+            assert!(self.latch.count_down(1), "the scope's one child");
+            false
+        }
+
+        fn shutting_down(&self) -> bool {
+            self.shutdown.load(Ordering::SeqCst)
+        }
+
+        fn spin(&mut self, _latch: &Latch) -> bool {
+            false
+        }
+
+        fn look(&mut self) -> bool {
+            matches!(self.child, Child::Queued(queued) if queued.load(Ordering::SeqCst))
+        }
+
+        fn park(&mut self, _latch: &Latch) {
+            assert!(self.heard.load(Ordering::SeqCst), "the opener parked in no `park` span");
+            panic!("the opener parked {}, its wake's token taken", self.beside);
+        }
+    }
+
+    /// Listens to the latch `park`. Its `new_span` brings about `event`, which ends the wait
+    /// and unparks the opener, as another worker would; its `enter` then waits through the
+    /// thread's parker, which takes that unpark's token.
+    struct TakesTheToken<F> {
+        event: std::sync::Mutex<Option<F>>,
+        heard: Arc<AtomicBool>,
+    }
+
+    impl<F: FnOnce() + Send + 'static> Subscriber for TakesTheToken<F> {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.name() == "park"
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            self.heard.store(true, Ordering::SeqCst);
+            if let Some(event) = self.event.lock().unwrap().take() {
+                event();
+            }
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+        fn event(&self, _event: &Event<'_>) {}
+
+        fn enter(&self, _span: &Id) {
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    /// Runs the opener's wait for a scope of one child under [`TakesTheToken`] with `event`.
+    fn wait_through(
+        gate: &Gate,
+        latch: &Latch,
+        shutdown: &AtomicBool,
+        child: Child<'_>,
+        beside: &'static str,
+        event: impl FnOnce() + Send + 'static,
+    ) {
+        let wake = Opened(std::thread::current());
+        let heard = Arc::new(AtomicBool::new(false));
+        let mut opener = OneChild { latch, shutdown, heard: &heard, child, stopped: false, beside };
+        let event = std::sync::Mutex::new(Some(event));
+        let listener = TakesTheToken { event, heard: heard.clone() };
+        tracing::subscriber::with_default(listener, || {
+            wait_for_children(latch, gate, 0, &wake, &mut opener);
+        });
+        assert!(heard.load(Ordering::SeqCst), "the opener made no `park` span");
+        assert!(latch.is_set(), "the wait ended with the scope's child done");
+    }
+
+    #[test]
+    fn a_listener_that_takes_the_last_childs_unpark_costs_no_wake_up() {
+        let (gate, latch) = (Gate::new(1), Arc::new(Latch::new()));
+        latch.add(1);
+        assert!(gate.try_acquire(), "the opener's permit");
+        let event = {
+            let (latch, opener) = (latch.clone(), Opened(std::thread::current()));
+            move || {
+                assert!(latch.count_down(1), "the child with another worker is the last");
+                opener.unpark(0);
+            }
+        };
+        let shutdown = AtomicBool::new(false);
+        wait_through(&gate, &latch, &shutdown, Child::Elsewhere, "on a set latch", event);
+        assert_eq!(gate.permits(), (1, None), "the opener holds its permit again");
+    }
+
+    #[test]
+    fn a_listener_that_takes_a_freed_permits_unpark_costs_no_wake_up() {
+        let (gate, latch) = (Arc::new(Gate::new(1)), Latch::new());
+        latch.add(1);
+        // The opener's, another worker's and that of a `block_in_place` reserving one, which
+        // gives its own up as it closes the gate.
+        for _ in 0..3 {
+            assert!(gate.try_acquire());
+        }
+        gate.close(1, &Opened(std::thread::current()));
+        let event = {
+            let (gate, opener) = (gate.clone(), Opened(std::thread::current()));
+            move || gate.release(&opener)
+        };
+        let beside = "beside its child and a free permit";
+        wait_through(&gate, &latch, &AtomicBool::new(false), Child::OnDeque, beside, event);
+        assert_eq!(gate.permits(), (1, Some(1)), "the opener holds the reserved permit");
+    }
+
+    #[test]
+    fn a_listener_that_takes_shutdowns_unpark_costs_no_wake_up() {
+        let (gate, latch, shutdown) =
+            (Gate::new(1), Latch::new(), Arc::new(AtomicBool::new(false)));
+        latch.add(1);
+        // The opener's and that of a `block_in_place` reserving none.
+        for _ in 0..2 {
+            assert!(gate.try_acquire());
+        }
+        gate.close(0, &Opened(std::thread::current()));
+        let event = {
+            let (shutdown, opener) = (shutdown.clone(), Opened(std::thread::current()));
+            move || {
+                shutdown.store(true, Ordering::SeqCst);
+                opener.unpark(0);
+            }
+        };
+        let beside = "beside its child after shutdown";
+        wait_through(&gate, &latch, &shutdown, Child::OnDeque, beside, event);
+        assert_eq!(gate.permits(), (1, Some(0)), "the opener took a permit back past the limit");
+    }
+
+    #[test]
+    fn a_listener_that_takes_a_queued_childs_unpark_costs_no_wake_up() {
+        let (gate, latch, queued) = (Gate::new(1), Latch::new(), Arc::new(AtomicBool::new(false)));
+        latch.add(1);
+        assert!(gate.try_acquire(), "the opener's permit");
+        let event = {
+            let (queued, opener) = (queued.clone(), Opened(std::thread::current()));
+            // As `Width::queued` does for a child another worker splits off or puts back.
+            move || {
+                queued.store(true, Ordering::SeqCst);
+                opener.unpark(0);
+            }
+        };
+        let (shutdown, child) = (AtomicBool::new(false), Child::Queued(&queued));
+        wait_through(&gate, &latch, &shutdown, child, "with its child queued", event);
+        assert_eq!(gate.permits(), (1, None), "the opener holds its permit again");
     }
 }

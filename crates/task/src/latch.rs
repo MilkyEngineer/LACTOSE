@@ -59,7 +59,10 @@ impl Latch {
     ///
     /// A park token left by an unrelated unpark only costs one more trip round that loop,
     /// and a token set between the check and the park makes the park return at once, so no
-    /// wake-up is lost.
+    /// wake-up is lost, as long as nothing between them waits through this thread's parker
+    /// and so takes the token. Code that can, such as a tracing listener's callbacks, must
+    /// run before the check, which is why `gate::wait_for_children` checks again once the
+    /// `park` span is entered.
     pub(crate) fn park(&self) {
         park();
     }

@@ -172,6 +172,42 @@ fn a_panic_while_a_cancelled_future_is_dropped_aborts_the_process() {
     }
 }
 
+/// A tracing listener that panics when a frame worker begins its idle wait.
+struct PanicsInAnIdlePark;
+
+impl tracing::Subscriber for PanicsInAnIdlePark {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "whisk" && metadata.name() == "park"
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let name = std::thread::current().name().unwrap_or_default().to_owned();
+        assert!(!name.starts_with("whisk-frame-"), "deliberate panic in a listener");
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, _event: &tracing::Event<'_>) {}
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// A listener's callbacks for the `park` span run in a worker's idle wait, so a panic in one
+/// aborts there as in a job. Unwound, it would end the worker's thread with its sleeper bit
+/// announced, and a waker would wake a thread that is gone.
+#[test]
+fn a_panic_in_a_listener_of_the_idle_wait_aborts_the_process() {
+    const TEST: &str = "a_panic_in_a_listener_of_the_idle_wait_aborts_the_process";
+    if aborts_saying(TEST, "idle listener", "deliberate panic in a listener") {
+        tracing::subscriber::set_global_default(PanicsInAnIdlePark).unwrap();
+        // The frame worker finds nothing to do and goes to sleep.
+        let _executor = executor(1, 1);
+        std::thread::sleep(Duration::from_secs(30));
+        unreachable!("the process aborts when the frame worker begins its idle wait");
+    }
+}
+
 /// A log from another program cannot be followed. Replay notices that the job the log
 /// names next is not there while other work waits and nothing is running, and stops with
 /// a diagnostic instead of hanging until a test timeout.

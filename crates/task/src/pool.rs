@@ -967,7 +967,8 @@ fn worker_loop(local: &WorkerLocal) {
         }
         scanning_since = None;
         scans = 0;
-        idle(local);
+        // A tracing listener's callbacks run in there (the `park` span).
+        abort_on_unwind(|| idle(local));
     }
     if permit {
         pool.release();
