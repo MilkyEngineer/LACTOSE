@@ -94,6 +94,14 @@ dependency.
   with `-fvk-use-entrypoint-name`. On macOS the MSL is compiled by
   `xcrun -sdk macosx metal -std=metal3.1 -mmacosx-version-min=14.0 -Werror`, MSL 3.1 for
   macOS 14, the oldest client.
+- **Line endings.** The Windows `slangc` writes its text with CRLF line endings, where the
+  other hosts' write LF: the MSL on its standard output, Slang's reflection and its
+  diagnostics. Each CRLF of every text the cook reads back from the toolchain (the MSL, the
+  reflection, a diagnostic, the version `-version` reports) is made LF before it is parsed,
+  stored or shown, and a lone CR is kept; the SPIR-V and the metallib are binary and kept as
+  written. So the MSL and SPIR-V a cook stores, and their versions, are the same bytes on
+  every host, which the `shaders (hashes)` CI job compares across Linux, macOS and Windows.
+  A failed program is named by its file stem, `slangc` on Windows too.
 - **Where the toolchain writes.** It runs as subprocesses on the thread that polls the
   cook, in the sources directory, and reads the sources itself, outside the pool. A link
   module's compiled form and each metallib's MSL are written to a scratch directory of the
@@ -419,6 +427,8 @@ The tests that run Slang are ignored, and run once `cargo xtask slang` has insta
 | The varying components with the built-ins, on the gpu review's probes: sixteen `float4` and `Position` (v14), the same read with `FragCoord` (v23), and fifteen read with `FragCoord` and `FrontFacing` (v25) are refused, each naming its count; fifteen read with `FragCoord` (v24) cook | `tests/shader.rs`, `varyings_and_built_ins_past_64_components_are_refused` |
 | A `half`, an `int16_t` and a `double` varying and constant, and a `centroid` and a `sample` varying, are refused by name | `tests/shader.rs`, `a_varying_or_constant_of_16_or_64_bits_or_centroid_or_sample_is_refused_by_name` |
 | The shader kind's load against section 5.1's slice (row 136): the store's synchronous call, the version hash and the decode, the median of 101 calls per shader | `tests/shader.rs`, `the_shader_kind_loads_against_the_slice`, with `--release --no-capture` |
+| CRLF from the Windows `slangc` is made LF and a lone CR kept: MSL written with CRLF, which the reader refuses as written, is LF once converted, and a diagnostic's CRLF is shown as LF | `src/shader.rs`, `crlf_is_made_lf_and_a_lone_cr_is_kept`, `msl_the_windows_slangc_wrote_with_crlf_is_read_and_stored_with_lf`, `a_diagnostic_with_crlf_is_shown_with_lf` |
+| A cook through a script around the pin that writes CRLF as the Windows `slangc` does, in its MSL, diagnostics, version and reflection, stores the code the pin's cook does byte for byte, and the same pack off macOS; a cook that stores the MSL as written, or BASE's, which refuses it, fails it. Unix only, so the Linux and macOS `shaders` legs and the M1 run it | `tests/shader.rs`, `a_slangc_that_writes_crlf_cooks_the_bytes_the_pin_does` |
 | Each check of the SPIR-V reader, on modules built by hand where Slang cannot emit the case: what is not a module, a capability or an extension off the list and the reason given for seven, two entry points, each descriptor rule and image form, each step of a sample without `NonUniform` and each way of using the heap the check cannot follow, the locations of outputs and varyings, each varying's type and a type off the format's, a varying or an output with a `Component` decoration, a `centroid` or `sample` varying, the components of the varyings and the built-ins, a stage input, the constants' types and a type off the format's, the workgroup, `LocalSizeId` and `BuiltIn WorkgroupSize`, and the push block's size and refusals; Slang's reflection read, its workgroup, and each of its refusals; the MSL's interface, its varyings' and constants' types, and each of its refusals; the three readings' agreement, the types and the workgroup among it | `src/spirv.rs`'s, `src/semantics.rs`'s, `src/msl.rs`'s and `src/shader.rs`'s tests |
 | Every cooked MSL and metallib makes a pipeline state with its function constants, made and not run, under Metal API validation and with shader validation loaded, each shown listening by its canary, on a device with what the code needs of it | `cargo xtask gpu --driver system` (`tools/xtask/README.md`, "GPU runs") |
 

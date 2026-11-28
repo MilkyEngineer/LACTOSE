@@ -1015,3 +1015,66 @@ fn the_shader_kind_loads_against_the_slice() {
         println!("measure: shader_load_us.{} {:.2} ({} bytes)", asset.name, times[50], bytes.len());
     }
 }
+
+/// What the Windows `slangc` writes, played on this host by a script around the pin: every
+/// LF of its MSL, its diagnostics, its version and its reflection written as CRLF, as a C
+/// runtime's text mode writes them, and the SPIR-V untouched. A cook with it stores the same
+/// bytes as a cook with the pin (`README.md`, "Line endings").
+#[cfg(unix)]
+#[test]
+#[ignore = "runs the pinned Slang: `cargo xtask slang` installs it"]
+fn a_slangc_that_writes_crlf_cooks_the_bytes_the_pin_does() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let env = Env::new("crlf-slangc");
+    let fake = env.dir.join("fake").join("slangc");
+    std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+    let script = format!(
+        "#!/bin/sh\n\
+         target=; json=; prev=\n\
+         for a in \"$@\"; do\n  \
+           case $prev in -target) target=$a ;; -reflection-json) json=$a ;; esac\n  \
+           prev=$a\n\
+         done\n\
+         out=$(mktemp); err=$(mktemp)\n\
+         '{}' \"$@\" > \"$out\" 2> \"$err\"; status=$?\n\
+         if [ \"$target\" = spirv ]; then cat \"$out\"; else perl -pe 's/\\n/\\r\\n/' \"$out\"; fi\n\
+         perl -pe 's/\\n/\\r\\n/' \"$err\" >&2\n\
+         if [ -n \"$json\" ]; then perl -pi -e 's/\\n/\\r\\n/' \"$json\"; fi\n\
+         rm -f \"$out\" \"$err\"\n\
+         exit $status\n",
+        slangc().display()
+    );
+    std::fs::write(&fake, script).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The script writes CRLF, so the test cannot pass on a cook that never sees one.
+    let msl = Command::new(&fake)
+        .current_dir(root().join("shaders"))
+        .args(["client/present.slang", "-entry", "fs_main", "-I", "modules", "-target", "metal"])
+        .output()
+        .unwrap();
+    assert!(msl.status.success() && msl.stdout.windows(2).any(|w| w == b"\r\n"));
+    let crlf = Slang::new(&fake).expect("the script reports the pin's version");
+    let pin = slang();
+    let cooked = |slang: &Slang, name: &str| {
+        let code = env.dir.join(name);
+        let shaders = Shaders { slang, code: Some(&code), cooked: None };
+        let pack = env.dir.join(format!("{name}.pack"));
+        env.wait(cook(&env.io, &root().join("shaders"), &pack, Some(shaders))).unwrap();
+        let files = files(&code);
+        (
+            files.into_iter().filter(|(name, _)| !name.ends_with(".metallib")).collect::<Vec<_>>(),
+            pack,
+        )
+    };
+    let ((pinned, pinned_pack), (written, written_pack)) =
+        (cooked(&pin, "pin"), cooked(&crlf, "crlf"));
+    assert!(!pinned.is_empty());
+    for ((name, a), (crlf_name, b)) in pinned.iter().zip(&written) {
+        assert_eq!(name, crlf_name);
+        assert!(a == b, "{name}: the CRLF slangc's cook stored other bytes");
+    }
+    assert_eq!(pinned.len(), written.len());
+    if !cfg!(target_os = "macos") {
+        assert!(std::fs::read(pinned_pack).unwrap() == std::fs::read(written_pack).unwrap());
+    }
+}

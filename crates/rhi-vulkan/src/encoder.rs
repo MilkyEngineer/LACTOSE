@@ -1586,7 +1586,7 @@ impl Encoder for VulkanEncoder {
             return;
         }
         let limit = self.shared.caps.compute_groups;
-        if (0..3).any(|at| groups[at] > limit[at]) {
+        if beyond(groups, limit) {
             self.fail(Rule::Bounds, format!("a dispatch of {groups:?} groups, above {limit:?}"));
             return;
         }
@@ -1741,12 +1741,19 @@ fn draw_checks(pass: &RenderScope, indexed: bool) -> core::result::Result<(), Br
     Ok(())
 }
 
+/// Whether a dispatch of `groups` exceeds the device's `limit` in a dimension. A count at
+/// the limit is taken, `u32::MAX` among them, which the conformance case dispatches on a
+/// device only up to its budget of groups.
+fn beyond(groups: [u32; 3], limit: [u32; 3]) -> bool {
+    (0..3).any(|at| groups[at] > limit[at])
+}
+
 #[cfg(test)]
 mod tests {
     use ash::vk::{self, Handle};
     use lactose_rhi_api::BufferState;
 
-    use super::buffer_calls;
+    use super::{beyond, buffer_calls};
     use crate::convert::{Change, Side, buffer_scope};
 
     const GRAPHICS: Side = Side { queue: 0, family: 0, graphics: true };
@@ -1773,6 +1780,27 @@ mod tests {
             || barrier.dst_stage_mask.intersects(host)
             || barrier.src_access_mask.intersects(access)
             || barrier.dst_access_mask.intersects(access)
+    }
+
+    /// At the limits AMD's Windows driver 26.11.2 reports, and at `u32::MAX` in each.
+    #[test]
+    fn a_dispatch_at_each_group_limit_is_taken_and_one_past_it_refused() {
+        let amd = [u32::MAX, 65535, 65535];
+        for groups in [[u32::MAX, 1, 1], [1, 65535, 1], [1, 1, 65535], amd] {
+            assert!(!beyond(groups, amd), "{groups:?}");
+        }
+        for groups in [[1, 65536, 1], [1, 1, 65536], [u32::MAX, 65536, 65535]] {
+            assert!(beyond(groups, amd), "{groups:?}");
+        }
+        assert!(!beyond([u32::MAX; 3], [u32::MAX; 3]));
+        let moltenvk = [1 << 30; 3];
+        for axis in 0..3 {
+            let mut groups = [1; 3];
+            groups[axis] = 1 << 30;
+            assert!(!beyond(groups, moltenvk), "{groups:?}");
+            groups[axis] += 1;
+            assert!(beyond(groups, moltenvk), "{groups:?}");
+        }
     }
 
     #[test]

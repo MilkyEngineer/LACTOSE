@@ -15,11 +15,14 @@ use lactose_rhi_null::{Control, NullDevice};
 
 use crate::{Silent, request};
 
-/// The harness: five capability sets, and the control of each device it made.
+/// The harness: five capability sets, or the sets a test names, and the control of each
+/// device it made.
 #[derive(Default)]
 struct Null {
     /// Each device's control, by the address of the device while it lives.
     controls: Mutex<Vec<(usize, Control)>>,
+    /// The sets in place of [`SETS`], where a test names its own.
+    sets: Option<Vec<Capabilities>>,
 }
 
 /// The capability sets the contract needs, between them: one queue and several, each role
@@ -70,7 +73,7 @@ impl Null {
 
 impl Harness for Null {
     fn sets(&self) -> Vec<Capabilities> {
-        SETS.to_vec()
+        self.sets.clone().unwrap_or_else(|| SETS.to_vec())
     }
 
     fn device(
@@ -366,6 +369,27 @@ cases! {
     dispatches_of_one_pass_see_each_others_writes
     dispatch_indirect_reads_its_counts
     each_validator_reports_its_canary
+}
+
+/// A dispatch's group limit of `u32::MAX` in a dimension, which AMD's Windows driver
+/// 26.11.2 reports in x, cannot be exceeded there: the case checks the other dimensions,
+/// and the limit itself, and is skipped where all three are `u32::MAX`.
+#[test]
+fn a_group_limit_of_u32_max_is_skipped_in_its_dimension() {
+    let case = case("dispatch_beyond_the_group_limit_is_refused");
+    let amd = Capabilities {
+        compute_groups: [u32::MAX, 65535, 65535],
+        queues: QueueLayout { compute: QueuePath::Own, present: QueuePath::Shared },
+        ..Capabilities::LEAST
+    };
+    let harness = Null { sets: Some(vec![amd]), ..Null::default() };
+    assert_eq!(conformance::run(&harness, case), Outcome::Passed);
+    let unbounded = Capabilities { compute_groups: [u32::MAX; 3], ..Capabilities::LEAST };
+    let harness = Null { sets: Some(vec![unbounded]), ..Null::default() };
+    assert_eq!(
+        conformance::run(&harness, case),
+        Outcome::Skipped("each dimension's group limit is u32::MAX, which no dispatch exceeds")
+    );
 }
 
 /// Null's harness with no loss: what a device backend's harness is unless it has a hook of

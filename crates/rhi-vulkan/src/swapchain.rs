@@ -32,6 +32,7 @@ use crate::lock;
 use crate::raw::{Presents, Raw, driver, unsupported};
 use crate::records::{ImageRec, QUEUES, Stamps};
 use crate::submit::{self, Binary, Staged, Staging};
+use crate::wait;
 
 /// The bound of an acquire, of a present's wait for its submit's release, and of a
 /// `resize`'s wait for the swapchain's presents.
@@ -678,10 +679,10 @@ impl VulkanSwapchain {
         if fences.is_empty() {
             return Ok(true);
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        let nanos = u64::try_from(left.as_nanos()).unwrap_or(u64::MAX);
-        // SAFETY: the fences are this swapchain's; a wait is bounded by `deadline`.
-        let waited = unsafe { self.device().wait_for_fences(&fences, true, nanos) };
+        let waited = wait::until(Some(deadline), |nanos| {
+            // SAFETY: the fences are this swapchain's; a wait is bounded by `deadline`.
+            unsafe { self.device().wait_for_fences(&fences, true, nanos) }
+        });
         match waited {
             Ok(()) | Err(vk::Result::TIMEOUT) => {}
             Err(error) => return Err(self.failed(error, "vkWaitForFences")),
@@ -726,11 +727,12 @@ impl VulkanSwapchain {
         let semaphores = [self.shared.queue(self.queue).timeline];
         let values = [seq];
         let info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values);
-        let left = deadline.saturating_duration_since(Instant::now());
-        let nanos = u64::try_from(left.as_nanos()).unwrap_or(u64::MAX);
-        // SAFETY: the queue's semaphore lives as long as the device, which the swapchain
-        // holds; the wait is bounded.
-        match unsafe { self.device().wait_semaphores(&info, nanos) } {
+        let waited = wait::until(Some(deadline), |nanos| {
+            // SAFETY: the queue's semaphore lives as long as the device, which the swapchain
+            // holds; the wait is bounded.
+            unsafe { self.device().wait_semaphores(&info, nanos) }
+        });
+        match waited {
             Ok(()) => Ok(true),
             Err(vk::Result::TIMEOUT) => Ok(false),
             Err(error) => Err(self.failed(error, "vkWaitSemaphores")),
@@ -1046,18 +1048,20 @@ impl Swapchain for VulkanSwapchain {
             return Ok(Acquired::Stale);
         }
         let at = self.acquire_semaphore()?;
-        let nanos = u64::try_from(BOUND.as_nanos()).unwrap_or(u64::MAX);
-        // SAFETY: the swapchain is this one's, not retired (`stale` is set wherever it may
-        // be), and reached by this thread alone (`Swapchain` is not `Sync`); the semaphore
-        // is unsignalled with no operation pending (`Use::Free`).
-        let acquired = unsafe {
-            self.presents().swapchain.acquire_next_image(
-                self.chain.swapchain(),
-                nanos,
-                self.pool[at].0,
-                vk::Fence::null(),
-            )
-        };
+        let acquired = wait::until(wait::deadline(BOUND), |nanos| {
+            // SAFETY: the swapchain is this one's, not retired (`stale` is set wherever it
+            // may be), and reached by this thread alone (`Swapchain` is not `Sync`); the
+            // semaphore is unsignalled with no operation pending (`Use::Free`), which an
+            // acquire that timed out leaves it.
+            unsafe {
+                self.presents().swapchain.acquire_next_image(
+                    self.chain.swapchain(),
+                    nanos,
+                    self.pool[at].0,
+                    vk::Fence::null(),
+                )
+            }
+        });
         match acquired {
             // `VK_SUBOPTIMAL_KHR` is an image, never stale.
             Ok((index, _)) => {
@@ -1371,7 +1375,8 @@ mod tests {
     //! The pure parts with no device: the empty surface, the drain of the display-time
     //! history and its ids. Then, on a driver, what no safe call can reach: an acquire
     //! semaphore reused under a pending wait, a drop that leaks, an injected failure of a
-    //! resize, and the walk a frame thread's submit decides, which a counter shows.
+    //! resize, the walk a frame thread's submit decides, which a counter shows, and the timed
+    //! waits against a driver that returns early.
 
     use std::panic::AssertUnwindSafe;
     use std::sync::atomic::Ordering;
@@ -1713,6 +1718,79 @@ mod tests {
             reach: PassReach::NOTHING,
         });
         encoder.end_pass();
+    }
+
+    /// The time of the timed waits below, each made with its first driver call given half
+    /// the time left (`wait::return_early`), as AMD's Windows driver 26.11.2 returned
+    /// `VK_TIMEOUT` before the time it was given.
+    const EARLY_WAIT: Duration = Duration::from_millis(30);
+
+    /// Runs `wait`, a timed wait of `EARLY_WAIT` that is not met, against a driver that
+    /// returns early once: it returns `false` no sooner than its time, through `wait::until`.
+    fn waited_out(what: &str, wait: impl FnOnce() -> bool) {
+        crate::wait::return_early(1);
+        let start = Instant::now();
+        let reached = wait();
+        let took = start.elapsed();
+        assert!(!reached, "{what}: met");
+        assert_eq!(crate::wait::early_left(), 0, "{what}: its driver wait is not `wait::until`'s");
+        assert!(took >= EARLY_WAIT, "{what}: returned after {took:?} of {EARLY_WAIT:?}");
+    }
+
+    /// `wait_timeline` on a point no one signals is held to its time against a driver
+    /// that returns early, on a device with no surface.
+    #[test]
+    #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+    fn a_timeline_wait_returned_early_waits_out_its_time() {
+        let kept = Arc::new(Kept::default());
+        let device = VulkanDevice::new(DeviceRequest {
+            adapter: std::env::var("LACTOSE_GPU_ADAPTER").ok(),
+            surface: None,
+            heap_slots: HEAP_SLOTS_DEFAULT,
+            samplers: SAMPLERS_DEFAULT,
+            pipeline_cache: Vec::new(),
+            messages: Arc::clone(&kept) as _,
+        })
+        .expect("a Vulkan device");
+        let timeline = device.create_timeline(0).expect("a timeline");
+        waited_out("wait_timeline", || {
+            device.wait_timeline(at(timeline, 1), EARLY_WAIT).expect("the wait")
+        });
+        drop(device);
+        assert_eq!(breaches(&kept), Vec::<String>::new());
+    }
+
+    /// The swapchain's wait for its present queue's own timeline, on a stamp no submit
+    /// has taken, and its wait for a present's fence, on one no present signals, are each
+    /// held to their time against a driver that returns early.
+    #[test]
+    #[ignore = "needs a Vulkan driver: cargo xtask gpu"]
+    fn the_swapchains_waits_returned_early_wait_out_their_time() {
+        let kept = Arc::new(Kept::default());
+        let Some(device) = device(&kept, "the_swapchains_waits_returned_early_wait_out_their_time")
+        else {
+            return;
+        };
+        let shared = Arc::clone(device.shared());
+        let mut swapchain = VulkanSwapchain::new(&shared, SMALL).expect("a swapchain");
+        let seq = shared.records().queues[swapchain.queue].next;
+        waited_out("wait_queue", || {
+            swapchain.wait_queue(seq, Instant::now() + EARLY_WAIT).expect("the wait")
+        });
+        let info = vk::FenceCreateInfo::default();
+        // SAFETY: the device is live.
+        let fence = unsafe { shared.raw.device.create_fence(&info, None) }.expect("a fence");
+        swapchain.pending.push(fence);
+        waited_out("wait_fences", || {
+            swapchain.wait_fences(&[fence], Instant::now() + EARLY_WAIT).expect("the wait")
+        });
+        swapchain.pending.retain(|&pending| pending != fence);
+        // SAFETY: the fence was never submitted, and the swapchain no longer names it.
+        unsafe { shared.raw.device.destroy_fence(fence, None) };
+        drop(swapchain);
+        drop(shared);
+        drop(device);
+        assert_eq!(breaches(&kept), Vec::<String>::new());
     }
 
     /// An acquire that reuses the last acquire's semaphore while the batch that waits for it

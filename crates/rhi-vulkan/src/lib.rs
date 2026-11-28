@@ -27,6 +27,7 @@ mod surface;
 mod swapchain;
 mod table;
 mod timestamps;
+mod wait;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 

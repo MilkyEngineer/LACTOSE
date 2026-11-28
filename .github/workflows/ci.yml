@@ -77,7 +77,7 @@ env:
 # GitHub's 10 GB, but GitHub evicts the least recently used entries first, and most of it was
 # entries of older keys: the newest entry of each job came to about 2.6 GB. The first run after
 # the split restores nothing (no earlier key has the group in it) and builds cold, and no job
-# restores a `v0-rust-check-<os>-...` entry again. check and windows-lint-release set
+# restores a `v0-rust-check-<os>-...` entry again. check, windows-lint-release and shaders set
 # cache-on-failure, so a cold run that times out late in its build still saves its dependencies.
 # But rust-cache saves only when its key missed, so a run on a new key that fails or is
 # cancelled before its build finishes leaves a partial entry that later runs restore and never
@@ -250,7 +250,7 @@ jobs:
           if-no-files-found: ignore
 
   # The shader runner of criterion 7 (milestone 2 plan, decision 5.8): the engine's shaders
-  # cooked with the pinned Slang on both hosts, the two hosts' SPIR-V and MSL compared, and
+  # cooked with the pinned Slang on each of the three hosts, their SPIR-V and MSL compared, and
   # every MSL and metallib made into a pipeline state on macOS, under Metal API and shader
   # validation with their canaries (`cargo xtask gpu`, tools/xtask/README.md). What the runners
   # offer is not assumed: each job first records its Xcode, its `metal`, its `swift` and its
@@ -263,11 +263,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
+      # The Windows leg's first run builds cold, and a failure of one of its cook tests,
+      # which have not run there before, would otherwise save nothing and leave every later
+      # run cold.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.151
@@ -286,8 +291,10 @@ jobs:
       - name: Cook and load the engine shaders
         if: runner.os == 'macOS'
         run: cargo xtask gpu --driver system --only metal
+      # Bash, so that `$SLANGC` is the variable on Windows too, where the default is PowerShell.
       - name: Cook the engine shaders
         if: runner.os != 'macOS'
+        shell: bash
         env:
           SLANGC: ${{ steps.slang.outputs.slangc }}
         run: >-
@@ -301,13 +308,17 @@ jobs:
           cargo nextest run --locked -p lactose-cook --run-ignored only
           -E 'not test(the_shader_kind_loads_against_the_slice)'
       # Every cooked file but the metallibs, which only macOS writes and whose bytes nothing
-      # rests on.
+      # rests on. Each file is read on standard input and its name printed here, so the lines
+      # are the same whichever of `sha256sum` and `shasum` the host has.
       - name: Hashes
         if: success() || failure()
         shell: bash
         run: |
+          if command -v sha256sum > /dev/null; then sum=(sha256sum); else sum=(shasum -a 256); fi
           cd target/gpu/code
-          find . -type f ! -name '*.metallib' -print | LC_ALL=C sort | xargs shasum -a 256 > ../hashes.txt
+          find . -type f ! -name '*.metallib' -print | LC_ALL=C sort | while read -r file; do
+            printf '%s  %s\n' "$("${sum[@]}" < "$file" | cut -d ' ' -f 1)" "$file"
+          done > ../hashes.txt
           cat ../hashes.txt
       - uses: actions/upload-artifact@v6
         if: success() || failure()
@@ -366,11 +377,29 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           pattern: shaders-*
-      - name: The two hosts' SPIR-V and MSL are equal
+      # Windows' `slangc` writes its MSL with CRLF, which the cook makes LF (tools/cook/README.md,
+      # "Line endings"), so all three hosts cook the same bytes.
+      - name: The three hosts' SPIR-V and MSL are equal
         shell: bash
         run: |
-          if ! diff shaders-Linux/hashes.txt shaders-macOS/hashes.txt; then
-            echo "::error::the SPIR-V or MSL cooked on Linux and on macOS differ (lines above)"
+          # A leg that timed out wrote no hashes, which is not a difference.
+          if [ ! -f shaders-Linux/hashes.txt ]; then
+            echo "::error::the Linux leg left no hashes: see its job"
+            exit 1
+          fi
+          failed=false
+          for os in macOS Windows; do
+            if [ ! -f "shaders-$os/hashes.txt" ]; then
+              echo "::error::the $os leg left no hashes: see its job"
+              failed=true
+              continue
+            fi
+            if ! diff shaders-Linux/hashes.txt "shaders-$os/hashes.txt"; then
+              echo "::error::the SPIR-V or MSL cooked on Linux and on $os differ (lines above)"
+              failed=true
+            fi
+          done
+          if $failed; then
             exit 1
           fi
 
